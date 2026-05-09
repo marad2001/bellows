@@ -91,14 +91,30 @@ pub async fn run_once(
     };
 
     sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+
+    // If claude wrote a PR description file, capture + remove it before
+    // committing so it does not appear in the diff. Fall back to a
+    // boilerplate body otherwise.
+    let pr_description_path = workspace.path().join(".bellows-pr-description.md");
+    let claude_pr_body = if pr_description_path.exists() {
+        let body = tokio::fs::read_to_string(&pr_description_path).await?;
+        tokio::fs::remove_file(&pr_description_path).await?;
+        Some(body.trim().to_string())
+    } else {
+        None
+    };
+
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
-    let pr_title = format!("Bellows stub run for issue #{}", claimed.number);
-    let pr_body = format!(
-        "Closes #{}.\n\n_(Stub run produced by Bellows v1.)_",
-        claimed.number
-    );
+    let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
+    let pr_body = match claude_pr_body {
+        Some(body) => format!("Closes #{}.\n\n{}", claimed.number, body),
+        None => format!(
+            "Closes #{}.\n\n_(Run produced by Bellows v1; the agent did not write a PR description.)_",
+            claimed.number
+        ),
+    };
     let pr = workspace::open_pr(
         client,
         &owner,
