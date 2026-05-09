@@ -1,4 +1,7 @@
-use bellows::policy::{classify_exit, render_kickoff, ExitReason};
+use bellows::policy::{
+    classify_exit, render_kickoff, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes,
+    ReviewOutcome,
+};
 
 #[test]
 fn rendered_kickoff_includes_the_agent_brief_body() {
@@ -33,9 +36,55 @@ fn rendered_kickoff_includes_stop_conditions_and_tooling_hints() {
 }
 
 #[test]
+fn classify_exit_returns_success_when_all_phases_clean() {
+    // Tracer bullet for slice X1: every phase produced a clean exit and
+    // every cargo gate's clippy + test passed. No findings, so review-fix
+    // didn't run. Both gates ran (Cargo.toml is at the workspace root).
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 0,
+            stderr_tail: String::new(),
+        },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(0),
+            cargo_test: Some(0),
+        },
+        review: Some(ReviewOutcome {
+            findings_text: None,
+            exit_code: 0,
+        }),
+        review_fix: None,
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(0),
+            cargo_test: Some(0),
+        }),
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
+}
+
+/// Helper for migrated tests: an `Outcomes` shape representing the
+/// slice-5 path (only the post-implement gate populated, no review,
+/// no end gate). Each test tweaks one field to express its scenario.
+fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes {
+    PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: implement_exit,
+            stderr_tail: String::new(),
+        },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: None,
+            cargo_test,
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+    }
+}
+
+#[test]
 fn classify_exit_returns_success_for_clean_run_with_tests_green() {
     assert_eq!(
-        classify_exit(0, false, Some(0)),
+        classify_exit(false, &slice5_shaped(0, Some(0))),
         ExitReason::Success
     );
 }
@@ -44,7 +93,10 @@ fn classify_exit_returns_success_for_clean_run_with_tests_green() {
 fn classify_exit_returns_success_when_cargo_test_gate_was_skipped() {
     // None means the workspace had no Cargo.toml at root; the runner
     // skipped the cargo test gate. Non-Rust briefs are a valid use case.
-    assert_eq!(classify_exit(0, false, None), ExitReason::Success);
+    assert_eq!(
+        classify_exit(false, &slice5_shaped(0, None)),
+        ExitReason::Success
+    );
 }
 
 #[test]
@@ -52,7 +104,7 @@ fn classify_exit_returns_self_reported_failure_when_agent_notes_present() {
     // agent-notes.md presence wins over exit code 0 AND green tests —
     // the agent's voice trumps everything.
     assert_eq!(
-        classify_exit(0, true, Some(0)),
+        classify_exit(true, &slice5_shaped(0, Some(0))),
         ExitReason::AgentSelfReportedFailure
     );
 }
@@ -61,8 +113,14 @@ fn classify_exit_returns_self_reported_failure_when_agent_notes_present() {
 fn classify_exit_returns_crash_when_agent_exits_non_zero_without_notes() {
     // Agent process died (claude itself errored, OOM, etc.). No notes
     // file means the agent didn't get to write a structured report.
-    assert_eq!(classify_exit(1, false, None), ExitReason::Crash);
-    assert_eq!(classify_exit(137, false, Some(0)), ExitReason::Crash);
+    assert_eq!(
+        classify_exit(false, &slice5_shaped(1, None)),
+        ExitReason::Crash
+    );
+    assert_eq!(
+        classify_exit(false, &slice5_shaped(137, Some(0))),
+        ExitReason::Crash
+    );
 }
 
 #[test]
@@ -70,11 +128,11 @@ fn classify_exit_returns_final_tests_red_when_cargo_test_failed() {
     // Agent thought it was done (exit 0, no notes), but the cargo test
     // gate caught failing tests.
     assert_eq!(
-        classify_exit(0, false, Some(1)),
+        classify_exit(false, &slice5_shaped(0, Some(1))),
         ExitReason::FinalTestsRed
     );
     assert_eq!(
-        classify_exit(0, false, Some(101)),
+        classify_exit(false, &slice5_shaped(0, Some(101))),
         ExitReason::FinalTestsRed
     );
 }

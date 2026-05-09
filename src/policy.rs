@@ -1,6 +1,9 @@
 /// Classification of how an agent run ended. `policy::classify_exit`
 /// produces this from the post-run signals; the runner uses it to choose
 /// PR draft state, label, and log-comment shape.
+///
+/// `FinalTestsRed` covers any failing post-run cargo check — clippy or
+/// test, in either the post-implement gate or the end-of-pipeline gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
     Success,
@@ -9,28 +12,85 @@ pub enum ExitReason {
     FinalTestsRed,
 }
 
-/// Decide how a finished agent run should be classified.
+/// Outcome of the implement run: the first phase, where claude reads
+/// the agent brief and writes code.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImplementOutcome {
+    pub exit_code: i64,
+    pub stderr_tail: String,
+}
+
+/// Outcome of one cargo checks gate run (clippy followed by test).
+/// `None` for either field encodes "the check did not run" — clippy is
+/// `None` when the workspace has no `Cargo.toml` at the root; test is
+/// `None` when clippy failed and we never got to it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GateOutcome {
+    pub cargo_clippy: Option<i64>,
+    pub cargo_test: Option<i64>,
+}
+
+/// Outcome of the review phase. `findings_text` is `Some` when the agent
+/// produced a non-empty findings file; `None` means the review run found
+/// nothing to flag (clean diff) and the runner skipped review-fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewOutcome {
+    pub findings_text: Option<String>,
+    pub exit_code: i64,
+}
+
+/// Outcome of the review-fix phase. Only present in `PhaseOutcomes` when
+/// review produced findings and the fix run was actually launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixOutcome {
+    pub exit_code: i64,
+}
+
+/// Aggregated per-phase signals from one agent pipeline run. Drives the
+/// PR-body and log-body builders (which consume the per-phase detail)
+/// and `classify_exit` (which collapses it into a single `ExitReason`
+/// for routing).
 ///
-/// `cargo_test_result` is `None` when the workspace had no `Cargo.toml`
-/// at the root and the gate was skipped — that case counts as success.
+/// `Option` fields encode "phase did not run" cleanly — e.g. `review` is
+/// `None` when the post-implement gate failed and the runner short-
+/// circuited before reaching review.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PhaseOutcomes {
+    pub implement: ImplementOutcome,
+    pub post_implement_gate: GateOutcome,
+    pub review: Option<ReviewOutcome>,
+    pub review_fix: Option<FixOutcome>,
+    pub end_pipeline_gate: Option<GateOutcome>,
+}
+
+/// Decide how a finished agent run should be classified.
 ///
 /// Precedence: an agent self-report (notes file present) wins over
 /// everything else; the agent's voice always trumps tooling signals.
-pub fn classify_exit(
-    agent_exit_code: i64,
-    has_agent_notes: bool,
-    cargo_test_result: Option<i64>,
-) -> ExitReason {
+/// Then any non-zero implement exit is `Crash`. Then any failing cargo
+/// gate (clippy or test, post-implement or end-pipeline) is
+/// `FinalTestsRed`. Otherwise `Success`.
+pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitReason {
     if has_agent_notes {
         return ExitReason::AgentSelfReportedFailure;
     }
-    if agent_exit_code != 0 {
+    if outcomes.implement.exit_code != 0 {
         return ExitReason::Crash;
     }
-    if matches!(cargo_test_result, Some(code) if code != 0) {
+    if gate_failed(&outcomes.post_implement_gate) {
+        return ExitReason::FinalTestsRed;
+    }
+    if let Some(end_gate) = &outcomes.end_pipeline_gate
+        && gate_failed(end_gate)
+    {
         return ExitReason::FinalTestsRed;
     }
     ExitReason::Success
+}
+
+fn gate_failed(gate: &GateOutcome) -> bool {
+    matches!(gate.cargo_clippy, Some(code) if code != 0)
+        || matches!(gate.cargo_test, Some(code) if code != 0)
 }
 
 /// Render the kickoff prompt that gets fed into `claude -p` inside the

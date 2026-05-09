@@ -2,7 +2,7 @@ use std::io::Write;
 
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
-use crate::policy::{self, ExitReason};
+use crate::policy::{self, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes};
 use crate::sandbox::{self, AgentRun, CargoTestRun, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
@@ -142,11 +142,23 @@ pub async fn run_once(
     };
     let cargo_test_result: Option<i64> = cargo_test_run.as_ref().map(|r| r.exit_code);
 
-    let reason = policy::classify_exit(
-        agent_run.exit_code,
-        agent_notes.is_some(),
-        cargo_test_result,
-    );
+    // Slice X1 introduces PhaseOutcomes. Until the review/end-gate phases
+    // land later in this slice, only the post-implement gate is populated;
+    // the rest stays `None`. classify_exit's behaviour is preserved.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: agent_run.exit_code,
+            stderr_tail: agent_run.stderr_tail.clone(),
+        },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: None,
+            cargo_test: cargo_test_result,
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+    };
+    let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
     let draft = !matches!(reason, ExitReason::Success);
     // Exhaustive match — no `_ => ...` fallthrough — so when slice 6
