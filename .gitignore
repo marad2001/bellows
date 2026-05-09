@@ -1,1 +1,7 @@
 /target
+
+# Operator-local config (the example lives at orchestrator.example.toml).
+orchestrator.toml
+
+# Default log file location.
+bellows.log

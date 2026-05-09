@@ -1,0 +1,35 @@
+# Bellows orchestrator config (example).
+#
+# Copy this file to `orchestrator.toml` and fill in the values that match
+# your environment. The real `orchestrator.toml` is gitignored so you can
+# keep deployment-specific values out of source control.
+
+[repo]
+# The GitHub repository Bellows will poll for `ready-for-agent` issues.
+url = "https://github.com/marad2001/bellows-test"
+
+[github]
+# Name of the environment variable holding your fine-grained PAT.
+# The PAT needs: Issues: write, Pull requests: write, Contents: write.
+pat_env_var = "BELLOWS_GITHUB_TOKEN"
+
+# All sections below are optional; defaults shown are what you get if
+# you omit the section entirely.
+
+[polling]
+# How often to poll GitHub. Default: 45 seconds.
+interval_seconds = 30
+# Which label marks an issue as ready for an AFK agent to pick up.
+pickup_label = "ready-for-agent"
+
+[runtime_labels]
+# Strings Bellows applies during a run. Defaults match these names verbatim.
+agent_in_progress = "agent-in-progress"
+agent_done        = "agent-done"
+agent_failed      = "agent-failed"
+agent_rate_limited = "agent-rate-limited"
+agent_cancelled   = "agent-cancelled"
+
+[logging]
+# Single log file path. Default: "bellows.log" in cwd.
+path = "bellows.log"
