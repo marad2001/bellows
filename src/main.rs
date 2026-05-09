@@ -127,11 +127,12 @@ async fn run(config_path: &PathBuf) -> Result<()> {
             Ok(RunOutcome::Finalised {
                 issue_number,
                 pr_number,
+                reason,
             }) => log(
                 &mut log_file,
                 &format!(
-                    "bellows: finalised issue #{} -> PR #{}",
-                    issue_number, pr_number
+                    "bellows: finalised issue #{} -> PR #{} ({:?})",
+                    issue_number, pr_number, reason
                 ),
             ),
             Ok(RunOutcome::Contended { issue_number }) => log(

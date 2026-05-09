@@ -148,6 +148,7 @@ pub async fn open_pr(
     base_branch: &str,
     title: &str,
     body: &str,
+    draft: bool,
 ) -> Result<Pr, octocrab::Error> {
     let route = format!("/repos/{owner}/{repo}/pulls");
     let payload = serde_json::json!({
@@ -155,7 +156,7 @@ pub async fn open_pr(
         "head": head_branch,
         "base": base_branch,
         "body": body,
-        "draft": false,
+        "draft": draft,
     });
     let pr: Pr = client.post(&route, Some(&payload)).await?;
     Ok(pr)

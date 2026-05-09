@@ -2,7 +2,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bellows::tracker::{claim, fetch_agent_brief, finalise_success, find_next_issue, ClaimError};
+use bellows::tracker::{claim, fetch_agent_brief, finalise, find_next_issue, ClaimError};
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
     octocrab::OctocrabBuilder::new()
@@ -167,7 +167,7 @@ async fn claim_returns_contended_when_pickup_label_already_swapped() {
 }
 
 #[tokio::test]
-async fn finalise_success_posts_log_comment_and_transitions_to_done() {
+async fn finalise_posts_log_comment_and_transitions_to_outcome_label() {
     let mock = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -205,7 +205,7 @@ async fn finalise_success_posts_log_comment_and_transitions_to_done() {
         .await;
 
     let client = octocrab_pointed_at(mock.uri());
-    let updated = finalise_success(
+    let updated = finalise(
         &client,
         "marad2001",
         "test-repo",
@@ -222,6 +222,57 @@ async fn finalise_success_posts_log_comment_and_transitions_to_done() {
     assert!(label_names.contains(&"agent-done"));
     assert!(label_names.contains(&"enhancement"));
     assert!(!label_names.contains(&"agent-in-progress"));
+}
+
+#[tokio::test]
+async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 7 })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Failing run",
+            "labels": [{ "name": "agent-in-progress" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .and(body_json(json!({ "labels": ["agent-failed"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Failing run",
+            "labels": [{ "name": "agent-failed" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let updated = finalise(
+        &client,
+        "marad2001",
+        "test-repo",
+        55,
+        77,
+        "agent-in-progress",
+        "agent-failed",
+        "Tests failed",
+    )
+    .await
+    .expect("finalise should succeed");
+
+    let label_names: Vec<&str> = updated.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(label_names.contains(&"agent-failed"));
+    assert!(!label_names.contains(&"agent-in-progress"));
+    assert!(!label_names.contains(&"agent-done"));
 }
 
 #[tokio::test]
