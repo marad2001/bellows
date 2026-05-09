@@ -11,6 +11,8 @@ pub struct Config {
     pub runtime_labels: RuntimeLabelsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +112,34 @@ impl Default for LoggingConfig {
 
 fn default_logging_path() -> PathBuf {
     PathBuf::from("bellows.log")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub method: AuthMethod,
+    #[serde(default = "default_credentials_volume")]
+    pub credentials_volume: String,
+}
+
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    #[default]
+    Subscription,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            method: AuthMethod::default(),
+            credentials_volume: default_credentials_volume(),
+        }
+    }
+}
+
+fn default_credentials_volume() -> String {
+    "bellows-claude-credentials".to_string()
 }
 
 impl Config {

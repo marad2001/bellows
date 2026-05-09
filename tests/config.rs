@@ -1,4 +1,4 @@
-use bellows::config::Config;
+use bellows::config::{AuthMethod, Config};
 
 const MINIMAL_CONFIG: &str = r#"
 [repo]
@@ -36,4 +36,11 @@ fn runtime_labels_section_defaults_apply_when_omitted() {
 fn logging_section_defaults_apply_when_omitted() {
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
     assert_eq!(config.logging.path, std::path::PathBuf::from("bellows.log"));
+}
+
+#[test]
+fn auth_section_defaults_apply_when_omitted() {
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert!(matches!(config.auth.method, AuthMethod::Subscription));
+    assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
 }

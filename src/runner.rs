@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use crate::config::Config;
+use crate::auth::Auth;
+use crate::config::{AuthMethod, Config};
+use crate::policy;
 use crate::sandbox::{self, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
@@ -17,6 +19,11 @@ pub enum RunError {
     Io(#[from] std::io::Error),
     #[error("repo url is not in the form https://host/owner/repo: {0}")]
     InvalidRepoUrl(String),
+    #[error(
+        "issue #{0} is labelled ready-for-agent but no `## Agent Brief` comment was found; \
+         move it back to needs-triage and write the brief"
+    )]
+    MissingAgentBrief(u64),
 }
 
 #[derive(Debug)]
@@ -46,6 +53,14 @@ pub async fn run_once(
         return Ok(RunOutcome::Idle);
     };
 
+    // Fetch the agent brief BEFORE claiming. If it's missing we return
+    // an error without label-swapping the issue — the next polling tick
+    // will see it fresh once a human posts the brief, instead of leaving
+    // it stuck in agent-in-progress with no automated recovery.
+    let brief = tracker::fetch_agent_brief(client, &owner, &repo, issue.number)
+        .await?
+        .ok_or(RunError::MissingAgentBrief(issue.number))?;
+
     let claimed = match tracker::claim(
         client,
         &owner,
@@ -70,15 +85,40 @@ pub async fn run_once(
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
 
-    sandbox::run_agent(&workspace, claimed.number, log_writer).await?;
+    let kickoff = policy::render_kickoff(&brief, &config.repo.url, &branch_name);
+    tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
+
+    let auth = match config.auth.method {
+        AuthMethod::Subscription => Auth::Subscription {
+            credentials_volume_name: config.auth.credentials_volume.clone(),
+        },
+    };
+
+    sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+
+    // If claude wrote a PR description file, capture + remove it before
+    // committing so it does not appear in the diff. Fall back to a
+    // boilerplate body otherwise.
+    let pr_description_path = workspace.path().join(".bellows-pr-description.md");
+    let claude_pr_body = if pr_description_path.exists() {
+        let body = tokio::fs::read_to_string(&pr_description_path).await?;
+        tokio::fs::remove_file(&pr_description_path).await?;
+        Some(body.trim().to_string())
+    } else {
+        None
+    };
+
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
-    let pr_title = format!("Bellows stub run for issue #{}", claimed.number);
-    let pr_body = format!(
-        "Closes #{}.\n\n_(Stub run produced by Bellows v1.)_",
-        claimed.number
-    );
+    let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
+    let pr_body = match claude_pr_body {
+        Some(body) => format!("Closes #{}.\n\n{}", claimed.number, body),
+        None => format!(
+            "Closes #{}.\n\n_(Run produced by Bellows v1; the agent did not write a PR description.)_",
+            claimed.number
+        ),
+    };
     let pr = workspace::open_pr(
         client,
         &owner,
@@ -92,7 +132,7 @@ pub async fn run_once(
 
     let finished = chrono::Utc::now();
     let log_body = format!(
-        "<details><summary>Bellows run log</summary>\n\nIssue: #{}\nClaimed at: {}\nFinalised at: {}\nBranch: `{}`\nMarker file: `.bellows-stub-marker`\n</details>",
+        "<details><summary>Bellows run log</summary>\n\nIssue: #{}\nClaimed at: {}\nFinalised at: {}\nBranch: `{}`\n</details>",
         claimed.number,
         started.to_rfc3339(),
         finished.to_rfc3339(),

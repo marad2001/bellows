@@ -1,0 +1,37 @@
+#!/bin/sh
+# Bellows policy-image entrypoint.
+#
+# Runs once per container start. Copies the baked skills + CLAUDE.md from
+# /opt/bellows-policy/ into /home/bellows/.claude/ (where the credentials
+# volume mounts) so they layer with the persisted OAuth tokens, then
+# exec's run-agent.
+#
+# Idempotent: subsequent runs overwrite any older copies in the volume,
+# which is what we want — the policy image is the source of truth for
+# skills + CLAUDE.md, the volume is the source of truth for credentials.
+
+set -eu
+
+CLAUDE_HOME=/home/bellows/.claude
+
+mkdir -p "$CLAUDE_HOME/skills"
+
+# Use cp -r with a trailing /. so we copy CONTENTS, not the directory
+# itself, regardless of whether the destination already exists.
+cp -r /opt/bellows-policy/skills/. "$CLAUDE_HOME/skills/"
+cp /opt/bellows-policy/CLAUDE.md "$CLAUDE_HOME/CLAUDE.md"
+
+# Workaround for Claude Code v2.1: setup-auth created
+# /home/bellows/.claude.json (sibling file), but the credentials volume
+# only mounts /home/bellows/.claude/ (the directory). .claude.json is
+# NOT in the volume, so it's lost on container exit. Claude Code itself
+# stashes a backup inside /home/bellows/.claude/backups/ (which IS in
+# the volume); restore it on each start so Claude Code finds its config.
+if [ ! -f /home/bellows/.claude.json ]; then
+    LATEST_BACKUP=$(ls -t "$CLAUDE_HOME/backups/.claude.json.backup."* 2>/dev/null | head -n 1 || true)
+    if [ -n "$LATEST_BACKUP" ]; then
+        cp "$LATEST_BACKUP" /home/bellows/.claude.json
+    fi
+fi
+
+exec /usr/local/bin/run-agent "$@"
