@@ -27,3 +27,15 @@ pub fn slugify_title(title: &str) -> String {
     }
     slug
 }
+
+/// Branch name for the given issue. If the title slugifies to empty
+/// (e.g. all-non-ASCII), the branch is `agent/{issue_number}` with no
+/// trailing hyphen.
+pub fn agent_branch_name(issue_number: u64, title: &str) -> String {
+    let slug = slugify_title(title);
+    if slug.is_empty() {
+        format!("agent/{}", issue_number)
+    } else {
+        format!("agent/{}-{}", issue_number, slug)
+    }
+}

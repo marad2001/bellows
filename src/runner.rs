@@ -12,15 +12,6 @@ pub enum RunError {
     InvalidRepoUrl(String),
 }
 
-impl From<ClaimError> for RunError {
-    fn from(e: ClaimError) -> Self {
-        match e {
-            ClaimError::Contended => unreachable!("Contended is handled inline in run_once"),
-            ClaimError::Octocrab(e) => RunError::Octocrab(e),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum RunOutcome {
     Idle,
@@ -67,11 +58,7 @@ pub async fn run_once(
     };
 
     let started = chrono::Utc::now();
-    let branch_name = format!(
-        "agent/{}-{}",
-        claimed.number,
-        crate::slugify_title(&claimed.title)
-    );
+    let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
     let marker_content = format!(
@@ -126,11 +113,57 @@ pub async fn run_once(
 }
 
 fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
-    let stripped = url.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts: Vec<&str> = stripped.rsplitn(3, '/').take(2).collect();
-    parts.reverse();
-    if parts.len() < 2 || parts.iter().any(|s| s.is_empty()) {
+    // Only http(s):// URLs are supported. SSH (`git@host:owner/repo`) and
+    // local paths can clone fine, but the (owner, repo) tuple they produce
+    // would be wrong for the GitHub API calls.
+    let after_scheme = match url.split_once("://") {
+        Some((scheme, rest)) if scheme == "http" || scheme == "https" => rest,
+        _ => return Err(RunError::InvalidRepoUrl(url.to_string())),
+    };
+    let trimmed = after_scheme.trim_end_matches('/').trim_end_matches(".git");
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    // Expecting host / owner / repo at minimum.
+    if segments.len() < 3 || segments.iter().any(|s| s.is_empty()) {
         return Err(RunError::InvalidRepoUrl(url.to_string()));
     }
-    Ok((parts[0].to_string(), parts[1].to_string()))
+    Ok((segments[1].to_string(), segments[2].to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_owner_repo_https_happy_path() {
+        let (owner, repo) =
+            parse_owner_repo("https://github.com/marad2001/bellows-test").unwrap();
+        assert_eq!(owner, "marad2001");
+        assert_eq!(repo, "bellows-test");
+    }
+
+    #[test]
+    fn parse_owner_repo_strips_trailing_slash_and_dot_git() {
+        let (owner, repo) =
+            parse_owner_repo("https://github.com/marad2001/bellows-test.git/").unwrap();
+        assert_eq!(owner, "marad2001");
+        assert_eq!(repo, "bellows-test");
+    }
+
+    #[test]
+    fn parse_owner_repo_rejects_ssh_url() {
+        let err = parse_owner_repo("git@github.com:marad2001/bellows-test.git").unwrap_err();
+        assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn parse_owner_repo_rejects_local_path() {
+        let err = parse_owner_repo("/tmp/bellows-test").unwrap_err();
+        assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn parse_owner_repo_rejects_url_with_too_few_segments() {
+        let err = parse_owner_repo("https://github.com/marad2001").unwrap_err();
+        assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
+    }
 }

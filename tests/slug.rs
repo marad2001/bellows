@@ -1,4 +1,4 @@
-use bellows::slugify_title;
+use bellows::{agent_branch_name, slugify_title};
 
 #[test]
 fn slugify_lowercases_and_replaces_spaces_with_hyphens() {
@@ -24,4 +24,18 @@ fn slugify_truncates_long_titles_to_max_length_without_trailing_separator() {
     let result = slugify_title(&long_input);
     assert!(result.len() <= 50, "len was {}: {:?}", result.len(), result);
     assert!(!result.ends_with('-'), "trailing '-': {:?}", result);
+}
+
+#[test]
+fn agent_branch_name_for_normal_title() {
+    assert_eq!(
+        agent_branch_name(42, "Fix the foo bug"),
+        "agent/42-fix-the-foo-bug"
+    );
+}
+
+#[test]
+fn agent_branch_name_for_empty_slug_omits_trailing_hyphen() {
+    assert_eq!(agent_branch_name(42, "日本語"), "agent/42");
+    assert_eq!(agent_branch_name(7, "  !!!  "), "agent/7");
 }
