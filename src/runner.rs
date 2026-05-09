@@ -149,9 +149,14 @@ pub async fn run_once(
     );
 
     let draft = !matches!(reason, ExitReason::Success);
+    // Exhaustive match — no `_ => ...` fallthrough — so when slice 6
+    // adds RateLimited / WallClockExceeded variants the compiler will
+    // refuse to build until we make an explicit decision per variant.
     let outcome_label = match reason {
         ExitReason::Success => &config.runtime_labels.agent_done,
-        _ => &config.runtime_labels.agent_failed,
+        ExitReason::AgentSelfReportedFailure
+        | ExitReason::Crash
+        | ExitReason::FinalTestsRed => &config.runtime_labels.agent_failed,
     };
 
     let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
@@ -336,5 +341,121 @@ mod tests {
     fn parse_owner_repo_rejects_url_with_too_few_segments() {
         let err = parse_owner_repo("https://github.com/marad2001").unwrap_err();
         assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
+    }
+
+    fn agent_run(exit: i64, tail: &str) -> AgentRun {
+        AgentRun {
+            exit_code: exit,
+            stderr_tail: tail.to_string(),
+        }
+    }
+
+    fn cargo_test_run(exit: i64, output: &str) -> CargoTestRun {
+        CargoTestRun {
+            exit_code: exit,
+            output: output.to_string(),
+        }
+    }
+
+    fn fixed_timestamp() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-09T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn build_pr_body_for_success_uses_claude_pr_body_when_present() {
+        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None);
+        assert!(body.starts_with("Closes #42.\n\n"));
+        assert!(body.contains("My PR body."));
+    }
+
+    #[test]
+    fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
+        let body = build_pr_body(&ExitReason::Success, 42, None, None);
+        assert!(body.contains("the agent did not write a PR description"));
+    }
+
+    #[test]
+    fn build_pr_body_for_self_reported_failure_quotes_agent_notes() {
+        let body = build_pr_body(
+            &ExitReason::AgentSelfReportedFailure,
+            42,
+            None,
+            Some("I got stuck on the brief."),
+        );
+        assert!(body.contains("self-reported failure"));
+        assert!(body.contains("I got stuck on the brief."));
+    }
+
+    #[test]
+    fn build_pr_body_for_crash_mentions_stderr_tail_pointer() {
+        let body = build_pr_body(&ExitReason::Crash, 42, None, None);
+        assert!(body.contains("crashed"));
+        assert!(body.contains("stderr tail"));
+    }
+
+    #[test]
+    fn build_pr_body_for_final_tests_red_mentions_test_output_pointer() {
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None);
+        assert!(body.contains("`cargo test` failed"));
+        assert!(body.contains("full test output"));
+    }
+
+    #[test]
+    fn build_log_body_for_success_skips_failure_sections() {
+        let started = fixed_timestamp();
+        let finished = started;
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &agent_run(0, "not shown"),
+            None,
+        );
+        assert!(body.contains("Bellows run log (Success)"));
+        assert!(!body.contains("### Agent output tail"));
+        assert!(!body.contains("### `cargo test` output"));
+    }
+
+    #[test]
+    fn build_log_body_for_final_tests_red_includes_agent_tail_and_cargo_output() {
+        let started = fixed_timestamp();
+        let finished = started;
+        let body = build_log_body(
+            &ExitReason::FinalTestsRed,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &agent_run(0, "agent told you it was done"),
+            Some(&cargo_test_run(101, "test foo ... FAILED")),
+        );
+        assert!(body.contains("FinalTestsRed"));
+        assert!(body.contains("### Agent output tail"));
+        assert!(body.contains("agent told you it was done"));
+        assert!(body.contains("### `cargo test` output (exit 101)"));
+        assert!(body.contains("test foo ... FAILED"));
+    }
+
+    #[test]
+    fn build_log_body_for_self_reported_failure_includes_agent_tail_only() {
+        let started = fixed_timestamp();
+        let finished = started;
+        let body = build_log_body(
+            &ExitReason::AgentSelfReportedFailure,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &agent_run(0, "stuck on something"),
+            None,
+        );
+        assert!(body.contains("AgentSelfReportedFailure"));
+        assert!(body.contains("### Agent output tail"));
+        assert!(body.contains("stuck on something"));
+        assert!(!body.contains("### `cargo test` output"));
     }
 }

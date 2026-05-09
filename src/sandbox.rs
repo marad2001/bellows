@@ -73,8 +73,6 @@ pub enum SandboxError {
     ImageBuildFailed(std::process::ExitStatus),
     #[error("docker images failed (status {0})")]
     ImageQueryFailed(std::process::ExitStatus),
-    #[error("container exited non-zero (status code {0})")]
-    ContainerNonZeroExit(i64),
     #[error("policy-image dir not found at {0}")]
     PolicyImageMissing(String),
 }
@@ -86,6 +84,120 @@ pub async fn ensure_policy_image() -> Result<String, SandboxError> {
     let image_tag = format!("bellows-policy:{}", &hash[..12]);
     ensure_image_built(&hash, &image_tag).await?;
     Ok(image_tag)
+}
+
+/// How the lifecycle helper should retain the container's stdout/stderr.
+enum CaptureMode {
+    /// Keep at most this many bytes of the most-recent output (used for
+    /// the agent run's failure-log tail).
+    BoundedTail(usize),
+    /// Keep the full output (used for the cargo-test gate so the
+    /// failure log comment can show every failing assertion).
+    Full,
+}
+
+enum Captured {
+    Bounded(OutputTail),
+    Full(Vec<u8>),
+}
+
+impl Captured {
+    fn new(mode: CaptureMode) -> Self {
+        match mode {
+            CaptureMode::BoundedTail(cap) => Captured::Bounded(OutputTail::new(cap)),
+            CaptureMode::Full => Captured::Full(Vec::new()),
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        match self {
+            Captured::Bounded(tail) => tail.append(bytes),
+            Captured::Full(buf) => buf.extend_from_slice(bytes),
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Captured::Bounded(tail) => tail.into_string(),
+            Captured::Full(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        }
+    }
+}
+
+struct ContainerOutcome {
+    exit_code: i64,
+    captured: String,
+}
+
+/// Run a container through its full lifecycle: create, start, stream
+/// stdout/stderr to `log_writer` while capturing per `capture_mode`,
+/// wait for exit, force-remove. Container is removed even on error.
+///
+/// Non-zero container exit is returned as `exit_code`, NOT as a sandbox
+/// error — the caller (run_agent / run_cargo_test) and ultimately
+/// policy::classify_exit decide what a non-zero exit means.
+async fn run_container(
+    docker: &Docker,
+    config: ContainerCreateBody,
+    log_writer: &mut dyn Write,
+    capture_mode: CaptureMode,
+) -> Result<ContainerOutcome, SandboxError> {
+    let container = docker.create_container(None, config).await?;
+    let id = container.id;
+
+    // Once the container exists on the daemon it must be removed even if
+    // start/log/wait fail. Run the lifecycle inside an inner async block
+    // and force-remove unconditionally afterwards.
+    let lifecycle: Result<ContainerOutcome, SandboxError> = async {
+        docker.start_container(&id, None).await?;
+
+        let log_options = LogsOptionsBuilder::default()
+            .follow(true)
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut log_stream = docker.logs(&id, Some(log_options));
+        let mut captured = Captured::new(capture_mode);
+        while let Some(frame) = log_stream.next().await {
+            let frame = frame?;
+            let bytes = match frame {
+                bollard::container::LogOutput::StdOut { message } => message,
+                bollard::container::LogOutput::StdErr { message } => message,
+                _ => continue,
+            };
+            log_writer.write_all(&bytes)?;
+            log_writer.flush()?;
+            captured.append(&bytes);
+        }
+
+        let mut wait_stream = docker.wait_container(&id, None);
+        let mut exit_code = 0i64;
+        while let Some(response) = wait_stream.next().await {
+            match response {
+                Ok(r) => exit_code = r.status_code,
+                // Bollard converts a non-zero container exit into this
+                // error variant. For Bellows the exit code is data
+                // (policy::classify_exit routes on it), not a failure
+                // condition — un-wrap the variant back into a normal
+                // i64 here. Other bollard errors still propagate.
+                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
+                    exit_code = code;
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        Ok(ContainerOutcome {
+            exit_code,
+            captured: captured.into_string(),
+        })
+    }
+    .await;
+
+    let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
+    let _ = docker.remove_container(&id, Some(remove_options)).await;
+
+    lifecycle
 }
 
 pub async fn run_agent(
@@ -106,16 +218,14 @@ pub async fn run_agent(
 
     let mut labels = HashMap::new();
     labels.insert("bellows-managed".to_string(), "true".to_string());
-    labels.insert("bellows-run-id".to_string(), run_id.clone());
+    labels.insert("bellows-run-id".to_string(), run_id);
 
     let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
     env.extend(auth.extra_env());
 
-    // Use the structured Mount API instead of `binds: Vec<String>` so the
-    // host source path doesn't collide with bind syntax's `:` separator
-    // on Windows (drive letters like `C:\...`). Auth contributes any
-    // credentials/cache volumes it needs (e.g. the OAuth volume for
-    // Auth::Subscription).
+    // Structured Mount API rather than `binds: Vec<String>` to avoid
+    // collision with bind syntax's `:` separator on Windows drive
+    // letters. Auth contributes any credentials/cache volumes it needs.
     let mut mounts = vec![Mount {
         target: Some("/workspace".to_string()),
         source: Some(workspace_path),
@@ -137,66 +247,18 @@ pub async fn run_agent(
         ..Default::default()
     };
 
-    let container = docker.create_container(None, config).await?;
-    let id = container.id;
+    let outcome = run_container(
+        &docker,
+        config,
+        log_writer,
+        CaptureMode::BoundedTail(OUTPUT_TAIL_CAP_BYTES),
+    )
+    .await?;
 
-    // Once the container exists on the daemon it must be removed even if
-    // start/log/wait fail. Run the lifecycle inside an inner async block
-    // and force-remove unconditionally afterwards.
-    let lifecycle: Result<AgentRun, SandboxError> = async {
-        docker.start_container(&id, None).await?;
-
-        let log_options = LogsOptionsBuilder::default()
-            .follow(true)
-            .stdout(true)
-            .stderr(true)
-            .build();
-        let mut log_stream = docker.logs(&id, Some(log_options));
-        let mut tail = OutputTail::new(OUTPUT_TAIL_CAP_BYTES);
-        while let Some(frame) = log_stream.next().await {
-            let frame = frame?;
-            let bytes = match frame {
-                bollard::container::LogOutput::StdOut { message } => message,
-                bollard::container::LogOutput::StdErr { message } => message,
-                _ => continue,
-            };
-            log_writer.write_all(&bytes)?;
-            log_writer.flush()?;
-            tail.append(&bytes);
-        }
-
-        let mut wait_stream = docker.wait_container(&id, None);
-        let mut exit_code = 0i64;
-        while let Some(response) = wait_stream.next().await {
-            match response {
-                Ok(r) => exit_code = r.status_code,
-                // Bollard converts a non-zero container exit into this
-                // error variant. For Bellows the exit code is data
-                // (policy::classify_exit routes on it), not a failure
-                // condition — un-wrap the variant back into a normal
-                // i64 here. Other bollard errors still propagate.
-                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
-                    exit_code = code;
-                }
-                Err(other) => return Err(other.into()),
-            }
-        }
-        Ok(AgentRun {
-            exit_code,
-            stderr_tail: tail.into_string(),
-        })
-    }
-    .await;
-
-    let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
-    let _ = docker.remove_container(&id, Some(remove_options)).await;
-
-    // We deliberately do NOT error on a non-zero exit — that's a signal
-    // the runner uses (via policy::classify_exit) to choose between
-    // ExitReason::Crash and the success/test-red paths. Genuine sandbox
-    // errors (Docker connectivity, image build, etc.) still bubble up
-    // via the lifecycle's ?-propagation above.
-    lifecycle
+    Ok(AgentRun {
+        exit_code: outcome.exit_code,
+        stderr_tail: outcome.captured,
+    })
 }
 
 /// Outcome of running `cargo test` in a sanity-gate container after the
@@ -210,10 +272,9 @@ pub struct CargoTestRun {
 }
 
 /// Spawn a fresh container from the policy image, override the entrypoint
-/// to `cargo test`, run it against the workspace, capture output, and
-/// return the exit code + captured output. No credentials volume needed
-/// — the gate runs without Anthropic auth. Same lifecycle pattern as
-/// `run_agent`: container is force-removed on any path.
+/// to `cargo test`, run it against the workspace, capture full output,
+/// and return the exit code + captured output. No credentials volume —
+/// the gate runs without Anthropic auth.
 pub async fn run_cargo_test(
     workspace: &Workspace,
     log_writer: &mut dyn Write,
@@ -250,59 +311,12 @@ pub async fn run_cargo_test(
         ..Default::default()
     };
 
-    let container = docker.create_container(None, config).await?;
-    let id = container.id;
+    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
 
-    let lifecycle: Result<CargoTestRun, SandboxError> = async {
-        docker.start_container(&id, None).await?;
-
-        let log_options = LogsOptionsBuilder::default()
-            .follow(true)
-            .stdout(true)
-            .stderr(true)
-            .build();
-        let mut log_stream = docker.logs(&id, Some(log_options));
-        let mut captured: Vec<u8> = Vec::new();
-        while let Some(frame) = log_stream.next().await {
-            let frame = frame?;
-            let bytes = match frame {
-                bollard::container::LogOutput::StdOut { message } => message,
-                bollard::container::LogOutput::StdErr { message } => message,
-                _ => continue,
-            };
-            log_writer.write_all(&bytes)?;
-            log_writer.flush()?;
-            captured.extend_from_slice(&bytes);
-        }
-
-        let mut wait_stream = docker.wait_container(&id, None);
-        let mut exit_code = 0i64;
-        while let Some(response) = wait_stream.next().await {
-            match response {
-                Ok(r) => exit_code = r.status_code,
-                // Bollard converts a non-zero container exit into this
-                // error variant. For Bellows the exit code is data
-                // (policy::classify_exit routes on it), not a failure
-                // condition — un-wrap the variant back into a normal
-                // i64 here. Other bollard errors still propagate.
-                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
-                    exit_code = code;
-                }
-                Err(other) => return Err(other.into()),
-            }
-        }
-
-        Ok(CargoTestRun {
-            exit_code,
-            output: String::from_utf8_lossy(&captured).into_owned(),
-        })
-    }
-    .await;
-
-    let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
-    let _ = docker.remove_container(&id, Some(remove_options)).await;
-
-    lifecycle
+    Ok(CargoTestRun {
+        exit_code: outcome.exit_code,
+        output: outcome.captured,
+    })
 }
 
 fn compute_dir_content_hash(dir: &Path) -> Result<String, SandboxError> {
