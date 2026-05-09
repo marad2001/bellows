@@ -20,4 +20,8 @@ fi
 PROMPT="$(cat "$KICKOFF")"
 rm -f "$KICKOFF"
 
-exec claude -p "$PROMPT"
+# --dangerously-skip-permissions bypasses Claude Code's per-tool approval
+# prompts. The container is the sandbox boundary (Docker isolation,
+# /workspace-only mount), so the per-tool gate is redundant and would
+# otherwise hang headlessly waiting for a human to approve each Write.
+exec claude --dangerously-skip-permissions -p "$PROMPT"

@@ -19,4 +19,17 @@ mkdir -p /root/.claude/skills
 cp -r /opt/bellows-policy/skills/. /root/.claude/skills/
 cp /opt/bellows-policy/CLAUDE.md /root/.claude/CLAUDE.md
 
+# Workaround for Claude Code v2.1: setup-auth created /root/.claude.json
+# but the credentials volume only mounts /root/.claude/ (the directory).
+# .claude.json (sibling file) is NOT in the volume, so it's lost on
+# container exit. Claude Code itself stashes a backup inside
+# /root/.claude/backups/ (which IS in the volume); restore it on each
+# start so Claude Code finds its config.
+if [ ! -f /root/.claude.json ]; then
+    LATEST_BACKUP=$(ls -t /root/.claude/backups/.claude.json.backup.* 2>/dev/null | head -n 1 || true)
+    if [ -n "$LATEST_BACKUP" ]; then
+        cp "$LATEST_BACKUP" /root/.claude.json
+    fi
+fi
+
 exec /usr/local/bin/run-agent "$@"

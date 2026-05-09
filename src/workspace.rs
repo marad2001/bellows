@@ -15,6 +15,8 @@ pub enum WorkspaceError {
         args: Vec<String>,
         status: std::process::ExitStatus,
     },
+    #[error("agent produced no changes to commit; the brief was probably unmet")]
+    NoChangesToCommit,
 }
 
 pub struct Workspace {
@@ -95,9 +97,32 @@ async fn detect_default_branch(repo: &Path) -> Result<String, WorkspaceError> {
 /// Stage everything in the workspace and create a single commit. Used after
 /// the sandbox has run; the caller does not know in advance which files were
 /// produced, so we `git add -A` rather than naming files explicitly.
+///
+/// Returns [`WorkspaceError::NoChangesToCommit`] if the workspace is clean
+/// after staging — this typically means the agent produced nothing, not a
+/// genuine git failure.
 pub async fn commit_all(workspace: &Workspace) -> Result<(), WorkspaceError> {
     git(workspace.path(), &["add", "-A"]).await?;
-    git(workspace.path(), &["commit", "-m", "Bellows stub run marker"]).await?;
+
+    // Detect "nothing to commit" via porcelain status before attempting a
+    // commit, so we surface a clear error instead of git's terse exit 1.
+    let status_output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .await?;
+    if !status_output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec!["status".into(), "--porcelain".into()],
+            status: status_output.status,
+        });
+    }
+    if status_output.stdout.is_empty() {
+        return Err(WorkspaceError::NoChangesToCommit);
+    }
+
+    git(workspace.path(), &["commit", "-m", "Bellows agent run"]).await?;
     Ok(())
 }
 
