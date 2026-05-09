@@ -92,7 +92,7 @@ pub async fn run_once(
         &owner,
         &repo,
         &branch_name,
-        "master",
+        workspace.default_branch(),
         &pr_title,
         &pr_body,
     )

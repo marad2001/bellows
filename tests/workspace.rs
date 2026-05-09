@@ -49,6 +49,7 @@ async fn prepare_clones_remote_into_tempdir_and_creates_agent_branch() {
     assert!(workspace.path().join(".git").exists(), "should be a git repo");
     assert_eq!(current_branch(workspace.path()), "agent/42-fix-the-foo-bug");
     assert_eq!(workspace.branch_name(), "agent/42-fix-the-foo-bug");
+    assert_eq!(workspace.default_branch(), "master");
 }
 
 #[tokio::test]
