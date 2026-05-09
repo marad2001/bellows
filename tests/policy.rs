@@ -124,6 +124,44 @@ fn classify_exit_returns_crash_when_agent_exits_non_zero_without_notes() {
 }
 
 #[test]
+fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed() {
+    // Implement run was clean (exit 0, no notes) and cargo test passed,
+    // but clippy flagged something — gate fails on clippy alone.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(101),
+            cargo_test: Some(0),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
+}
+
+#[test]
+fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
+    // Post-implement gate was clean. Review ran and produced findings,
+    // review-fix addressed them, but the fixups broke a test — caught
+    // by the end-of-pipeline gate.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(0),
+            cargo_test: Some(0),
+        },
+        review: Some(ReviewOutcome { findings_text: Some("found stuff".to_string()), exit_code: 0 }),
+        review_fix: Some(bellows::policy::FixOutcome { exit_code: 0 }),
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(0),
+            cargo_test: Some(101),
+        }),
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
+}
+
+#[test]
 fn classify_exit_returns_final_tests_red_when_cargo_test_failed() {
     // Agent thought it was done (exit 0, no notes), but the cargo test
     // gate caught failing tests.
