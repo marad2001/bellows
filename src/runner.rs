@@ -127,6 +127,7 @@ pub async fn run_once(
         workspace.default_branch(),
         &pr_title,
         &pr_body,
+        false,
     )
     .await?;
 
@@ -139,7 +140,7 @@ pub async fn run_once(
         branch_name,
     );
 
-    tracker::finalise_success(
+    tracker::finalise(
         client,
         &owner,
         &repo,

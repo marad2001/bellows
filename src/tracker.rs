@@ -75,14 +75,19 @@ pub async fn fetch_agent_brief(
         .next_back())
 }
 
-pub async fn finalise_success(
+/// Post a log comment on the PR and transition the issue's labels from
+/// `in_progress_label` to `outcome_label`. Generic over the outcome —
+/// the caller decides whether the run was a success (`agent-done`),
+/// a failure (`agent-failed`), or one of the more specific failure
+/// kinds added in later slices.
+pub async fn finalise(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
     issue_number: u64,
     pr_number: u64,
     in_progress_label: &str,
-    done_label: &str,
+    outcome_label: &str,
     log_body: &str,
 ) -> Result<Issue, octocrab::Error> {
     let comment_route = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
@@ -97,7 +102,7 @@ pub async fn finalise_success(
         .map(|l| l.name.clone())
         .filter(|n| n != in_progress_label)
         .collect();
-    new_labels.push(done_label.to_string());
+    new_labels.push(outcome_label.to_string());
     new_labels.sort();
 
     let body = serde_json::json!({ "labels": new_labels });

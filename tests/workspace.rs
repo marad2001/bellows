@@ -3,7 +3,7 @@ use std::process::Command;
 
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path as wm_path};
+use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::workspace::{commit_all, open_pr, prepare, push_branch};
@@ -127,11 +127,12 @@ async fn push_branch_pushes_agent_branch_to_remote() {
 }
 
 #[tokio::test]
-async fn open_pr_posts_a_non_draft_pull_request_against_the_default_branch() {
+async fn open_pr_with_draft_false_posts_a_regular_pull_request() {
     let mock = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(wm_path("/repos/marad2001/test-repo/pulls"))
+        .and(body_partial_json(json!({ "draft": false })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "number": 99,
             "html_url": "https://github.com/marad2001/test-repo/pull/99"
@@ -153,6 +154,7 @@ async fn open_pr_posts_a_non_draft_pull_request_against_the_default_branch() {
         "master",
         "Bellows stub run for issue #42",
         "Closes #42.",
+        false,
     )
     .await
     .expect("open_pr should succeed");
@@ -162,4 +164,40 @@ async fn open_pr_posts_a_non_draft_pull_request_against_the_default_branch() {
         pr.html_url,
         "https://github.com/marad2001/test-repo/pull/99"
     );
+}
+
+#[tokio::test]
+async fn open_pr_with_draft_true_posts_a_draft_pull_request() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(wm_path("/repos/marad2001/test-repo/pulls"))
+        .and(body_partial_json(json!({ "draft": true })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "number": 42,
+            "html_url": "https://github.com/marad2001/test-repo/pull/42"
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab::OctocrabBuilder::new()
+        .base_uri(mock.uri())
+        .expect("base uri")
+        .build()
+        .expect("octocrab");
+
+    let pr = open_pr(
+        &client,
+        "marad2001",
+        "test-repo",
+        "agent/8-cargo-test-failed",
+        "main",
+        "Bellows agent run for issue #8",
+        "Closes #8. Final tests red.",
+        true,
+    )
+    .await
+    .expect("open_pr should succeed");
+
+    assert_eq!(pr.number, 42);
 }
