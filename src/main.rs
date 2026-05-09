@@ -94,10 +94,20 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                     issue_number
                 ),
             ),
-            Err(e) => log(&mut log_file, &format!("bellows: error: {}", e)),
+            Err(e) => log(&mut log_file, &format!("bellows: error: {}", format_error_chain(&e))),
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = format!("{} (debug: {:?})", err, err);
+    let mut source = err.source();
+    while let Some(s) = source {
+        out.push_str(&format!("\n    caused by: {} (debug: {:?})", s, s));
+        source = s.source();
+    }
+    out
 }
 
 fn log(file: &mut File, line: &str) {
