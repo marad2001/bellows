@@ -1,4 +1,7 @@
+use std::io::Write;
+
 use crate::config::Config;
+use crate::sandbox::{self, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
 
@@ -8,6 +11,10 @@ pub enum RunError {
     Octocrab(#[from] octocrab::Error),
     #[error("workspace: {0}")]
     Workspace(#[from] WorkspaceError),
+    #[error("sandbox: {0}")]
+    Sandbox(#[from] SandboxError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("repo url is not in the form https://host/owner/repo: {0}")]
     InvalidRepoUrl(String),
 }
@@ -22,6 +29,7 @@ pub enum RunOutcome {
 pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
+    log_writer: &mut dyn Write,
 ) -> Result<RunOutcome, RunError> {
     let (owner, repo) = parse_owner_repo(&config.repo.url)?;
 
@@ -61,17 +69,14 @@ pub async fn run_once(
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
-    let marker_content = format!(
-        "issue=#{} timestamp={}\n",
-        claimed.number,
-        started.to_rfc3339()
-    );
-    workspace::commit_marker(&workspace, &marker_content).await?;
+
+    sandbox::run_agent(&workspace, claimed.number, log_writer).await?;
+    workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
     let pr_title = format!("Bellows stub run for issue #{}", claimed.number);
     let pr_body = format!(
-        "Closes #{}.\n\n_(Stub run produced by Bellows v1, slice 1.)_",
+        "Closes #{}.\n\n_(Stub run produced by Bellows v1.)_",
         claimed.number
     );
     let pr = workspace::open_pr(

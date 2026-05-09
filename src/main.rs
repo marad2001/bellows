@@ -75,7 +75,8 @@ async fn run(config_path: &PathBuf) -> Result<()> {
     );
 
     loop {
-        match runner::run_once(&client, &config).await {
+        let outcome = runner::run_once(&client, &config, &mut log_file).await;
+        match outcome {
             Ok(RunOutcome::Idle) => log(&mut log_file, "bellows: idle (no ready-for-agent issues)"),
             Ok(RunOutcome::Finalised {
                 issue_number,
@@ -94,7 +95,10 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                     issue_number
                 ),
             ),
-            Err(e) => log(&mut log_file, &format!("bellows: error: {}", format_error_chain(&e))),
+            Err(e) => log(
+                &mut log_file,
+                &format!("bellows: error: {}", format_error_chain(&e)),
+            ),
         }
         tokio::time::sleep(interval).await;
     }

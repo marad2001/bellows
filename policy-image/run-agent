@@ -1,0 +1,17 @@
+#!/bin/sh
+# Bellows stub agent (slice 2).
+#
+# Writes a single marker file into /workspace so the orchestrator's
+# commit_all step has something to stage. Slice 3 (#5) replaces this
+# with `claude -p` reading a kickoff prompt.
+
+set -eu
+
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ISSUE="${BELLOWS_ISSUE_NUMBER:-unknown}"
+
+cat > /workspace/.bellows-stub-marker <<EOF
+issue=#${ISSUE} timestamp=${TIMESTAMP}
+EOF
+
+echo "bellows-stub-agent: wrote marker for issue #${ISSUE} at ${TIMESTAMP}"
