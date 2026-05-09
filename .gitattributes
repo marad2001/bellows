@@ -1,0 +1,8 @@
+# Default: let git handle line endings per-platform.
+* text=auto
+
+# Files that run inside Linux containers must keep LF endings even on
+# Windows checkouts, otherwise the shebang/COPY pulls in `\r` characters
+# and the container fails at runtime.
+policy-image/Dockerfile text eol=lf
+policy-image/run-agent text eol=lf
