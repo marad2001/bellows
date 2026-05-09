@@ -20,14 +20,21 @@ pub struct ImplementOutcome {
     pub stderr_tail: String,
 }
 
+/// One cargo subcommand's exit code + captured output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckResult {
+    pub exit_code: i64,
+    pub output: String,
+}
+
 /// Outcome of one cargo checks gate run (clippy followed by test).
 /// `None` for either field encodes "the check did not run" — clippy is
 /// `None` when the workspace has no `Cargo.toml` at the root; test is
 /// `None` when clippy failed and we never got to it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GateOutcome {
-    pub cargo_clippy: Option<i64>,
-    pub cargo_test: Option<i64>,
+    pub cargo_clippy: Option<CheckResult>,
+    pub cargo_test: Option<CheckResult>,
 }
 
 /// Outcome of the review phase. `findings_text` is `Some` when the agent
@@ -89,8 +96,8 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
 }
 
 fn gate_failed(gate: &GateOutcome) -> bool {
-    matches!(gate.cargo_clippy, Some(code) if code != 0)
-        || matches!(gate.cargo_test, Some(code) if code != 0)
+    let nonzero = |c: &Option<CheckResult>| matches!(c, Some(r) if r.exit_code != 0);
+    nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
 }
 
 /// Render the kickoff prompt that gets fed into `claude -p` inside the

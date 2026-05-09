@@ -2,8 +2,10 @@ use std::io::Write;
 
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
-use crate::policy::{self, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes};
-use crate::sandbox::{self, AgentRun, CargoTestRun, SandboxError};
+use crate::policy::{
+    self, CheckResult, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes,
+};
+use crate::sandbox::{self, CargoTestRun, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
 
@@ -140,8 +142,6 @@ pub async fn run_once(
     } else {
         None
     };
-    let cargo_test_result: Option<i64> = cargo_test_run.as_ref().map(|r| r.exit_code);
-
     // Slice X1 introduces PhaseOutcomes. Until the review/end-gate phases
     // land later in this slice, only the post-implement gate is populated;
     // the rest stays `None`. classify_exit's behaviour is preserved.
@@ -152,7 +152,10 @@ pub async fn run_once(
         },
         post_implement_gate: GateOutcome {
             cargo_clippy: None,
-            cargo_test: cargo_test_result,
+            cargo_test: cargo_test_run.as_ref().map(|r| CheckResult {
+                exit_code: r.exit_code,
+                output: r.output.clone(),
+            }),
         },
         review: None,
         review_fix: None,
@@ -198,8 +201,7 @@ pub async fn run_once(
         started,
         finished,
         &branch_name,
-        &agent_run,
-        cargo_test_run.as_ref(),
+        &outcomes,
     );
 
     tracker::finalise(
@@ -262,8 +264,7 @@ fn build_log_body(
     started: chrono::DateTime<chrono::Utc>,
     finished: chrono::DateTime<chrono::Utc>,
     branch_name: &str,
-    agent_run: &AgentRun,
-    cargo_test_run: Option<&CargoTestRun>,
+    outcomes: &PhaseOutcomes,
 ) -> String {
     let mut body = format!(
         "<details><summary>Bellows run log ({reason:?})</summary>\n\n\
@@ -274,22 +275,24 @@ fn build_log_body(
          Agent exit code: {agent_exit}\n",
         started_rfc = started.to_rfc3339(),
         finished_rfc = finished.to_rfc3339(),
-        agent_exit = agent_run.exit_code,
+        agent_exit = outcomes.implement.exit_code,
     );
+
+    let post_test = outcomes.post_implement_gate.cargo_test.as_ref();
 
     if !matches!(reason, ExitReason::Success) {
         body.push_str("\n### Agent output tail\n\n```\n");
-        body.push_str(&agent_run.stderr_tail);
+        body.push_str(&outcomes.implement.stderr_tail);
         body.push_str("\n```\n");
 
-        if let Some(test_run) = cargo_test_run {
+        if let Some(test_run) = post_test {
             body.push_str(&format!(
                 "\n### `cargo test` output (exit {code})\n\n```\n{output}\n```\n",
                 code = test_run.exit_code,
                 output = test_run.output,
             ));
         }
-    } else if let Some(test_run) = cargo_test_run {
+    } else if let Some(test_run) = post_test {
         body.push_str(&format!(
             "\nCargo test gate: exit {} (passed)\n",
             test_run.exit_code
@@ -355,17 +358,27 @@ mod tests {
         assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
     }
 
-    fn agent_run(exit: i64, tail: &str) -> AgentRun {
-        AgentRun {
-            exit_code: exit,
-            stderr_tail: tail.to_string(),
-        }
-    }
-
-    fn cargo_test_run(exit: i64, output: &str) -> CargoTestRun {
-        CargoTestRun {
-            exit_code: exit,
-            output: output.to_string(),
+    /// Construct a slice-5-shaped `PhaseOutcomes` for build_log_body tests:
+    /// implement run with the given exit + stderr tail, and an
+    /// `Option<cargo test>` in the post-implement gate. Clippy stays
+    /// `None` (slice-5 didn't run clippy); review/end-gate stay `None`
+    /// (slice-5 didn't have those phases).
+    fn slice5_log_outcomes(implement_exit: i64, tail: &str, test: Option<(i64, &str)>) -> PhaseOutcomes {
+        PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: implement_exit,
+                stderr_tail: tail.to_string(),
+            },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: None,
+                cargo_test: test.map(|(exit, output)| CheckResult {
+                    exit_code: exit,
+                    output: output.to_string(),
+                }),
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
         }
     }
 
@@ -424,8 +437,7 @@ mod tests {
             started,
             finished,
             "agent/42-x",
-            &agent_run(0, "not shown"),
-            None,
+            &slice5_log_outcomes(0, "not shown", None),
         );
         assert!(body.contains("Bellows run log (Success)"));
         assert!(!body.contains("### Agent output tail"));
@@ -442,8 +454,7 @@ mod tests {
             started,
             finished,
             "agent/42-x",
-            &agent_run(0, "agent told you it was done"),
-            Some(&cargo_test_run(101, "test foo ... FAILED")),
+            &slice5_log_outcomes(0, "agent told you it was done", Some((101, "test foo ... FAILED"))),
         );
         assert!(body.contains("FinalTestsRed"));
         assert!(body.contains("### Agent output tail"));
@@ -462,8 +473,7 @@ mod tests {
             started,
             finished,
             "agent/42-x",
-            &agent_run(0, "stuck on something"),
-            None,
+            &slice5_log_outcomes(0, "stuck on something", None),
         );
         assert!(body.contains("AgentSelfReportedFailure"));
         assert!(body.contains("### Agent output tail"));

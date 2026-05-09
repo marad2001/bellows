@@ -1,7 +1,11 @@
 use bellows::policy::{
-    classify_exit, render_kickoff, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes,
-    ReviewOutcome,
+    classify_exit, render_kickoff, CheckResult, ExitReason, GateOutcome, ImplementOutcome,
+    PhaseOutcomes, ReviewOutcome,
 };
+
+fn check(exit: i64) -> CheckResult {
+    CheckResult { exit_code: exit, output: String::new() }
+}
 
 #[test]
 fn rendered_kickoff_includes_the_agent_brief_body() {
@@ -46,8 +50,8 @@ fn classify_exit_returns_success_when_all_phases_clean() {
             stderr_tail: String::new(),
         },
         post_implement_gate: GateOutcome {
-            cargo_clippy: Some(0),
-            cargo_test: Some(0),
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
         },
         review: Some(ReviewOutcome {
             findings_text: None,
@@ -55,8 +59,8 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         }),
         review_fix: None,
         end_pipeline_gate: Some(GateOutcome {
-            cargo_clippy: Some(0),
-            cargo_test: Some(0),
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
         }),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
@@ -73,7 +77,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         },
         post_implement_gate: GateOutcome {
             cargo_clippy: None,
-            cargo_test,
+            cargo_test: cargo_test.map(check),
         },
         review: None,
         review_fix: None,
@@ -130,8 +134,8 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
         post_implement_gate: GateOutcome {
-            cargo_clippy: Some(101),
-            cargo_test: Some(0),
+            cargo_clippy: Some(check(101)),
+            cargo_test: Some(check(0)),
         },
         review: None,
         review_fix: None,
@@ -148,14 +152,14 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
         post_implement_gate: GateOutcome {
-            cargo_clippy: Some(0),
-            cargo_test: Some(0),
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
         },
         review: Some(ReviewOutcome { findings_text: Some("found stuff".to_string()), exit_code: 0 }),
         review_fix: Some(bellows::policy::FixOutcome { exit_code: 0 }),
         end_pipeline_gate: Some(GateOutcome {
-            cargo_clippy: Some(0),
-            cargo_test: Some(101),
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(101)),
         }),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
