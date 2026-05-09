@@ -76,7 +76,7 @@ pub async fn run_once(
 
     let pr_title = format!("Bellows stub run for issue #{}", claimed.number);
     let pr_body = format!(
-        "Closes #{}.\n\n_(Stub run produced by Bellows v1, slice 1.)_",
+        "Closes #{}.\n\n_(Stub run produced by Bellows v1.)_",
         claimed.number
     );
     let pr = workspace::open_pr(
