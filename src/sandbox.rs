@@ -168,7 +168,18 @@ pub async fn run_agent(
         let mut wait_stream = docker.wait_container(&id, None);
         let mut exit_code = 0i64;
         while let Some(response) = wait_stream.next().await {
-            exit_code = response?.status_code;
+            match response {
+                Ok(r) => exit_code = r.status_code,
+                // Bollard converts a non-zero container exit into this
+                // error variant. For Bellows the exit code is data
+                // (policy::classify_exit routes on it), not a failure
+                // condition — un-wrap the variant back into a normal
+                // i64 here. Other bollard errors still propagate.
+                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
+                    exit_code = code;
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
         Ok(AgentRun {
             exit_code,
@@ -267,7 +278,18 @@ pub async fn run_cargo_test(
         let mut wait_stream = docker.wait_container(&id, None);
         let mut exit_code = 0i64;
         while let Some(response) = wait_stream.next().await {
-            exit_code = response?.status_code;
+            match response {
+                Ok(r) => exit_code = r.status_code,
+                // Bollard converts a non-zero container exit into this
+                // error variant. For Bellows the exit code is data
+                // (policy::classify_exit routes on it), not a failure
+                // condition — un-wrap the variant back into a normal
+                // i64 here. Other bollard errors still propagate.
+                Err(bollard::errors::Error::DockerContainerWaitError { code, .. }) => {
+                    exit_code = code;
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
 
         Ok(CargoTestRun {
