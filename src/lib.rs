@@ -1,4 +1,5 @@
 pub mod config;
+pub mod tracker;
 
 const MAX_SLUG_LEN: usize = 50;
 
