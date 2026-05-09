@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use crate::config::Config;
+use crate::auth::Auth;
+use crate::config::{AuthMethod, Config};
+use crate::policy;
 use crate::sandbox::{self, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
@@ -17,6 +19,11 @@ pub enum RunError {
     Io(#[from] std::io::Error),
     #[error("repo url is not in the form https://host/owner/repo: {0}")]
     InvalidRepoUrl(String),
+    #[error(
+        "issue #{0} is labelled ready-for-agent but no `## Agent Brief` comment was found; \
+         move it back to needs-triage and write the brief"
+    )]
+    MissingAgentBrief(u64),
 }
 
 #[derive(Debug)]
@@ -68,9 +75,22 @@ pub async fn run_once(
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
+    let brief = tracker::fetch_agent_brief(client, &owner, &repo, claimed.number)
+        .await?
+        .ok_or(RunError::MissingAgentBrief(claimed.number))?;
+
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
 
-    sandbox::run_agent(&workspace, claimed.number, log_writer).await?;
+    let kickoff = policy::render_kickoff(&brief, &config.repo.url, &branch_name);
+    tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
+
+    let auth = match config.auth.method {
+        AuthMethod::Subscription => Auth::Subscription {
+            credentials_volume_name: config.auth.credentials_volume.clone(),
+        },
+    };
+
+    sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 

@@ -1,17 +1,23 @@
 #!/bin/sh
-# Bellows stub agent (slice 2).
+# Bellows agent entry (slice 3 - real Claude Code).
 #
-# Writes a single marker file into /workspace so the orchestrator's
-# commit_all step has something to stage. Slice 3 (#5) replaces this
-# with `claude -p` reading a kickoff prompt.
+# Reads the kickoff prompt Bellows wrote into the workspace before
+# the container started, removes the prompt file so it doesn't leak
+# into the resulting commit, and exec's `claude -p` with the prompt.
+#
+# Slice 2's stub-marker behaviour is gone; the agent is responsible
+# for whatever changes end up in the workspace.
 
 set -eu
 
-TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-ISSUE="${BELLOWS_ISSUE_NUMBER:-unknown}"
+KICKOFF=/workspace/.bellows-kickoff.md
 
-cat > /workspace/.bellows-stub-marker <<EOF
-issue=#${ISSUE} timestamp=${TIMESTAMP}
-EOF
+if [ ! -f "$KICKOFF" ]; then
+    echo "bellows: missing kickoff prompt at $KICKOFF" >&2
+    exit 2
+fi
 
-echo "bellows-stub-agent: wrote marker for issue #${ISSUE} at ${TIMESTAMP}"
+PROMPT="$(cat "$KICKOFF")"
+rm -f "$KICKOFF"
+
+exec claude -p "$PROMPT"

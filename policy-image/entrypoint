@@ -1,0 +1,22 @@
+#!/bin/sh
+# Bellows policy-image entrypoint.
+#
+# Runs once per container start. Copies the baked skills + CLAUDE.md from
+# /opt/bellows-policy/ into /root/.claude/ (where the credentials volume
+# is mounted) so they layer with the persisted OAuth tokens, then exec's
+# run-agent.
+#
+# Idempotent: subsequent runs overwrite any older copies in the volume,
+# which is what we want — the policy image is the source of truth for
+# skills + CLAUDE.md, the volume is the source of truth for credentials.
+
+set -eu
+
+mkdir -p /root/.claude/skills
+
+# Use cp -r with a trailing /. so we copy CONTENTS, not the directory
+# itself, regardless of whether /root/.claude/skills already exists.
+cp -r /opt/bellows-policy/skills/. /root/.claude/skills/
+cp /opt/bellows-policy/CLAUDE.md /root/.claude/CLAUDE.md
+
+exec /usr/local/bin/run-agent "$@"

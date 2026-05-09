@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::auth::Auth;
 use crate::workspace::Workspace;
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
@@ -29,15 +30,22 @@ pub enum SandboxError {
     PolicyImageMissing(String),
 }
 
+/// Build (or reuse the cached) policy image and return its tag. Used by
+/// both `run_agent` and `bellows setup-auth`.
+pub async fn ensure_policy_image() -> Result<String, SandboxError> {
+    let hash = compute_dir_content_hash(Path::new(POLICY_IMAGE_DIR))?;
+    let image_tag = format!("bellows-policy:{}", &hash[..12]);
+    ensure_image_built(&hash, &image_tag).await?;
+    Ok(image_tag)
+}
+
 pub async fn run_agent(
     workspace: &Workspace,
+    auth: &Auth,
     issue_number: u64,
     log_writer: &mut dyn Write,
 ) -> Result<(), SandboxError> {
-    let hash = compute_dir_content_hash(Path::new(POLICY_IMAGE_DIR))?;
-    let image_tag = format!("bellows-policy:{}", &hash[..12]);
-
-    ensure_image_built(&hash, &image_tag).await?;
+    let image_tag = ensure_policy_image().await?;
 
     let docker = Docker::connect_with_local_defaults()?;
     let run_id = Uuid::new_v4().to_string();
@@ -51,18 +59,24 @@ pub async fn run_agent(
     labels.insert("bellows-managed".to_string(), "true".to_string());
     labels.insert("bellows-run-id".to_string(), run_id.clone());
 
-    let env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
+    let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
+    env.extend(auth.extra_env());
 
     // Use the structured Mount API instead of `binds: Vec<String>` so the
     // host source path doesn't collide with bind syntax's `:` separator
-    // on Windows (drive letters like `C:\...`).
+    // on Windows (drive letters like `C:\...`). Auth contributes any
+    // credentials/cache volumes it needs (e.g. the OAuth volume for
+    // Auth::Subscription).
+    let mut mounts = vec![Mount {
+        target: Some("/workspace".to_string()),
+        source: Some(workspace_path),
+        typ: Some(MountType::BIND),
+        ..Default::default()
+    }];
+    mounts.extend(auth.extra_mounts());
+
     let host_config = HostConfig {
-        mounts: Some(vec![Mount {
-            target: Some("/workspace".to_string()),
-            source: Some(workspace_path),
-            typ: Some(MountType::BIND),
-            ..Default::default()
-        }]),
+        mounts: Some(mounts),
         ..Default::default()
     };
 

@@ -6,8 +6,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
+use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
 use bellows::config::Config;
 use bellows::runner::{self, RunOutcome};
+use bellows::sandbox;
 
 #[derive(Parser)]
 #[command(name = "bellows", about = "AFK Claude Code orchestrator for Rust repos")]
@@ -24,6 +26,8 @@ struct Cli {
 enum Command {
     /// Start the polling loop in the foreground.
     Run,
+    /// One-time interactive `claude login` against the credentials volume.
+    SetupAuth,
 }
 
 #[tokio::main]
@@ -36,7 +40,49 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run(&config_path).await,
+        Command::SetupAuth => setup_auth(&config_path).await,
     }
+}
+
+async fn setup_auth(config_path: &PathBuf) -> Result<()> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config at {}", config_path.display()))?;
+    let config = Config::from_str(&config_text)
+        .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    let image_tag = sandbox::ensure_policy_image()
+        .await
+        .context("build/check policy image")?;
+
+    let volume = &config.auth.credentials_volume;
+    println!(
+        "bellows: launching interactive container to seed `{}` with OAuth credentials.",
+        volume
+    );
+    println!("bellows: complete the `claude login` flow inside the container, then it'll exit.");
+
+    let status = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "-it",
+            "--rm",
+            "--volume",
+            &format!("{volume}:{}", CLAUDE_HOME_IN_CONTAINER),
+            "--entrypoint",
+            "claude",
+            &image_tag,
+            "login",
+        ])
+        .status()
+        .await
+        .context("spawn `docker run -it`")?;
+
+    if !status.success() {
+        anyhow::bail!("docker run exited with {}", status);
+    }
+
+    println!("bellows: setup-auth complete; credentials volume `{}` is seeded.", volume);
+    Ok(())
 }
 
 async fn run(config_path: &PathBuf) -> Result<()> {
