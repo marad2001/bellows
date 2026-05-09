@@ -1,5 +1,6 @@
 pub mod config;
 pub mod tracker;
+pub mod workspace;
 
 const MAX_SLUG_LEN: usize = 50;
 
