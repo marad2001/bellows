@@ -2,8 +2,8 @@ use std::io::Write;
 
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
-use crate::policy;
-use crate::sandbox::{self, SandboxError};
+use crate::policy::{self, ExitReason};
+use crate::sandbox::{self, AgentRun, CargoTestRun, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
 
@@ -29,8 +29,14 @@ pub enum RunError {
 #[derive(Debug)]
 pub enum RunOutcome {
     Idle,
-    Finalised { issue_number: u64, pr_number: u64 },
-    Contended { issue_number: u64 },
+    Finalised {
+        issue_number: u64,
+        pr_number: u64,
+        reason: ExitReason,
+    },
+    Contended {
+        issue_number: u64,
+    },
 }
 
 pub async fn run_once(
@@ -94,11 +100,25 @@ pub async fn run_once(
         },
     };
 
-    sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+    let agent_run = sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
 
-    // If claude wrote a PR description file, capture + remove it before
-    // committing so it does not appear in the diff. Fall back to a
-    // boilerplate body otherwise.
+    // If the agent wrote a self-report blocker file, capture its content.
+    // Do NOT remove — it stays in the workspace and ends up in the commit
+    // so the human reviewer can see what the agent struggled with.
+    let agent_notes_path = workspace.path().join("agent-notes.md");
+    let agent_notes = if agent_notes_path.exists() {
+        Some(
+            tokio::fs::read_to_string(&agent_notes_path)
+                .await?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    // If the agent wrote a PR description file, capture + remove it
+    // before committing so it does NOT appear in the diff.
     let pr_description_path = workspace.path().join(".bellows-pr-description.md");
     let claude_pr_body = if pr_description_path.exists() {
         let body = tokio::fs::read_to_string(&pr_description_path).await?;
@@ -111,14 +131,37 @@ pub async fn run_once(
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
-    let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
-    let pr_body = match claude_pr_body {
-        Some(body) => format!("Closes #{}.\n\n{}", claimed.number, body),
-        None => format!(
-            "Closes #{}.\n\n_(Run produced by Bellows v1; the agent did not write a PR description.)_",
-            claimed.number
-        ),
+    // Run the cargo test sanity gate inside a fresh container, but ONLY
+    // when the workspace looks like a Rust project (has Cargo.toml at
+    // the root). For non-Rust briefs the gate is skipped and the run is
+    // treated as success — see policy::classify_exit's None branch.
+    let cargo_test_run: Option<CargoTestRun> = if workspace.path().join("Cargo.toml").exists() {
+        Some(sandbox::run_cargo_test(&workspace, log_writer).await?)
+    } else {
+        None
     };
+    let cargo_test_result: Option<i64> = cargo_test_run.as_ref().map(|r| r.exit_code);
+
+    let reason = policy::classify_exit(
+        agent_run.exit_code,
+        agent_notes.is_some(),
+        cargo_test_result,
+    );
+
+    let draft = !matches!(reason, ExitReason::Success);
+    let outcome_label = match reason {
+        ExitReason::Success => &config.runtime_labels.agent_done,
+        _ => &config.runtime_labels.agent_failed,
+    };
+
+    let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
+    let pr_body = build_pr_body(
+        &reason,
+        claimed.number,
+        claude_pr_body.as_deref(),
+        agent_notes.as_deref(),
+    );
+
     let pr = workspace::open_pr(
         client,
         &owner,
@@ -127,17 +170,19 @@ pub async fn run_once(
         workspace.default_branch(),
         &pr_title,
         &pr_body,
-        false,
+        draft,
     )
     .await?;
 
     let finished = chrono::Utc::now();
-    let log_body = format!(
-        "<details><summary>Bellows run log</summary>\n\nIssue: #{}\nClaimed at: {}\nFinalised at: {}\nBranch: `{}`\n</details>",
+    let log_body = build_log_body(
+        &reason,
         claimed.number,
-        started.to_rfc3339(),
-        finished.to_rfc3339(),
-        branch_name,
+        started,
+        finished,
+        &branch_name,
+        &agent_run,
+        cargo_test_run.as_ref(),
     );
 
     tracker::finalise(
@@ -147,7 +192,7 @@ pub async fn run_once(
         claimed.number,
         pr.number,
         &config.runtime_labels.agent_in_progress,
-        &config.runtime_labels.agent_done,
+        outcome_label,
         &log_body,
     )
     .await?;
@@ -155,7 +200,87 @@ pub async fn run_once(
     Ok(RunOutcome::Finalised {
         issue_number: claimed.number,
         pr_number: pr.number,
+        reason,
     })
+}
+
+fn build_pr_body(
+    reason: &ExitReason,
+    issue_number: u64,
+    claude_pr_body: Option<&str>,
+    agent_notes: Option<&str>,
+) -> String {
+    let header = format!("Closes #{issue_number}.\n\n");
+    let body = match reason {
+        ExitReason::Success => claude_pr_body
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "_(Run produced by Bellows v1; the agent did not write a PR description.)_"
+                    .to_string()
+            }),
+        ExitReason::AgentSelfReportedFailure => format!(
+            "## Agent self-reported failure\n\n\
+             The agent wrote `agent-notes.md` rather than complete the brief. The notes are committed in this PR's diff; quoted below for convenience.\n\n\
+             ```\n{}\n```\n\n\
+             See the run-log comment on this PR for the agent's output tail.",
+            agent_notes.unwrap_or("(no notes content captured)")
+        ),
+        ExitReason::Crash => {
+            "## Agent run crashed\n\n\
+             The container exited non-zero before the agent could finish. See the run-log comment on this PR for the stderr tail."
+                .to_string()
+        }
+        ExitReason::FinalTestsRed => {
+            "## `cargo test` failed after the agent's run\n\n\
+             The agent reported done with exit 0 but the post-run test gate caught failing tests. See the run-log comment on this PR for the full test output."
+                .to_string()
+        }
+    };
+    header + &body
+}
+
+fn build_log_body(
+    reason: &ExitReason,
+    issue_number: u64,
+    started: chrono::DateTime<chrono::Utc>,
+    finished: chrono::DateTime<chrono::Utc>,
+    branch_name: &str,
+    agent_run: &AgentRun,
+    cargo_test_run: Option<&CargoTestRun>,
+) -> String {
+    let mut body = format!(
+        "<details><summary>Bellows run log ({reason:?})</summary>\n\n\
+         Issue: #{issue_number}\n\
+         Claimed at: {started_rfc}\n\
+         Finalised at: {finished_rfc}\n\
+         Branch: `{branch_name}`\n\
+         Agent exit code: {agent_exit}\n",
+        started_rfc = started.to_rfc3339(),
+        finished_rfc = finished.to_rfc3339(),
+        agent_exit = agent_run.exit_code,
+    );
+
+    if !matches!(reason, ExitReason::Success) {
+        body.push_str("\n### Agent output tail\n\n```\n");
+        body.push_str(&agent_run.stderr_tail);
+        body.push_str("\n```\n");
+
+        if let Some(test_run) = cargo_test_run {
+            body.push_str(&format!(
+                "\n### `cargo test` output (exit {code})\n\n```\n{output}\n```\n",
+                code = test_run.exit_code,
+                output = test_run.output,
+            ));
+        }
+    } else if let Some(test_run) = cargo_test_run {
+        body.push_str(&format!(
+            "\nCargo test gate: exit {} (passed)\n",
+            test_run.exit_code
+        ));
+    }
+
+    body.push_str("\n</details>");
+    body
 }
 
 fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
