@@ -56,10 +56,11 @@ async fn setup_auth(config_path: &PathBuf) -> Result<()> {
 
     let volume = &config.auth.credentials_volume;
     println!(
-        "bellows: launching interactive container to seed `{}` with OAuth credentials.",
+        "bellows: launching interactive Claude Code in a container to seed `{}` with OAuth credentials.",
         volume
     );
-    println!("bellows: complete the `claude login` flow inside the container, then it'll exit.");
+    println!("bellows: inside the container, type `/login` to start the OAuth flow.");
+    println!("bellows: when login completes, type `/exit` to close Claude Code. The container will exit and the volume retains the credentials.");
 
     let status = tokio::process::Command::new("docker")
         .args([
@@ -71,7 +72,6 @@ async fn setup_auth(config_path: &PathBuf) -> Result<()> {
             "--entrypoint",
             "claude",
             &image_tag,
-            "login",
         ])
         .status()
         .await
