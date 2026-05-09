@@ -6,7 +6,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bellows::workspace::{commit_marker, open_pr, prepare, push_branch};
+use bellows::workspace::{commit_all, open_pr, prepare, push_branch};
 
 fn init_remote_repo(path: &Path) {
     run_git(path, &["init"]);
@@ -53,7 +53,7 @@ async fn prepare_clones_remote_into_tempdir_and_creates_agent_branch() {
 }
 
 #[tokio::test]
-async fn commit_marker_writes_file_and_commits_to_agent_branch() {
+async fn commit_all_stages_and_commits_arbitrary_workspace_changes() {
     let remote_dir = TempDir::new().unwrap();
     init_remote_repo(remote_dir.path());
     let remote_url = remote_dir.path().to_string_lossy().to_string();
@@ -62,27 +62,36 @@ async fn commit_marker_writes_file_and_commits_to_agent_branch() {
         .await
         .unwrap();
 
-    let marker_content = "issue=42 timestamp=2026-05-09T13:00:00Z";
-    commit_marker(&workspace, marker_content)
-        .await
-        .expect("commit_marker should succeed");
+    // Simulate what a containerised stub agent (or future Claude agent) would
+    // produce: arbitrary files in the workspace, including a nested directory.
+    std::fs::write(workspace.path().join(".bellows-stub-marker"), "marker").unwrap();
+    std::fs::write(workspace.path().join("hello.txt"), "world").unwrap();
+    std::fs::create_dir(workspace.path().join("subdir")).unwrap();
+    std::fs::write(workspace.path().join("subdir").join("nested.md"), "x").unwrap();
 
-    let marker_path = workspace.path().join(".bellows-stub-marker");
-    assert!(marker_path.exists(), "marker file should exist");
-    let on_disk = std::fs::read_to_string(&marker_path).unwrap();
-    assert_eq!(on_disk.trim(), marker_content);
+    commit_all(&workspace).await.expect("commit_all should succeed");
 
-    let log = Command::new("git")
+    let names = Command::new("git")
+        .args(["log", "-1", "--name-only", "--format="])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    let names_text = String::from_utf8(names.stdout).unwrap();
+    assert!(names_text.contains(".bellows-stub-marker"), "log: {}", names_text);
+    assert!(names_text.contains("hello.txt"), "log: {}", names_text);
+    assert!(names_text.contains("subdir/nested.md"), "log: {}", names_text);
+
+    let oneline = Command::new("git")
         .args(["log", "--oneline"])
         .current_dir(workspace.path())
         .output()
         .unwrap();
-    let log_text = String::from_utf8(log.stdout).unwrap();
+    let oneline_text = String::from_utf8(oneline.stdout).unwrap();
     assert_eq!(
-        log_text.lines().count(),
+        oneline_text.lines().count(),
         2,
-        "expected initial commit + marker commit, got: {}",
-        log_text
+        "expected initial + commit_all, got: {}",
+        oneline_text
     );
 }
 
@@ -95,9 +104,12 @@ async fn push_branch_pushes_agent_branch_to_remote() {
     let workspace = prepare(&remote_url, "agent/42-fix-the-foo-bug")
         .await
         .unwrap();
-    commit_marker(&workspace, "issue=42 timestamp=2026-05-09T13:00:00Z")
-        .await
-        .unwrap();
+    std::fs::write(
+        workspace.path().join(".bellows-stub-marker"),
+        "issue=42 timestamp=2026-05-09T13:00:00Z",
+    )
+    .unwrap();
+    commit_all(&workspace).await.unwrap();
 
     push_branch(&workspace).await.expect("push should succeed");
 

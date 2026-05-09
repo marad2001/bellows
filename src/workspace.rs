@@ -39,8 +39,6 @@ impl Workspace {
     }
 }
 
-pub const MARKER_FILE: &str = ".bellows-stub-marker";
-
 pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, WorkspaceError> {
     let temp_dir = TempDir::new()?;
     let path = temp_dir.path();
@@ -94,9 +92,11 @@ async fn detect_default_branch(repo: &Path) -> Result<String, WorkspaceError> {
         .to_string())
 }
 
-pub async fn commit_marker(workspace: &Workspace, content: &str) -> Result<(), WorkspaceError> {
-    tokio::fs::write(workspace.path().join(MARKER_FILE), content).await?;
-    git(workspace.path(), &["add", MARKER_FILE]).await?;
+/// Stage everything in the workspace and create a single commit. Used after
+/// the sandbox has run; the caller does not know in advance which files were
+/// produced, so we `git add -A` rather than naming files explicitly.
+pub async fn commit_all(workspace: &Workspace) -> Result<(), WorkspaceError> {
+    git(workspace.path(), &["add", "-A"]).await?;
     git(workspace.path(), &["commit", "-m", "Bellows stub run marker"]).await?;
     Ok(())
 }

@@ -8,6 +8,8 @@ pub enum RunError {
     Octocrab(#[from] octocrab::Error),
     #[error("workspace: {0}")]
     Workspace(#[from] WorkspaceError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("repo url is not in the form https://host/owner/repo: {0}")]
     InvalidRepoUrl(String),
 }
@@ -61,12 +63,21 @@ pub async fn run_once(
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
+
+    // TODO(slice 2 / #3): replace this inline write with sandbox::run_agent
+    // so the marker file is produced by a container, not by the host process.
     let marker_content = format!(
         "issue=#{} timestamp={}\n",
         claimed.number,
         started.to_rfc3339()
     );
-    workspace::commit_marker(&workspace, &marker_content).await?;
+    tokio::fs::write(
+        workspace.path().join(".bellows-stub-marker"),
+        marker_content,
+    )
+    .await?;
+
+    workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
     let pr_title = format!("Bellows stub run for issue #{}", claimed.number);
