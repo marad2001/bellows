@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -142,8 +143,10 @@ fn default_credentials_volume() -> String {
     "bellows-claude-credentials".to_string()
 }
 
-impl Config {
-    pub fn from_str(s: &str) -> Result<Self, toml::de::Error> {
+impl FromStr for Config {
+    type Err = toml::de::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         toml::from_str(s)
     }
 }

@@ -185,13 +185,15 @@ pub async fn run_once(
 
     let pr = workspace::open_pr(
         client,
-        &owner,
-        &repo,
-        &branch_name,
-        workspace.default_branch(),
-        &pr_title,
-        &pr_body,
-        draft,
+        workspace::OpenPrRequest {
+            owner: &owner,
+            repo: &repo,
+            head_branch: &branch_name,
+            base_branch: workspace.default_branch(),
+            title: &pr_title,
+            body: &pr_body,
+            draft,
+        },
     )
     .await?;
 
@@ -207,13 +209,15 @@ pub async fn run_once(
 
     tracker::finalise(
         client,
-        &owner,
-        &repo,
-        claimed.number,
-        pr.number,
-        &config.runtime_labels.agent_in_progress,
-        outcome_label,
-        &log_body,
+        tracker::FinaliseRequest {
+            owner: &owner,
+            repo: &repo,
+            issue_number: claimed.number,
+            pr_number: pr.number,
+            in_progress_label: &config.runtime_labels.agent_in_progress,
+            outcome_label,
+            log_body: &log_body,
+        },
     )
     .await?;
 

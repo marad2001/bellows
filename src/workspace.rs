@@ -140,23 +140,30 @@ pub struct Pr {
     pub html_url: String,
 }
 
+/// Inputs for `open_pr`. Bundled into a struct rather than passed as
+/// 8 positional arguments — clippy was already flagging the count and
+/// later slices may add fields (reviewers, assignees, etc.).
+pub struct OpenPrRequest<'a> {
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub head_branch: &'a str,
+    pub base_branch: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub draft: bool,
+}
+
 pub async fn open_pr(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
-    head_branch: &str,
-    base_branch: &str,
-    title: &str,
-    body: &str,
-    draft: bool,
+    req: OpenPrRequest<'_>,
 ) -> Result<Pr, octocrab::Error> {
-    let route = format!("/repos/{owner}/{repo}/pulls");
+    let route = format!("/repos/{owner}/{repo}/pulls", owner = req.owner, repo = req.repo);
     let payload = serde_json::json!({
-        "title": title,
-        "head": head_branch,
-        "base": base_branch,
-        "body": body,
-        "draft": draft,
+        "title": req.title,
+        "head": req.head_branch,
+        "base": req.base_branch,
+        "body": req.body,
+        "draft": req.draft,
     });
     let pr: Pr = client.post(&route, Some(&payload)).await?;
     Ok(pr)

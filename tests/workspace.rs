@@ -6,7 +6,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bellows::workspace::{commit_all, open_pr, prepare, push_branch};
+use bellows::workspace::{commit_all, open_pr, prepare, push_branch, OpenPrRequest};
 
 fn init_remote_repo(path: &Path) {
     run_git(path, &["init"]);
@@ -148,13 +148,15 @@ async fn open_pr_with_draft_false_posts_a_regular_pull_request() {
 
     let pr = open_pr(
         &client,
-        "marad2001",
-        "test-repo",
-        "agent/42-fix-the-foo-bug",
-        "master",
-        "Bellows stub run for issue #42",
-        "Closes #42.",
-        false,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/42-fix-the-foo-bug",
+            base_branch: "master",
+            title: "Bellows stub run for issue #42",
+            body: "Closes #42.",
+            draft: false,
+        },
     )
     .await
     .expect("open_pr should succeed");
@@ -188,13 +190,15 @@ async fn open_pr_with_draft_true_posts_a_draft_pull_request() {
 
     let pr = open_pr(
         &client,
-        "marad2001",
-        "test-repo",
-        "agent/8-cargo-test-failed",
-        "main",
-        "Bellows agent run for issue #8",
-        "Closes #8. Final tests red.",
-        true,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/8-cargo-test-failed",
+            base_branch: "main",
+            title: "Bellows agent run for issue #8",
+            body: "Closes #8. Final tests red.",
+            draft: true,
+        },
     )
     .await
     .expect("open_pr should succeed");

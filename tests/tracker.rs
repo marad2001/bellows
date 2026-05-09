@@ -4,6 +4,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
     claim, fetch_agent_brief, finalise, find_next_issue, post_pr_comment, ClaimError,
+    FinaliseRequest,
 };
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
@@ -209,13 +210,15 @@ async fn finalise_posts_log_comment_and_transitions_to_outcome_label() {
     let client = octocrab_pointed_at(mock.uri());
     let updated = finalise(
         &client,
-        "marad2001",
-        "test-repo",
-        42,
-        99,
-        "agent-in-progress",
-        "agent-done",
-        "Run completed",
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 42,
+            pr_number: 99,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-done",
+            log_body: "Run completed",
+        },
     )
     .await
     .expect("finalise should succeed");
@@ -260,13 +263,15 @@ async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
     let client = octocrab_pointed_at(mock.uri());
     let updated = finalise(
         &client,
-        "marad2001",
-        "test-repo",
-        55,
-        77,
-        "agent-in-progress",
-        "agent-failed",
-        "Tests failed",
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 55,
+            pr_number: 77,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-failed",
+            log_body: "Tests failed",
+        },
     )
     .await
     .expect("finalise should succeed");

@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use bellows::config::{AuthMethod, Config};
 
 const MINIMAL_CONFIG: &str = r#"
