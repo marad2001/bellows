@@ -45,6 +45,36 @@ pub async fn find_next_issue(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct Comment {
+    body: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ListCommentsParams {
+    per_page: u32,
+}
+
+/// Look up the latest agent-brief comment on an issue (the one whose body
+/// includes the `## Agent Brief` header that `/triage` posts). Returns
+/// `Ok(None)` if no such comment exists.
+pub async fn fetch_agent_brief(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<Option<String>, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments");
+    let params = ListCommentsParams { per_page: 100 };
+    let comments: Vec<Comment> = client.get(&route, Some(&params)).await?;
+
+    Ok(comments
+        .into_iter()
+        .filter_map(|c| c.body)
+        .filter(|b| b.contains("## Agent Brief"))
+        .next_back())
+}
+
 pub async fn finalise_success(
     client: &octocrab::Octocrab,
     owner: &str,

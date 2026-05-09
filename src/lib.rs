@@ -1,4 +1,6 @@
+pub mod auth;
 pub mod config;
+pub mod policy;
 pub mod runner;
 pub mod sandbox;
 pub mod tracker;
