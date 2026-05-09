@@ -53,6 +53,14 @@ pub async fn run_once(
         return Ok(RunOutcome::Idle);
     };
 
+    // Fetch the agent brief BEFORE claiming. If it's missing we return
+    // an error without label-swapping the issue — the next polling tick
+    // will see it fresh once a human posts the brief, instead of leaving
+    // it stuck in agent-in-progress with no automated recovery.
+    let brief = tracker::fetch_agent_brief(client, &owner, &repo, issue.number)
+        .await?
+        .ok_or(RunError::MissingAgentBrief(issue.number))?;
+
     let claimed = match tracker::claim(
         client,
         &owner,
@@ -74,10 +82,6 @@ pub async fn run_once(
 
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
-
-    let brief = tracker::fetch_agent_brief(client, &owner, &repo, claimed.number)
-        .await?
-        .ok_or(RunError::MissingAgentBrief(claimed.number))?;
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
 
