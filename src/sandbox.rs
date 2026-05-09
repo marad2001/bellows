@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
-use bollard::query_parameters::LogsOptionsBuilder;
+use bollard::query_parameters::{LogsOptionsBuilder, RemoveContainerOptionsBuilder};
 use bollard::Docker;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
@@ -15,7 +15,7 @@ const POLICY_IMAGE_DIR: &str = "policy-image";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    #[error("docker daemon not reachable: {0}")]
+    #[error("docker: {0}")]
     Bollard(#[from] bollard::errors::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -34,7 +34,7 @@ pub async fn run_agent(
     issue_number: u64,
     log_writer: &mut dyn Write,
 ) -> Result<(), SandboxError> {
-    let hash = compute_image_hash()?;
+    let hash = compute_dir_content_hash(Path::new(POLICY_IMAGE_DIR))?;
     let image_tag = format!("bellows-policy:{}", &hash[..12]);
 
     ensure_image_built(&hash, &image_tag).await?;
@@ -77,45 +77,49 @@ pub async fn run_agent(
     let container = docker.create_container(None, config).await?;
     let id = container.id;
 
-    docker.start_container(&id, None).await?;
+    // Once the container exists on the daemon it must be removed even if
+    // start/log/wait fail. Run the lifecycle inside an inner async block
+    // and force-remove unconditionally afterwards.
+    let lifecycle: Result<i64, SandboxError> = async {
+        docker.start_container(&id, None).await?;
 
-    let log_options = LogsOptionsBuilder::default()
-        .follow(true)
-        .stdout(true)
-        .stderr(true)
-        .build();
-    let mut log_stream = docker.logs(&id, Some(log_options));
-    while let Some(frame) = log_stream.next().await {
-        let frame = frame?;
-        let bytes = match frame {
-            bollard::container::LogOutput::StdOut { message } => message,
-            bollard::container::LogOutput::StdErr { message } => message,
-            _ => continue,
-        };
-        log_writer.write_all(&bytes)?;
-        log_writer.flush()?;
-    }
-
-    let mut wait_stream = docker.wait_container(&id, None);
-    let mut exit_code = 0i64;
-    while let Some(result) = wait_stream.next().await {
-        match result {
-            Ok(response) => exit_code = response.status_code,
-            Err(e) => return Err(e.into()),
+        let log_options = LogsOptionsBuilder::default()
+            .follow(true)
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut log_stream = docker.logs(&id, Some(log_options));
+        while let Some(frame) = log_stream.next().await {
+            let frame = frame?;
+            let bytes = match frame {
+                bollard::container::LogOutput::StdOut { message } => message,
+                bollard::container::LogOutput::StdErr { message } => message,
+                _ => continue,
+            };
+            log_writer.write_all(&bytes)?;
+            log_writer.flush()?;
         }
+
+        let mut wait_stream = docker.wait_container(&id, None);
+        let mut exit_code = 0i64;
+        while let Some(response) = wait_stream.next().await {
+            exit_code = response?.status_code;
+        }
+        Ok(exit_code)
     }
+    .await;
 
-    docker.remove_container(&id, None).await?;
+    let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
+    let _ = docker.remove_container(&id, Some(remove_options)).await;
 
+    let exit_code = lifecycle?;
     if exit_code != 0 {
         return Err(SandboxError::ContainerNonZeroExit(exit_code));
     }
-
     Ok(())
 }
 
-fn compute_image_hash() -> Result<String, SandboxError> {
-    let dir = Path::new(POLICY_IMAGE_DIR);
+fn compute_dir_content_hash(dir: &Path) -> Result<String, SandboxError> {
     if !dir.exists() {
         return Err(SandboxError::PolicyImageMissing(
             dir.display().to_string(),
@@ -128,7 +132,9 @@ fn compute_image_hash() -> Result<String, SandboxError> {
 
     let mut hasher = Sha256::new();
     for path in &files {
-        let rel = path.strip_prefix(dir).unwrap_or(path);
+        let rel = path
+            .strip_prefix(dir)
+            .expect("walked path is always under dir");
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
         let content = std::fs::read(path)?;
@@ -179,4 +185,58 @@ async fn ensure_image_built(hash: &str, tag: &str) -> Result<(), SandboxError> {
         return Err(SandboxError::ImageBuildFailed(status));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn hash_changes_when_file_contents_change() {
+        let a = TempDir::new().unwrap();
+        std::fs::write(a.path().join("f"), "alpha").unwrap();
+        let h_a = compute_dir_content_hash(a.path()).unwrap();
+
+        let b = TempDir::new().unwrap();
+        std::fs::write(b.path().join("f"), "beta").unwrap();
+        let h_b = compute_dir_content_hash(b.path()).unwrap();
+
+        assert_ne!(h_a, h_b);
+    }
+
+    #[test]
+    fn hash_is_stable_across_calls_with_identical_contents() {
+        let a = TempDir::new().unwrap();
+        std::fs::write(a.path().join("f"), "x").unwrap();
+        std::fs::write(a.path().join("g"), "y").unwrap();
+        let h_a = compute_dir_content_hash(a.path()).unwrap();
+
+        let b = TempDir::new().unwrap();
+        std::fs::write(b.path().join("f"), "x").unwrap();
+        std::fs::write(b.path().join("g"), "y").unwrap();
+        let h_b = compute_dir_content_hash(b.path()).unwrap();
+
+        assert_eq!(h_a, h_b);
+    }
+
+    #[test]
+    fn hash_differs_when_filenames_differ() {
+        let a = TempDir::new().unwrap();
+        std::fs::write(a.path().join("foo"), "x").unwrap();
+        let h_a = compute_dir_content_hash(a.path()).unwrap();
+
+        let b = TempDir::new().unwrap();
+        std::fs::write(b.path().join("bar"), "x").unwrap();
+        let h_b = compute_dir_content_hash(b.path()).unwrap();
+
+        assert_ne!(h_a, h_b);
+    }
+
+    #[test]
+    fn hash_errors_when_directory_does_not_exist() {
+        let nope = std::path::Path::new("does-not-exist-bellows-test");
+        let err = compute_dir_content_hash(nope).unwrap_err();
+        assert!(matches!(err, SandboxError::PolicyImageMissing(_)));
+    }
 }
