@@ -3,7 +3,8 @@ use std::io::Write;
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
 use crate::policy::{
-    self, CheckResult, ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes,
+    self, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome, PhaseOutcomes,
+    ReviewOutcome,
 };
 use crate::sandbox::{self, CargoTestRun, SandboxError};
 use crate::tracker::{self, ClaimError};
@@ -250,8 +251,8 @@ fn build_pr_body(
                 .to_string()
         }
         ExitReason::FinalTestsRed => {
-            "## `cargo test` failed after the agent's run\n\n\
-             The agent reported done with exit 0 but the post-run test gate caught failing tests. See the run-log comment on this PR for the full test output."
+            "## Cargo checks failed after the agent's run\n\n\
+             The agent reported done with exit 0 but a post-run cargo check (clippy or test, in either the post-implement or end-of-pipeline gate) failed. See the run-log comment on this PR for the per-phase summary and the failing output."
                 .to_string()
         }
     };
@@ -272,43 +273,98 @@ fn build_log_body(
          Claimed at: {started_rfc}\n\
          Finalised at: {finished_rfc}\n\
          Branch: `{branch_name}`\n\
-         Agent exit code: {agent_exit}\n",
+         Agent exit code: {agent_exit}\n\n\
+         ## Phase summary\n\n\
+         - Implement: exit {agent_exit}\n\
+         - Cargo checks (post-implement): {post_gate}\n\
+         - Review: {review}\n\
+         - Review-fix: {review_fix}\n\
+         - Cargo checks (end-pipeline): {end_gate}\n",
         started_rfc = started.to_rfc3339(),
         finished_rfc = finished.to_rfc3339(),
         agent_exit = outcomes.implement.exit_code,
+        post_gate = gate_summary_line(&outcomes.post_implement_gate),
+        review = review_summary(&outcomes.review),
+        review_fix = review_fix_summary(&outcomes.review_fix),
+        end_gate = match &outcomes.end_pipeline_gate {
+            Some(gate) => gate_summary_line(gate),
+            None => "did not run".to_string(),
+        },
     );
-
-    let post_clippy = outcomes.post_implement_gate.cargo_clippy.as_ref();
-    let post_test = outcomes.post_implement_gate.cargo_test.as_ref();
 
     if !matches!(reason, ExitReason::Success) {
         body.push_str("\n### Agent output tail\n\n```\n");
         body.push_str(&outcomes.implement.stderr_tail);
         body.push_str("\n```\n");
 
-        if let Some(clippy) = post_clippy {
-            body.push_str(&format!(
-                "\n### `cargo clippy` output (exit {code})\n\n```\n{output}\n```\n",
-                code = clippy.exit_code,
-                output = clippy.output,
-            ));
+        emit_failed_gate_outputs(
+            &mut body,
+            "post-implement gate",
+            &outcomes.post_implement_gate,
+        );
+        if let Some(end_gate) = &outcomes.end_pipeline_gate {
+            emit_failed_gate_outputs(&mut body, "end-pipeline gate", end_gate);
         }
-        if let Some(test_run) = post_test {
-            body.push_str(&format!(
-                "\n### `cargo test` output (exit {code})\n\n```\n{output}\n```\n",
-                code = test_run.exit_code,
-                output = test_run.output,
-            ));
-        }
-    } else if let Some(test_run) = post_test {
-        body.push_str(&format!(
-            "\nCargo test gate: exit {} (passed)\n",
-            test_run.exit_code
-        ));
     }
 
     body.push_str("\n</details>");
     body
+}
+
+fn gate_summary_line(gate: &GateOutcome) -> String {
+    fn part(name: &str, check: &Option<CheckResult>) -> String {
+        match check {
+            None => format!("{name} did not run"),
+            Some(r) if r.exit_code == 0 => format!("{name} PASSED"),
+            Some(r) => format!("{name} FAILED (exit {})", r.exit_code),
+        }
+    }
+    format!(
+        "{}, {}",
+        part("clippy", &gate.cargo_clippy),
+        part("tests", &gate.cargo_test),
+    )
+}
+
+fn review_summary(review: &Option<ReviewOutcome>) -> String {
+    match review {
+        None => "did not run".to_string(),
+        Some(r) if r.exit_code != 0 => format!("crashed (exit {})", r.exit_code),
+        Some(r) => match &r.findings_text {
+            Some(_) => "findings produced".to_string(),
+            None => "no findings".to_string(),
+        },
+    }
+}
+
+fn review_fix_summary(fix: &Option<FixOutcome>) -> String {
+    match fix {
+        None => "did not run".to_string(),
+        Some(f) if f.exit_code != 0 => format!("crashed (exit {})", f.exit_code),
+        Some(_) => "exit 0".to_string(),
+    }
+}
+
+/// Append `### \`cargo X\` output` blocks for any failing checks in this
+/// gate. Successful checks produce no block — they're already named in
+/// the phase summary at the top, no need to dump empty output text.
+fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) {
+    if let Some(clippy) = &gate.cargo_clippy
+        && clippy.exit_code != 0
+    {
+        body.push_str(&format!(
+            "\n### `cargo clippy` output ({label}, exit {})\n\n```\n{}\n```\n",
+            clippy.exit_code, clippy.output,
+        ));
+    }
+    if let Some(test) = &gate.cargo_test
+        && test.exit_code != 0
+    {
+        body.push_str(&format!(
+            "\n### `cargo test` output ({label}, exit {})\n\n```\n{}\n```\n",
+            test.exit_code, test.output,
+        ));
+    }
 }
 
 fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
@@ -429,10 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn build_pr_body_for_final_tests_red_mentions_test_output_pointer() {
+    fn build_pr_body_for_final_tests_red_mentions_cargo_checks_not_just_tests() {
+        // After slice X1 the gate runs both clippy and test, in either the
+        // post-implement or end-of-pipeline position — the PR body should
+        // reflect that, not pin "test" specifically.
         let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None);
-        assert!(body.contains("`cargo test` failed"));
-        assert!(body.contains("full test output"));
+        assert!(body.to_lowercase().contains("cargo checks"));
+        assert!(body.contains("run-log comment"));
     }
 
     #[test]
@@ -467,7 +526,9 @@ mod tests {
         assert!(body.contains("FinalTestsRed"));
         assert!(body.contains("### Agent output tail"));
         assert!(body.contains("agent told you it was done"));
-        assert!(body.contains("### `cargo test` output (exit 101)"));
+        // Header includes the gate label (post-implement) and the exit code.
+        assert!(body.contains("`cargo test`"));
+        assert!(body.contains("exit 101"));
         assert!(body.contains("test foo ... FAILED"));
     }
 
@@ -503,9 +564,121 @@ mod tests {
             &outcomes,
         );
         assert!(body.contains("FinalTestsRed"));
-        assert!(body.contains("clippy"));
+        assert!(body.contains("`cargo clippy`"));
         assert!(body.contains("warning: this is a clippy lint"));
+        // No cargo test section was emitted (test exit absent / passing).
         assert!(!body.contains("`cargo test` output"));
+    }
+
+    #[test]
+    fn build_log_body_for_final_tests_red_includes_both_clippy_and_test_when_both_failed() {
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 101, output: "clippy lint here".to_string() }),
+                cargo_test: Some(CheckResult { exit_code: 1, output: "test panicked".to_string() }),
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+        };
+        let body = build_log_body(
+            &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
+        );
+        assert!(body.contains("`cargo clippy`"));
+        assert!(body.contains("clippy lint here"));
+        assert!(body.contains("`cargo test`"));
+        assert!(body.contains("test panicked"));
+        assert!(body.contains("exit 101"));
+        assert!(body.contains("exit 1"));
+    }
+
+    #[test]
+    fn build_log_body_for_final_tests_red_includes_end_pipeline_gate_output() {
+        // Post-implement gate clean. Review ran (no findings). End-pipeline
+        // gate caught a regression. The log body should include the
+        // end-pipeline gate's output, distinguishable from the post-implement
+        // gate's (which passed cleanly here).
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome { findings_text: None, exit_code: 0 }),
+            review_fix: None,
+            end_pipeline_gate: Some(GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
+            }),
+        };
+        let body = build_log_body(
+            &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
+        );
+        // The end-pipeline section is named distinctly from post-implement
+        // so a reader knows the failure was after review-fix, not before.
+        assert!(body.contains("end-pipeline"));
+        assert!(body.contains("regression here"));
+    }
+
+    #[test]
+    fn build_log_body_includes_per_phase_summary() {
+        // For a clean run, the summary names each phase that ran with a
+        // human-readable outcome. The brief's example: 'Review: 3 findings,
+        // all addressed. Cargo checks: clippy PASSED, tests PASSED.'
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome { findings_text: Some("findings".to_string()), exit_code: 0 }),
+            review_fix: Some(FixOutcome { exit_code: 0 }),
+            end_pipeline_gate: Some(GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            }),
+        };
+        let body = build_log_body(
+            &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
+        );
+        assert!(body.contains("Review:"));
+        assert!(body.contains("Cargo checks (post-implement)"));
+        assert!(body.contains("Cargo checks (end-pipeline)"));
+    }
+
+    #[test]
+    fn build_log_body_attributes_review_phase_crash() {
+        // Review run crashed (non-zero exit). Per the halt-on-phase-failure
+        // contract the runner halts before review-fix or end-gate, so both
+        // are None. The log body should name the crash explicitly so a
+        // human reading the comment knows which phase died.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome { findings_text: None, exit_code: 137 }),
+            review_fix: None,
+            end_pipeline_gate: None,
+        };
+        let body = build_log_body(
+            &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
+        );
+        assert!(body.contains("Review: crashed"));
+        assert!(body.contains("137"));
+        // Phases that didn't run because of the halt are visibly named.
+        assert!(body.contains("Review-fix: did not run"));
+        assert!(body.contains("Cargo checks (end-pipeline): did not run"));
     }
 
     #[test]
