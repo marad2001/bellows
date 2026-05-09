@@ -278,6 +278,7 @@ fn build_log_body(
         agent_exit = outcomes.implement.exit_code,
     );
 
+    let post_clippy = outcomes.post_implement_gate.cargo_clippy.as_ref();
     let post_test = outcomes.post_implement_gate.cargo_test.as_ref();
 
     if !matches!(reason, ExitReason::Success) {
@@ -285,6 +286,13 @@ fn build_log_body(
         body.push_str(&outcomes.implement.stderr_tail);
         body.push_str("\n```\n");
 
+        if let Some(clippy) = post_clippy {
+            body.push_str(&format!(
+                "\n### `cargo clippy` output (exit {code})\n\n```\n{output}\n```\n",
+                code = clippy.exit_code,
+                output = clippy.output,
+            ));
+        }
         if let Some(test_run) = post_test {
             body.push_str(&format!(
                 "\n### `cargo test` output (exit {code})\n\n```\n{output}\n```\n",
@@ -461,6 +469,43 @@ mod tests {
         assert!(body.contains("agent told you it was done"));
         assert!(body.contains("### `cargo test` output (exit 101)"));
         assert!(body.contains("test foo ... FAILED"));
+    }
+
+    #[test]
+    fn build_log_body_for_final_tests_red_attributes_clippy_failure() {
+        // Clippy failed (exit 101) in the post-implement gate; cargo test
+        // never ran. The log body should name clippy and include its
+        // output, and should NOT include a cargo-test section.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 0,
+                stderr_tail: "agent done".to_string(),
+            },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult {
+                    exit_code: 101,
+                    output: "warning: this is a clippy lint".to_string(),
+                }),
+                cargo_test: None,
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+        };
+        let body = build_log_body(
+            &ExitReason::FinalTestsRed,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.contains("FinalTestsRed"));
+        assert!(body.contains("clippy"));
+        assert!(body.contains("warning: this is a clippy lint"));
+        assert!(!body.contains("`cargo test` output"));
     }
 
     #[test]
