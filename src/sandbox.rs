@@ -10,6 +10,7 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::auth::Auth;
+use crate::policy::{CheckResult, GateOutcome};
 use crate::workspace::Workspace;
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
@@ -261,24 +262,30 @@ pub async fn run_agent(
     })
 }
 
-/// Outcome of running `cargo test` in a sanity-gate container after the
-/// agent exits. Carries the exit code (so the runner can pass it to
-/// `policy::classify_exit`) and the captured stdout+stderr (so the
-/// failure log comment can show the operator exactly which tests failed).
-#[derive(Debug, Clone)]
-pub struct CargoTestRun {
-    pub exit_code: i64,
-    pub output: String,
-}
+/// Workspace-side files written by the policy image's `run-cargo-checks`
+/// script. The runner reads these after the container exits so it can
+/// attribute clippy / test failures separately, then removes them so
+/// they don't end up in any subsequent commit.
+const CARGO_CLIPPY_OUTPUT_FILE: &str = ".bellows-cargo-clippy-output";
+const CARGO_TEST_OUTPUT_FILE: &str = ".bellows-cargo-test-output";
+const CARGO_CHECKS_RESULTS_FILE: &str = ".bellows-cargo-checks-results";
 
-/// Spawn a fresh container from the policy image, override the entrypoint
-/// to `cargo test`, run it against the workspace, capture full output,
-/// and return the exit code + captured output. No credentials volume —
-/// the gate runs without Anthropic auth.
-pub async fn run_cargo_test(
+/// Spawn a fresh container from the policy image and run the cargo
+/// checks gate: `cargo clippy --all-targets --all-features -- -D
+/// warnings` followed by `cargo test`. Both run inside the same
+/// container (entrypoint overridden to `run-cargo-checks`) so clippy's
+/// compilation artifacts are reused by test.
+///
+/// Returns a `GateOutcome` carrying each check's exit code + captured
+/// output. `cargo_test` is `None` when clippy failed and the gate
+/// short-circuited before running tests. Either being `None` and the
+/// other being `Some` with a non-zero exit signals the gate failed.
+///
+/// No credentials volume — the gate has no Anthropic dependency.
+pub async fn run_cargo_checks(
     workspace: &Workspace,
     log_writer: &mut dyn Write,
-) -> Result<CargoTestRun, SandboxError> {
+) -> Result<GateOutcome, SandboxError> {
     let image_tag = ensure_policy_image().await?;
 
     let docker = Docker::connect_with_local_defaults()?;
@@ -289,7 +296,7 @@ pub async fn run_cargo_test(
     let mut labels = HashMap::new();
     labels.insert("bellows-managed".to_string(), "true".to_string());
     labels.insert("bellows-run-id".to_string(), run_id);
-    labels.insert("bellows-purpose".to_string(), "cargo-test-gate".to_string());
+    labels.insert("bellows-purpose".to_string(), "cargo-checks-gate".to_string());
 
     let host_config = HostConfig {
         mounts: Some(vec![Mount {
@@ -303,7 +310,7 @@ pub async fn run_cargo_test(
 
     let config = ContainerCreateBody {
         image: Some(image_tag),
-        entrypoint: Some(vec!["cargo".to_string(), "test".to_string()]),
+        entrypoint: Some(vec!["/usr/local/bin/run-cargo-checks".to_string()]),
         cmd: Some(vec![]),
         working_dir: Some("/workspace".to_string()),
         labels: Some(labels),
@@ -311,12 +318,62 @@ pub async fn run_cargo_test(
         ..Default::default()
     };
 
-    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
+    // Container's overall exit is consumed only as a SandboxError trigger
+    // (it's already encoded by per-check exit codes parsed below).
+    let _ = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
 
-    Ok(CargoTestRun {
-        exit_code: outcome.exit_code,
-        output: outcome.captured,
+    let workspace_path = workspace.path();
+    let clippy_output =
+        read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))?.unwrap_or_default();
+    let test_output =
+        read_and_remove(workspace_path.join(CARGO_TEST_OUTPUT_FILE))?.unwrap_or_default();
+    let results_text =
+        read_and_remove(workspace_path.join(CARGO_CHECKS_RESULTS_FILE))?.unwrap_or_default();
+
+    let (clippy_exit, test_exit) = parse_checks_results(&results_text);
+
+    Ok(GateOutcome {
+        cargo_clippy: clippy_exit.map(|exit_code| CheckResult {
+            exit_code,
+            output: clippy_output,
+        }),
+        cargo_test: test_exit.map(|exit_code| CheckResult {
+            exit_code,
+            output: test_output,
+        }),
     })
+}
+
+/// Read a file at `path`, remove it, and return its contents. Returns
+/// `Ok(None)` if the file doesn't exist (treated by the caller as
+/// "the corresponding check did not produce output").
+fn read_and_remove(path: PathBuf) -> Result<Option<String>, SandboxError> {
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let _ = std::fs::remove_file(&path);
+            Ok(Some(content))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SandboxError::Io(e)),
+    }
+}
+
+/// Parse the tiny `clippy_exit=N` / `test_exit=N` results file written
+/// by `run-cargo-checks`. Empty `test_exit=` value means the test step
+/// did not run (clippy short-circuited it). Missing or malformed lines
+/// return `None` for that field — the runner treats `None` as "check
+/// did not run."
+fn parse_checks_results(text: &str) -> (Option<i64>, Option<i64>) {
+    let mut clippy = None;
+    let mut test = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("clippy_exit=") {
+            clippy = rest.trim().parse::<i64>().ok();
+        } else if let Some(rest) = line.strip_prefix("test_exit=") {
+            test = rest.trim().parse::<i64>().ok();
+        }
+    }
+    (clippy, test)
 }
 
 fn compute_dir_content_hash(dir: &Path) -> Result<String, SandboxError> {
@@ -461,5 +518,36 @@ mod tests {
         tail.append(b"hello ");
         tail.append(b"world");
         assert_eq!(tail.into_string(), "hello world");
+    }
+
+    #[test]
+    fn parse_checks_results_reads_both_exits() {
+        let (clippy, test) = parse_checks_results("clippy_exit=0\ntest_exit=0\n");
+        assert_eq!(clippy, Some(0));
+        assert_eq!(test, Some(0));
+    }
+
+    #[test]
+    fn parse_checks_results_reads_clippy_failed_test_skipped() {
+        // Empty test_exit value means the test step did not run because
+        // clippy short-circuited the gate. The script's wrapper writes
+        // `test_exit=` (no value) in that case.
+        let (clippy, test) = parse_checks_results("clippy_exit=101\ntest_exit=\n");
+        assert_eq!(clippy, Some(101));
+        assert_eq!(test, None);
+    }
+
+    #[test]
+    fn parse_checks_results_reads_test_failed() {
+        let (clippy, test) = parse_checks_results("clippy_exit=0\ntest_exit=101\n");
+        assert_eq!(clippy, Some(0));
+        assert_eq!(test, Some(101));
+    }
+
+    #[test]
+    fn parse_checks_results_returns_none_for_missing_lines() {
+        let (clippy, test) = parse_checks_results("");
+        assert!(clippy.is_none());
+        assert!(test.is_none());
     }
 }

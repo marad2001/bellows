@@ -1,0 +1,66 @@
+#!/bin/sh
+# Bellows post-run cargo checks gate (slice X1).
+#
+# Runs `cargo clippy --all-targets --all-features -- -D warnings` then,
+# if clippy passed, `cargo test` — both inside the same container so
+# clippy's compilation artifacts are reused by test.
+#
+# Each check's stdout+stderr is captured to its own file in the
+# workspace bind mount so the runner can attribute failures to the
+# right check in the PR log comment. Exit codes are written to a tiny
+# results file. The container's overall exit follows the worst exit
+# code seen (clippy failure beats test failure).
+#
+# The runner is responsible for reading these files after the
+# container exits, then removing them so they don't end up in any
+# subsequent commit.
+
+set -u
+
+cd /workspace
+
+CLIPPY_OUTPUT=/workspace/.bellows-cargo-clippy-output
+TEST_OUTPUT=/workspace/.bellows-cargo-test-output
+RESULTS=/workspace/.bellows-cargo-checks-results
+
+# Truncate any leftovers from a prior run (defensive — Bellows removes
+# these on the host between runs, but a partial file should never block
+# the gate from producing fresh output).
+: > "$CLIPPY_OUTPUT"
+: > "$TEST_OUTPUT"
+: > "$RESULTS"
+
+cargo clippy --all-targets --all-features -- -D warnings >"$CLIPPY_OUTPUT" 2>&1
+CLIPPY_EXIT=$?
+
+if [ $CLIPPY_EXIT -eq 0 ]; then
+    cargo test >"$TEST_OUTPUT" 2>&1
+    TEST_EXIT=$?
+    TEST_RECORDED=$TEST_EXIT
+else
+    echo "(skipped — clippy failed with exit $CLIPPY_EXIT)" >"$TEST_OUTPUT"
+    TEST_EXIT=0       # used only for the container's overall exit
+    TEST_RECORDED=    # empty = "did not run", parsed by the runner
+fi
+
+# Tiny key=value results file the runner parses after the container
+# exits. test_exit is empty when the test step did not run.
+{
+    echo "clippy_exit=$CLIPPY_EXIT"
+    echo "test_exit=$TEST_RECORDED"
+} >"$RESULTS"
+
+# Tee the captured outputs to stdout so an operator watching `bellows
+# run` in their terminal sees what cargo said live, not just after
+# the container exits.
+echo "=== cargo clippy ==="
+cat "$CLIPPY_OUTPUT"
+echo "=== cargo test ==="
+cat "$TEST_OUTPUT"
+
+# Container exit follows the worst of the two exit codes — non-zero
+# from either check propagates so the runner sees the gate as failed.
+if [ $CLIPPY_EXIT -ne 0 ]; then
+    exit $CLIPPY_EXIT
+fi
+exit $TEST_EXIT

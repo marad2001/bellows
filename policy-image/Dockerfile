@@ -47,7 +47,8 @@ COPY CLAUDE.md /opt/bellows-policy/CLAUDE.md
 
 COPY entrypoint /usr/local/bin/entrypoint
 COPY run-agent /usr/local/bin/run-agent
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent
+COPY run-cargo-checks /usr/local/bin/run-cargo-checks
+RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent /usr/local/bin/run-cargo-checks
 
 # Pre-create the bellows user's claude home with the right ownership so
 # the named-volume mount inherits these permissions on first attach.

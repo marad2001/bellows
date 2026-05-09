@@ -6,7 +6,7 @@ use crate::policy::{
     self, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome, PhaseOutcomes,
     ReviewOutcome,
 };
-use crate::sandbox::{self, CargoTestRun, SandboxError};
+use crate::sandbox::{self, SandboxError};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
 
@@ -134,30 +134,25 @@ pub async fn run_once(
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
-    // Run the cargo test sanity gate inside a fresh container, but ONLY
+    // Run the cargo checks gate inside a fresh container, but ONLY
     // when the workspace looks like a Rust project (has Cargo.toml at
-    // the root). For non-Rust briefs the gate is skipped and the run is
-    // treated as success — see policy::classify_exit's None branch.
-    let cargo_test_run: Option<CargoTestRun> = if workspace.path().join("Cargo.toml").exists() {
-        Some(sandbox::run_cargo_test(&workspace, log_writer).await?)
+    // the root). For non-Rust briefs the gate is skipped (GateOutcome
+    // default = both checks `None`) and the run is treated as success.
+    let post_implement_gate: GateOutcome = if workspace.path().join("Cargo.toml").exists() {
+        sandbox::run_cargo_checks(&workspace, log_writer).await?
     } else {
-        None
+        GateOutcome::default()
     };
-    // Slice X1 introduces PhaseOutcomes. Until the review/end-gate phases
-    // land later in this slice, only the post-implement gate is populated;
-    // the rest stays `None`. classify_exit's behaviour is preserved.
+
+    // Slice X1: review/review-fix/end-gate phases land in K2-K4. For
+    // now PhaseOutcomes carries implement + post-implement gate; review
+    // and the rest stay `None` until those phases ship.
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
             exit_code: agent_run.exit_code,
             stderr_tail: agent_run.stderr_tail.clone(),
         },
-        post_implement_gate: GateOutcome {
-            cargo_clippy: None,
-            cargo_test: cargo_test_run.as_ref().map(|r| CheckResult {
-                exit_code: r.exit_code,
-                output: r.output.clone(),
-            }),
-        },
+        post_implement_gate,
         review: None,
         review_fix: None,
         end_pipeline_gate: None,
