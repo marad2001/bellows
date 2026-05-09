@@ -128,7 +128,7 @@ pub async fn run_once(
 
     let finished = chrono::Utc::now();
     let log_body = format!(
-        "<details><summary>Bellows run log</summary>\n\nIssue: #{}\nClaimed at: {}\nFinalised at: {}\nBranch: `{}`\nMarker file: `.bellows-stub-marker`\n</details>",
+        "<details><summary>Bellows run log</summary>\n\nIssue: #{}\nClaimed at: {}\nFinalised at: {}\nBranch: `{}`\n</details>",
         claimed.number,
         started.to_rfc3339(),
         finished.to_rfc3339(),
