@@ -2,7 +2,9 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bellows::tracker::{claim, fetch_agent_brief, finalise, find_next_issue, ClaimError};
+use bellows::tracker::{
+    claim, fetch_agent_brief, finalise, find_next_issue, post_pr_comment, ClaimError,
+};
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
     octocrab::OctocrabBuilder::new()
@@ -318,4 +320,29 @@ async fn fetch_agent_brief_returns_none_when_no_brief_comment_exists() {
         .await
         .expect("call should succeed");
     assert!(brief.is_none(), "expected None, got {:?}", brief);
+}
+
+#[tokio::test]
+async fn post_pr_comment_posts_body_to_the_pr_comments_endpoint() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .and(body_json(json!({
+            "body": "## Review findings\n\nfound stuff"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    post_pr_comment(
+        &client,
+        "marad2001",
+        "test-repo",
+        99,
+        "## Review findings\n\nfound stuff",
+    )
+    .await
+    .expect("post_pr_comment should succeed");
 }

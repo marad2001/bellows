@@ -110,6 +110,23 @@ pub async fn finalise(
     Ok(updated)
 }
 
+/// Post a freestanding comment on an issue or PR (PRs share the issues
+/// comments endpoint on GitHub). Used by the runner to surface the
+/// review-phase findings file as a `## Review findings` comment without
+/// the label-swap baked into `finalise`.
+pub async fn post_pr_comment(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<(), octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
+    let payload = serde_json::json!({ "body": body });
+    let _: serde_json::Value = client.post(&route, Some(&payload)).await?;
+    Ok(())
+}
+
 pub async fn claim(
     client: &octocrab::Octocrab,
     owner: &str,
