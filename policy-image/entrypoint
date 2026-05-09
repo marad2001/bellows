@@ -12,23 +12,25 @@
 
 set -eu
 
-mkdir -p /root/.claude/skills
+CLAUDE_HOME=/home/bellows/.claude
+
+mkdir -p "$CLAUDE_HOME/skills"
 
 # Use cp -r with a trailing /. so we copy CONTENTS, not the directory
-# itself, regardless of whether /root/.claude/skills already exists.
-cp -r /opt/bellows-policy/skills/. /root/.claude/skills/
-cp /opt/bellows-policy/CLAUDE.md /root/.claude/CLAUDE.md
+# itself, regardless of whether the destination already exists.
+cp -r /opt/bellows-policy/skills/. "$CLAUDE_HOME/skills/"
+cp /opt/bellows-policy/CLAUDE.md "$CLAUDE_HOME/CLAUDE.md"
 
-# Workaround for Claude Code v2.1: setup-auth created /root/.claude.json
-# but the credentials volume only mounts /root/.claude/ (the directory).
-# .claude.json (sibling file) is NOT in the volume, so it's lost on
-# container exit. Claude Code itself stashes a backup inside
-# /root/.claude/backups/ (which IS in the volume); restore it on each
-# start so Claude Code finds its config.
-if [ ! -f /root/.claude.json ]; then
-    LATEST_BACKUP=$(ls -t /root/.claude/backups/.claude.json.backup.* 2>/dev/null | head -n 1 || true)
+# Workaround for Claude Code v2.1: setup-auth created
+# /home/bellows/.claude.json (sibling file), but the credentials volume
+# only mounts /home/bellows/.claude/ (the directory). .claude.json is
+# NOT in the volume, so it's lost on container exit. Claude Code itself
+# stashes a backup inside /home/bellows/.claude/backups/ (which IS in
+# the volume); restore it on each start so Claude Code finds its config.
+if [ ! -f /home/bellows/.claude.json ]; then
+    LATEST_BACKUP=$(ls -t "$CLAUDE_HOME/backups/.claude.json.backup."* 2>/dev/null | head -n 1 || true)
     if [ -n "$LATEST_BACKUP" ]; then
-        cp "$LATEST_BACKUP" /root/.claude.json
+        cp "$LATEST_BACKUP" /home/bellows/.claude.json
     fi
 fi
 

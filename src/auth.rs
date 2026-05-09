@@ -4,7 +4,12 @@ use bollard::models::{Mount, MountType};
 /// The credentials volume mounts here; the policy-image entrypoint copies
 /// the baked skills + CLAUDE.md into the same path at container start so
 /// they layer with the persisted OAuth tokens.
-pub const CLAUDE_HOME_IN_CONTAINER: &str = "/root/.claude";
+///
+/// Owned by the non-root `bellows` user inside the container. Anthropic
+/// blocks `--dangerously-skip-permissions` when claude runs as root, so
+/// the policy image runs as a constrained account; the credentials home
+/// has to be under that user's HOME for permissions to work.
+pub const CLAUDE_HOME_IN_CONTAINER: &str = "/home/bellows/.claude";
 
 pub enum Auth {
     Subscription { credentials_volume_name: String },

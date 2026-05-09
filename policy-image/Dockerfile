@@ -29,12 +29,18 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI.
+# Claude Code CLI (installed system-wide as root so any user can invoke it).
 RUN npm install -g @anthropic-ai/claude-code@latest
 
+# Non-root user for the agent run. Claude Code refuses to honour
+# --dangerously-skip-permissions when running as root (and we need that
+# flag for headless runs); USER bellows below switches to a constrained
+# account before the entrypoint executes.
+RUN useradd --create-home --shell /bin/bash --uid 1000 bellows
+
 # Baked policy: skills + CLAUDE.md live here. The entrypoint copies them
-# into /root/.claude/ at container start so they layer correctly with the
-# OAuth state in the credentials volume.
+# into the bellows user's claude home at container start so they layer
+# with the OAuth state in the credentials volume.
 RUN mkdir -p /opt/bellows-policy/skills
 COPY skills/ /opt/bellows-policy/skills/
 COPY CLAUDE.md /opt/bellows-policy/CLAUDE.md
@@ -43,5 +49,11 @@ COPY entrypoint /usr/local/bin/entrypoint
 COPY run-agent /usr/local/bin/run-agent
 RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent
 
+# Pre-create the bellows user's claude home with the right ownership so
+# the named-volume mount inherits these permissions on first attach.
+RUN mkdir -p /home/bellows/.claude/skills \
+    && chown -R bellows:bellows /home/bellows
+
+USER bellows
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
