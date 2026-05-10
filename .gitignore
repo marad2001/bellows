@@ -5,3 +5,7 @@ orchestrator.toml
 
 # Default log file location.
 bellows.log
+
+# Claude Code local state (permissions, etc.) — per-operator, never
+# committed.
+.claude/

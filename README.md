@@ -1,0 +1,482 @@
+# Bellows
+
+> AFK Claude Code orchestrator for Rust repos. Bellows watches a GitHub
+> issue tracker, picks up issues that you've triaged to `ready-for-agent`,
+> and runs a sandboxed Claude Code agent inside a Docker container against
+> a fresh clone of your repo. The agent works the issue test-first, the
+> orchestrator gates on `cargo clippy` and `cargo test`, an automated
+> code-review phase pushes follow-up findings, and the result lands on
+> GitHub as a pull request (draft on failure, regular on success) for a
+> human to review.
+
+Bellows is the plumbing — container lifecycle, git, GitHub API, label
+state machine, wall-clock budget, log shipping. Claude Code (running
+headless inside the sandbox via `claude -p`) is the brain. V1 is a
+single-repo, single-in-flight-issue orchestrator that runs on the
+developer's laptop, authenticated to Anthropic via a personal
+subscription. See [`RESEARCH.md`](RESEARCH.md) for the full design
+briefing and [`PRD.md`](PRD.md) for the v1 contract.
+
+## Prerequisites
+
+Before installing bellows, you need:
+
+- **Docker** running on the host (Docker Desktop on Windows/macOS,
+  Docker Engine on Linux). Every agent run happens inside a container
+  built from the policy image bellows ships; if Docker isn't reachable
+  via the local socket, bellows can't dispatch.
+- **A Rust toolchain** (stable, edition 2024). Needed to build bellows
+  from source — bellows is not published to a package manager in v1.
+- **A GitHub Personal Access Token (fine-grained)** for the target
+  repo with the following permissions: **Issues: read & write**,
+  **Pull requests: read & write**, **Contents: read & write**. Bellows
+  reads this token via the env var named in `orchestrator.toml`'s
+  `[github].pat_env_var` (default `BELLOWS_GITHUB_TOKEN`).
+- **The target repo's GitHub issue tracker** with the canonical bellows
+  label vocabulary already in place. The full list is below in
+  [One-time setup](#one-time-setup) — you can create the labels through
+  the GitHub UI or `gh label create`.
+
+## Install
+
+Clone the bellows repo and install the binary into your Cargo bin
+directory:
+
+```bash
+git clone https://github.com/marad2001/bellows.git
+cd bellows
+cargo install --path .
+```
+
+`bellows` will land on your `PATH` if `~/.cargo/bin` is on it. There is
+no `cargo install bellows` from crates.io in v1 — bellows is not
+published to a package manager.
+
+If you'd rather not install globally, `cargo build --release` then run
+`./target/release/bellows` from the clone — every subcommand below works
+the same way against the built binary.
+
+## One-time setup
+
+There are three things to set up once per operator + target-repo
+pairing: the config file, the GitHub PAT in your environment, and the
+Claude Code credentials volume. After that, daily use is a single
+`bellows run` command.
+
+### 1. Copy and edit the config
+
+The canonical config schema lives in
+[`orchestrator.example.toml`](orchestrator.example.toml). Copy it to
+`orchestrator.toml` (the real file is gitignored, so your
+deployment-specific values stay out of source control):
+
+```bash
+cp orchestrator.example.toml orchestrator.toml
+$EDITOR orchestrator.toml
+```
+
+Sections of `orchestrator.toml`, all of which are read at startup:
+
+- **`[repo].url`** — the GitHub repository bellows polls. Single-repo
+  in v1; the field accepts one URL.
+- **`[github].pat_env_var`** — the name of the environment variable
+  bellows will read your PAT from. Defaults to `BELLOWS_GITHUB_TOKEN`.
+  Renaming this is purely cosmetic; bellows never reads the token from
+  the file directly.
+- **`[polling]`** — how often to poll GitHub
+  (`interval_seconds`, default 45) and which label flags an issue as
+  ready (`pickup_label`, default `ready-for-agent`).
+- **`[runtime_labels]`** — the label strings bellows applies as the
+  agent moves through its state machine (`agent_in_progress`,
+  `agent_done`, `agent_failed`, `agent_rate_limited`,
+  `agent_cancelled`). Defaults match the names verbatim; override only
+  if your tracker uses different strings.
+- **`[logging].path`** — where bellows writes its single log file.
+  Default `bellows.log` in the current working directory; `tail -f` is
+  the intended UX.
+- **`[auth]`** — `method = "subscription"` (the only v1 variant) and
+  `credentials_volume`, the name of the Docker volume holding the
+  Claude Code OAuth session (default `bellows-claude-credentials`).
+- **`[agent].wall_clock_minutes`** — the per-issue wall-clock budget.
+  Default 60. Bellows tracks elapsed time across all containers in the
+  pipeline (implement + post-implement gate + review + review-fix +
+  end-pipeline gate); when the budget is spent the run halts and
+  routes to a draft PR with `agent-failed`.
+
+### 2. Export your GitHub PAT
+
+Put the token wherever your shell picks it up at startup
+(`~/.zshrc`, `~/.bashrc`, a `direnv` `.envrc`, etc.):
+
+```bash
+export BELLOWS_GITHUB_TOKEN=ghp_yourtokenhere
+```
+
+The variable name must match `[github].pat_env_var`. Bellows refuses
+to start if the variable is unset, so you'll know immediately.
+
+### 3. Seed the Claude Code credentials volume
+
+The agent inside the sandbox authenticates to Anthropic via a
+persistent Docker volume holding an OAuth session — your personal
+Max-plan subscription. Seed it once with `bellows setup-auth`:
+
+```bash
+bellows setup-auth
+```
+
+This opens an interactive Claude Code session inside a one-shot
+container, with the credentials volume mounted at the right path.
+Inside the container, type `/login` to start the OAuth flow, complete
+it in your browser, then `/exit`. The volume retains the tokens; every
+future agent run mounts the same volume read-write. Concurrency=1
+prevents container races on the volume. If the refresh token expires
+later, [`bellows refresh-auth`](#daily-use) re-seeds it the same way.
+
+### 4. Create the GitHub label vocabulary
+
+Bellows operates a label state machine on the target repo, so the
+labels need to exist before bellows starts polling. There are two
+groups.
+
+**Triage labels** (used by the triage skill to move issues into the
+`ready-for-agent` state; see
+[`docs/agents/triage-labels.md`](docs/agents/triage-labels.md)):
+
+- `needs-triage` — maintainer needs to evaluate this issue.
+- `needs-info` — waiting on reporter for more information.
+- `ready-for-agent` — fully specified, ready for an AFK agent.
+- `ready-for-human` — requires human implementation.
+- `wontfix` — will not be actioned.
+
+Plus the two category labels that the triage skill uses on every
+issue:
+
+- `bug` — the issue describes a defect in existing behavior.
+- `enhancement` — the issue describes new or changed behavior.
+
+**Runtime labels** (applied by bellows itself as a run progresses;
+override the strings via `[runtime_labels]` in `orchestrator.toml` if
+you need to):
+
+- `agent-in-progress` — bellows has claimed the issue; a container is
+  running or about to run.
+- `agent-done` — the run finished successfully; PR opened, `cargo
+  test` was green.
+- `agent-failed` — the run finished unsuccessfully; a draft PR was
+  opened with logs as a `<details>` comment.
+- `agent-rate-limited` — a draft PR was opened because Anthropic
+  rate-limited the agent mid-run.
+- `agent-cancelled` — an operator ran `bellows kill <issue>`; the
+  container was stopped and a draft PR was opened.
+
+Quick way to create all of these with the `gh` CLI:
+
+```bash
+for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug enhancement \
+             agent-in-progress agent-done agent-failed agent-rate-limited agent-cancelled; do
+  gh label create "$label" --force
+done
+```
+
+## Daily use
+
+The v1 operator-facing toolkit is four subcommands: `run`, `status`,
+`kill`, `refresh-auth`. Two of these (`run` and `status`) ship today;
+the other two (`kill` and `refresh-auth`) are planned for later slices
+and are documented below so this README captures the full v1 surface
+in one place. Each unshipped subcommand carries an explicit "planned"
+note pointing at its tracking issue.
+
+### `bellows run` — start the polling loop
+
+```bash
+bellows run
+```
+
+`run` is the foreground polling loop. It reads `orchestrator.toml` from
+the current directory (override with `--config path/to/file`), connects
+to Docker, cleans up any orphan containers left by a prior bellows
+process (slice 7), then polls GitHub every `interval_seconds`. When it
+sees a `ready-for-agent` issue, it swaps that label for
+`agent-in-progress` and dispatches a sandboxed Claude Code container.
+
+In the terminal you'll see phase-boundary announcements as the
+pipeline progresses (implement → post-implement gate → review →
+review-fix → end-pipeline gate → finalise). The same lines, plus the
+full log stream, also land in the log file at the path configured in
+`[logging].path` (default `bellows.log` in the working directory).
+`tail -f bellows.log` from a second terminal is the recommended way to
+watch a long-running run unattended.
+
+Bellows is foreground by design in v1 — close the terminal and the
+loop stops. The standard pattern is to run it in `tmux` / `screen` /
+`nohup` if you want it to persist while the lid is closed.
+
+### `bellows status` — is bellows busy or idle?
+
+```bash
+bellows status
+```
+
+`status` prints one line describing what the polling loop is doing
+right now: not running, idle, or busy on issue #N (with the agent
+phase and elapsed wall-clock time). It reads a small status file the
+running orchestrator keeps fresh — no IPC needed. Useful from a
+second terminal when you don't want to grep `bellows.log` to figure
+out whether bellows is alive.
+
+### `bellows kill <issue>` — abort an in-flight run
+
+> ⚠️ **Planned — not yet shipped.** Tracked in
+> [issue #9 (slice 10)](https://github.com/marad2001/bellows/issues/9).
+> Until that lands, abort an in-flight run by Ctrl-C-ing `bellows run`;
+> slice 7's orphan cleanup catches the leftover container at the next
+> startup. You'll need to manually re-label the issue back to
+> `ready-for-agent` to retry.
+
+```bash
+bellows kill 42
+```
+
+`kill` stops an in-flight run on a specific issue: SIGKILLs the
+container, pushes whatever the agent had committed up to that point,
+opens a draft PR with the logs as a `<details>` comment, and
+transitions the issue's label to `agent-cancelled`. Use it when you
+realise an issue brief was wrong, or when an agent has clearly stuck
+itself and burning the rest of the wall-clock budget won't help.
+
+### `bellows refresh-auth` — re-seed expired OAuth tokens
+
+> ⚠️ **Planned — not yet shipped.** Tracked in
+> [issue #10 (slice 12)](https://github.com/marad2001/bellows/issues/10).
+> Until that lands, use `bellows setup-auth` directly to re-seed the
+> credentials volume — it's functionally the same flow; this slice
+> just adds an alias with situation-appropriate naming plus
+> auth-error detection in agent stderr.
+
+```bash
+bellows refresh-auth
+```
+
+When the Claude Code OAuth refresh token in the credentials volume
+expires (or the volume gets clobbered), agent runs start failing with
+401-shaped auth errors in stderr. `refresh-auth` opens the same
+interactive Claude Code container as `setup-auth` so you can `/login`
+again and re-seed the volume. The volume name is the one in
+`[auth].credentials_volume`. See
+[Troubleshooting](#troubleshooting) for the signature to watch for.
+
+## Issue lifecycle
+
+Bellows is the final stage of a four-step pipeline. End-to-end, a
+single issue moves like this:
+
+1. **File the issue** on the target GitHub repo. Apply `needs-triage`
+   (or just leave it unlabelled — your triage workflow's choice).
+2. **Triage** the issue manually or via the triage skill. The
+   terminal state is `ready-for-agent`, which requires:
+   - one category label (`bug` or `enhancement`);
+   - an **agent brief** as the latest comment on the issue, with
+     concrete testable acceptance criteria. The brief is what the
+     in-container agent will treat as its contract; weak briefs
+     produce weak runs. The triage skill's `AGENT-BRIEF.md` template
+     is the canonical shape — see
+     [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md)
+     and [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md)
+     for the conventions this repo's triage uses.
+3. **Bellows polls** every `interval_seconds`. On the next tick after
+   the label change, it claims the issue (swaps `ready-for-agent` for
+   `agent-in-progress`), spawns a sandboxed Claude Code container with
+   a kickoff prompt built from the brief, and starts the pipeline.
+4. **The agent runs** test-first under the `tdd` skill (see
+   [`policy-image/skills/`](policy-image/skills/)). The orchestrator
+   gates on `cargo clippy` and `cargo test`, runs an automated
+   code-review phase, applies fixes from that review, then a final
+   gate.
+5. **The PR opens.** Regular PR + `agent-done` label on success;
+   draft PR + `agent-failed` (or `agent-rate-limited` /
+   `agent-cancelled`) on failure, with the run's logs attached as a
+   collapsible `<details>` comment.
+6. **A human reviews** the PR — bellows never merges. Squash-on-merge
+   keeps the agent's intermediate commits out of `main`'s history.
+
+Bellows does **not** auto-retry. If a run lands at `agent-failed` and
+you want to try again, fix whatever needs fixing (the agent brief, the
+test environment, an upstream dep) and re-label the issue back to
+`ready-for-agent`. Bellows will pick it up on the next poll.
+
+## Troubleshooting
+
+### Cold-cache build time on first run for a repo
+
+The single biggest Rust-specific operational hazard. A fresh
+agent-side workspace has no `target/` directory and no warm cargo
+registry, so the agent's first `cargo build` on a new repo recompiles
+every dependency from scratch — easily 15–25 minutes for a non-trivial
+project, which eats most of the default 60-minute wall-clock budget
+before the agent has done anything useful.
+
+**Workaround until issue #6 lands** (per-repo `target/` named volume
+and a shared cargo registry volume): manually pre-warm the workspace
+before bellows picks up the first issue. From a fresh clone of the
+target repo, run `cargo build` once on your host, then make sure
+bellows is configured against that same repo. The next agent run still
+clones fresh inside the sandbox, so this is a partial fix — the real
+remedy is cache volumes, tracked in
+[issue #6](https://github.com/marad2001/bellows/issues/6).
+
+If you're seeing repeated wall-clock-cap failures on a new repo and
+you haven't pre-warmed, that's almost certainly why — see the
+wall-clock entry below for bumping the cap as a stopgap.
+
+### Expired Claude Code refresh token
+
+**Symptom:** agent runs start failing very fast (well under the
+wall-clock cap), and the run's `<details>` log comment contains
+`401`-shaped errors, `authentication` strings, or other auth-failure
+signatures in the agent's stderr. The Claude Code OAuth refresh token
+in the credentials volume has expired or been invalidated.
+
+**Remedy:** run `bellows refresh-auth` to re-seed the volume. This
+opens the same interactive container as `setup-auth`; `/login` again
+in the browser, `/exit` when done, and the next bellows run will pick
+up the new tokens.
+
+Auto-detection of this failure signature is tracked in
+[issue #10](https://github.com/marad2001/bellows/issues/10) (slice 12)
+— once it lands, bellows will surface the remedy directly in the log
+instead of leaving you to grep stderr.
+
+### Orphan containers from a crashed bellows process
+
+If bellows crashes or is killed mid-run, the agent container it spawned
+is left behind by Docker (it has nothing else to clean it up). Bellows
+handles this automatically: at startup, the `run` command lists
+bellows-tagged containers and removes any that aren't associated with
+the current process. No manual intervention needed; you'll see a
+`cleaned up N orphan containers` line in `bellows.log` if the cleanup
+fired.
+
+The orphan-container cleanup does **not** auto-reclaim GitHub issues
+that were stuck at `agent-in-progress` from the killed run. See the
+next item.
+
+### Issue stuck at `agent-in-progress`
+
+If you see an issue stuck at `agent-in-progress` and no container is
+actually running, one of two things happened:
+
+- bellows crashed mid-run (the next startup cleaned up the orphan
+  container but cannot infer the operator's intent for the labels), or
+- you ran `bellows kill <issue>` (in which case the label should have
+  already moved to `agent-cancelled`).
+
+Either way, the remedy is the same: manually swap the label back to
+`ready-for-agent`. Bellows will pick the issue up again on the next
+poll. Bellows does not auto-retry because a flapping orchestrator
+would otherwise blow through your wall-clock budget on the same
+broken issue.
+
+### Wall-clock cap firing too aggressively
+
+If runs are consistently failing at `agent-failed` with `(killed by
+deadline)` in stderr and you've ruled out a stuck agent, bump
+`[agent].wall_clock_minutes` in `orchestrator.toml`. The default of 60
+is calibrated for warm-cache runs against a not-too-large Rust repo;
+bigger codebases or cold-cache scenarios may legitimately need more.
+
+Be wary of pushing this much past 90 — long-running agents tend to
+drift, and the wall-clock cap exists partly to detect that drift.
+
+## TOS posture
+
+Bellows authenticates the in-container agent to Anthropic using a
+**personal Claude Code subscription** (the OAuth session you seeded
+into the credentials volume during `setup-auth`), invoked via Claude
+Code's officially supported **headless mode** (`claude -p ...`).
+Concurrency is **hard-coded to 1**: bellows runs at most one agent
+container at any moment, queueing other `ready-for-agent` issues
+serially. This matches what a single human operator working AFK could
+do interactively, and avoids parallelism patterns that would be
+inconsistent with personal-subscription terms as currently understood.
+
+This is the right call for v1, but it does sit on a single
+TOS-interpretation assumption. If Anthropic tightens its stance on
+headless / orchestrated subscription usage, the fallback is to switch
+to API-key auth and pay per-token. The plumbing is already in place:
+`Auth` in [`src/auth.rs`](src/auth.rs) is an enum with `Subscription`
+and `Auth::ApiKey` variants, and only `Subscription` is implemented
+today (the `Auth::ApiKey` arms `todo!()`). Switching, when needed,
+would mean filling in those arms and flipping the config — no
+architectural change.
+
+## v1 scope
+
+The smallest end-to-end thing that works. Every item in the "not in
+v1" list is additive on the current architecture; future slices will
+chip away at them.
+
+### In v1
+
+- single repo (one URL in `[repo]`);
+- single in-flight issue at any moment (concurrency=1, hard-coded);
+- subscription auth via Anthropic personal subscription, OAuth in a
+  Docker volume;
+- headless Claude Code agent (`claude -p ...`) inside a Docker
+  sandbox built from a baked policy image;
+- `cargo clippy` + `cargo test` gate after the agent reports done;
+- automated code review + fix loop after the gate passes
+  (clippy / test failures land before review even runs);
+- always-open-a-PR contract — regular PR on success, draft PR on
+  failure with logs as a `<details>` comment;
+- GitHub label state machine across triage labels +
+  `agent-in-progress` / `agent-done` / `agent-failed` /
+  `agent-rate-limited` / `agent-cancelled`.
+
+### Not in v1
+
+- multi-repo (the config field exists, only the first repo is read);
+- multi-host orchestration / true 24/7 AFK from a VPS;
+- parallelism / concurrent issues (concurrency stays at 1);
+- `sccache` or other build caches beyond what the agent's own
+  `target/` directory provides
+  (per-repo cache volumes are tracked in issue #6);
+- web dashboard / TUI / status UI beyond the `bellows status`
+  one-liner;
+- push notifications (Discord, Pushover, etc.);
+- auto-retry after failure (you re-label `ready-for-agent` to retry);
+- GitHub App auth (fine-grained PAT only);
+- per-repo policy customisation;
+- cost / token tracking (subscription mode doesn't price per-token);
+- automated triage (issues #21 and #22 are queued but not built);
+- security review phase (issue #20 also queued).
+
+## Further reading
+
+For deeper context, the repo ships these documents alongside the
+README. None are required to operate bellows; reach for them when you
+want to understand the decisions, not just the keystrokes.
+
+- [`RESEARCH.md`](RESEARCH.md) — the original briefing, with the full
+  reasoning behind every architectural decision (brain-vs-plumbing,
+  sandbox technology, polling vs webhooks, auth, build cache strategy,
+  stop conditions, v1 scope justification). Start here if you want
+  the "why".
+- [`PRD.md`](PRD.md) — the v1 contract, slice by slice.
+- [`CLAUDE.md`](CLAUDE.md) — the project's agent-skills config. Tells
+  Claude Code agents working on the bellows codebase itself how this
+  repo's domain docs and issue tracker are arranged.
+- [`policy-image/CLAUDE.md`](policy-image/CLAUDE.md) — the baseline
+  CLAUDE.md baked into the sandbox image. This is what the
+  in-container agent sees on every run, before the per-issue kickoff
+  prompt; read it if you want to know the agent's standing
+  instructions.
+- [`docs/agents/`](docs/agents/) — per-skill conventions: the
+  [issue tracker](docs/agents/issue-tracker.md) (how skills should use
+  `gh`), the [triage labels](docs/agents/triage-labels.md) (canonical
+  vs project-specific label strings), and the
+  [domain doc layout](docs/agents/domain.md) (where `CONTEXT.md` and
+  ADRs live).
+- [`orchestrator.example.toml`](orchestrator.example.toml) — the
+  canonical config schema with inline commentary for every field.
