@@ -134,6 +134,36 @@ pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
     .await
 }
 
+/// Capture `git diff <default_branch>...HEAD` and write it to
+/// `dest_filename` (a workspace-relative path). Used by the runner to
+/// feed the implement-phase diff into the review-phase claude run via
+/// a workspace file rather than a `gh pr diff` call inside the
+/// container.
+///
+/// Uses three dots (`<base>...HEAD`) so the diff is exactly what the
+/// PR would show — only commits unique to this branch since it
+/// diverged from the base.
+pub async fn generate_diff(
+    workspace: &Workspace,
+    dest_filename: &str,
+) -> Result<(), WorkspaceError> {
+    let spec = format!("{}...HEAD", workspace.default_branch);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["diff", &spec])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec!["diff".into(), spec.clone()],
+            status: output.status,
+        });
+    }
+    tokio::fs::write(workspace.path().join(dest_filename), &output.stdout).await?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Pr {
     pub number: u64,

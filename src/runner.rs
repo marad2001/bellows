@@ -103,22 +103,9 @@ pub async fn run_once(
         },
     };
 
-    let agent_run = sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
-
-    // If the agent wrote a self-report blocker file, capture its content.
-    // Do NOT remove — it stays in the workspace and ends up in the commit
-    // so the human reviewer can see what the agent struggled with.
-    let agent_notes_path = workspace.path().join("agent-notes.md");
-    let agent_notes = if agent_notes_path.exists() {
-        Some(
-            tokio::fs::read_to_string(&agent_notes_path)
-                .await?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    // ---- Phase 1: Implement ----
+    let implement_agent_run =
+        sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
 
     // If the agent wrote a PR description file, capture + remove it
     // before committing so it does NOT appear in the diff.
@@ -134,28 +121,126 @@ pub async fn run_once(
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
-    // Run the cargo checks gate inside a fresh container, but ONLY
-    // when the workspace looks like a Rust project (has Cargo.toml at
-    // the root). For non-Rust briefs the gate is skipped (GateOutcome
-    // default = both checks `None`) and the run is treated as success.
+    // ---- Phase 2: Post-implement cargo checks gate ----
     let post_implement_gate: GateOutcome = if workspace.path().join("Cargo.toml").exists() {
         sandbox::run_cargo_checks(&workspace, log_writer).await?
     } else {
         GateOutcome::default()
     };
 
-    // Slice X1: review/review-fix/end-gate phases land in K2-K4. For
-    // now PhaseOutcomes carries implement + post-implement gate; review
-    // and the rest stay `None` until those phases ship.
+    // Halt-on-phase-failure: if implement crashed or the post-implement
+    // gate failed, skip review/review-fix/end-gate and short-circuit.
+    // agent-notes from the implement phase will be picked up in the
+    // final read just before classify_exit.
+    let halt_after_post_implement =
+        implement_agent_run.exit_code != 0 || gate_failed_local(&post_implement_gate);
+
+    let mut review_outcome: Option<ReviewOutcome> = None;
+    let mut review_fix_outcome: Option<FixOutcome> = None;
+    let mut end_pipeline_gate: Option<GateOutcome> = None;
+    let mut review_findings_for_comment: Option<String> = None;
+
+    if !halt_after_post_implement {
+        // ---- Phase 3: Review ----
+        workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+        tokio::fs::write(
+            workspace.path().join(".bellows-kickoff.md"),
+            policy::REVIEW_PROMPT,
+        )
+        .await?;
+        let review_agent_run =
+            sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+
+        // Read the findings file. Don't remove it yet — review-fix may
+        // need to read it. If review-fix runs successfully it removes
+        // the file itself. Bellows removes any leftover before the next
+        // commit_all so the file never lands in the PR diff.
+        let findings_path = workspace.path().join(policy::REVIEW_FINDINGS_FILE);
+        let findings_text = if findings_path.exists() {
+            let raw = tokio::fs::read_to_string(&findings_path).await?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("(no findings)") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        } else {
+            None
+        };
+        review_findings_for_comment = findings_text.clone();
+        review_outcome = Some(ReviewOutcome {
+            findings_text: findings_text.clone(),
+            exit_code: review_agent_run.exit_code,
+        });
+
+        let halt_after_review = review_agent_run.exit_code != 0;
+
+        let mut halt_after_fix = false;
+        if !halt_after_review && findings_text.is_some() {
+            // ---- Phase 4: Review-fix ----
+            tokio::fs::write(
+                workspace.path().join(".bellows-kickoff.md"),
+                policy::REVIEW_FIX_PROMPT,
+            )
+            .await?;
+            let review_fix_agent_run =
+                sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+            review_fix_outcome = Some(FixOutcome {
+                exit_code: review_fix_agent_run.exit_code,
+            });
+            halt_after_fix = review_fix_agent_run.exit_code != 0;
+
+            // Capture any review-fix commits and any agent-notes appended
+            // by review-fix. Best-effort — NoChangesToCommit is fine here
+            // (review-fix may have legitimately produced no commits if
+            // every finding was a "nit" the agent could not address).
+            cleanup_phase_handoff_files(&workspace).await?;
+            match workspace::commit_all(&workspace).await {
+                Ok(()) => workspace::push_branch(&workspace).await?,
+                Err(WorkspaceError::NoChangesToCommit) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // ---- Phase 5: End-of-pipeline cargo checks gate ----
+        if !halt_after_review
+            && !halt_after_fix
+            && workspace.path().join("Cargo.toml").exists()
+        {
+            end_pipeline_gate = Some(sandbox::run_cargo_checks(&workspace, log_writer).await?);
+        }
+
+        // Defensive cleanup: even on halt paths the diff file should not
+        // outlive the run. Findings file is also ensured-removed so it
+        // never appears in any subsequent commit.
+        cleanup_phase_handoff_files(&workspace).await?;
+    }
+
+    // Read agent-notes.md ONCE at the very end. Any phase may have
+    // written/appended to it (implement, review, review-fix). Notes
+    // stay in the workspace and the diff so the human reviewer sees
+    // them — not removed.
+    let agent_notes_path = workspace.path().join("agent-notes.md");
+    let agent_notes = if agent_notes_path.exists() {
+        Some(
+            tokio::fs::read_to_string(&agent_notes_path)
+                .await?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
-            exit_code: agent_run.exit_code,
-            stderr_tail: agent_run.stderr_tail.clone(),
+            exit_code: implement_agent_run.exit_code,
+            stderr_tail: implement_agent_run.stderr_tail.clone(),
         },
         post_implement_gate,
-        review: None,
-        review_fix: None,
-        end_pipeline_gate: None,
+        review: review_outcome,
+        review_fix: review_fix_outcome,
+        end_pipeline_gate,
     };
     let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -191,6 +276,15 @@ pub async fn run_once(
         },
     )
     .await?;
+
+    // Post the review findings as a separate `## Review findings` PR
+    // comment if the review phase produced any. Posted regardless of
+    // whether review-fix succeeded — readers always see what was
+    // flagged.
+    if let Some(findings) = review_findings_for_comment {
+        let comment_body = format!("## Review findings\n\n{findings}");
+        tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
+    }
 
     let finished = chrono::Utc::now();
     let log_body = build_log_body(
@@ -364,6 +458,37 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
             test.exit_code, test.output,
         ));
     }
+}
+
+/// Check whether a gate's clippy or test exited non-zero. Same predicate
+/// as policy::gate_failed but kept private to runner.rs since it's
+/// purely an orchestration question (should we halt before review?)
+/// rather than a routing decision (which `ExitReason` to produce).
+fn gate_failed_local(gate: &GateOutcome) -> bool {
+    let nonzero = |c: &Option<CheckResult>| matches!(c, Some(r) if r.exit_code != 0);
+    nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
+}
+
+/// Remove the slice-X1 phase handoff files from the workspace. The
+/// review diff (input to the review prompt) and the review findings
+/// file (output of review, input of review-fix) are both Bellows-
+/// internal — they must never land in any subsequent commit. Called
+/// after review-fix and as a defensive sweep on the halt path.
+///
+/// Best-effort: a missing file is not an error. A genuinely failing
+/// remove (permissions, IO error) is propagated.
+async fn cleanup_phase_handoff_files(
+    workspace: &crate::workspace::Workspace,
+) -> Result<(), std::io::Error> {
+    for name in [policy::REVIEW_DIFF_FILE, policy::REVIEW_FINDINGS_FILE] {
+        let path = workspace.path().join(name);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
