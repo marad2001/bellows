@@ -405,6 +405,30 @@ fn build_log_body(
         },
     );
 
+    // Per-reason callout block, before the agent output tail. Surfaces
+    // the operator-relevant headline for non-generic failures so the
+    // log comment communicates "what kind of failure this was" without
+    // having to scan the per-phase summary.
+    match reason {
+        ExitReason::WallClockExceeded => {
+            let elapsed_minutes = (finished - started).num_minutes();
+            body.push_str(&format!(
+                "\n### Wall-clock cap reached after {elapsed_minutes} minutes\n\n\
+                 The pipeline was halted because the per-issue wall-clock budget was \
+                 exceeded. The phase summary above shows where the time went.\n",
+            ));
+        }
+        ExitReason::RateLimited => {
+            body.push_str(
+                "\n### Anthropic API rate limit detected\n\n\
+                 A claude phase exited non-zero with stderr matching a known rate-limit \
+                 signature. The agent output tail below contains the matched line. \
+                 Re-run the issue once the rate-limit window clears.\n",
+            );
+        }
+        _ => {}
+    }
+
     if !matches!(reason, ExitReason::Success) {
         body.push_str("\n### Agent output tail\n\n```\n");
         body.push_str(&outcomes.implement.stderr_tail);
@@ -820,6 +844,87 @@ mod tests {
         // Phases that didn't run because of the halt are visibly named.
         assert!(body.contains("Review-fix: did not run"));
         assert!(body.contains("Cargo checks (end-pipeline): did not run"));
+    }
+
+    #[test]
+    fn build_log_body_for_wall_clock_exceeded_mentions_cap_and_elapsed_minutes() {
+        // Operator should be able to see at-a-glance that the run was
+        // killed because the wall-clock cap fired, and how much time
+        // elapsed before it did.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::minutes(60);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 137, // SIGKILL exit code
+                stderr_tail: "(killed by deadline)".to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: true,
+        };
+        let body = build_log_body(
+            &ExitReason::WallClockExceeded,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.contains("WallClockExceeded"));
+        assert!(body.to_lowercase().contains("wall-clock"));
+        // 60 minutes elapsed should appear in human-readable form.
+        assert!(body.contains("60"));
+    }
+
+    #[test]
+    fn build_log_body_for_rate_limited_quotes_the_matched_signature() {
+        // The stderr tail is already shown in the body for non-Success
+        // reasons, so the matched signature naturally appears. The test
+        // pins that the body specifically calls out the rate-limit
+        // detection so an operator can verify the classification.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::seconds(30);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 1,
+                stderr_tail:
+                    r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
+                        .to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+        };
+        let body = build_log_body(
+            &ExitReason::RateLimited,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.contains("RateLimited"));
+        assert!(body.to_lowercase().contains("rate limit"));
+        // The matched signature appears in the body via the stderr tail.
+        assert!(body.contains("rate_limit_error"));
+    }
+
+    #[test]
+    fn build_pr_body_for_wall_clock_exceeded_mentions_cap() {
+        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None);
+        assert!(body.to_lowercase().contains("wall-clock"));
+        assert!(body.contains("run-log comment"));
+    }
+
+    #[test]
+    fn build_pr_body_for_rate_limited_mentions_rate_limit() {
+        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None);
+        assert!(body.to_lowercase().contains("rate limit"));
+        assert!(body.contains("run-log comment"));
     }
 
     #[test]

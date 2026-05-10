@@ -14,6 +14,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +143,26 @@ impl Default for AuthConfig {
 
 fn default_credentials_volume() -> String {
     "bellows-claude-credentials".to_string()
+}
+
+/// Per-issue agent budget. Currently just the wall-clock cap; later
+/// slices may add per-phase budgets, retry policy, etc.
+#[derive(Debug, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default = "default_wall_clock_minutes")]
+    pub wall_clock_minutes: u64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            wall_clock_minutes: default_wall_clock_minutes(),
+        }
+    }
+}
+
+fn default_wall_clock_minutes() -> u64 {
+    60
 }
 
 impl FromStr for Config {

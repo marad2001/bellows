@@ -46,3 +46,27 @@ fn auth_section_defaults_apply_when_omitted() {
     assert!(matches!(config.auth.method, AuthMethod::Subscription));
     assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
 }
+
+#[test]
+fn agent_section_defaults_apply_when_omitted() {
+    // Slice 6: the per-issue wall-clock budget defaults to 60 minutes
+    // when [agent].wall_clock_minutes is unspecified.
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert_eq!(config.agent.wall_clock_minutes, 60);
+}
+
+#[test]
+fn agent_section_wall_clock_minutes_can_be_overridden() {
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[agent]
+wall_clock_minutes = 5
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(config.agent.wall_clock_minutes, 5);
+}
