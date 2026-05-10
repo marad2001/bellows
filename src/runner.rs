@@ -108,7 +108,7 @@ pub async fn run_once(
     // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
     // reports the deadline fired.
     let mut budget = WallClockBudget::new(Duration::from_secs(
-        config.agent.wall_clock_minutes * 60,
+        config.agent.wall_clock_minutes.get() * 60,
     ));
 
     // ---- Phase 1: Implement ----
@@ -467,9 +467,18 @@ fn build_log_body(
     }
 
     if !matches!(reason, ExitReason::Success) {
-        body.push_str("\n### Agent output tail\n\n```\n");
-        body.push_str(&outcomes.implement.stderr_tail);
-        body.push_str("\n```\n");
+        // When SIGKILL fires before any agent output flushes (typical for
+        // wall-clock kill mid-startup), `stderr_tail` is empty; emitting
+        // the section anyway produces an empty markdown code fence in the
+        // PR comment. Surface a placeholder instead so the operator sees
+        // why the section is empty.
+        if outcomes.implement.stderr_tail.trim().is_empty() {
+            body.push_str("\n_(No agent output was captured before termination.)_\n");
+        } else {
+            body.push_str("\n### Agent output tail\n\n```\n");
+            body.push_str(&outcomes.implement.stderr_tail);
+            body.push_str("\n```\n");
+        }
 
         emit_failed_gate_outputs(
             &mut body,
@@ -992,6 +1001,39 @@ mod tests {
         assert!(body.to_lowercase().contains("rate limit"));
         // The matched signature appears in the body via the stderr tail.
         assert!(body.contains("rate_limit_error"));
+    }
+
+    #[test]
+    fn build_log_body_emits_placeholder_when_stderr_tail_is_empty() {
+        // S1 smoke regression: when SIGKILL fires before any agent output
+        // flushes, the stderr_tail is empty. Without the placeholder, the
+        // body emitted an empty code fence which rendered as a useless
+        // empty block in the PR comment. The placeholder explains why the
+        // section is empty so the operator isn't left wondering.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::minutes(2);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 137,
+                stderr_tail: String::new(), // empty — kill happened before any flush
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: true,
+        };
+        let body = build_log_body(
+            &ExitReason::WallClockExceeded,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.to_lowercase().contains("no agent output was captured"));
+        // The empty code fence section header is NOT emitted.
+        assert!(!body.contains("### Agent output tail"));
     }
 
     #[test]

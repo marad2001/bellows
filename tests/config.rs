@@ -52,7 +52,7 @@ fn agent_section_defaults_apply_when_omitted() {
     // Slice 6: the per-issue wall-clock budget defaults to 60 minutes
     // when [agent].wall_clock_minutes is unspecified.
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
-    assert_eq!(config.agent.wall_clock_minutes, 60);
+    assert_eq!(config.agent.wall_clock_minutes.get(), 60);
 }
 
 #[test]
@@ -68,5 +68,31 @@ pat_env_var = "GITHUB_TOKEN"
 wall_clock_minutes = 5
 "#;
     let config = Config::from_str(config_text).unwrap();
-    assert_eq!(config.agent.wall_clock_minutes, 5);
+    assert_eq!(config.agent.wall_clock_minutes.get(), 5);
+}
+
+#[test]
+fn agent_section_wall_clock_minutes_rejects_zero() {
+    // Defending against a misconfigured `wall_clock_minutes = 0`. With
+    // a plain u64 the budget would be marked exceeded on the first
+    // call and the runner would pass `None` as the deadline to the
+    // implement phase — which `run_container` reads as "no deadline" —
+    // bypassing the cap entirely. NonZeroU64 makes `0` a parse-time
+    // error.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[agent]
+wall_clock_minutes = 0
+"#;
+    let result = Config::from_str(config_text);
+    assert!(
+        result.is_err(),
+        "expected wall_clock_minutes = 0 to fail parsing, got {:?}",
+        result.as_ref().map(|_| "Ok"),
+    );
 }
