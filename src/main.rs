@@ -121,6 +121,42 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         ),
     );
 
+    // Slice 7: clean up any orphan containers from a prior bellows
+    // process that didn't shut down cleanly. Best-effort — a flaky
+    // Docker daemon shouldn't prevent bellows from running. Note that
+    // GitHub issues stuck at agent-in-progress from the killed run
+    // are NOT auto-reclaimed; the operator re-labels manually.
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(docker) => {
+            match sandbox::cleanup_orphan_containers(&docker, &mut log_file).await {
+                Ok(0) => log(
+                    &mut log_file,
+                    "bellows: no orphan containers from prior runs",
+                ),
+                Ok(n) => log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: cleaned up {n} orphan containers from prior runs (any GitHub issues stuck at agent-in-progress need manual re-labelling to retry)",
+                    ),
+                ),
+                Err(e) => log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: orphan-cleanup failed (continuing anyway): {}",
+                        format_error_chain(&e),
+                    ),
+                ),
+            }
+        }
+        Err(e) => log(
+            &mut log_file,
+            &format!(
+                "bellows: could not connect to Docker for orphan cleanup (continuing anyway): {}",
+                format_error_chain(&e),
+            ),
+        ),
+    }
+
     loop {
         let outcome = runner::run_once(&client, &config, &mut log_file).await;
         match outcome {

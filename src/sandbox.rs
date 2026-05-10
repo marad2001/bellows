@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
-    KillContainerOptions, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    KillContainerOptions, ListContainersOptionsBuilder, LogsOptionsBuilder,
+    RemoveContainerOptionsBuilder,
 };
 use bollard::Docker;
 use sha2::{Digest, Sha256};
@@ -541,10 +542,128 @@ async fn ensure_image_built(hash: &str, tag: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// One leftover container Bellows is cleaning up at startup. Holds just
+/// the fields surfaced in the per-orphan log line; the full bollard
+/// summary isn't propagated past `cleanup_orphan_containers`.
+struct OrphanInfo {
+    short_id: String,
+    run_id: Option<String>,
+    purpose: Option<String>,
+}
+
+/// Format a per-orphan log line. Pure function so the line shape is
+/// unit-testable without docker. Includes the short-id always, and the
+/// run-id / purpose only when present (not all bellows containers carry
+/// purpose — e.g. the agent run doesn't).
+fn format_orphan_log_line(info: &OrphanInfo) -> String {
+    let mut line = format!("bellows: cleaned up orphan container {}", info.short_id);
+    if let Some(rid) = &info.run_id {
+        line.push_str(&format!(" (run-id: {rid})"));
+    }
+    if let Some(p) = &info.purpose {
+        line.push_str(&format!(" (purpose: {p})"));
+    }
+    line
+}
+
+/// Extract bellows label fields from a bollard container's labels map.
+/// Pure transformation so the extraction is unit-testable without docker.
+/// `id` is the full 64-char container ID; the function shortens it to
+/// the docker-conventional 12 chars for human-readable logs.
+fn orphan_info_from_labels(id: &str, labels: &HashMap<String, String>) -> OrphanInfo {
+    OrphanInfo {
+        short_id: id.chars().take(12).collect(),
+        run_id: labels.get("bellows-run-id").cloned(),
+        purpose: labels.get("bellows-purpose").cloned(),
+    }
+}
+
+/// Force-remove every container carrying the `bellows-managed=true`
+/// label. Called once at `bellows run` startup, before the polling loop.
+/// Containers that completed normally were already removed by their
+/// own lifecycle (see `run_container`'s drop path); anything still
+/// present is by definition an orphan from a prior bellows process
+/// that didn't shut down cleanly (Ctrl-C, SIGKILL, panic, machine
+/// sleep).
+///
+/// Single-instance assumption: this rule assumes only one `bellows
+/// run` process exists at a time. Running two instances in parallel
+/// would clobber the other's running containers. Acceptable for v1;
+/// `bellows-process-id` labeling is a future enhancement for
+/// multi-instance support.
+///
+/// GitHub state is NOT touched. Issues that were `agent-in-progress`
+/// when the prior bellows died stay there until the operator
+/// manually re-labels them — auto-reclaim could replay a partially-
+/// completed run on stale workspace state.
+///
+/// Errors are best-effort: a failure removing one container is logged
+/// but doesn't stop the function attempting the rest. Returns the
+/// count of orphans successfully removed.
+pub async fn cleanup_orphan_containers(
+    docker: &Docker,
+    log_writer: &mut dyn Write,
+) -> Result<usize, SandboxError> {
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec!["bellows-managed=true".to_string()],
+    );
+    let options = ListContainersOptionsBuilder::default()
+        .all(true) // include stopped containers as well as running
+        .filters(&filters)
+        .build();
+
+    let containers = docker.list_containers(Some(options)).await?;
+    let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
+
+    let mut removed = 0usize;
+    for c in containers {
+        let Some(id) = c.id else {
+            continue;
+        };
+        let info = orphan_info_from_labels(&id, &c.labels.unwrap_or_default());
+
+        match docker
+            .remove_container(&id, Some(remove_options.clone()))
+            .await
+        {
+            Ok(()) => {
+                let _ = writeln!(log_writer, "{}", format_orphan_log_line(&info));
+                removed += 1;
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: failed to remove orphan container {} ({e})",
+                    info.short_id,
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn format_orphan_log_line_contains_short_id_and_orphan_word() {
+        // Tracer bullet for slice 7. The line a human reads to know
+        // bellows cleaned up a leftover container from a prior process.
+        // Must surface the short-id and use the word "orphan" so the
+        // line is greppable.
+        let info = OrphanInfo {
+            short_id: "abc123def456".to_string(),
+            run_id: None,
+            purpose: None,
+        };
+        let line = format_orphan_log_line(&info);
+        assert!(line.contains("abc123def456"), "missing short-id: {line}");
+        assert!(line.to_lowercase().contains("orphan"), "missing 'orphan': {line}");
+    }
 
     #[test]
     fn hash_changes_when_file_contents_change() {
