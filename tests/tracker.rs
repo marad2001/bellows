@@ -3,9 +3,10 @@ use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
-    claim, fetch_agent_brief, finalise, find_next_issue, post_pr_comment, ClaimError,
-    FinaliseRequest,
+    claim, fetch_agent_brief, finalise, find_next_issue, post_pr_comment,
+    transition_to_cancelled, ClaimError, FinaliseRequest,
 };
+use wiremock::matchers::body_string_contains;
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
     octocrab::OctocrabBuilder::new()
@@ -208,7 +209,7 @@ async fn finalise_posts_log_comment_and_transitions_to_outcome_label() {
         .await;
 
     let client = octocrab_pointed_at(mock.uri());
-    let updated = finalise(
+    let outcome = finalise(
         &client,
         FinaliseRequest {
             owner: "marad2001",
@@ -223,7 +224,8 @@ async fn finalise_posts_log_comment_and_transitions_to_outcome_label() {
     .await
     .expect("finalise should succeed");
 
-    let label_names: Vec<&str> = updated.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(!outcome.externally_cancelled);
+    let label_names: Vec<&str> = outcome.issue.labels.iter().map(|l| l.name.as_str()).collect();
     assert!(label_names.contains(&"agent-done"));
     assert!(label_names.contains(&"enhancement"));
     assert!(!label_names.contains(&"agent-in-progress"));
@@ -261,7 +263,7 @@ async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
         .await;
 
     let client = octocrab_pointed_at(mock.uri());
-    let updated = finalise(
+    let outcome = finalise(
         &client,
         FinaliseRequest {
             owner: "marad2001",
@@ -276,10 +278,130 @@ async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
     .await
     .expect("finalise should succeed");
 
-    let label_names: Vec<&str> = updated.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(!outcome.externally_cancelled);
+    let label_names: Vec<&str> = outcome.issue.labels.iter().map(|l| l.name.as_str()).collect();
     assert!(label_names.contains(&"agent-failed"));
     assert!(!label_names.contains(&"agent-in-progress"));
     assert!(!label_names.contains(&"agent-done"));
+}
+
+#[tokio::test]
+async fn finalise_skips_label_patch_when_in_progress_label_already_removed_externally() {
+    // Slice 10 contract: when `bellows kill <N>` ran in another terminal,
+    // it already removed the in_progress label and applied agent-cancelled.
+    // The running orchestrator's finalise must (a) still post the log
+    // comment so the operator sees what happened, (b) NOT issue the PATCH
+    // (the operator's label is already correct), and (c) signal back via
+    // `externally_cancelled = true` so run_once can return RunOutcome::Cancelled.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 7 })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Cancelled run",
+            "labels": [
+                { "name": "agent-cancelled" },
+                { "name": "enhancement" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // Deliberately mount NO PATCH mock: if finalise issues a PATCH against
+    // an issue whose in_progress label is already gone, wiremock will
+    // return 404 and the test will fail.
+
+    let client = octocrab_pointed_at(mock.uri());
+    let outcome = finalise(
+        &client,
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 55,
+            pr_number: 77,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-failed",
+            log_body: "Run interrupted",
+        },
+    )
+    .await
+    .expect("finalise should succeed even when externally cancelled");
+
+    assert!(outcome.externally_cancelled, "expected externally_cancelled = true");
+    let label_names: Vec<&str> = outcome.issue.labels.iter().map(|l| l.name.as_str()).collect();
+    // The returned issue reflects the current state (operator already labelled it).
+    assert!(label_names.contains(&"agent-cancelled"));
+    assert!(!label_names.contains(&"agent-in-progress"));
+}
+
+#[tokio::test]
+async fn transition_to_cancelled_posts_short_comment_and_swaps_labels() {
+    // The `bellows kill <N>` GitHub-side handler. Posts a short
+    // AI-disclaimer-style comment so a human reading the issue knows what
+    // happened, then swaps `agent-in-progress` for `agent-cancelled`.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/55/comments"))
+        // The body is fixed-template ("> *bellows: cancelled by operator at <ts>*")
+        // — pin the recognisable substrings rather than the full timestamp so
+        // the test is not tied to wall-clock now().
+        .and(body_string_contains("bellows"))
+        .and(body_string_contains("cancelled by operator"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 8 })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Run to cancel",
+            "labels": [
+                { "name": "agent-in-progress" },
+                { "name": "enhancement" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .and(body_json(json!({ "labels": ["agent-cancelled", "enhancement"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Run to cancel",
+            "labels": [
+                { "name": "agent-cancelled" },
+                { "name": "enhancement" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let updated = transition_to_cancelled(
+        &client,
+        "marad2001",
+        "test-repo",
+        55,
+        "agent-in-progress",
+        "agent-cancelled",
+    )
+    .await
+    .expect("transition_to_cancelled should succeed");
+
+    let label_names: Vec<&str> = updated.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(label_names.contains(&"agent-cancelled"));
+    assert!(label_names.contains(&"enhancement"));
+    assert!(!label_names.contains(&"agent-in-progress"));
 }
 
 #[tokio::test]

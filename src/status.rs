@@ -200,6 +200,50 @@ impl StatusContext {
     }
 }
 
+/// Outcome of `check_status_for_kill` — whether `bellows kill <N>`
+/// should proceed to find + remove the container, or refuse with a
+/// clear message because the orchestrator isn't busy on that issue.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KillPrecheck {
+    /// Status file shows bellows is busy on the requested issue —
+    /// safe to look up the container and force-remove it.
+    Proceed,
+    /// Status file shows bellows is idle, working on a different
+    /// issue, or not running at all. Holds the message the CLI
+    /// should print to stderr before exiting non-zero.
+    Refuse(String),
+}
+
+/// Decide whether `bellows kill <N>` should proceed based on what the
+/// status file (and PID-liveness) report. Pure function — no IO — so
+/// every branch (no file, idle, busy on different issue, busy on the
+/// requested issue, stale PID) is testable without orchestrating a
+/// real bellows process.
+///
+/// `pid_alive` is the result of `is_pid_alive(status.pid)` and is
+/// passed in rather than recomputed so the tests can pin both branches
+/// of the staleness check.
+pub fn check_status_for_kill(
+    status: Option<&Status>,
+    pid_alive: bool,
+    target_issue: u64,
+) -> KillPrecheck {
+    let busy_on = match status {
+        None => None,
+        Some(_) if !pid_alive => None,
+        Some(s) => s.current.as_ref().map(|c| c.issue_number),
+    };
+    match busy_on {
+        Some(n) if n == target_issue => KillPrecheck::Proceed,
+        Some(n) => KillPrecheck::Refuse(format!(
+            "bellows is not currently working on issue #{target_issue} (currently busy on issue #{n})",
+        )),
+        None => KillPrecheck::Refuse(format!(
+            "bellows is not currently working on issue #{target_issue} (currently idle)",
+        )),
+    }
+}
+
 /// Format a one-paragraph human-readable summary of the status state
 /// for `bellows status`. Pure function — accepts the parsed `Status`
 /// (or `None` for a missing file) and a precomputed pid-liveness
@@ -484,6 +528,68 @@ mod tests {
         // function should refuse such PIDs before the syscall.
         assert!(!is_pid_alive(u32::MAX));
         assert!(!is_pid_alive((i32::MAX as u32) + 1));
+    }
+
+    #[test]
+    fn check_status_for_kill_proceeds_when_busy_on_requested_issue() {
+        let st = sample_status(); // sample is busy on issue 9
+        match check_status_for_kill(Some(&st), true, 9) {
+            KillPrecheck::Proceed => {}
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_status_for_kill_refuses_when_busy_on_different_issue() {
+        let st = sample_status(); // busy on issue 9
+        match check_status_for_kill(Some(&st), true, 17) {
+            KillPrecheck::Refuse(msg) => {
+                assert!(
+                    msg.contains("issue #17") && msg.contains("issue #9"),
+                    "msg should name both target and current issue: {msg}",
+                );
+                assert!(msg.contains("not currently working"), "msg: {msg}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_status_for_kill_refuses_when_idle() {
+        let mut st = sample_status();
+        st.current = None;
+        match check_status_for_kill(Some(&st), true, 9) {
+            KillPrecheck::Refuse(msg) => {
+                assert!(msg.contains("issue #9"), "msg should name target: {msg}");
+                assert!(msg.contains("currently idle"), "msg: {msg}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_status_for_kill_refuses_when_no_status_file() {
+        match check_status_for_kill(None, false, 9) {
+            KillPrecheck::Refuse(msg) => {
+                assert!(msg.contains("issue #9"), "msg should name target: {msg}");
+                assert!(msg.contains("currently idle"), "msg: {msg}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_status_for_kill_treats_stale_pid_as_idle() {
+        // Status file says busy on 9, but the PID isn't alive — the
+        // orchestrator process died and left the file behind. There's
+        // no process to signal, so refuse with the idle message.
+        let st = sample_status();
+        match check_status_for_kill(Some(&st), false, 9) {
+            KillPrecheck::Refuse(msg) => {
+                assert!(msg.contains("currently idle"), "msg: {msg}");
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
     }
 
     #[test]

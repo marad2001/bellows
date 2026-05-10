@@ -42,6 +42,17 @@ pub enum RunOutcome {
     Contended {
         issue_number: u64,
     },
+    /// The orchestrator detected mid-run that the operator already
+    /// transitioned the issue's label out from under it (slice-10
+    /// `bellows kill <N>` path). The PR was still opened (workspace
+    /// state at kill time, as a draft) and the log comment still
+    /// posted, but the runner skipped the label transition and
+    /// surfaces this variant so the polling loop can log "cancelled
+    /// by operator" rather than "finalised."
+    Cancelled {
+        issue_number: u64,
+        pr_number: u64,
+    },
 }
 
 pub async fn run_once(
@@ -189,8 +200,13 @@ pub async fn run_once(
             log_writer,
             "bellows: phase 2/5 — cargo checks gate (clippy + test, fresh container)",
         );
-        let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
-            .await?;
+        let run = sandbox::run_cargo_checks(
+            &workspace,
+            claimed.number,
+            log_writer,
+            budget.deadline_or_halt(),
+        )
+        .await?;
         budget.mark_killed_if(run.killed_by_deadline);
         run.gate
     } else {
@@ -312,8 +328,13 @@ pub async fn run_once(
                 log_writer,
                 "bellows: phase 5/5 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
             );
-            let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
-                .await?;
+            let run = sandbox::run_cargo_checks(
+                &workspace,
+                claimed.number,
+                log_writer,
+                budget.deadline_or_halt(),
+            )
+            .await?;
             budget.mark_killed_if(run.killed_by_deadline);
             end_pipeline_gate = Some(run.gate);
         }
@@ -425,7 +446,7 @@ pub async fn run_once(
         &outcomes,
     );
 
-    tracker::finalise(
+    let finalise_outcome = tracker::finalise(
         client,
         tracker::FinaliseRequest {
             owner: &owner,
@@ -452,11 +473,18 @@ pub async fn run_once(
         );
     }
 
-    Ok(RunOutcome::Finalised {
-        issue_number: claimed.number,
-        pr_number: pr.number,
-        reason,
-    })
+    if finalise_outcome.externally_cancelled {
+        Ok(RunOutcome::Cancelled {
+            issue_number: claimed.number,
+            pr_number: pr.number,
+        })
+    } else {
+        Ok(RunOutcome::Finalised {
+            issue_number: claimed.number,
+            pr_number: pr.number,
+            reason,
+        })
+    }
 }
 
 fn build_pr_body(

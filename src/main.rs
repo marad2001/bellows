@@ -11,7 +11,8 @@ use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
 use bellows::config::Config;
 use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
-use bellows::status::{self, StatusContext};
+use bellows::status::{self, KillPrecheck, StatusContext};
+use bellows::tracker;
 
 #[derive(Parser)]
 #[command(name = "bellows", about = "AFK Claude Code orchestrator for Rust repos")]
@@ -32,6 +33,16 @@ enum Command {
     SetupAuth,
     /// Print a one-line summary of the running orchestrator's state.
     Status,
+    /// Abort the in-flight bellows run for a specific issue. Force-removes
+    /// the sandbox container, transitions the GitHub issue's label from
+    /// `agent-in-progress` to `agent-cancelled`, and posts a short
+    /// cancellation comment. The running orchestrator detects the missing
+    /// label in finalise, opens whatever workspace state existed at kill
+    /// time as a draft PR, and returns to polling.
+    Kill {
+        /// GitHub issue number to cancel.
+        issue: u64,
+    },
 }
 
 #[tokio::main]
@@ -46,7 +57,106 @@ async fn main() -> Result<()> {
         Command::Run => run(&config_path).await,
         Command::SetupAuth => setup_auth(&config_path).await,
         Command::Status => status_cmd().await,
+        Command::Kill { issue } => kill_cmd(&config_path, issue).await,
     }
+}
+
+async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config at {}", config_path.display()))?;
+    let config = Config::from_str(&config_text)
+        .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // Step 1: confirm bellows is running and busy on the requested issue
+    // by reading the slice-9 status file. Using is_pid_alive so a stale
+    // status file from a crashed prior bellows is treated as idle.
+    let status_path = status::default_status_path().context("resolve status file path")?;
+    let parsed = status::read(&status_path)
+        .await
+        .with_context(|| format!("read status file at {}", status_path.display()))?;
+    let alive = parsed.as_ref().is_some_and(|s| status::is_pid_alive(s.pid));
+
+    match status::check_status_for_kill(parsed.as_ref(), alive, issue) {
+        KillPrecheck::Refuse(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+        KillPrecheck::Proceed => {}
+    }
+
+    // Step 2: locate + force-remove the sandbox container via a
+    // server-side label filter. A `None` here means the orchestrator has
+    // status=busy but no container is currently up (transient gap between
+    // phases) — still proceed to the GitHub-side transition; the running
+    // orchestrator will detect the label flip in its next finalise pass.
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .context("connect to local docker daemon")?;
+    match sandbox::find_container_for_issue(&docker, issue)
+        .await
+        .context("find container for issue")?
+    {
+        Some(id) => {
+            sandbox::kill_container(&docker, &id)
+                .await
+                .context("force-remove sandbox container")?;
+            println!("bellows: removed container {} for issue #{}", &id[..id.len().min(12)], issue);
+        }
+        None => {
+            println!(
+                "bellows: no live sandbox container found for issue #{} (orchestrator likely between phases)",
+                issue,
+            );
+        }
+    }
+
+    // Step 3: transition the GitHub issue's label and post the
+    // cancellation comment. The running orchestrator's finalise will
+    // detect the missing in_progress label and short-circuit cleanly.
+    let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
+        anyhow!(
+            "env var {} (configured in [github].pat_env_var) is not set",
+            config.github.pat_env_var
+        )
+    })?;
+    let client = octocrab::OctocrabBuilder::new()
+        .personal_token(pat)
+        .build()
+        .context("build octocrab client")?;
+    let (owner, repo) = parse_owner_repo(&config.repo.url)?;
+    tracker::transition_to_cancelled(
+        &client,
+        &owner,
+        &repo,
+        issue,
+        &config.runtime_labels.agent_in_progress,
+        &config.runtime_labels.agent_cancelled,
+    )
+    .await
+    .context("transition issue label to agent-cancelled")?;
+
+    println!(
+        "bellows: kill signal sent; agent-cancelled label applied to issue #{}",
+        issue,
+    );
+    Ok(())
+}
+
+/// Parse a GitHub repo URL like `https://github.com/owner/repo` (with or
+/// without `.git` suffix or trailing slash) into `(owner, repo)`.
+/// Duplicates the runner's identical parser to keep main.rs from depending
+/// on a private runner helper; the runner's lives privately because most
+/// of its internals aren't intended for re-use.
+fn parse_owner_repo(url: &str) -> Result<(String, String)> {
+    let after_scheme = match url.split_once("://") {
+        Some((scheme, rest)) if scheme == "http" || scheme == "https" => rest,
+        _ => return Err(anyhow!("repo url is not in the form https://host/owner/repo: {}", url)),
+    };
+    let trimmed = after_scheme.trim_end_matches('/').trim_end_matches(".git");
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() < 3 || segments.iter().any(|s| s.is_empty()) {
+        return Err(anyhow!("repo url is not in the form https://host/owner/repo: {}", url));
+    }
+    Ok((segments[1].to_string(), segments[2].to_string()))
 }
 
 async fn status_cmd() -> Result<()> {
@@ -245,6 +355,16 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                 &format!(
                     "bellows: claim contended on issue #{}; will retry next tick",
                     issue_number
+                ),
+            ),
+            Ok(RunOutcome::Cancelled {
+                issue_number,
+                pr_number,
+            }) => log(
+                &mut log_file,
+                &format!(
+                    "bellows: cancelled by operator mid-run — issue #{} -> draft PR #{} (agent-cancelled label applied externally)",
+                    issue_number, pr_number,
                 ),
             ),
             Err(e) => {

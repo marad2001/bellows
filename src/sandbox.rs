@@ -274,9 +274,7 @@ pub async fn run_agent(
     // bind-mount handler rejects, so we use the path as-is.
     let workspace_path = workspace.path().to_string_lossy().to_string();
 
-    let mut labels = HashMap::new();
-    labels.insert("bellows-managed".to_string(), "true".to_string());
-    labels.insert("bellows-run-id".to_string(), run_id);
+    let labels = build_managed_labels(&run_id, issue_number, None);
 
     let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
     env.extend(auth.extra_env());
@@ -357,6 +355,7 @@ pub struct CargoChecksRun {
 /// No credentials volume — the gate has no Anthropic dependency.
 pub async fn run_cargo_checks(
     workspace: &Workspace,
+    issue_number: u64,
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<CargoChecksRun, SandboxError> {
@@ -367,10 +366,7 @@ pub async fn run_cargo_checks(
 
     let workspace_path = workspace.path().to_string_lossy().to_string();
 
-    let mut labels = HashMap::new();
-    labels.insert("bellows-managed".to_string(), "true".to_string());
-    labels.insert("bellows-run-id".to_string(), run_id);
-    labels.insert("bellows-purpose".to_string(), "cargo-checks-gate".to_string());
+    let labels = build_managed_labels(&run_id, issue_number, Some("cargo-checks-gate"));
 
     let host_config = HostConfig {
         mounts: Some(vec![Mount {
@@ -539,6 +535,83 @@ async fn ensure_image_built(hash: &str, tag: &str) -> Result<(), SandboxError> {
     if !status.success() {
         return Err(SandboxError::ImageBuildFailed(status));
     }
+    Ok(())
+}
+
+/// Build the label set every Bellows-managed container carries. Pulled
+/// out of the inline body in `run_agent` / `run_cargo_checks` so the
+/// label shape is unit-testable without spinning up Docker.
+///
+/// Always sets `bellows-managed=true`, `bellows-run-id=<run_id>`, and
+/// `bellows-issue-number=<issue_number>`. Optionally sets
+/// `bellows-purpose=<purpose>` when `purpose` is `Some` (the
+/// cargo-checks-gate uses this to distinguish itself from the agent
+/// run; `bellows kill <N>` uses `bellows-issue-number` to find either
+/// kind via a server-side label filter).
+fn build_managed_labels(
+    run_id: &str,
+    issue_number: u64,
+    purpose: Option<&str>,
+) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert("bellows-managed".to_string(), "true".to_string());
+    labels.insert("bellows-run-id".to_string(), run_id.to_string());
+    labels.insert(
+        "bellows-issue-number".to_string(),
+        issue_number.to_string(),
+    );
+    if let Some(p) = purpose {
+        labels.insert("bellows-purpose".to_string(), p.to_string());
+    }
+    labels
+}
+
+/// Build the bollard list-containers label filter for finding the
+/// container associated with a specific issue. Used by
+/// `find_container_for_issue` to locate the running agent or
+/// cargo-checks container so `bellows kill <N>` can force-remove it.
+/// Pulled out as a pure function so the filter shape is unit-testable
+/// without docker.
+fn build_issue_container_filter(issue_number: u64) -> HashMap<String, Vec<String>> {
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![
+            "bellows-managed=true".to_string(),
+            format!("bellows-issue-number={}", issue_number),
+        ],
+    );
+    filters
+}
+
+/// Find the container associated with a specific issue. Used by
+/// `bellows kill <N>` to locate the running agent or cargo-checks
+/// container before force-removing it. Returns the container's full
+/// 64-char ID (suitable for passing to `kill_container`) or `None` if
+/// no matching container exists. Uses a server-side label filter
+/// (`bellows-managed=true` + `bellows-issue-number=<N>`) so the
+/// daemon does the matching, mirroring the slice-7 orphan-cleanup
+/// pattern of "filter then act" rather than "list all then inspect."
+pub async fn find_container_for_issue(
+    docker: &Docker,
+    issue_number: u64,
+) -> Result<Option<String>, SandboxError> {
+    let filters = build_issue_container_filter(issue_number);
+    let options = ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let containers = docker.list_containers(Some(options)).await?;
+    Ok(containers.into_iter().find_map(|c| c.id))
+}
+
+/// Force-remove a container by ID. Used by `bellows kill <N>` after
+/// `find_container_for_issue` locates the target. Removes via bollard
+/// with `force=true` (SIGKILL semantics) — slice 10 is intentionally
+/// blunt; a graceful SIGTERM-then-SIGKILL phase is a future enhancement.
+pub async fn kill_container(docker: &Docker, id: &str) -> Result<(), SandboxError> {
+    let options = RemoveContainerOptionsBuilder::default().force(true).build();
+    docker.remove_container(id, Some(options)).await?;
     Ok(())
 }
 
@@ -814,5 +887,61 @@ mod tests {
         let (clippy, test) = parse_checks_results("");
         assert!(clippy.is_none());
         assert!(test.is_none());
+    }
+
+    #[test]
+    fn build_managed_labels_for_agent_run_includes_issue_number_and_omits_purpose() {
+        // Slice 10 contract: every container Bellows spawns must carry
+        // `bellows-issue-number=<N>` so `bellows kill <N>` can find it
+        // via a server-side label filter. The agent run carries no
+        // `bellows-purpose`; the cargo-checks-gate does.
+        let labels = build_managed_labels("run-uuid-here", 42, None);
+        assert_eq!(labels.get("bellows-managed").map(String::as_str), Some("true"));
+        assert_eq!(
+            labels.get("bellows-run-id").map(String::as_str),
+            Some("run-uuid-here"),
+        );
+        assert_eq!(
+            labels.get("bellows-issue-number").map(String::as_str),
+            Some("42"),
+            "agent run must carry bellows-issue-number for `bellows kill <N>`",
+        );
+        assert!(
+            !labels.contains_key("bellows-purpose"),
+            "agent run does not carry bellows-purpose",
+        );
+    }
+
+    #[test]
+    fn build_managed_labels_for_cargo_checks_includes_purpose() {
+        let labels =
+            build_managed_labels("run-uuid", 42, Some("cargo-checks-gate"));
+        assert_eq!(
+            labels.get("bellows-issue-number").map(String::as_str),
+            Some("42"),
+        );
+        assert_eq!(
+            labels.get("bellows-purpose").map(String::as_str),
+            Some("cargo-checks-gate"),
+        );
+    }
+
+    #[test]
+    fn build_issue_container_filter_uses_managed_and_issue_number() {
+        // Used by find_container_for_issue. The filter must restrict to
+        // bellows-managed containers AND scope to the requested issue
+        // number — otherwise a kill could hit the wrong run.
+        let filter = build_issue_container_filter(42);
+        let label_values = filter.get("label").expect("label key required");
+        assert!(
+            label_values.iter().any(|v| v == "bellows-managed=true"),
+            "filter must include bellows-managed=true: {:?}",
+            label_values,
+        );
+        assert!(
+            label_values.iter().any(|v| v == "bellows-issue-number=42"),
+            "filter must include bellows-issue-number=N: {:?}",
+            label_values,
+        );
     }
 }
