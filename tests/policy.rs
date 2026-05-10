@@ -1,6 +1,6 @@
 use bellows::policy::{
-    classify_exit, render_kickoff, CheckResult, ExitReason, GateOutcome, ImplementOutcome,
-    PhaseOutcomes, ReviewOutcome,
+    classify_exit, is_rate_limit_signature, render_kickoff, CheckResult, ExitReason, GateOutcome,
+    ImplementOutcome, PhaseOutcomes, ReviewOutcome,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -147,6 +147,106 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         wall_clock_exceeded: true,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::WallClockExceeded);
+}
+
+#[test]
+fn is_rate_limit_signature_matches_anthropic_json_error_type() {
+    // Anthropic's API returns errors with a `"type": "rate_limit_error"`
+    // field — that exact string is what claude's stderr surfaces when
+    // hitting the rate limit. Match should be case-insensitive on the
+    // signature itself, but the typical surface is exactly this form.
+    assert!(is_rate_limit_signature(
+        r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}"#
+    ));
+}
+
+#[test]
+fn is_rate_limit_signature_rejects_ordinary_panic_stderr() {
+    // A run-of-the-mill panic should NOT match — different operator
+    // response (investigate vs wait-and-retry).
+    let panic_stderr =
+        "thread 'main' panicked at src/main.rs:42:5: index out of bounds: the len is 3 but the index is 5";
+    assert!(!is_rate_limit_signature(panic_stderr));
+}
+
+#[test]
+fn is_rate_limit_signature_does_not_false_positive_on_unrelated_rate_mention() {
+    // The word "rate" appearing in unrelated contexts (e.g. naming a
+    // variable, a test fixture, a comment) must not trigger the
+    // detector. Specificity comes from the underscore-style identifiers
+    // Anthropic uses (`rate_limit_error`, `rate_limited`), not the bare
+    // word "rate."
+    let benign_stderr = "Computing rate at which the simulation converges. Result: 0.42";
+    assert!(!is_rate_limit_signature(benign_stderr));
+}
+
+#[test]
+fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implement_exit_non_zero() {
+    // Implement crashed (non-zero exit) AND its captured stderr tail
+    // contains an Anthropic rate-limit signature. Operator-wise this
+    // is meaningfully different from a generic crash — the response is
+    // "wait for the rate-limit window to clear and re-run", not
+    // "investigate". So classify as RateLimited, not Crash.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 1,
+            stderr_tail:
+                r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
+                    .to_string(),
+        },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::RateLimited);
+}
+
+#[test]
+fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_was_zero() {
+    // Signature alone is NOT enough — the run must have actually exited
+    // non-zero. A clean run that happened to print "rate_limit_error"
+    // somewhere benign (e.g. as part of a documentation string the
+    // agent committed) shouldn't classify as RateLimited.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 0,
+            stderr_tail:
+                "Wrote example handling for rate_limit_error to docs.md.".to_string(),
+        },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
+}
+
+#[test]
+fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
+    // Notes-precedence: even when the runner halted due to wall-clock,
+    // an agent-notes.md present in the workspace still classifies as
+    // AgentSelfReportedFailure. The agent's voice trumps tooling
+    // signals, including the wall-clock kill — if claude got far enough
+    // to write structured notes about why it couldn't finish, those
+    // notes are the operator's most useful artifact.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: true,
+    };
+    assert_eq!(
+        classify_exit(true, &outcomes),
+        ExitReason::AgentSelfReportedFailure,
+    );
 }
 
 #[test]

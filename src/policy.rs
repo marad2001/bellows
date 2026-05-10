@@ -102,6 +102,17 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
     }
+    // Rate-limit detection runs BEFORE the generic Crash check so a
+    // non-zero exit caused by an Anthropic rate-limit gets the more
+    // specific operator signal. Signature alone is insufficient — the
+    // run must have actually exited non-zero, otherwise a successful
+    // run that happens to mention a rate-limit error string in benign
+    // context would misclassify.
+    if outcomes.implement.exit_code != 0
+        && is_rate_limit_signature(&outcomes.implement.stderr_tail)
+    {
+        return ExitReason::RateLimited;
+    }
     if outcomes.implement.exit_code != 0 {
         return ExitReason::Crash;
     }
@@ -114,6 +125,23 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
         return ExitReason::FinalTestsRed;
     }
     ExitReason::Success
+}
+
+/// Whether the given text contains a known Anthropic API rate-limit
+/// signature. Used by `classify_exit` to distinguish a rate-limit
+/// failure from a generic crash so the operator gets the right
+/// follow-up signal ("wait for the rate-limit window to clear and
+/// re-run" vs "investigate").
+///
+/// Matches case-insensitively against the underscore-style identifiers
+/// Anthropic uses in API error responses (`rate_limit_error`,
+/// `rate_limited`). Bare HTTP `429` is deliberately NOT matched — too
+/// false-positive-prone (port numbers, test fixtures, JSON byte
+/// counts, etc.).
+pub fn is_rate_limit_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 2] = ["rate_limit_error", "rate_limited"];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
 /// Whether either of a gate's checks exited non-zero. Crate-public so the
