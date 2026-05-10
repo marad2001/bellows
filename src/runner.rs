@@ -561,6 +561,26 @@ fn build_log_body(
         _ => {}
     }
 
+    // Auth-error pointer: signature-driven, not ExitReason-driven, per
+    // the slice-X1 routing-focused-enum principle. The run still
+    // classifies as Crash (or another existing variant) — this callout
+    // just tells the operator that the underlying cause is an expired
+    // OAuth session and points them at `bellows refresh-auth`. Gated on
+    // a non-zero implement exit so a clean run that happens to mention
+    // "refresh_token_expired" in committed docs doesn't get the
+    // callout.
+    if outcomes.implement.exit_code != 0
+        && policy::is_auth_error_signature(&outcomes.implement.stderr_tail)
+    {
+        body.push_str(
+            "\n### Authentication error detected in agent stderr\n\n\
+             A claude phase exited non-zero with stderr matching a known auth-error \
+             signature (e.g. an expired OAuth refresh token). Run `bellows refresh-auth` \
+             to re-authenticate, then re-label the issue to retry. The agent output tail \
+             below contains the matched line.\n",
+        );
+    }
+
     if !matches!(reason, ExitReason::Success) {
         // When SIGKILL fires before any agent output flushes (typical for
         // wall-clock kill mid-startup), `stderr_tail` is empty; emitting
@@ -1110,6 +1130,88 @@ mod tests {
         assert!(body.to_lowercase().contains("rate limit"));
         // The matched signature appears in the body via the stderr tail.
         assert!(body.contains("rate_limit_error"));
+    }
+
+    #[test]
+    fn build_log_body_for_crash_with_auth_error_stderr_emits_refresh_auth_callout() {
+        // Implement phase exited non-zero with stderr matching an Anthropic
+        // auth-error signature. The run still classifies as Crash (no new
+        // ExitReason variant per the routing-focused-enum principle), but
+        // the log comment must include a callout telling the operator to
+        // run `bellows refresh-auth` so the diagnostic pointer isn't
+        // buried in the stderr tail.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::seconds(15);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 1,
+                stderr_tail:
+                    r#"Error: 401 Unauthorized: {"error":{"type":"authentication_error","message":"refresh_token_expired"}}"#
+                        .to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+        };
+        let body = build_log_body(
+            &ExitReason::Crash,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        // The callout names the operator action explicitly.
+        assert!(
+            body.to_lowercase().contains("authentication error"),
+            "auth-error callout must name the failure: {body}"
+        );
+        assert!(
+            body.contains("bellows refresh-auth"),
+            "auth-error callout must point the operator at `bellows refresh-auth`: {body}"
+        );
+        // Sanity: the stderr tail is also still surfaced (so a curious
+        // operator can read the matched signature themselves).
+        assert!(body.contains("refresh_token_expired"));
+    }
+
+    #[test]
+    fn build_log_body_omits_refresh_auth_callout_when_exit_was_clean() {
+        // Signature alone is NOT enough — the run must have actually exited
+        // non-zero for the callout to appear. A clean Success run that
+        // happens to mention "refresh_token_expired" somewhere benign
+        // (e.g. inside committed docs) must not get the callout.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 0,
+                stderr_tail:
+                    "Documented how to handle refresh_token_expired in docs.md.".to_string(),
+            },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+        };
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            !body.contains("bellows refresh-auth"),
+            "clean Success run must not show the refresh-auth callout: {body}"
+        );
     }
 
     #[test]
