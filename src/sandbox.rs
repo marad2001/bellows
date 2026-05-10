@@ -666,6 +666,50 @@ mod tests {
     }
 
     #[test]
+    fn format_orphan_log_line_includes_run_id_and_purpose_when_present() {
+        // For a cargo-checks-gate orphan we have both run-id (uuid)
+        // and purpose ("cargo-checks-gate"). The log line should let an
+        // operator tell at a glance which kind of phase the orphan was.
+        let info = OrphanInfo {
+            short_id: "deadbeefcafe".to_string(),
+            run_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            purpose: Some("cargo-checks-gate".to_string()),
+        };
+        let line = format_orphan_log_line(&info);
+        assert!(line.contains("deadbeefcafe"));
+        assert!(
+            line.contains("11111111-2222-3333-4444-555555555555"),
+            "missing run-id: {line}",
+        );
+        assert!(line.contains("cargo-checks-gate"), "missing purpose: {line}");
+    }
+
+    #[test]
+    fn orphan_info_from_labels_shortens_id_and_extracts_known_labels() {
+        // The agent-run container has bellows-managed + bellows-run-id
+        // but NO bellows-purpose. The cargo-checks-gate has all three.
+        // Either way, orphan_info_from_labels should pluck what's there
+        // and shorten the 64-char container id to docker's conventional
+        // 12 chars.
+        let full_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let mut labels = HashMap::new();
+        labels.insert("bellows-managed".to_string(), "true".to_string());
+        labels.insert(
+            "bellows-run-id".to_string(),
+            "deadbeef-1234-5678-9abc-def012345678".to_string(),
+        );
+        labels.insert("unrelated-other-label".to_string(), "ignored".to_string());
+
+        let info = orphan_info_from_labels(full_id, &labels);
+        assert_eq!(info.short_id, "abcdef012345"); // first 12 chars
+        assert_eq!(
+            info.run_id.as_deref(),
+            Some("deadbeef-1234-5678-9abc-def012345678"),
+        );
+        assert_eq!(info.purpose, None); // bellows-purpose not present
+    }
+
+    #[test]
     fn hash_changes_when_file_contents_change() {
         let a = TempDir::new().unwrap();
         std::fs::write(a.path().join("f"), "alpha").unwrap();
