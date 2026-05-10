@@ -71,8 +71,20 @@ pub async fn fetch_agent_brief(
     Ok(comments
         .into_iter()
         .filter_map(|c| c.body)
-        .filter(|b| b.contains("## Agent Brief"))
-        .next_back())
+        .rfind(|b| b.contains("## Agent Brief")))
+}
+
+/// Inputs for `finalise`. Bundled into a struct rather than passed as
+/// 8 positional arguments — clippy's too_many_arguments threshold and
+/// readability both improve.
+pub struct FinaliseRequest<'a> {
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub issue_number: u64,
+    pub pr_number: u64,
+    pub in_progress_label: &'a str,
+    pub outcome_label: &'a str,
+    pub log_body: &'a str,
 }
 
 /// Post a log comment on the PR and transition the issue's labels from
@@ -82,32 +94,53 @@ pub async fn fetch_agent_brief(
 /// kinds added in later slices.
 pub async fn finalise(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
-    issue_number: u64,
-    pr_number: u64,
-    in_progress_label: &str,
-    outcome_label: &str,
-    log_body: &str,
+    req: FinaliseRequest<'_>,
 ) -> Result<Issue, octocrab::Error> {
-    let comment_route = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
-    let comment_body = serde_json::json!({ "body": log_body });
+    let comment_route = format!(
+        "/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        owner = req.owner,
+        repo = req.repo,
+        pr_number = req.pr_number,
+    );
+    let comment_body = serde_json::json!({ "body": req.log_body });
     let _: serde_json::Value = client.post(&comment_route, Some(&comment_body)).await?;
 
-    let issue_route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let issue_route = format!(
+        "/repos/{owner}/{repo}/issues/{issue_number}",
+        owner = req.owner,
+        repo = req.repo,
+        issue_number = req.issue_number,
+    );
     let current: Issue = client.get(&issue_route, None::<&()>).await?;
     let mut new_labels: Vec<String> = current
         .labels
         .iter()
         .map(|l| l.name.clone())
-        .filter(|n| n != in_progress_label)
+        .filter(|n| n != req.in_progress_label)
         .collect();
-    new_labels.push(outcome_label.to_string());
+    new_labels.push(req.outcome_label.to_string());
     new_labels.sort();
 
     let body = serde_json::json!({ "labels": new_labels });
     let updated: Issue = client.patch(&issue_route, Some(&body)).await?;
     Ok(updated)
+}
+
+/// Post a freestanding comment on an issue or PR (PRs share the issues
+/// comments endpoint on GitHub). Used by the runner to surface the
+/// review-phase findings file as a `## Review findings` comment without
+/// the label-swap baked into `finalise`.
+pub async fn post_pr_comment(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<(), octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{pr_number}/comments");
+    let payload = serde_json::json!({ "body": body });
+    let _: serde_json::Value = client.post(&route, Some(&payload)).await?;
+    Ok(())
 }
 
 pub async fn claim(

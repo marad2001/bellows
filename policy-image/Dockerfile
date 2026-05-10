@@ -32,6 +32,12 @@ RUN apt-get update \
 # Claude Code CLI (installed system-wide as root so any user can invoke it).
 RUN npm install -g @anthropic-ai/claude-code@latest
 
+# rust:1.95-slim ships rustc + cargo but not clippy. Slice X1's cargo
+# checks gate runs `cargo clippy --all-targets --all-features -- -D
+# warnings` so the component must be present. Install via rustup so it
+# stays in lock-step with the toolchain.
+RUN rustup component add clippy
+
 # Non-root user for the agent run. Claude Code refuses to honour
 # --dangerously-skip-permissions when running as root (and we need that
 # flag for headless runs); USER bellows below switches to a constrained
@@ -47,7 +53,8 @@ COPY CLAUDE.md /opt/bellows-policy/CLAUDE.md
 
 COPY entrypoint /usr/local/bin/entrypoint
 COPY run-agent /usr/local/bin/run-agent
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent
+COPY run-cargo-checks /usr/local/bin/run-cargo-checks
+RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent /usr/local/bin/run-cargo-checks
 
 # Pre-create the bellows user's claude home with the right ownership so
 # the named-volume mount inherits these permissions on first attach.

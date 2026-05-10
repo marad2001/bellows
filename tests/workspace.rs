@@ -6,7 +6,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bellows::workspace::{commit_all, open_pr, prepare, push_branch};
+use bellows::workspace::{commit_all, open_pr, prepare, push_branch, OpenPrRequest};
 
 fn init_remote_repo(path: &Path) {
     run_git(path, &["init"]);
@@ -62,9 +62,12 @@ async fn commit_all_stages_and_commits_arbitrary_workspace_changes() {
         .await
         .unwrap();
 
-    // Simulate what a containerised stub agent (or future Claude agent) would
-    // produce: arbitrary files in the workspace, including a nested directory.
-    std::fs::write(workspace.path().join(".bellows-stub-marker"), "marker").unwrap();
+    // Simulate what a containerised agent would produce: arbitrary files
+    // in the workspace, including a nested directory. Filenames must not
+    // match Bellows-managed local exclusions (`.bellows-*`, `target/`,
+    // etc.) — those represent internal handoff state we deliberately
+    // keep out of commits.
+    std::fs::write(workspace.path().join("agent-output.txt"), "marker").unwrap();
     std::fs::write(workspace.path().join("hello.txt"), "world").unwrap();
     std::fs::create_dir(workspace.path().join("subdir")).unwrap();
     std::fs::write(workspace.path().join("subdir").join("nested.md"), "x").unwrap();
@@ -77,7 +80,7 @@ async fn commit_all_stages_and_commits_arbitrary_workspace_changes() {
         .output()
         .unwrap();
     let names_text = String::from_utf8(names.stdout).unwrap();
-    assert!(names_text.contains(".bellows-stub-marker"), "log: {}", names_text);
+    assert!(names_text.contains("agent-output.txt"), "log: {}", names_text);
     assert!(names_text.contains("hello.txt"), "log: {}", names_text);
     assert!(names_text.contains("subdir/nested.md"), "log: {}", names_text);
 
@@ -105,7 +108,7 @@ async fn push_branch_pushes_agent_branch_to_remote() {
         .await
         .unwrap();
     std::fs::write(
-        workspace.path().join(".bellows-stub-marker"),
+        workspace.path().join("agent-output.txt"),
         "issue=42 timestamp=2026-05-09T13:00:00Z",
     )
     .unwrap();
@@ -148,13 +151,15 @@ async fn open_pr_with_draft_false_posts_a_regular_pull_request() {
 
     let pr = open_pr(
         &client,
-        "marad2001",
-        "test-repo",
-        "agent/42-fix-the-foo-bug",
-        "master",
-        "Bellows stub run for issue #42",
-        "Closes #42.",
-        false,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/42-fix-the-foo-bug",
+            base_branch: "master",
+            title: "Bellows stub run for issue #42",
+            body: "Closes #42.",
+            draft: false,
+        },
     )
     .await
     .expect("open_pr should succeed");
@@ -188,13 +193,15 @@ async fn open_pr_with_draft_true_posts_a_draft_pull_request() {
 
     let pr = open_pr(
         &client,
-        "marad2001",
-        "test-repo",
-        "agent/8-cargo-test-failed",
-        "main",
-        "Bellows agent run for issue #8",
-        "Closes #8. Final tests red.",
-        true,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/8-cargo-test-failed",
+            base_branch: "main",
+            title: "Bellows agent run for issue #8",
+            body: "Closes #8. Final tests red.",
+            draft: true,
+        },
     )
     .await
     .expect("open_pr should succeed");
