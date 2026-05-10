@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -14,6 +15,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +144,30 @@ impl Default for AuthConfig {
 
 fn default_credentials_volume() -> String {
     "bellows-claude-credentials".to_string()
+}
+
+/// Per-issue agent budget. Currently just the wall-clock cap; later
+/// slices may add per-phase budgets, retry policy, etc.
+#[derive(Debug, Deserialize)]
+pub struct AgentConfig {
+    /// `NonZeroU64` rather than `u64` so a misconfigured `0` is
+    /// rejected at config load time rather than silently producing an
+    /// always-exceeded budget that bypasses the cap entirely. The
+    /// runner converts this to `Duration` via `.get() * 60`.
+    #[serde(default = "default_wall_clock_minutes")]
+    pub wall_clock_minutes: NonZeroU64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            wall_clock_minutes: default_wall_clock_minutes(),
+        }
+    }
+}
+
+fn default_wall_clock_minutes() -> NonZeroU64 {
+    NonZeroU64::new(60).expect("60 is non-zero")
 }
 
 impl FromStr for Config {

@@ -4,12 +4,24 @@
 ///
 /// `FinalTestsRed` covers any failing post-run cargo check — clippy or
 /// test, in either the post-implement gate or the end-of-pipeline gate.
+///
+/// `WallClockExceeded` covers any pipeline that exceeded the configured
+/// per-issue budget (`[agent].wall_clock_minutes`) — either short-
+/// circuited before a phase started because the budget was already
+/// spent, or had a container killed mid-run when the deadline fired.
+///
+/// `RateLimited` covers a non-zero phase exit whose stderr matches a
+/// known Anthropic API rate-limit signature. Operator-distinguishable
+/// from `Crash` because the appropriate response is "wait for the
+/// rate-limit window to clear and re-run" rather than "investigate."
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
     Success,
     AgentSelfReportedFailure,
     Crash,
     FinalTestsRed,
+    WallClockExceeded,
+    RateLimited,
 }
 
 /// Outcome of the implement run: the first phase, where claude reads
@@ -68,6 +80,12 @@ pub struct PhaseOutcomes {
     pub review: Option<ReviewOutcome>,
     pub review_fix: Option<FixOutcome>,
     pub end_pipeline_gate: Option<GateOutcome>,
+    /// True when the runner short-circuited the pipeline because the
+    /// per-issue wall-clock budget was exceeded — either the budget hit
+    /// zero before a phase started, or a container was killed mid-run
+    /// when its deadline fired. Orthogonal to per-phase exit codes since
+    /// the run was killed, not exited cleanly.
+    pub wall_clock_exceeded: bool,
 }
 
 /// Decide how a finished agent run should be classified.
@@ -81,6 +99,20 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
     if has_agent_notes {
         return ExitReason::AgentSelfReportedFailure;
     }
+    if outcomes.wall_clock_exceeded {
+        return ExitReason::WallClockExceeded;
+    }
+    // Rate-limit detection runs BEFORE the generic Crash check so a
+    // non-zero exit caused by an Anthropic rate-limit gets the more
+    // specific operator signal. Signature alone is insufficient — the
+    // run must have actually exited non-zero, otherwise a successful
+    // run that happens to mention a rate-limit error string in benign
+    // context would misclassify.
+    if outcomes.implement.exit_code != 0
+        && is_rate_limit_signature(&outcomes.implement.stderr_tail)
+    {
+        return ExitReason::RateLimited;
+    }
     if outcomes.implement.exit_code != 0 {
         return ExitReason::Crash;
     }
@@ -93,6 +125,23 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
         return ExitReason::FinalTestsRed;
     }
     ExitReason::Success
+}
+
+/// Whether the given text contains a known Anthropic API rate-limit
+/// signature. Used by `classify_exit` to distinguish a rate-limit
+/// failure from a generic crash so the operator gets the right
+/// follow-up signal ("wait for the rate-limit window to clear and
+/// re-run" vs "investigate").
+///
+/// Matches case-insensitively against the underscore-style identifiers
+/// Anthropic uses in API error responses (`rate_limit_error`,
+/// `rate_limited`). Bare HTTP `429` is deliberately NOT matched — too
+/// false-positive-prone (port numbers, test fixtures, JSON byte
+/// counts, etc.).
+pub fn is_rate_limit_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 2] = ["rate_limit_error", "rate_limited"];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
 /// Whether either of a gate's checks exited non-zero. Crate-public so the

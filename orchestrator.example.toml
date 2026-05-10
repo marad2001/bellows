@@ -33,3 +33,11 @@ agent_cancelled   = "agent-cancelled"
 [logging]
 # Single log file path. Default: "bellows.log" in cwd.
 path = "bellows.log"
+
+[agent]
+# Per-issue wall-clock budget. Bellows tracks elapsed time across all
+# container runs in one pipeline (implement, post-implement gate,
+# review, review-fix, end-pipeline gate); when the budget is spent or
+# the deadline fires mid-container, the run halts and routes to a
+# draft PR with the `agent-failed` label. Default: 60 minutes.
+wall_clock_minutes = 60

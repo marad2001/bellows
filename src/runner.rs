@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::time::Duration;
 
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
@@ -103,9 +104,23 @@ pub async fn run_once(
         },
     };
 
+    // Per-issue wall-clock budget. Threaded through every container call
+    // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
+    // reports the deadline fired.
+    let mut budget = WallClockBudget::new(Duration::from_secs(
+        config.agent.wall_clock_minutes.get() * 60,
+    ));
+
     // ---- Phase 1: Implement ----
-    let implement_agent_run =
-        sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+    let implement_agent_run = sandbox::run_agent(
+        &workspace,
+        &auth,
+        claimed.number,
+        log_writer,
+        budget.deadline_or_halt(),
+    )
+    .await?;
+    budget.mark_killed_if(implement_agent_run.killed_by_deadline);
 
     // If the agent wrote a PR description file, capture + remove it
     // before committing so it does NOT appear in the diff.
@@ -122,18 +137,25 @@ pub async fn run_once(
     workspace::push_branch(&workspace).await?;
 
     // ---- Phase 2: Post-implement cargo checks gate ----
-    let post_implement_gate: GateOutcome = if workspace.path().join("Cargo.toml").exists() {
-        sandbox::run_cargo_checks(&workspace, log_writer).await?
+    let post_implement_gate: GateOutcome = if !budget.exceeded
+        && workspace.path().join("Cargo.toml").exists()
+    {
+        let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
+            .await?;
+        budget.mark_killed_if(run.killed_by_deadline);
+        run.gate
     } else {
         GateOutcome::default()
     };
 
-    // Halt-on-phase-failure: if implement crashed or the post-implement
-    // gate failed, skip review/review-fix/end-gate and short-circuit.
-    // agent-notes from the implement phase will be picked up in the
-    // final read just before classify_exit.
-    let halt_after_post_implement =
-        implement_agent_run.exit_code != 0 || policy::gate_failed(&post_implement_gate);
+    // Halt-on-phase-failure: if implement crashed, the post-implement
+    // gate failed, OR the wall-clock budget is already spent, skip
+    // review/review-fix/end-gate and short-circuit. agent-notes from
+    // the implement phase will be picked up in the final read just
+    // before classify_exit.
+    let halt_after_post_implement = implement_agent_run.exit_code != 0
+        || policy::gate_failed(&post_implement_gate)
+        || budget.exceeded;
 
     let mut review_outcome: Option<ReviewOutcome> = None;
     let mut review_fix_outcome: Option<FixOutcome> = None;
@@ -147,8 +169,15 @@ pub async fn run_once(
             policy::REVIEW_PROMPT,
         )
         .await?;
-        let review_agent_run =
-            sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+        let review_agent_run = sandbox::run_agent(
+            &workspace,
+            &auth,
+            claimed.number,
+            log_writer,
+            budget.deadline_or_halt(),
+        )
+        .await?;
+        budget.mark_killed_if(review_agent_run.killed_by_deadline);
 
         // Read the findings file. Don't remove it yet — review-fix may
         // need to read it. If review-fix runs successfully it removes
@@ -175,15 +204,22 @@ pub async fn run_once(
         let halt_after_review = review_agent_run.exit_code != 0;
 
         let mut halt_after_fix = false;
-        if !halt_after_review && has_findings {
+        if !halt_after_review && has_findings && !budget.exceeded {
             // ---- Phase 4: Review-fix ----
             tokio::fs::write(
                 workspace.path().join(".bellows-kickoff.md"),
                 policy::REVIEW_FIX_PROMPT,
             )
             .await?;
-            let review_fix_agent_run =
-                sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+            let review_fix_agent_run = sandbox::run_agent(
+                &workspace,
+                &auth,
+                claimed.number,
+                log_writer,
+                budget.deadline_or_halt(),
+            )
+            .await?;
+            budget.mark_killed_if(review_fix_agent_run.killed_by_deadline);
             review_fix_outcome = Some(FixOutcome {
                 exit_code: review_fix_agent_run.exit_code,
             });
@@ -204,9 +240,13 @@ pub async fn run_once(
         // ---- Phase 5: End-of-pipeline cargo checks gate ----
         if !halt_after_review
             && !halt_after_fix
+            && !budget.exceeded
             && workspace.path().join("Cargo.toml").exists()
         {
-            end_pipeline_gate = Some(sandbox::run_cargo_checks(&workspace, log_writer).await?);
+            let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
+                .await?;
+            budget.mark_killed_if(run.killed_by_deadline);
+            end_pipeline_gate = Some(run.gate);
         }
 
         // Defensive cleanup: even on halt paths the diff file should not
@@ -240,6 +280,7 @@ pub async fn run_once(
         review: review_outcome,
         review_fix: review_fix_outcome,
         end_pipeline_gate,
+        wall_clock_exceeded: budget.exceeded,
     };
     let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -251,7 +292,9 @@ pub async fn run_once(
         ExitReason::Success => &config.runtime_labels.agent_done,
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
-        | ExitReason::FinalTestsRed => &config.runtime_labels.agent_failed,
+        | ExitReason::FinalTestsRed
+        | ExitReason::WallClockExceeded => &config.runtime_labels.agent_failed,
+        ExitReason::RateLimited => &config.runtime_labels.agent_rate_limited,
     };
 
     let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
@@ -352,6 +395,16 @@ fn build_pr_body(
              The agent reported done with exit 0 but a post-run cargo check (clippy or test, in either the post-implement or end-of-pipeline gate) failed. See the run-log comment on this PR for the per-phase summary and the failing output."
                 .to_string()
         }
+        ExitReason::WallClockExceeded => {
+            "## Wall-clock cap reached\n\n\
+             The pipeline exceeded the configured per-issue wall-clock budget and was halted. See the run-log comment on this PR for elapsed minutes and a per-phase breakdown of where the time went."
+                .to_string()
+        }
+        ExitReason::RateLimited => {
+            "## Anthropic API rate limit detected\n\n\
+             A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
+                .to_string()
+        }
     };
     header + &body
 }
@@ -389,10 +442,43 @@ fn build_log_body(
         },
     );
 
+    // Per-reason callout block, before the agent output tail. Surfaces
+    // the operator-relevant headline for non-generic failures so the
+    // log comment communicates "what kind of failure this was" without
+    // having to scan the per-phase summary.
+    match reason {
+        ExitReason::WallClockExceeded => {
+            let elapsed_minutes = (finished - started).num_minutes();
+            body.push_str(&format!(
+                "\n### Wall-clock cap reached after {elapsed_minutes} minutes\n\n\
+                 The pipeline was halted because the per-issue wall-clock budget was \
+                 exceeded. The phase summary above shows where the time went.\n",
+            ));
+        }
+        ExitReason::RateLimited => {
+            body.push_str(
+                "\n### Anthropic API rate limit detected\n\n\
+                 A claude phase exited non-zero with stderr matching a known rate-limit \
+                 signature. The agent output tail below contains the matched line. \
+                 Re-run the issue once the rate-limit window clears.\n",
+            );
+        }
+        _ => {}
+    }
+
     if !matches!(reason, ExitReason::Success) {
-        body.push_str("\n### Agent output tail\n\n```\n");
-        body.push_str(&outcomes.implement.stderr_tail);
-        body.push_str("\n```\n");
+        // When SIGKILL fires before any agent output flushes (typical for
+        // wall-clock kill mid-startup), `stderr_tail` is empty; emitting
+        // the section anyway produces an empty markdown code fence in the
+        // PR comment. Surface a placeholder instead so the operator sees
+        // why the section is empty.
+        if outcomes.implement.stderr_tail.trim().is_empty() {
+            body.push_str("\n_(No agent output was captured before termination.)_\n");
+        } else {
+            body.push_str("\n### Agent output tail\n\n```\n");
+            body.push_str(&outcomes.implement.stderr_tail);
+            body.push_str("\n```\n");
+        }
 
         emit_failed_gate_outputs(
             &mut body,
@@ -461,6 +547,50 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
             "\n### `cargo test` output ({label}, exit {})\n\n```\n{}\n```\n",
             test.exit_code, test.output,
         ));
+    }
+}
+
+/// Tracks the per-issue wall-clock budget across the slice-X1
+/// multi-phase pipeline. Each phase that spawns a container asks for
+/// `deadline_or_halt()` to compute its own deadline, and reports back
+/// via `mark_killed_if(...)` whether the container was actually killed.
+/// Once `exceeded` flips to true the runner short-circuits the rest of
+/// the pipeline and produces a `WallClockExceeded` outcome.
+struct WallClockBudget {
+    start: std::time::Instant,
+    cap: Duration,
+    exceeded: bool,
+}
+
+impl WallClockBudget {
+    fn new(cap: Duration) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            cap,
+            exceeded: false,
+        }
+    }
+
+    /// Returns the remaining budget as a `Duration` to use as a phase
+    /// deadline, or `None` if the budget is already spent (and marks
+    /// `exceeded` as a side effect so subsequent phases skip too).
+    fn deadline_or_halt(&mut self) -> Option<Duration> {
+        if self.exceeded {
+            return None;
+        }
+        let elapsed = self.start.elapsed();
+        if elapsed >= self.cap {
+            self.exceeded = true;
+            None
+        } else {
+            Some(self.cap - elapsed)
+        }
+    }
+
+    fn mark_killed_if(&mut self, killed: bool) {
+        if killed {
+            self.exceeded = true;
+        }
     }
 }
 
@@ -562,6 +692,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         }
     }
 
@@ -673,6 +804,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -702,6 +834,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -734,6 +867,7 @@ mod tests {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
             }),
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -763,6 +897,7 @@ mod tests {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -789,6 +924,7 @@ mod tests {
             review: Some(ReviewOutcome { findings_text: None, exit_code: 137 }),
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
@@ -798,6 +934,120 @@ mod tests {
         // Phases that didn't run because of the halt are visibly named.
         assert!(body.contains("Review-fix: did not run"));
         assert!(body.contains("Cargo checks (end-pipeline): did not run"));
+    }
+
+    #[test]
+    fn build_log_body_for_wall_clock_exceeded_mentions_cap_and_elapsed_minutes() {
+        // Operator should be able to see at-a-glance that the run was
+        // killed because the wall-clock cap fired, and how much time
+        // elapsed before it did.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::minutes(60);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 137, // SIGKILL exit code
+                stderr_tail: "(killed by deadline)".to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: true,
+        };
+        let body = build_log_body(
+            &ExitReason::WallClockExceeded,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.contains("WallClockExceeded"));
+        assert!(body.to_lowercase().contains("wall-clock"));
+        // 60 minutes elapsed should appear in human-readable form.
+        assert!(body.contains("60"));
+    }
+
+    #[test]
+    fn build_log_body_for_rate_limited_quotes_the_matched_signature() {
+        // The stderr tail is already shown in the body for non-Success
+        // reasons, so the matched signature naturally appears. The test
+        // pins that the body specifically calls out the rate-limit
+        // detection so an operator can verify the classification.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::seconds(30);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 1,
+                stderr_tail:
+                    r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
+                        .to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+        };
+        let body = build_log_body(
+            &ExitReason::RateLimited,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.contains("RateLimited"));
+        assert!(body.to_lowercase().contains("rate limit"));
+        // The matched signature appears in the body via the stderr tail.
+        assert!(body.contains("rate_limit_error"));
+    }
+
+    #[test]
+    fn build_log_body_emits_placeholder_when_stderr_tail_is_empty() {
+        // S1 smoke regression: when SIGKILL fires before any agent output
+        // flushes, the stderr_tail is empty. Without the placeholder, the
+        // body emitted an empty code fence which rendered as a useless
+        // empty block in the PR comment. The placeholder explains why the
+        // section is empty so the operator isn't left wondering.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::minutes(2);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 137,
+                stderr_tail: String::new(), // empty — kill happened before any flush
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: true,
+        };
+        let body = build_log_body(
+            &ExitReason::WallClockExceeded,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(body.to_lowercase().contains("no agent output was captured"));
+        // The empty code fence section header is NOT emitted.
+        assert!(!body.contains("### Agent output tail"));
+    }
+
+    #[test]
+    fn build_pr_body_for_wall_clock_exceeded_mentions_cap() {
+        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None);
+        assert!(body.to_lowercase().contains("wall-clock"));
+        assert!(body.contains("run-log comment"));
+    }
+
+    #[test]
+    fn build_pr_body_for_rate_limited_mentions_rate_limit() {
+        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None);
+        assert!(body.to_lowercase().contains("rate limit"));
+        assert!(body.contains("run-log comment"));
     }
 
     #[test]
