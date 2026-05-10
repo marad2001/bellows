@@ -182,11 +182,10 @@ done
 ## Daily use
 
 The v1 operator-facing toolkit is four subcommands: `run`, `status`,
-`kill`, `refresh-auth`. Two of these (`run` and `status`) ship today;
-the other two (`kill` and `refresh-auth`) are planned for later slices
-and are documented below so this README captures the full v1 surface
-in one place. Each unshipped subcommand carries an explicit "planned"
-note pointing at its tracking issue.
+`kill`, `refresh-auth`. Three of these (`run`, `status`,
+`refresh-auth`) ship today; `kill` is planned for a later slice and
+carries an explicit "planned" note pointing at its tracking issue so
+this README captures the full v1 surface in one place.
 
 ### `bellows run` — start the polling loop
 
@@ -247,13 +246,6 @@ realise an issue brief was wrong, or when an agent has clearly stuck
 itself and burning the rest of the wall-clock budget won't help.
 
 ### `bellows refresh-auth` — re-seed expired OAuth tokens
-
-> ⚠️ **Planned — not yet shipped.** Tracked in
-> [issue #10 (slice 12)](https://github.com/marad2001/bellows/issues/10).
-> Until that lands, use `bellows setup-auth` directly to re-seed the
-> credentials volume — it's functionally the same flow; this slice
-> just adds an alias with situation-appropriate naming plus
-> auth-error detection in agent stderr.
 
 ```bash
 bellows refresh-auth
