@@ -346,13 +346,23 @@ fn review_fix_prompt_makes_blocker_and_important_findings_mandatory() {
     // top two severities so silent skip is prompt-out-of-bounds. PR #26
     // motivated this — the agent silently skipped an `important` finding
     // and committed nothing; the maintainer caught it manually.
+    //
+    // PR #28 review finding #1: a permissive substring match like
+    // .contains("MUST") would still pass if the load-bearing sentence
+    // got silently downgraded to "SHOULD" elsewhere (there are several
+    // other MUSTs in the prompt — title-line format, etc.). Pin the
+    // exact mandate clause so the regression this slice prevents is
+    // actually locked.
     assert!(
-        REVIEW_FIX_PROMPT.contains("MUST"),
-        "REVIEW_FIX_PROMPT must use imperative MUST language: {REVIEW_FIX_PROMPT}"
+        REVIEW_FIX_PROMPT
+            .contains("MUST address every finding marked `blocker` or `important`"),
+        "REVIEW_FIX_PROMPT must contain the literal address-OR-explain mandate clause: \
+         {REVIEW_FIX_PROMPT}"
     );
     assert!(
-        REVIEW_FIX_PROMPT.contains("blocker") && REVIEW_FIX_PROMPT.contains("important"),
-        "REVIEW_FIX_PROMPT must reference both blocker and important severities: {REVIEW_FIX_PROMPT}"
+        REVIEW_FIX_PROMPT.contains("Silent skip is not an option for these severities"),
+        "REVIEW_FIX_PROMPT must spell out that silent skip is not allowed for \
+         blocker/important: {REVIEW_FIX_PROMPT}"
     );
 }
 
@@ -364,14 +374,21 @@ fn review_fix_prompt_permits_silent_skip_of_nit_findings() {
     // comment and can decide whether to follow up. The prompt must say
     // so — otherwise the imperative language bleeds into nit territory
     // and the agent burns time on cosmetic findings.
-    let lower = REVIEW_FIX_PROMPT.to_lowercase();
+    //
+    // PR #28 review finding #2: a substring match like "skip" or
+    // "without explanation" doesn't pin the DIRECTION of the rule —
+    // a reversed clause ("every nit must be addressed; do not skip")
+    // would still match. Pin the literal permission clause so a
+    // future edit can't silently flip the rule.
     assert!(
-        lower.contains("nit"),
-        "REVIEW_FIX_PROMPT must mention nit severity: {REVIEW_FIX_PROMPT}"
+        REVIEW_FIX_PROMPT.contains("MAY skip a `nit`"),
+        "REVIEW_FIX_PROMPT must literally permit skipping nit findings: \
+         {REVIEW_FIX_PROMPT}"
     );
     assert!(
-        lower.contains("skip") || lower.contains("without explanation"),
-        "REVIEW_FIX_PROMPT must explicitly permit skipping nit findings: {REVIEW_FIX_PROMPT}"
+        REVIEW_FIX_PROMPT.contains("operator-discretionary"),
+        "REVIEW_FIX_PROMPT must frame nit findings as operator-discretionary: \
+         {REVIEW_FIX_PROMPT}"
     );
 }
 
