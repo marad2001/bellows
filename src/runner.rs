@@ -240,6 +240,10 @@ pub async fn run_once(
         review: review_outcome,
         review_fix: review_fix_outcome,
         end_pipeline_gate,
+        // Slice 6 wires this to runner-side budget tracking; for the
+        // current pipeline the field stays false (no deadline plumbed
+        // through yet — that's K1-K3 in this slice).
+        wall_clock_exceeded: false,
     };
     let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -251,7 +255,9 @@ pub async fn run_once(
         ExitReason::Success => &config.runtime_labels.agent_done,
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
-        | ExitReason::FinalTestsRed => &config.runtime_labels.agent_failed,
+        | ExitReason::FinalTestsRed
+        | ExitReason::WallClockExceeded => &config.runtime_labels.agent_failed,
+        ExitReason::RateLimited => &config.runtime_labels.agent_rate_limited,
     };
 
     let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
@@ -350,6 +356,16 @@ fn build_pr_body(
         ExitReason::FinalTestsRed => {
             "## Cargo checks failed after the agent's run\n\n\
              The agent reported done with exit 0 but a post-run cargo check (clippy or test, in either the post-implement or end-of-pipeline gate) failed. See the run-log comment on this PR for the per-phase summary and the failing output."
+                .to_string()
+        }
+        ExitReason::WallClockExceeded => {
+            "## Wall-clock cap reached\n\n\
+             The pipeline exceeded the configured per-issue wall-clock budget and was halted. See the run-log comment on this PR for elapsed minutes and a per-phase breakdown of where the time went."
+                .to_string()
+        }
+        ExitReason::RateLimited => {
+            "## Anthropic API rate limit detected\n\n\
+             A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
                 .to_string()
         }
     };
@@ -562,6 +578,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         }
     }
 
@@ -673,6 +690,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -702,6 +720,7 @@ mod tests {
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -734,6 +753,7 @@ mod tests {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
             }),
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -763,6 +783,7 @@ mod tests {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -789,6 +810,7 @@ mod tests {
             review: Some(ReviewOutcome { findings_text: None, exit_code: 137 }),
             review_fix: None,
             end_pipeline_gate: None,
+            wall_clock_exceeded: false,
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,

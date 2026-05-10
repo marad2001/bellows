@@ -62,6 +62,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
         }),
+        wall_clock_exceeded: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -82,6 +83,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         review: None,
         review_fix: None,
         end_pipeline_gate: None,
+        wall_clock_exceeded: false,
     }
 }
 
@@ -128,6 +130,26 @@ fn classify_exit_returns_crash_when_agent_exits_non_zero_without_notes() {
 }
 
 #[test]
+fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
+    // Tracer bullet for slice 6: even with otherwise-clean outcomes, the
+    // wall_clock_exceeded flag drives WallClockExceeded. Set when the
+    // runner kills a container at the deadline OR finds remaining budget
+    // <= 0 before launching a phase.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: true,
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::WallClockExceeded);
+}
+
+#[test]
 fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed() {
     // Implement run was clean (exit 0, no notes) and cargo test passed,
     // but clippy flagged something — gate fails on clippy alone.
@@ -140,6 +162,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         review: None,
         review_fix: None,
         end_pipeline_gate: None,
+        wall_clock_exceeded: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -161,6 +184,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(101)),
         }),
+        wall_clock_exceeded: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
