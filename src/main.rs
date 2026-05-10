@@ -11,6 +11,7 @@ use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
 use bellows::config::Config;
 use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
+use bellows::status::{self, StatusContext};
 
 #[derive(Parser)]
 #[command(name = "bellows", about = "AFK Claude Code orchestrator for Rust repos")]
@@ -29,6 +30,8 @@ enum Command {
     Run,
     /// One-time interactive `claude login` against the credentials volume.
     SetupAuth,
+    /// Print a one-line summary of the running orchestrator's state.
+    Status,
 }
 
 #[tokio::main]
@@ -42,6 +45,27 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run(&config_path).await,
         Command::SetupAuth => setup_auth(&config_path).await,
+        Command::Status => status_cmd().await,
+    }
+}
+
+async fn status_cmd() -> Result<()> {
+    let path = status::default_status_path().context("resolve status file path")?;
+    let parsed = status::read(&path).await;
+    match parsed {
+        Ok(opt) => {
+            let alive = opt.as_ref().is_some_and(|s| status::is_pid_alive(s.pid));
+            println!("{}", status::summarise(opt.as_ref(), alive));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "bellows: status file at {} is malformed: {}",
+                path.display(),
+                e,
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -167,8 +191,42 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         ),
     }
 
+    // Slice 9: write an initial idle status so `bellows status` in
+    // another terminal can answer "is bellows running?" before the
+    // first issue is claimed. The status file lives at
+    // `dirs::cache_dir()/bellows/status.json`. Best-effort: a failure
+    // to resolve the path or write the initial file is logged but
+    // does not prevent bellows from running — the operator still has
+    // the log file to fall back on.
+    let status_ctx = match status::default_status_path() {
+        Ok(p) => {
+            let ctx = StatusContext::new(p);
+            if let Err(e) = ctx.write_idle().await {
+                log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: could not write initial status file at {} (continuing): {}",
+                        ctx.path.display(),
+                        format_error_chain(&e),
+                    ),
+                );
+            }
+            Some(ctx)
+        }
+        Err(e) => {
+            log(
+                &mut log_file,
+                &format!(
+                    "bellows: could not resolve status file path (continuing without it): {}",
+                    format_error_chain(&e),
+                ),
+            );
+            None
+        }
+    };
+
     loop {
-        let outcome = runner::run_once(&client, &config, &mut log_file).await;
+        let outcome = runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref()).await;
         match outcome {
             Ok(RunOutcome::Idle) => log(&mut log_file, "bellows: idle (no ready-for-agent issues)"),
             Ok(RunOutcome::Finalised {
@@ -189,10 +247,30 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                     issue_number
                 ),
             ),
-            Err(e) => log(
-                &mut log_file,
-                &format!("bellows: error: {}", format_error_chain(&e)),
-            ),
+            Err(e) => {
+                log(
+                    &mut log_file,
+                    &format!("bellows: error: {}", format_error_chain(&e)),
+                );
+                // Finding #1 (review of PR #26): if run_once returned Err
+                // between write_busy and write_idle (any of ~24 `?`
+                // propagations — workspace ops, sandbox calls, tokio::fs,
+                // octocrab), the status file is still pinned to the prior
+                // CurrentRun. PID-liveness can't save us because the
+                // polling-loop process is still alive. Reset to idle here
+                // so `bellows status` doesn't lie until the next claim.
+                if let Some(ctx) = status_ctx.as_ref()
+                    && let Err(e) = ctx.write_idle().await
+                {
+                    log(
+                        &mut log_file,
+                        &format!(
+                            "bellows: warning: status idle write failed after error: {}",
+                            format_error_chain(&e),
+                        ),
+                    );
+                }
+            }
         }
         tokio::time::sleep(interval).await;
     }

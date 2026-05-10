@@ -3,6 +3,7 @@ pub mod config;
 pub mod policy;
 pub mod runner;
 pub mod sandbox;
+pub mod status;
 pub mod tracker;
 pub mod workspace;
 
