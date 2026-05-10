@@ -247,10 +247,30 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                     issue_number
                 ),
             ),
-            Err(e) => log(
-                &mut log_file,
-                &format!("bellows: error: {}", format_error_chain(&e)),
-            ),
+            Err(e) => {
+                log(
+                    &mut log_file,
+                    &format!("bellows: error: {}", format_error_chain(&e)),
+                );
+                // Finding #1 (review of PR #26): if run_once returned Err
+                // between write_busy and write_idle (any of ~24 `?`
+                // propagations — workspace ops, sandbox calls, tokio::fs,
+                // octocrab), the status file is still pinned to the prior
+                // CurrentRun. PID-liveness can't save us because the
+                // polling-loop process is still alive. Reset to idle here
+                // so `bellows status` doesn't lie until the next claim.
+                if let Some(ctx) = status_ctx.as_ref()
+                    && let Err(e) = ctx.write_idle().await
+                {
+                    log(
+                        &mut log_file,
+                        &format!(
+                            "bellows: warning: status idle write failed after error: {}",
+                            format_error_chain(&e),
+                        ),
+                    );
+                }
+            }
         }
         tokio::time::sleep(interval).await;
     }

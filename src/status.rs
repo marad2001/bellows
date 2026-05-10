@@ -96,6 +96,18 @@ pub async fn remove(path: &Path) -> Result<(), StatusError> {
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // Finding #2 (review of PR #26): on Unix `libc::pid_t` is `i32`,
+        // and `kill(-N, 0)` is POSIX-defined to probe process group N
+        // rather than process N. A `u32` PID above `i32::MAX` would
+        // silently get re-interpreted as a negative group probe. Real
+        // PIDs from `std::process::id()` are far below this limit
+        // (Linux's `pid_max` defaults to 32768; macOS caps at 99998),
+        // so this only matters for a hand-edited / corrupted status
+        // file — but reject it explicitly rather than silently doing
+        // the wrong thing.
+        if pid > i32::MAX as u32 {
+            return false;
+        }
         // SAFETY: libc::kill with sig=0 performs no action; it only
         // checks for the existence of the target process. The single
         // syscall has no preconditions and is safe to call from any
@@ -465,10 +477,26 @@ mod tests {
     }
 
     #[test]
+    fn is_pid_alive_rejects_pid_above_i32_max() {
+        // Finding #2 fix: PIDs above i32::MAX can't be expressed as a
+        // valid Unix `pid_t` (signed i32) — the previous cast would
+        // reinterpret them as negative process-group probes. The
+        // function should refuse such PIDs before the syscall.
+        assert!(!is_pid_alive(u32::MAX));
+        assert!(!is_pid_alive((i32::MAX as u32) + 1));
+    }
+
+    #[test]
     fn is_pid_alive_returns_false_for_almost_certainly_dead_pid() {
         // Pick a PID that's extremely unlikely to be in use. The Linux
         // default `pid_max` is 32768; macOS caps at 99998. A PID up at
         // u32::MAX - 1 is not assignable on either platform.
-        assert!(!is_pid_alive(u32::MAX - 1));
+        // Finding #2 fix: switched sentinel from u32::MAX - 1 (which on
+        // Unix would have been silently reinterpreted as a negative
+        // process-group probe and only "passed" because that group
+        // happened to be empty on the test host) to a value safely
+        // inside i32::MAX so the function actually exercises the
+        // ESRCH path on Unix and the empty-tasklist path on Windows.
+        assert!(!is_pid_alive(i32::MAX as u32 - 1));
     }
 }
