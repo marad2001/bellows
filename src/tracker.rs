@@ -100,6 +100,30 @@ pub struct FinaliseOutcome {
     pub externally_cancelled: bool,
 }
 
+/// Lightweight GET on an issue's current labels to check whether
+/// `in_progress_label` is still present. Used by `run_once` BEFORE
+/// opening the PR to detect mid-run cancellation by `bellows kill <N>`
+/// (slice 10) — without this check, the cancellation is only detected
+/// in `finalise`, which is too late: the PR has already been opened
+/// (potentially as ready-for-review with a "Success" log header) and
+/// post_pr_comment has already posted the findings comment.
+///
+/// Returns `Ok(true)` if the in-progress label is still on the issue,
+/// `Ok(false)` if it's been removed externally (operator cancelled).
+/// Errors propagate as-is — the runner treats fetch failures as
+/// "assume still in progress" (best-effort, doesn't block the pipeline).
+pub async fn issue_in_progress(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    in_progress_label: &str,
+) -> Result<bool, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let current: Issue = client.get(&route, None::<&()>).await?;
+    Ok(current.labels.iter().any(|l| l.name == in_progress_label))
+}
+
 /// Post a log comment on the PR and transition the issue's labels from
 /// `in_progress_label` to `outcome_label`. Generic over the outcome —
 /// the caller decides whether the run was a success (`agent-done`),

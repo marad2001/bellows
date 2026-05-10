@@ -568,7 +568,7 @@ fn build_managed_labels(
 
 /// Build the bollard list-containers label filter for finding the
 /// container associated with a specific issue. Used by
-/// `find_container_for_issue` to locate the running agent or
+/// `find_containers_for_issue` to locate the running agent or
 /// cargo-checks container so `bellows kill <N>` can force-remove it.
 /// Pulled out as a pure function so the filter shape is unit-testable
 /// without docker.
@@ -584,29 +584,38 @@ fn build_issue_container_filter(issue_number: u64) -> HashMap<String, Vec<String
     filters
 }
 
-/// Find the container associated with a specific issue. Used by
-/// `bellows kill <N>` to locate the running agent or cargo-checks
-/// container before force-removing it. Returns the container's full
-/// 64-char ID (suitable for passing to `kill_container`) or `None` if
-/// no matching container exists. Uses a server-side label filter
-/// (`bellows-managed=true` + `bellows-issue-number=<N>`) so the
-/// daemon does the matching, mirroring the slice-7 orphan-cleanup
-/// pattern of "filter then act" rather than "list all then inspect."
-pub async fn find_container_for_issue(
+/// Find every container associated with a specific issue. Used by
+/// `bellows kill <N>` to locate the live agent or cargo-checks
+/// container(s) before force-removing them. Returns ALL matching
+/// container IDs (suitable for passing to `kill_container`).
+///
+/// Multiple containers can legitimately match `bellows-issue-number=<N>`
+/// at the same time: if a prior phase's lifecycle-end force-remove
+/// failed transiently, the stopped corpse remains AND the next
+/// phase's container (running) shares the same `bellows-issue-number`
+/// label. Keeping only the first match (the old behaviour) could
+/// remove the corpse while leaving the live container running —
+/// exactly the failure mode the kill is supposed to prevent. So this
+/// function returns every match and the caller removes each.
+///
+/// Uses a server-side label filter (`bellows-managed=true` +
+/// `bellows-issue-number=<N>`) so the daemon does the matching,
+/// mirroring the slice-7 orphan-cleanup pattern.
+pub async fn find_containers_for_issue(
     docker: &Docker,
     issue_number: u64,
-) -> Result<Option<String>, SandboxError> {
+) -> Result<Vec<String>, SandboxError> {
     let filters = build_issue_container_filter(issue_number);
     let options = ListContainersOptionsBuilder::default()
         .all(true)
         .filters(&filters)
         .build();
     let containers = docker.list_containers(Some(options)).await?;
-    Ok(containers.into_iter().find_map(|c| c.id))
+    Ok(containers.into_iter().filter_map(|c| c.id).collect())
 }
 
 /// Force-remove a container by ID. Used by `bellows kill <N>` after
-/// `find_container_for_issue` locates the target. Removes via bollard
+/// `find_containers_for_issue` locates the target. Removes via bollard
 /// with `force=true` (SIGKILL semantics) — slice 10 is intentionally
 /// blunt; a graceful SIGTERM-then-SIGKILL phase is a future enhancement.
 pub async fn kill_container(docker: &Docker, id: &str) -> Result<(), SandboxError> {
@@ -928,7 +937,7 @@ mod tests {
 
     #[test]
     fn build_issue_container_filter_uses_managed_and_issue_number() {
-        // Used by find_container_for_issue. The filter must restrict to
+        // Used by find_containers_for_issue. The filter must restrict to
         // bellows-managed containers AND scope to the requested issue
         // number — otherwise a kill could hit the wrong run.
         let filter = build_issue_container_filter(42);

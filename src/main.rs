@@ -91,19 +91,34 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
     // orchestrator will detect the label flip in its next finalise pass.
     let docker = bollard::Docker::connect_with_local_defaults()
         .context("connect to local docker daemon")?;
-    match sandbox::find_container_for_issue(&docker, issue)
+    let container_ids = sandbox::find_containers_for_issue(&docker, issue)
         .await
-        .context("find container for issue")?
-    {
-        Some(id) => {
-            sandbox::kill_container(&docker, &id)
+        .context("find containers for issue")?;
+    if container_ids.is_empty() {
+        println!(
+            "bellows: no live sandbox container found for issue #{} (orchestrator likely between phases)",
+            issue,
+        );
+    } else {
+        // PR #33 review finding #1: a single `bellows-issue-number=<N>`
+        // label can match multiple containers — the live one plus a
+        // stopped corpse whose lifecycle force-remove failed. Remove
+        // every match so the kill is honest; reporting "removed N
+        // container(s)" tells the operator what happened.
+        for id in &container_ids {
+            sandbox::kill_container(&docker, id)
                 .await
-                .context("force-remove sandbox container")?;
-            println!("bellows: removed container {} for issue #{}", &id[..id.len().min(12)], issue);
-        }
-        None => {
+                .with_context(|| format!("force-remove sandbox container {id}"))?;
             println!(
-                "bellows: no live sandbox container found for issue #{} (orchestrator likely between phases)",
+                "bellows: removed container {} for issue #{}",
+                &id[..id.len().min(12)],
+                issue,
+            );
+        }
+        if container_ids.len() > 1 {
+            println!(
+                "bellows: removed {} containers in total for issue #{} (a prior phase's lifecycle-end force-remove likely failed; both the corpse and the live container shared the label)",
+                container_ids.len(),
                 issue,
             );
         }
@@ -142,21 +157,13 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
 }
 
 /// Parse a GitHub repo URL like `https://github.com/owner/repo` (with or
-/// without `.git` suffix or trailing slash) into `(owner, repo)`.
-/// Duplicates the runner's identical parser to keep main.rs from depending
-/// on a private runner helper; the runner's lives privately because most
-/// of its internals aren't intended for re-use.
+/// Thin wrapper that delegates to `runner::parse_owner_repo` and adapts
+/// the error from `RunError` into `anyhow::Error`. Single source of
+/// truth lives in runner.rs (where the parser's tests are); main.rs
+/// just consumes it. PR #33 review finding #3 fix — the previous
+/// per-crate copy would have drifted the moment either was updated.
 fn parse_owner_repo(url: &str) -> Result<(String, String)> {
-    let after_scheme = match url.split_once("://") {
-        Some((scheme, rest)) if scheme == "http" || scheme == "https" => rest,
-        _ => return Err(anyhow!("repo url is not in the form https://host/owner/repo: {}", url)),
-    };
-    let trimmed = after_scheme.trim_end_matches('/').trim_end_matches(".git");
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() < 3 || segments.iter().any(|s| s.is_empty()) {
-        return Err(anyhow!("repo url is not in the form https://host/owner/repo: {}", url));
-    }
-    Ok((segments[1].to_string(), segments[2].to_string()))
+    runner::parse_owner_repo(url).map_err(|e| anyhow!("{e}"))
 }
 
 async fn status_cmd() -> Result<()> {

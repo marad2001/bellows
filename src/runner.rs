@@ -372,12 +372,54 @@ pub async fn run_once(
         end_pipeline_gate,
         wall_clock_exceeded: budget.exceeded,
     };
-    let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
+    let pipeline_reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
+    // PR #33 review finding #2: detect external cancellation BEFORE
+    // opening the PR. Without this check, a kill that fires in the
+    // gap between phases (where no container is alive for SIGKILL to
+    // touch) and a pipeline that happens to complete its remaining
+    // phases successfully would land here with reason=Success →
+    // draft=false → open_pr(draft=false) → ready-for-review PR with
+    // a "Success" log body. The cancellation would only be noticed
+    // in finalise's GET, too late to fix the PR-open semantics. A
+    // reviewer scanning the PR list could plausibly merge the
+    // cancelled run.
+    //
+    // Lightweight GET on the issue's labels; best-effort. If the
+    // network is flaky and we can't tell, fall back to the pipeline-
+    // computed reason — finalise's own check is the safety net.
+    let externally_cancelled = match tracker::issue_in_progress(
+        client,
+        &owner,
+        &repo,
+        claimed.number,
+        &config.runtime_labels.agent_in_progress,
+    )
+    .await
+    {
+        Ok(in_progress) => !in_progress,
+        Err(e) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: pre-PR cancellation check failed (continuing): {}",
+                e,
+            );
+            false
+        }
+    };
+
+    let reason = if externally_cancelled {
+        ExitReason::Cancelled
+    } else {
+        pipeline_reason
+    };
+
+    // Cancelled runs always draft + always use agent_cancelled. Other
+    // non-Success reasons stay draft per the slice-5 contract.
     let draft = !matches!(reason, ExitReason::Success);
-    // Exhaustive match — no `_ => ...` fallthrough — so when slice 6
-    // adds RateLimited / WallClockExceeded variants the compiler will
-    // refuse to build until we make an explicit decision per variant.
+    // Exhaustive match — no `_ => ...` fallthrough — so when later
+    // slices add new variants the compiler refuses to build until we
+    // make an explicit decision per variant.
     let outcome_label = match reason {
         ExitReason::Success => &config.runtime_labels.agent_done,
         ExitReason::AgentSelfReportedFailure
@@ -385,6 +427,7 @@ pub async fn run_once(
         | ExitReason::FinalTestsRed
         | ExitReason::WallClockExceeded => &config.runtime_labels.agent_failed,
         ExitReason::RateLimited => &config.runtime_labels.agent_rate_limited,
+        ExitReason::Cancelled => &config.runtime_labels.agent_cancelled,
     };
 
     announce(
@@ -473,7 +516,17 @@ pub async fn run_once(
         );
     }
 
-    if finalise_outcome.externally_cancelled {
+    // Either signal can route to Cancelled:
+    //   - Pre-PR check (PR #33 review finding #2 fix): we detected the
+    //     cancellation before opening the PR, set reason=Cancelled,
+    //     opened draft, used the Cancelled log header.
+    //   - Finalise check (slice-10 safety net): the cancellation
+    //     happened in the narrow window between our pre-PR check and
+    //     finalise's GET. PR was opened with whatever the pipeline
+    //     reason was; finalise then skipped the label PATCH.
+    // Both routes return RunOutcome::Cancelled so the polling loop
+    // logs the right line.
+    if matches!(reason, ExitReason::Cancelled) || finalise_outcome.externally_cancelled {
         Ok(RunOutcome::Cancelled {
             issue_number: claimed.number,
             pr_number: pr.number,
@@ -526,6 +579,11 @@ fn build_pr_body(
         ExitReason::RateLimited => {
             "## Anthropic API rate limit detected\n\n\
              A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
+                .to_string()
+        }
+        ExitReason::Cancelled => {
+            "## Cancelled by operator\n\n\
+             `bellows kill` was invoked against this issue mid-run. Whatever workspace state the agent had produced before cancellation is committed in this PR's diff; the run-log comment captures the per-phase summary at cancellation time. Review the partial work and either salvage it as a starting point or drop the PR."
                 .to_string()
         }
     };
@@ -584,6 +642,15 @@ fn build_log_body(
                  A claude phase exited non-zero with stderr matching a known rate-limit \
                  signature. The agent output tail below contains the matched line. \
                  Re-run the issue once the rate-limit window clears.\n",
+            );
+        }
+        ExitReason::Cancelled => {
+            body.push_str(
+                "\n### Cancelled by operator\n\n\
+                 `bellows kill` was invoked against this issue mid-run. The phase \
+                 summary above reflects whichever phases completed before the \
+                 cancellation was detected; subsequent phases were short-circuited. \
+                 The PR's diff captures whatever workspace state was committed.\n",
             );
         }
         _ => {}
@@ -753,7 +820,12 @@ async fn cleanup_phase_handoff_files(
     Ok(())
 }
 
-fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
+/// Parse a GitHub repo URL like `https://github.com/owner/repo` (with or
+/// without `.git` suffix or trailing slash) into `(owner, repo)`. Public
+/// so the binary's `main.rs` can re-use it from the `Kill` subcommand —
+/// PR #33 review finding #3 fix replaced the per-crate duplicate copy
+/// with a single source of truth here, where the tests already live.
+pub fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
     // Only http(s):// URLs are supported. SSH (`git@host:owner/repo`) and
     // local paths can clone fine, but the (owner, repo) tuple they produce
     // would be wrong for the GitHub API calls.
