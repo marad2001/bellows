@@ -133,12 +133,11 @@ pub async fn run_once(
     // agent-notes from the implement phase will be picked up in the
     // final read just before classify_exit.
     let halt_after_post_implement =
-        implement_agent_run.exit_code != 0 || gate_failed_local(&post_implement_gate);
+        implement_agent_run.exit_code != 0 || policy::gate_failed(&post_implement_gate);
 
     let mut review_outcome: Option<ReviewOutcome> = None;
     let mut review_fix_outcome: Option<FixOutcome> = None;
     let mut end_pipeline_gate: Option<GateOutcome> = None;
-    let mut review_findings_for_comment: Option<String> = None;
 
     if !halt_after_post_implement {
         // ---- Phase 3: Review ----
@@ -167,16 +166,16 @@ pub async fn run_once(
         } else {
             None
         };
-        review_findings_for_comment = findings_text.clone();
+        let has_findings = findings_text.is_some();
         review_outcome = Some(ReviewOutcome {
-            findings_text: findings_text.clone(),
+            findings_text,
             exit_code: review_agent_run.exit_code,
         });
 
         let halt_after_review = review_agent_run.exit_code != 0;
 
         let mut halt_after_fix = false;
-        if !halt_after_review && findings_text.is_some() {
+        if !halt_after_review && has_findings {
             // ---- Phase 4: Review-fix ----
             tokio::fs::write(
                 workspace.path().join(".bellows-kickoff.md"),
@@ -280,8 +279,13 @@ pub async fn run_once(
     // Post the review findings as a separate `## Review findings` PR
     // comment if the review phase produced any. Posted regardless of
     // whether review-fix succeeded — readers always see what was
-    // flagged.
-    if let Some(findings) = review_findings_for_comment {
+    // flagged. Reads from the `outcomes` PhaseOutcomes since
+    // review_outcome was moved into that struct above.
+    if let Some(findings) = outcomes
+        .review
+        .as_ref()
+        .and_then(|r| r.findings_text.as_deref())
+    {
         let comment_body = format!("## Review findings\n\n{findings}");
         tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
     }
@@ -460,15 +464,6 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
     }
 }
 
-/// Check whether a gate's clippy or test exited non-zero. Same predicate
-/// as policy::gate_failed but kept private to runner.rs since it's
-/// purely an orchestration question (should we halt before review?)
-/// rather than a routing decision (which `ExitReason` to produce).
-fn gate_failed_local(gate: &GateOutcome) -> bool {
-    let nonzero = |c: &Option<CheckResult>| matches!(c, Some(r) if r.exit_code != 0);
-    nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
-}
-
 /// Remove the slice-X1 phase handoff files from the workspace. The
 /// review diff (input to the review prompt) and the review findings
 /// file (output of review, input of review-fix) are both Bellows-
@@ -478,7 +473,7 @@ fn gate_failed_local(gate: &GateOutcome) -> bool {
 /// Best-effort: a missing file is not an error. A genuinely failing
 /// remove (permissions, IO error) is propagated.
 async fn cleanup_phase_handoff_files(
-    workspace: &crate::workspace::Workspace,
+    workspace: &workspace::Workspace,
 ) -> Result<(), std::io::Error> {
     for name in [policy::REVIEW_DIFF_FILE, policy::REVIEW_FINDINGS_FILE] {
         let path = workspace.path().join(name);

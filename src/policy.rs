@@ -95,7 +95,11 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
     ExitReason::Success
 }
 
-fn gate_failed(gate: &GateOutcome) -> bool {
+/// Whether either of a gate's checks exited non-zero. Crate-public so the
+/// runner can use it for orchestration decisions ("should we halt before
+/// review?") with the same predicate `classify_exit` uses for routing —
+/// keeping them in sync prevents a divergence bug.
+pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
     let nonzero = |c: &Option<CheckResult>| matches!(c, Some(r) if r.exit_code != 0);
     nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
 }

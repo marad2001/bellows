@@ -76,6 +76,10 @@ pub enum SandboxError {
     ImageQueryFailed(std::process::ExitStatus),
     #[error("policy-image dir not found at {0}")]
     PolicyImageMissing(String),
+    #[error(
+        "cargo checks gate produced no results file (container exit {exit_code}); the run-cargo-checks script likely crashed before recording exit codes"
+    )]
+    CargoChecksScriptCrashed { exit_code: i64 },
 }
 
 /// Build (or reuse the cached) policy image and return its tag. Used by
@@ -318,19 +322,33 @@ pub async fn run_cargo_checks(
         ..Default::default()
     };
 
-    // Container's overall exit is consumed only as a SandboxError trigger
-    // (it's already encoded by per-check exit codes parsed below).
-    let _ = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
+    // Container exit is normally redundant (per-check codes are in the
+    // results file) — but if the script crashed BEFORE writing results,
+    // a missing/empty file would otherwise classify as "(None, None)" =
+    // non-Rust workspace = Success. Use the container exit as a tripwire
+    // for that scenario: non-zero container exit + no usable results
+    // file ⇒ raise CargoChecksScriptCrashed instead of silently passing.
+    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
 
     let workspace_path = workspace.path();
-    let clippy_output =
-        read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))?.unwrap_or_default();
-    let test_output =
-        read_and_remove(workspace_path.join(CARGO_TEST_OUTPUT_FILE))?.unwrap_or_default();
-    let results_text =
-        read_and_remove(workspace_path.join(CARGO_CHECKS_RESULTS_FILE))?.unwrap_or_default();
+    let clippy_output = read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))
+        .await?
+        .unwrap_or_default();
+    let test_output = read_and_remove(workspace_path.join(CARGO_TEST_OUTPUT_FILE))
+        .await?
+        .unwrap_or_default();
+    let results_text = read_and_remove(workspace_path.join(CARGO_CHECKS_RESULTS_FILE)).await?;
 
-    let (clippy_exit, test_exit) = parse_checks_results(&results_text);
+    let (clippy_exit, test_exit) = match results_text.as_deref() {
+        Some(text) => parse_checks_results(text),
+        None => (None, None),
+    };
+
+    if outcome.exit_code != 0 && clippy_exit.is_none() && test_exit.is_none() {
+        return Err(SandboxError::CargoChecksScriptCrashed {
+            exit_code: outcome.exit_code,
+        });
+    }
 
     Ok(GateOutcome {
         cargo_clippy: clippy_exit.map(|exit_code| CheckResult {
@@ -347,10 +365,10 @@ pub async fn run_cargo_checks(
 /// Read a file at `path`, remove it, and return its contents. Returns
 /// `Ok(None)` if the file doesn't exist (treated by the caller as
 /// "the corresponding check did not produce output").
-fn read_and_remove(path: PathBuf) -> Result<Option<String>, SandboxError> {
-    match std::fs::read_to_string(&path) {
+async fn read_and_remove(path: PathBuf) -> Result<Option<String>, SandboxError> {
+    match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
             Ok(Some(content))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
