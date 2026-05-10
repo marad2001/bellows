@@ -58,6 +58,21 @@ pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, Wor
     git(path, &["config", "user.email", "bellows@local"]).await?;
     git(path, &["config", "user.name", "Bellows"]).await?;
 
+    // Bellows-managed local exclusions. .git/info/exclude is per-clone
+    // and never committed — distinct from .gitignore which the agent
+    // owns. Defends against agents that don't write a .gitignore from
+    // committing canonical build-output directories on `git add -A`,
+    // which slice X1's smoke test caught when the agent committed an
+    // entire `target/` tree.
+    let exclude_path = path.join(".git").join("info").join("exclude");
+    let exclude_content =
+        "# Bellows-managed local exclusions; never committed to the repo.\n\
+         target/\n\
+         node_modules/\n\
+         __pycache__/\n\
+         .bellows-*\n";
+    tokio::fs::write(&exclude_path, exclude_content).await?;
+
     let default_branch = detect_default_branch(path).await?;
 
     git(path, &["checkout", "-b", branch_name]).await?;

@@ -62,9 +62,12 @@ async fn commit_all_stages_and_commits_arbitrary_workspace_changes() {
         .await
         .unwrap();
 
-    // Simulate what a containerised stub agent (or future Claude agent) would
-    // produce: arbitrary files in the workspace, including a nested directory.
-    std::fs::write(workspace.path().join(".bellows-stub-marker"), "marker").unwrap();
+    // Simulate what a containerised agent would produce: arbitrary files
+    // in the workspace, including a nested directory. Filenames must not
+    // match Bellows-managed local exclusions (`.bellows-*`, `target/`,
+    // etc.) — those represent internal handoff state we deliberately
+    // keep out of commits.
+    std::fs::write(workspace.path().join("agent-output.txt"), "marker").unwrap();
     std::fs::write(workspace.path().join("hello.txt"), "world").unwrap();
     std::fs::create_dir(workspace.path().join("subdir")).unwrap();
     std::fs::write(workspace.path().join("subdir").join("nested.md"), "x").unwrap();
@@ -77,7 +80,7 @@ async fn commit_all_stages_and_commits_arbitrary_workspace_changes() {
         .output()
         .unwrap();
     let names_text = String::from_utf8(names.stdout).unwrap();
-    assert!(names_text.contains(".bellows-stub-marker"), "log: {}", names_text);
+    assert!(names_text.contains("agent-output.txt"), "log: {}", names_text);
     assert!(names_text.contains("hello.txt"), "log: {}", names_text);
     assert!(names_text.contains("subdir/nested.md"), "log: {}", names_text);
 
@@ -105,7 +108,7 @@ async fn push_branch_pushes_agent_branch_to_remote() {
         .await
         .unwrap();
     std::fs::write(
-        workspace.path().join(".bellows-stub-marker"),
+        workspace.path().join("agent-output.txt"),
         "issue=42 timestamp=2026-05-09T13:00:00Z",
     )
     .unwrap();
