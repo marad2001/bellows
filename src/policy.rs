@@ -144,6 +144,29 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
     SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
+/// Whether the given text contains a known Anthropic / Claude Code
+/// auth-error signature. Used by the log-body builder to surface a
+/// clear "run `bellows refresh-auth`" pointer when a non-zero phase
+/// exit was caused by an expired OAuth refresh token rather than a
+/// generic crash. Mirrors `is_rate_limit_signature` in shape.
+///
+/// Matches case-insensitively. The signature set starts small and is
+/// extended over time as real-world failure modes surface — current
+/// entries cover the literal `"401 unauthorized"` HTTP status line,
+/// the underscore-style `"refresh_token_expired"` identifier
+/// Anthropic returns in API error payloads, and the human-readable
+/// `"authentication failed"` phrase that appears in Claude Code's
+/// stderr when its OAuth session is rejected.
+pub fn is_auth_error_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 3] = [
+        "401 unauthorized",
+        "refresh_token_expired",
+        "authentication failed",
+    ];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
 /// Whether either of a gate's checks exited non-zero. Crate-public so the
 /// runner can use it for orchestration decisions ("should we halt before
 /// review?") with the same predicate `classify_exit` uses for routing —

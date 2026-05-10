@@ -28,8 +28,14 @@ struct Cli {
 enum Command {
     /// Start the polling loop in the foreground.
     Run,
-    /// One-time interactive `claude login` against the credentials volume.
+    /// First-time auth setup — run once per new install to seed the
+    /// credentials volume with an OAuth session via an interactive
+    /// `claude login` flow.
     SetupAuth,
+    /// Re-authenticate when your Claude Code refresh token has expired.
+    /// Same flow as `setup-auth` (interactive container, `claude login`,
+    /// credentials volume seeded); different name for the situation.
+    RefreshAuth,
     /// Print a one-line summary of the running orchestrator's state.
     Status,
 }
@@ -44,7 +50,12 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run(&config_path).await,
-        Command::SetupAuth => setup_auth(&config_path).await,
+        // `refresh-auth` is a sibling subcommand to `setup-auth` for
+        // operator readability — they describe two different
+        // situations (first-time install vs token expired) but share
+        // the same underlying flow (interactive `claude login` against
+        // the credentials volume).
+        Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
         Command::Status => status_cmd().await,
     }
 }
@@ -289,4 +300,79 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
 fn log(file: &mut File, line: &str) {
     println!("{}", line);
     let _ = writeln!(file, "{}", line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_parses_refresh_auth_subcommand() {
+        // The new sibling subcommand must parse — operator typing
+        // `bellows refresh-auth` should not be rejected by clap.
+        let cli = Cli::try_parse_from(["bellows", "refresh-auth"]);
+        assert!(
+            cli.is_ok(),
+            "bellows refresh-auth must parse: {:?}",
+            cli.err(),
+        );
+    }
+
+    #[test]
+    fn cli_still_parses_setup_auth_subcommand() {
+        // Adding refresh-auth must not regress the existing setup-auth
+        // subcommand.
+        let cli = Cli::try_parse_from(["bellows", "setup-auth"]);
+        assert!(
+            cli.is_ok(),
+            "bellows setup-auth must still parse: {:?}",
+            cli.err(),
+        );
+    }
+
+    #[test]
+    fn cli_help_lists_both_setup_auth_and_refresh_auth() {
+        // `bellows --help` must surface both sibling subcommands so an
+        // operator scanning the help knows that refresh-auth exists.
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("setup-auth"),
+            "top-level --help must list setup-auth: {help}"
+        );
+        assert!(
+            help.contains("refresh-auth"),
+            "top-level --help must list refresh-auth: {help}"
+        );
+    }
+
+    #[test]
+    fn cli_help_differentiates_setup_auth_and_refresh_auth_situations() {
+        // The two names exist BECAUSE they describe two different
+        // operator situations. The help text for each must communicate
+        // its situational use case so the operator knows when to use
+        // which: setup-auth for first-time install, refresh-auth for
+        // an expired token.
+        let mut cmd = Cli::command();
+        let setup_help = cmd
+            .find_subcommand_mut("setup-auth")
+            .expect("setup-auth subcommand missing")
+            .render_help()
+            .to_string();
+        assert!(
+            setup_help.to_lowercase().contains("first-time"),
+            "setup-auth help must mention the first-time-install situation: {setup_help}"
+        );
+
+        let mut cmd = Cli::command();
+        let refresh_help = cmd
+            .find_subcommand_mut("refresh-auth")
+            .expect("refresh-auth subcommand missing")
+            .render_help()
+            .to_string();
+        assert!(
+            refresh_help.to_lowercase().contains("expired"),
+            "refresh-auth help must mention the expired-token situation: {refresh_help}"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 use bellows::policy::{
-    classify_exit, is_rate_limit_signature, render_kickoff, CheckResult, ExitReason, GateOutcome,
-    ImplementOutcome, PhaseOutcomes, ReviewOutcome, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    classify_exit, is_auth_error_signature, is_rate_limit_signature, render_kickoff, CheckResult,
+    ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes, ReviewOutcome, REVIEW_FIX_PROMPT,
+    REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -178,6 +179,37 @@ fn is_rate_limit_signature_does_not_false_positive_on_unrelated_rate_mention() {
     // word "rate."
     let benign_stderr = "Computing rate at which the simulation converges. Result: 0.42";
     assert!(!is_rate_limit_signature(benign_stderr));
+}
+
+#[test]
+fn is_auth_error_signature_matches_anthropic_refresh_token_expired_response() {
+    // Anthropic-style auth-error stderr after a refresh token expires.
+    // The canonical shape is a 401 with an underscore-style identifier;
+    // match should be case-insensitive on the signature.
+    assert!(is_auth_error_signature(
+        r#"401 Unauthorized: {"error":{"type":"authentication_error","message":"refresh_token_expired"}}"#
+    ));
+}
+
+#[test]
+fn is_auth_error_signature_rejects_ordinary_panic_stderr() {
+    // A run-of-the-mill panic should NOT match — different operator
+    // response (investigate vs run refresh-auth and retry).
+    let panic_stderr =
+        "thread 'main' panicked at src/main.rs:42:5: index out of bounds: the len is 3 but the index is 5";
+    assert!(!is_auth_error_signature(panic_stderr));
+}
+
+#[test]
+fn is_auth_error_signature_does_not_false_positive_on_benign_auth_word_mention() {
+    // The bare word "auth" or "authentication" appearing in unrelated
+    // contexts (e.g. test fixtures, variable names, documentation
+    // strings) must not trigger the detector. Specificity comes from the
+    // underscore-style identifiers and the literal "401 unauthorized"
+    // shape, not the standalone word "auth".
+    let benign_stderr =
+        "Wrote auth helper to src/auth.rs and added a doc comment for the authentication module.";
+    assert!(!is_auth_error_signature(benign_stderr));
 }
 
 #[test]
