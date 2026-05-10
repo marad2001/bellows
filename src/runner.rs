@@ -95,6 +95,14 @@ pub async fn run_once(
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
+    announce(
+        log_writer,
+        &format!(
+            "bellows: claimed issue #{} (\"{}\") — pipeline starting on branch `{}`",
+            claimed.number, claimed.title, branch_name,
+        ),
+    );
+
     // Slice 9: announce that we've claimed an issue. Best-effort —
     // a status-write failure is logged but does not abort the run.
     if let Some(ctx) = status_ctx {
@@ -132,6 +140,10 @@ pub async fn run_once(
     ));
 
     // ---- Phase 1: Implement ----
+    announce(
+        log_writer,
+        "bellows: phase 1/5 — implement (running claude in sandbox container, this is the long one)",
+    );
     let implement_agent_run = sandbox::run_agent(
         &workspace,
         &auth,
@@ -141,6 +153,18 @@ pub async fn run_once(
     )
     .await?;
     budget.mark_killed_if(implement_agent_run.killed_by_deadline);
+    announce(
+        log_writer,
+        &format!(
+            "bellows: implement done (exit {}{})",
+            implement_agent_run.exit_code,
+            if implement_agent_run.killed_by_deadline {
+                ", killed by wall-clock"
+            } else {
+                ""
+            },
+        ),
+    );
 
     // If the agent wrote a PR description file, capture + remove it
     // before committing so it does NOT appear in the diff.
@@ -153,6 +177,7 @@ pub async fn run_once(
         None
     };
 
+    announce(log_writer, "bellows: committing + pushing implement branch");
     workspace::commit_all(&workspace).await?;
     workspace::push_branch(&workspace).await?;
 
@@ -160,6 +185,10 @@ pub async fn run_once(
     let post_implement_gate: GateOutcome = if !budget.exceeded
         && workspace.path().join("Cargo.toml").exists()
     {
+        announce(
+            log_writer,
+            "bellows: phase 2/5 — cargo checks gate (clippy + test, fresh container)",
+        );
         let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
             .await?;
         budget.mark_killed_if(run.killed_by_deadline);
@@ -183,6 +212,10 @@ pub async fn run_once(
 
     if !halt_after_post_implement {
         // ---- Phase 3: Review ----
+        announce(
+            log_writer,
+            "bellows: phase 3/5 — review (claude reads diff, produces findings)",
+        );
         workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
         tokio::fs::write(
             workspace.path().join(".bellows-kickoff.md"),
@@ -223,9 +256,21 @@ pub async fn run_once(
 
         let halt_after_review = review_agent_run.exit_code != 0;
 
+        announce(
+            log_writer,
+            &format!(
+                "bellows: review done (findings: {})",
+                if has_findings { "yes" } else { "none" },
+            ),
+        );
+
         let mut halt_after_fix = false;
         if !halt_after_review && has_findings && !budget.exceeded {
             // ---- Phase 4: Review-fix ----
+            announce(
+                log_writer,
+                "bellows: phase 4/5 — review-fix (claude addresses findings, commits fixups)",
+            );
             tokio::fs::write(
                 workspace.path().join(".bellows-kickoff.md"),
                 policy::REVIEW_FIX_PROMPT,
@@ -263,6 +308,10 @@ pub async fn run_once(
             && !budget.exceeded
             && workspace.path().join("Cargo.toml").exists()
         {
+            announce(
+                log_writer,
+                "bellows: phase 5/5 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
+            );
             let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
                 .await?;
             budget.mark_killed_if(run.killed_by_deadline);
@@ -317,6 +366,15 @@ pub async fn run_once(
         ExitReason::RateLimited => &config.runtime_labels.agent_rate_limited,
     };
 
+    announce(
+        log_writer,
+        &format!(
+            "bellows: classified as {:?} — opening {} PR",
+            reason,
+            if draft { "draft" } else { "ready-for-review" },
+        ),
+    );
+
     let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
     let pr_body = build_pr_body(
         &reason,
@@ -338,6 +396,10 @@ pub async fn run_once(
         },
     )
     .await?;
+    announce(
+        log_writer,
+        &format!("bellows: opened PR #{} — finalising labels + log comment", pr.number),
+    );
 
     // Post the review findings as a separate `## Review findings` PR
     // comment if the review phase produced any. Posted regardless of
@@ -581,6 +643,20 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
             test.exit_code, test.output,
         ));
     }
+}
+
+/// Write a phase-boundary announcement to BOTH stdout AND the log file.
+/// The runner's `log_writer` parameter is the same File handle main.rs
+/// uses for the log file; we additionally print to stdout so an operator
+/// running `bellows run` interactively sees what phase is in flight
+/// without having to tail the log file.
+///
+/// Per-line write errors are swallowed (consistent with the rest of the
+/// codebase's log-writing policy: log lines are diagnostic, not
+/// load-bearing, and a failed write shouldn't halt the pipeline).
+fn announce(log_writer: &mut dyn Write, line: &str) {
+    println!("{}", line);
+    let _ = writeln!(log_writer, "{}", line);
 }
 
 /// Tracks the per-issue wall-clock budget across the slice-X1
