@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::time::Duration;
 
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
@@ -103,9 +104,23 @@ pub async fn run_once(
         },
     };
 
+    // Per-issue wall-clock budget. Threaded through every container call
+    // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
+    // reports the deadline fired.
+    let mut budget = WallClockBudget::new(Duration::from_secs(
+        config.agent.wall_clock_minutes * 60,
+    ));
+
     // ---- Phase 1: Implement ----
-    let implement_agent_run =
-        sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+    let implement_agent_run = sandbox::run_agent(
+        &workspace,
+        &auth,
+        claimed.number,
+        log_writer,
+        budget.deadline_or_halt(),
+    )
+    .await?;
+    budget.mark_killed_if(implement_agent_run.killed_by_deadline);
 
     // If the agent wrote a PR description file, capture + remove it
     // before committing so it does NOT appear in the diff.
@@ -122,18 +137,25 @@ pub async fn run_once(
     workspace::push_branch(&workspace).await?;
 
     // ---- Phase 2: Post-implement cargo checks gate ----
-    let post_implement_gate: GateOutcome = if workspace.path().join("Cargo.toml").exists() {
-        sandbox::run_cargo_checks(&workspace, log_writer).await?
+    let post_implement_gate: GateOutcome = if !budget.exceeded
+        && workspace.path().join("Cargo.toml").exists()
+    {
+        let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
+            .await?;
+        budget.mark_killed_if(run.killed_by_deadline);
+        run.gate
     } else {
         GateOutcome::default()
     };
 
-    // Halt-on-phase-failure: if implement crashed or the post-implement
-    // gate failed, skip review/review-fix/end-gate and short-circuit.
-    // agent-notes from the implement phase will be picked up in the
-    // final read just before classify_exit.
-    let halt_after_post_implement =
-        implement_agent_run.exit_code != 0 || policy::gate_failed(&post_implement_gate);
+    // Halt-on-phase-failure: if implement crashed, the post-implement
+    // gate failed, OR the wall-clock budget is already spent, skip
+    // review/review-fix/end-gate and short-circuit. agent-notes from
+    // the implement phase will be picked up in the final read just
+    // before classify_exit.
+    let halt_after_post_implement = implement_agent_run.exit_code != 0
+        || policy::gate_failed(&post_implement_gate)
+        || budget.exceeded;
 
     let mut review_outcome: Option<ReviewOutcome> = None;
     let mut review_fix_outcome: Option<FixOutcome> = None;
@@ -147,8 +169,15 @@ pub async fn run_once(
             policy::REVIEW_PROMPT,
         )
         .await?;
-        let review_agent_run =
-            sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+        let review_agent_run = sandbox::run_agent(
+            &workspace,
+            &auth,
+            claimed.number,
+            log_writer,
+            budget.deadline_or_halt(),
+        )
+        .await?;
+        budget.mark_killed_if(review_agent_run.killed_by_deadline);
 
         // Read the findings file. Don't remove it yet — review-fix may
         // need to read it. If review-fix runs successfully it removes
@@ -175,15 +204,22 @@ pub async fn run_once(
         let halt_after_review = review_agent_run.exit_code != 0;
 
         let mut halt_after_fix = false;
-        if !halt_after_review && has_findings {
+        if !halt_after_review && has_findings && !budget.exceeded {
             // ---- Phase 4: Review-fix ----
             tokio::fs::write(
                 workspace.path().join(".bellows-kickoff.md"),
                 policy::REVIEW_FIX_PROMPT,
             )
             .await?;
-            let review_fix_agent_run =
-                sandbox::run_agent(&workspace, &auth, claimed.number, log_writer).await?;
+            let review_fix_agent_run = sandbox::run_agent(
+                &workspace,
+                &auth,
+                claimed.number,
+                log_writer,
+                budget.deadline_or_halt(),
+            )
+            .await?;
+            budget.mark_killed_if(review_fix_agent_run.killed_by_deadline);
             review_fix_outcome = Some(FixOutcome {
                 exit_code: review_fix_agent_run.exit_code,
             });
@@ -204,9 +240,13 @@ pub async fn run_once(
         // ---- Phase 5: End-of-pipeline cargo checks gate ----
         if !halt_after_review
             && !halt_after_fix
+            && !budget.exceeded
             && workspace.path().join("Cargo.toml").exists()
         {
-            end_pipeline_gate = Some(sandbox::run_cargo_checks(&workspace, log_writer).await?);
+            let run = sandbox::run_cargo_checks(&workspace, log_writer, budget.deadline_or_halt())
+                .await?;
+            budget.mark_killed_if(run.killed_by_deadline);
+            end_pipeline_gate = Some(run.gate);
         }
 
         // Defensive cleanup: even on halt paths the diff file should not
@@ -240,10 +280,7 @@ pub async fn run_once(
         review: review_outcome,
         review_fix: review_fix_outcome,
         end_pipeline_gate,
-        // Slice 6 wires this to runner-side budget tracking; for the
-        // current pipeline the field stays false (no deadline plumbed
-        // through yet — that's K1-K3 in this slice).
-        wall_clock_exceeded: false,
+        wall_clock_exceeded: budget.exceeded,
     };
     let reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -501,6 +538,50 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
             "\n### `cargo test` output ({label}, exit {})\n\n```\n{}\n```\n",
             test.exit_code, test.output,
         ));
+    }
+}
+
+/// Tracks the per-issue wall-clock budget across the slice-X1
+/// multi-phase pipeline. Each phase that spawns a container asks for
+/// `deadline_or_halt()` to compute its own deadline, and reports back
+/// via `mark_killed_if(...)` whether the container was actually killed.
+/// Once `exceeded` flips to true the runner short-circuits the rest of
+/// the pipeline and produces a `WallClockExceeded` outcome.
+struct WallClockBudget {
+    start: std::time::Instant,
+    cap: Duration,
+    exceeded: bool,
+}
+
+impl WallClockBudget {
+    fn new(cap: Duration) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            cap,
+            exceeded: false,
+        }
+    }
+
+    /// Returns the remaining budget as a `Duration` to use as a phase
+    /// deadline, or `None` if the budget is already spent (and marks
+    /// `exceeded` as a side effect so subsequent phases skip too).
+    fn deadline_or_halt(&mut self) -> Option<Duration> {
+        if self.exceeded {
+            return None;
+        }
+        let elapsed = self.start.elapsed();
+        if elapsed >= self.cap {
+            self.exceeded = true;
+            None
+        } else {
+            Some(self.cap - elapsed)
+        }
+    }
+
+    fn mark_killed_if(&mut self, killed: bool) {
+        if killed {
+            self.exceeded = true;
+        }
     }
 }
 

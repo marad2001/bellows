@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
-use bollard::query_parameters::{LogsOptionsBuilder, RemoveContainerOptionsBuilder};
+use bollard::query_parameters::{
+    KillContainerOptions, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+};
 use bollard::Docker;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
@@ -21,12 +26,15 @@ const POLICY_IMAGE_DIR: &str = "policy-image";
 const OUTPUT_TAIL_CAP_BYTES: usize = 64 * 1024;
 
 /// Outcome of a finished agent run. Carries the container exit code so
-/// the runner can pass it to `policy::classify_exit`, and a tail of the
-/// container's stdout/stderr for embedding in failure log comments.
+/// the runner can pass it to `policy::classify_exit`, a tail of the
+/// container's stdout/stderr for embedding in failure log comments,
+/// and a flag indicating whether the run was killed by the wall-clock
+/// deadline rather than exiting on its own.
 #[derive(Debug, Clone)]
 pub struct AgentRun {
     pub exit_code: i64,
     pub stderr_tail: String,
+    pub killed_by_deadline: bool,
 }
 
 /// Bounded byte buffer that retains the most-recent N bytes appended.
@@ -132,6 +140,11 @@ impl Captured {
 struct ContainerOutcome {
     exit_code: i64,
     captured: String,
+    /// True when the lifecycle was terminated by the deadline firing
+    /// rather than by the container exiting on its own. The runner uses
+    /// this to set `PhaseOutcomes::wall_clock_exceeded` and short-
+    /// circuit the rest of the pipeline.
+    killed_by_deadline: bool,
 }
 
 /// Run a container through its full lifecycle: create, start, stream
@@ -139,13 +152,20 @@ struct ContainerOutcome {
 /// wait for exit, force-remove. Container is removed even on error.
 ///
 /// Non-zero container exit is returned as `exit_code`, NOT as a sandbox
-/// error — the caller (run_agent / run_cargo_test) and ultimately
+/// error — the caller (run_agent / run_cargo_checks) and ultimately
 /// policy::classify_exit decide what a non-zero exit means.
+///
+/// `deadline` is the wall-clock budget for THIS container run. When
+/// `Some` and the deadline fires before the container exits, the
+/// container is killed (SIGKILL) and `killed_by_deadline` is set. When
+/// `None`, the container runs to natural completion regardless of
+/// elapsed time.
 async fn run_container(
     docker: &Docker,
     config: ContainerCreateBody,
     log_writer: &mut dyn Write,
     capture_mode: CaptureMode,
+    deadline: Option<Duration>,
 ) -> Result<ContainerOutcome, SandboxError> {
     let container = docker.create_container(None, config).await?;
     let id = container.id;
@@ -156,6 +176,16 @@ async fn run_container(
     let lifecycle: Result<ContainerOutcome, SandboxError> = async {
         docker.start_container(&id, None).await?;
 
+        // Box the deadline future so we can race it against the log
+        // stream in tokio::select! while keeping a single sleep for
+        // the whole container lifetime (not re-armed each iteration).
+        // When deadline is None, fall back to a never-completing future
+        // so the deadline branch effectively never wins.
+        let mut deadline_future: Pin<Box<dyn Future<Output = ()> + Send>> = match deadline {
+            Some(d) => Box::pin(tokio::time::sleep(d)),
+            None => Box::pin(std::future::pending()),
+        };
+
         let log_options = LogsOptionsBuilder::default()
             .follow(true)
             .stdout(true)
@@ -163,16 +193,36 @@ async fn run_container(
             .build();
         let mut log_stream = docker.logs(&id, Some(log_options));
         let mut captured = Captured::new(capture_mode);
-        while let Some(frame) = log_stream.next().await {
-            let frame = frame?;
-            let bytes = match frame {
-                bollard::container::LogOutput::StdOut { message } => message,
-                bollard::container::LogOutput::StdErr { message } => message,
-                _ => continue,
-            };
-            log_writer.write_all(&bytes)?;
-            log_writer.flush()?;
-            captured.append(&bytes);
+        let mut killed_by_deadline = false;
+
+        loop {
+            tokio::select! {
+                maybe_frame = log_stream.next() => {
+                    match maybe_frame {
+                        None => break, // log stream ended (container exited)
+                        Some(frame) => {
+                            let frame = frame?;
+                            let bytes = match frame {
+                                bollard::container::LogOutput::StdOut { message } => message,
+                                bollard::container::LogOutput::StdErr { message } => message,
+                                _ => continue,
+                            };
+                            log_writer.write_all(&bytes)?;
+                            log_writer.flush()?;
+                            captured.append(&bytes);
+                        }
+                    }
+                }
+                _ = &mut deadline_future => {
+                    // Deadline fired — SIGKILL the container. wait_container
+                    // below will pick up the kill exit code (typically 137).
+                    let _ = docker
+                        .kill_container(&id, None::<KillContainerOptions>)
+                        .await;
+                    killed_by_deadline = true;
+                    break;
+                }
+            }
         }
 
         let mut wait_stream = docker.wait_container(&id, None);
@@ -195,6 +245,7 @@ async fn run_container(
         Ok(ContainerOutcome {
             exit_code,
             captured: captured.into_string(),
+            killed_by_deadline,
         })
     }
     .await;
@@ -210,6 +261,7 @@ pub async fn run_agent(
     auth: &Auth,
     issue_number: u64,
     log_writer: &mut dyn Write,
+    deadline: Option<Duration>,
 ) -> Result<AgentRun, SandboxError> {
     let image_tag = ensure_policy_image().await?;
 
@@ -257,12 +309,14 @@ pub async fn run_agent(
         config,
         log_writer,
         CaptureMode::BoundedTail(OUTPUT_TAIL_CAP_BYTES),
+        deadline,
     )
     .await?;
 
     Ok(AgentRun {
         exit_code: outcome.exit_code,
         stderr_tail: outcome.captured,
+        killed_by_deadline: outcome.killed_by_deadline,
     })
 }
 
@@ -274,22 +328,37 @@ const CARGO_CLIPPY_OUTPUT_FILE: &str = ".bellows-cargo-clippy-output";
 const CARGO_TEST_OUTPUT_FILE: &str = ".bellows-cargo-test-output";
 const CARGO_CHECKS_RESULTS_FILE: &str = ".bellows-cargo-checks-results";
 
+/// Result of running the cargo checks gate, carrying both the
+/// per-check `GateOutcome` (clippy + test exit codes & captured output)
+/// and the wall-clock kill flag the runner needs to set
+/// `PhaseOutcomes::wall_clock_exceeded`.
+pub struct CargoChecksRun {
+    pub gate: GateOutcome,
+    pub killed_by_deadline: bool,
+}
+
 /// Spawn a fresh container from the policy image and run the cargo
 /// checks gate: `cargo clippy --all-targets --all-features -- -D
 /// warnings` followed by `cargo test`. Both run inside the same
 /// container (entrypoint overridden to `run-cargo-checks`) so clippy's
 /// compilation artifacts are reused by test.
 ///
-/// Returns a `GateOutcome` carrying each check's exit code + captured
-/// output. `cargo_test` is `None` when clippy failed and the gate
-/// short-circuited before running tests. Either being `None` and the
-/// other being `Some` with a non-zero exit signals the gate failed.
+/// Returns a `CargoChecksRun` carrying each check's exit code + captured
+/// output (in `gate`) plus a `killed_by_deadline` flag. `cargo_test` in
+/// the gate is `None` when clippy failed and the gate short-circuited
+/// before running tests. Either being `None` and the other being `Some`
+/// with a non-zero exit signals the gate failed.
+///
+/// `deadline` is the budget for THIS gate run. When `Some` and the
+/// deadline fires, the container is killed and `killed_by_deadline` is
+/// set on the returned `CargoChecksRun`.
 ///
 /// No credentials volume — the gate has no Anthropic dependency.
 pub async fn run_cargo_checks(
     workspace: &Workspace,
     log_writer: &mut dyn Write,
-) -> Result<GateOutcome, SandboxError> {
+    deadline: Option<Duration>,
+) -> Result<CargoChecksRun, SandboxError> {
     let image_tag = ensure_policy_image().await?;
 
     let docker = Docker::connect_with_local_defaults()?;
@@ -328,7 +397,7 @@ pub async fn run_cargo_checks(
     // non-Rust workspace = Success. Use the container exit as a tripwire
     // for that scenario: non-zero container exit + no usable results
     // file ⇒ raise CargoChecksScriptCrashed instead of silently passing.
-    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full).await?;
+    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full, deadline).await?;
 
     let workspace_path = workspace.path();
     let clippy_output = read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))
@@ -344,21 +413,31 @@ pub async fn run_cargo_checks(
         None => (None, None),
     };
 
-    if outcome.exit_code != 0 && clippy_exit.is_none() && test_exit.is_none() {
+    // Wall-clock kill is a legitimate "no results file" path — the script
+    // never ran to completion. Don't conflate it with the script-crashed
+    // tripwire (which signals "container exited non-zero AND no results").
+    if !outcome.killed_by_deadline
+        && outcome.exit_code != 0
+        && clippy_exit.is_none()
+        && test_exit.is_none()
+    {
         return Err(SandboxError::CargoChecksScriptCrashed {
             exit_code: outcome.exit_code,
         });
     }
 
-    Ok(GateOutcome {
-        cargo_clippy: clippy_exit.map(|exit_code| CheckResult {
-            exit_code,
-            output: clippy_output,
-        }),
-        cargo_test: test_exit.map(|exit_code| CheckResult {
-            exit_code,
-            output: test_output,
-        }),
+    Ok(CargoChecksRun {
+        gate: GateOutcome {
+            cargo_clippy: clippy_exit.map(|exit_code| CheckResult {
+                exit_code,
+                output: clippy_output,
+            }),
+            cargo_test: test_exit.map(|exit_code| CheckResult {
+                exit_code,
+                output: test_output,
+            }),
+        },
+        killed_by_deadline: outcome.killed_by_deadline,
     })
 }
 
