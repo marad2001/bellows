@@ -8,6 +8,7 @@ use crate::policy::{
     ReviewOutcome,
 };
 use crate::sandbox::{self, SandboxError};
+use crate::status::{CurrentRun, StatusContext};
 use crate::tracker::{self, ClaimError};
 use crate::workspace::{self, WorkspaceError};
 
@@ -47,6 +48,7 @@ pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
     log_writer: &mut dyn Write,
+    status_ctx: Option<&StatusContext>,
 ) -> Result<RunOutcome, RunError> {
     let (owner, repo) = parse_owner_repo(&config.repo.url)?;
 
@@ -92,6 +94,24 @@ pub async fn run_once(
 
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
+
+    // Slice 9: announce that we've claimed an issue. Best-effort —
+    // a status-write failure is logged but does not abort the run.
+    if let Some(ctx) = status_ctx {
+        let current = CurrentRun {
+            issue_number: claimed.number,
+            issue_title: claimed.title.clone(),
+            repo: format!("{}/{}", owner, repo),
+            claimed_at: started,
+        };
+        if let Err(e) = ctx.write_busy(current).await {
+            let _ = writeln!(
+                log_writer,
+                "bellows: could not write busy status (continuing): {}",
+                e,
+            );
+        }
+    }
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
 
@@ -356,6 +376,19 @@ pub async fn run_once(
         },
     )
     .await?;
+
+    // Slice 9: announce we're back to idle. Best-effort —
+    // halt paths still reach finalise above, so a single
+    // write here covers all exit-reason variants.
+    if let Some(ctx) = status_ctx
+        && let Err(e) = ctx.write_idle().await
+    {
+        let _ = writeln!(
+            log_writer,
+            "bellows: could not write idle status after finalise (continuing): {}",
+            e,
+        );
+    }
 
     Ok(RunOutcome::Finalised {
         issue_number: claimed.number,
