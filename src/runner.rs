@@ -225,6 +225,12 @@ pub async fn run_once(
     let mut review_outcome: Option<ReviewOutcome> = None;
     let mut review_fix_outcome: Option<FixOutcome> = None;
     let mut end_pipeline_gate: Option<GateOutcome> = None;
+    // Slice 9.6: parser-as-backstop violations. Populated after the
+    // per-finding/nit-batch review-fix invocations complete and the
+    // parser cross-references findings against agent-notes sections.
+    // Non-empty values force the run to AgentSelfReportedFailure via
+    // a synthetic agent-notes entry.
+    let mut backstop_violations: Vec<policy::ParsedFinding> = Vec::new();
 
     if !halt_after_post_implement {
         // ---- Phase 3: Review ----
@@ -282,39 +288,224 @@ pub async fn run_once(
 
         let mut halt_after_fix = false;
         if !halt_after_review && has_findings && !budget.exceeded {
-            // ---- Phase 4: Review-fix ----
+            // ---- Phase 4: Review-fix (slice 9.6 per-finding shape) ----
+            // The slice-9.5 prompt-level tightening failed empirically:
+            // 4 consecutive bellows-on-bellows PRs (#26, #28, #30, #33)
+            // silently skipped `important` findings even with imperative
+            // MUST language. Slice 9.6 closes the loop with TWO
+            // interlocking mechanisms:
+            //
+            //   (1) Per-finding scoping: one claude -p invocation per
+            //       blocker/important finding. The agent never sees a
+            //       list of findings; there is nothing to "decide is
+            //       skippable" because the prompt presents a single
+            //       finding and exactly two options.
+            //   (2) Parser-as-backstop: after all invocations complete,
+            //       bellows independently verifies that every blocker/
+            //       important finding has EITHER a commit OR a matching
+            //       `## Unaddressed finding: <title>` section. Coverage
+            //       gaps force AgentSelfReportedFailure via a synthetic
+            //       agent-notes entry.
+            //
+            // Nits batch through a separate permissive invocation.
+            let findings_for_fix = review_outcome
+                .as_ref()
+                .and_then(|r| r.findings_text.as_deref())
+                .map(policy::parse_findings)
+                .unwrap_or_default();
+            if !findings_for_fix.malformed_titles.is_empty() {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: review produced {} malformed finding title(s) (off-vocabulary severity or no ` — <tag>` suffix); they will not flow into review-fix:",
+                        findings_for_fix.malformed_titles.len(),
+                    ),
+                );
+                for raw in &findings_for_fix.malformed_titles {
+                    announce(log_writer, &format!("  malformed: {}", raw));
+                }
+            }
+
+            let (urgent_findings, nit_findings): (
+                Vec<policy::ParsedFinding>,
+                Vec<policy::ParsedFinding>,
+            ) = findings_for_fix.findings.into_iter().partition(|f| {
+                matches!(
+                    f.severity,
+                    policy::Severity::Blocker | policy::Severity::Important
+                )
+            });
+
             announce(
                 log_writer,
-                "bellows: phase 4/5 — review-fix (claude addresses findings, commits fixups)",
+                &format!(
+                    "bellows: phase 4/5 — review-fix ({} blocker/important per-finding invocation(s) + {} batched nit(s))",
+                    urgent_findings.len(),
+                    nit_findings.len(),
+                ),
             );
-            tokio::fs::write(
-                workspace.path().join(".bellows-kickoff.md"),
-                policy::REVIEW_FIX_PROMPT,
-            )
-            .await?;
-            let review_fix_agent_run = sandbox::run_agent(
-                &workspace,
-                &auth,
-                claimed.number,
-                log_writer,
-                budget.deadline_or_halt(),
-            )
-            .await?;
-            budget.mark_killed_if(review_fix_agent_run.killed_by_deadline);
-            review_fix_outcome = Some(FixOutcome {
-                exit_code: review_fix_agent_run.exit_code,
-            });
-            halt_after_fix = review_fix_agent_run.exit_code != 0;
 
-            // Capture any review-fix commits and any agent-notes appended
-            // by review-fix. Best-effort — NoChangesToCommit is fine here
-            // (review-fix may have legitimately produced no commits if
-            // every finding was a "nit" the agent could not address).
-            cleanup_phase_handoff_files(&workspace).await?;
-            match workspace::commit_all(&workspace).await {
-                Ok(()) => workspace::push_branch(&workspace).await?,
-                Err(WorkspaceError::NoChangesToCommit) => {}
-                Err(e) => return Err(e.into()),
+            // Per-finding loop: one container per blocker/important
+            // finding. Each invocation respects the remaining wall-
+            // clock budget; one slow finding cannot blow the cap
+            // without halting subsequent ones.
+            let mut coverage: Vec<policy::FindingCoverage> = Vec::new();
+            let mut review_fix_exit: i64 = 0;
+            for (idx, finding) in urgent_findings.iter().enumerate() {
+                if budget.exceeded {
+                    announce(
+                        log_writer,
+                        &format!(
+                            "bellows: wall-clock budget spent; skipping per-finding invocation {}/{} (\"{}\")",
+                            idx + 1,
+                            urgent_findings.len(),
+                            finding.title,
+                        ),
+                    );
+                    // The remaining findings have no commit AND no
+                    // chance for the agent to write an Unaddressed
+                    // finding section. Record them as coverage entries
+                    // so the parser-as-backstop fires on them too.
+                    coverage.push(policy::FindingCoverage {
+                        finding: finding.clone(),
+                        commit_landed: false,
+                    });
+                    continue;
+                }
+
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: per-finding invocation {}/{} — {} ({})",
+                        idx + 1,
+                        urgent_findings.len(),
+                        finding.title,
+                        finding.severity.as_tag(),
+                    ),
+                );
+
+                let kickoff = policy::per_finding_kickoff(
+                    finding,
+                    policy::REVIEW_DIFF_FILE,
+                    "agent-notes.md",
+                );
+                tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff)
+                    .await?;
+                let per_finding_run = sandbox::run_agent(
+                    &workspace,
+                    &auth,
+                    claimed.number,
+                    log_writer,
+                    budget.deadline_or_halt(),
+                )
+                .await?;
+                budget.mark_killed_if(per_finding_run.killed_by_deadline);
+                if review_fix_exit == 0 && per_finding_run.exit_code != 0 {
+                    review_fix_exit = per_finding_run.exit_code;
+                }
+
+                // Did a commit land for this finding? `.bellows-*`
+                // files are excluded from `git add -A` so the diff
+                // file / findings file / kickoff don't taint the
+                // signal; a commit_all success means the per-finding
+                // agent produced real workspace changes.
+                let commit_landed = match workspace::commit_all(&workspace).await {
+                    Ok(()) => {
+                        workspace::push_branch(&workspace).await?;
+                        true
+                    }
+                    Err(WorkspaceError::NoChangesToCommit) => false,
+                    Err(e) => return Err(e.into()),
+                };
+                coverage.push(policy::FindingCoverage {
+                    finding: finding.clone(),
+                    commit_landed,
+                });
+            }
+
+            // Nit batch: single permissive invocation, silent skip
+            // allowed. Skipped entirely when there are no nits or the
+            // budget is spent.
+            if !nit_findings.is_empty() && !budget.exceeded {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: nit batch — {} nit(s) in one invocation",
+                        nit_findings.len(),
+                    ),
+                );
+                let mut nit_kickoff = String::from("## Nit findings to consider\n\n");
+                for nit in &nit_findings {
+                    nit_kickoff.push_str(&format!(
+                        "### {title} — nit\n\n{body}\n\n",
+                        title = nit.title,
+                        body = nit.body,
+                    ));
+                }
+                nit_kickoff.push_str("\n---\n\n");
+                nit_kickoff.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
+                tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &nit_kickoff)
+                    .await?;
+                let nit_batch_run = sandbox::run_agent(
+                    &workspace,
+                    &auth,
+                    claimed.number,
+                    log_writer,
+                    budget.deadline_or_halt(),
+                )
+                .await?;
+                budget.mark_killed_if(nit_batch_run.killed_by_deadline);
+                if review_fix_exit == 0 && nit_batch_run.exit_code != 0 {
+                    review_fix_exit = nit_batch_run.exit_code;
+                }
+                match workspace::commit_all(&workspace).await {
+                    Ok(()) => workspace::push_branch(&workspace).await?,
+                    Err(WorkspaceError::NoChangesToCommit) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            review_fix_outcome = Some(FixOutcome {
+                exit_code: review_fix_exit,
+            });
+            halt_after_fix = review_fix_exit != 0;
+
+            // Parser-as-backstop: independently parse agent-notes.md
+            // and cross-reference with the urgent-finding coverage we
+            // tracked above. Findings with neither a commit nor a
+            // verbatim-title section are violations; we synthesise
+            // entries for them so the existing has_agent_notes →
+            // AgentSelfReportedFailure precedence in classify_exit
+            // fires.
+            let notes_path = workspace.path().join("agent-notes.md");
+            let notes_text = if notes_path.exists() {
+                tokio::fs::read_to_string(&notes_path).await?
+            } else {
+                String::new()
+            };
+            let sections = policy::parse_agent_notes_sections(&notes_text);
+            let violations = policy::compute_coverage_violations(&coverage, &sections);
+            if !violations.is_empty() {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: parser-as-backstop detected {} address-or-explain violation(s); synthesising agent-notes entries to force agent-self-reported-failure",
+                        violations.len(),
+                    ),
+                );
+                let synth = policy::synthesize_unaddressed_entries(&violations);
+                let mut new_notes = notes_text.clone();
+                if !new_notes.ends_with('\n') && !new_notes.is_empty() {
+                    new_notes.push('\n');
+                }
+                new_notes.push_str(&synth);
+                tokio::fs::write(&notes_path, new_notes).await?;
+                match workspace::commit_all(&workspace).await {
+                    Ok(()) => workspace::push_branch(&workspace).await?,
+                    Err(WorkspaceError::NoChangesToCommit) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                backstop_violations = violations;
             }
         }
 
@@ -371,6 +562,7 @@ pub async fn run_once(
         review_fix: review_fix_outcome,
         end_pipeline_gate,
         wall_clock_exceeded: budget.exceeded,
+        backstop_violations,
     };
     let pipeline_reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -676,6 +868,17 @@ fn build_log_body(
         );
     }
 
+    // Slice 9.6 parser-as-backstop: when the per-finding agent silently
+    // skipped blocker/important findings, bellows synthesised
+    // agent-notes entries to force agent-self-reported-failure. Surface
+    // the violation list explicitly here so a reader of the PR comment
+    // sees which findings the agent dropped, rather than having to
+    // diff agent-notes.md to figure out why the run was forced into
+    // failure.
+    if !outcomes.backstop_violations.is_empty() {
+        body.push_str(&policy::build_violation_callout(&outcomes.backstop_violations));
+    }
+
     if !matches!(reason, ExitReason::Success) {
         // When SIGKILL fires before any agent output flushes (typical for
         // wall-clock kill mid-startup), `stderr_tail` is empty; emitting
@@ -922,6 +1125,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         }
     }
 
@@ -1034,6 +1238,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -1064,6 +1269,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1097,6 +1303,7 @@ mod tests {
                 cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
             }),
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1127,6 +1334,7 @@ mod tests {
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -1154,6 +1362,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
@@ -1182,6 +1391,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: true,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -1217,6 +1427,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::RateLimited,
@@ -1254,6 +1465,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Crash,
@@ -1299,6 +1511,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success,
@@ -1333,6 +1546,7 @@ mod tests {
             review_fix: None,
             end_pipeline_gate: None,
             wall_clock_exceeded: true,
+            backstop_violations: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -1345,6 +1559,95 @@ mod tests {
         assert!(body.to_lowercase().contains("no agent output was captured"));
         // The empty code fence section header is NOT emitted.
         assert!(!body.contains("### Agent output tail"));
+    }
+
+    #[test]
+    fn build_log_body_emits_address_or_explain_violation_callout_when_backstop_fires() {
+        // Slice 9.6: when the parser-as-backstop synthesises agent-notes
+        // entries because blocker/important findings were silently
+        // skipped, the log comment must surface the
+        // `### Address-or-explain contract violated` callout naming
+        // each offending finding by verbatim title + severity. Without
+        // this surface, a reader of the PR comment would have to diff
+        // agent-notes.md to figure out which findings the agent
+        // skipped — defeating the point of the explicit-failure mode.
+        use crate::policy::{ParsedFinding, Severity};
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::seconds(120);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome {
+                findings_text: Some("important: silently skipped — important".to_string()),
+                exit_code: 0,
+            }),
+            review_fix: Some(FixOutcome { exit_code: 0 }),
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+            backstop_violations: vec![
+                ParsedFinding {
+                    title: "important: silently skipped".to_string(),
+                    severity: Severity::Important,
+                    body: "body".to_string(),
+                },
+                ParsedFinding {
+                    title: "blocker also silently skipped".to_string(),
+                    severity: Severity::Blocker,
+                    body: "body".to_string(),
+                },
+            ],
+        };
+        let body = build_log_body(
+            &ExitReason::AgentSelfReportedFailure,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("### Address-or-explain contract violated"),
+            "log body must include the canonical violation callout heading: {body}"
+        );
+        assert!(
+            body.contains("important: silently skipped"),
+            "log body must name the first offending finding by verbatim title: {body}"
+        );
+        assert!(
+            body.contains("blocker also silently skipped"),
+            "log body must name the second offending finding by verbatim title: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_omits_violation_callout_when_no_backstop_violations() {
+        // Defensive: a clean run with no violations must NOT surface the
+        // callout — otherwise the canonical heading would appear in
+        // every PR's log body, robbing it of meaning.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
+        };
+        let body = build_log_body(
+            &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
+        );
+        assert!(
+            !body.contains("Address-or-explain contract violated"),
+            "log body must NOT include the violation callout when no violations occurred: {body}"
+        );
     }
 
     #[test]

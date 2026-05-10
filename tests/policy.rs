@@ -1,7 +1,9 @@
 use bellows::policy::{
-    classify_exit, is_auth_error_signature, is_rate_limit_signature, render_kickoff, CheckResult,
-    ExitReason, GateOutcome, ImplementOutcome, PhaseOutcomes, ReviewOutcome, REVIEW_FIX_PROMPT,
-    REVIEW_PROMPT,
+    build_violation_callout, classify_exit, compute_coverage_violations, is_auth_error_signature,
+    is_rate_limit_signature, parse_agent_notes_sections, parse_findings, per_finding_kickoff,
+    render_kickoff, synthesize_unaddressed_entries, AgentNoteSection, CheckResult, ExitReason,
+    FindingCoverage, GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome,
+    Severity, BATCH_REVIEW_FIX_NIT_PROMPT, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -64,6 +66,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
             cargo_test: Some(check(0)),
         }),
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -85,6 +88,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     }
 }
 
@@ -146,6 +150,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: true,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::WallClockExceeded);
 }
@@ -231,6 +236,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::RateLimited);
 }
@@ -255,6 +261,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -274,6 +281,7 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: true,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -295,6 +303,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         review_fix: None,
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -317,6 +326,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
             cargo_test: Some(check(101)),
         }),
         wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -373,70 +383,342 @@ fn review_prompt_example_demonstrates_each_severity() {
 }
 
 #[test]
-fn review_fix_prompt_makes_blocker_and_important_findings_mandatory() {
-    // The address-OR-explain contract: imperative MUST language for the
-    // top two severities so silent skip is prompt-out-of-bounds. PR #26
-    // motivated this — the agent silently skipped an `important` finding
-    // and committed nothing; the maintainer caught it manually.
-    //
-    // PR #28 review finding #1: a permissive substring match like
-    // .contains("MUST") would still pass if the load-bearing sentence
-    // got silently downgraded to "SHOULD" elsewhere (there are several
-    // other MUSTs in the prompt — title-line format, etc.). Pin the
-    // exact mandate clause so the regression this slice prevents is
-    // actually locked.
+fn review_prompt_locks_title_format_for_deterministic_parser_extraction() {
+    // Slice 9.6: the parser-as-backstop matches verbatim titles between
+    // findings and agent-notes sections. For that to be deterministic
+    // the review prompt must instruct the agent that the title line
+    // (a) is on ONE line, (b) ends with ` — <tag>`, and (c) contains no
+    // markdown links or backticks that would break extraction. Without
+    // these locks the parser would silently miss findings whose title
+    // formatting drifts.
     assert!(
-        REVIEW_FIX_PROMPT
-            .contains("MUST address every finding marked `blocker` or `important`"),
-        "REVIEW_FIX_PROMPT must contain the literal address-OR-explain mandate clause: \
-         {REVIEW_FIX_PROMPT}"
+        REVIEW_PROMPT.contains("title MUST be on one line"),
+        "REVIEW_PROMPT must lock the one-line title rule: {REVIEW_PROMPT}"
     );
     assert!(
-        REVIEW_FIX_PROMPT.contains("Silent skip is not an option for these severities"),
-        "REVIEW_FIX_PROMPT must spell out that silent skip is not allowed for \
-         blocker/important: {REVIEW_FIX_PROMPT}"
+        REVIEW_PROMPT.contains("MUST end with ` — `"),
+        "REVIEW_PROMPT must lock the em-dash separator suffix: {REVIEW_PROMPT}"
+    );
+    assert!(
+        REVIEW_PROMPT.contains("MUST NOT contain markdown links or backticks"),
+        "REVIEW_PROMPT must forbid markdown links/backticks in titles: {REVIEW_PROMPT}"
     );
 }
 
 #[test]
-fn review_fix_prompt_permits_silent_skip_of_nit_findings() {
-    // The address-OR-explain rule binds blocker and important. `nit`
-    // findings are explicitly opt-in: skipping one without a note is
-    // fine because the operator already sees the review-findings PR
-    // comment and can decide whether to follow up. The prompt must say
-    // so — otherwise the imperative language bleeds into nit territory
-    // and the agent burns time on cosmetic findings.
+fn review_fix_prompt_locks_per_finding_scope_not_every_finding_language() {
+    // Slice 9.6 rewrites REVIEW_FIX_PROMPT for the per-finding shape:
+    // the agent sees exactly ONE finding per invocation, not a list.
+    // The "every finding marked blocker or important" phrasing from the
+    // slice-9.5 prompt MUST be gone — it is the precise wording that
+    // allowed agents to decide "I'll skip all of them in one breath."
     //
-    // PR #28 review finding #2: a substring match like "skip" or
-    // "without explanation" doesn't pin the DIRECTION of the rule —
-    // a reversed clause ("every nit must be addressed; do not skip")
-    // would still match. Pin the literal permission clause so a
-    // future edit can't silently flip the rule.
+    // This test is the load-bearing replacement for the slice-9.5
+    // "makes_blocker_and_important_findings_mandatory" test. The SPIRIT
+    // (lock the address-OR-explain contract against future weakening)
+    // is preserved with equally-pinned wording on the per-finding shape.
     assert!(
-        REVIEW_FIX_PROMPT.contains("MAY skip a `nit`"),
-        "REVIEW_FIX_PROMPT must literally permit skipping nit findings: \
+        !REVIEW_FIX_PROMPT.contains("every finding marked"),
+        "REVIEW_FIX_PROMPT must NOT use the slice-9.5 every-finding phrasing — \
+         slice 9.6 scopes invocations to a single finding so that wording is no \
+         longer a valid description of the contract: {REVIEW_FIX_PROMPT}"
+    );
+    // The new mandate names the single-finding shape so the agent
+    // literally cannot read this prompt as "decide which of N to do."
+    assert!(
+        REVIEW_FIX_PROMPT.contains("ONE finding") || REVIEW_FIX_PROMPT.contains("one finding"),
+        "REVIEW_FIX_PROMPT must scope the agent to a single finding: {REVIEW_FIX_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_locks_address_or_explain_for_the_single_finding() {
+    // The address-OR-explain contract survives the rewrite, restated
+    // in the per-finding shape: address this finding in code OR write
+    // an agent-notes section. Silent skip is prompt-out-of-bounds.
+    //
+    // Load-bearing replacement for the slice-9.5
+    // "permits_silent_skip_of_nit_findings" inverse — that test moves
+    // to BATCH_REVIEW_FIX_NIT_PROMPT. Here we lock the OPPOSITE rule
+    // for the per-finding (blocker/important) path: silent skip is NOT
+    // permitted.
+    let lower = REVIEW_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("silent skip") && lower.contains("out-of-bounds"),
+        "REVIEW_FIX_PROMPT must literally frame silent skip as prompt-out-of-bounds: \
          {REVIEW_FIX_PROMPT}"
     );
+    // The two options must be explicit, in this order.
     assert!(
-        REVIEW_FIX_PROMPT.contains("operator-discretionary"),
-        "REVIEW_FIX_PROMPT must frame nit findings as operator-discretionary: \
+        REVIEW_FIX_PROMPT.contains("Address") || REVIEW_FIX_PROMPT.contains("address"),
+        "REVIEW_FIX_PROMPT must spell out option 1 (address in code): {REVIEW_FIX_PROMPT}"
+    );
+    assert!(
+        REVIEW_FIX_PROMPT.contains("## Unaddressed finding:"),
+        "REVIEW_FIX_PROMPT must spell out option 2 (## Unaddressed finding section): \
          {REVIEW_FIX_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_demands_verbatim_title_for_unaddressed_finding_section() {
+    // The bellows parser-as-backstop matches the section title against
+    // the finding title verbatim. The prompt MUST tell the agent to use
+    // the EXACT verbatim title — otherwise the agent will paraphrase
+    // ("# Unaddressed: short version") and the backstop silently fails
+    // to match, defeating the whole mechanism.
+    let lower = REVIEW_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("verbatim"),
+        "REVIEW_FIX_PROMPT must demand the verbatim title — otherwise the parser-as-backstop \
+         cannot cross-reference sections to findings: {REVIEW_FIX_PROMPT}"
     );
 }
 
 #[test]
 fn review_fix_prompt_documents_agent_self_reported_failure_routing() {
-    // The agent must understand the consequence of appending to
-    // agent-notes.md: it routes the run to AgentSelfReportedFailure
-    // (draft PR with the agent-failed label). Without this, the prompt
-    // reads as "write a note when stuck" which understates the signal —
-    // appending IS the escalation, and the agent should reach for it
-    // deliberately.
+    // Survives the rewrite: the agent must understand that appending an
+    // unaddressed-finding section routes the run to
+    // agent-self-reported-failure (draft PR with the agent-failed
+    // label). Without this, the prompt reads as "write a note when
+    // stuck" which understates the signal — appending IS the
+    // escalation, and the agent should reach for it deliberately.
     let lower = REVIEW_FIX_PROMPT.to_lowercase();
     assert!(
         lower.contains("agent-self-reported-failure")
-            || lower.contains("draft pr with agent-failed label"),
+            || lower.contains("draft pr with agent-failed label")
+            || lower.contains("agent-failed"),
         "REVIEW_FIX_PROMPT must surface the agent-self-reported-failure routing consequence: {REVIEW_FIX_PROMPT}"
+    );
+}
+
+// ---- Backstop helpers: compute_coverage_violations, synthesize_unaddressed_entries,
+//      build_violation_callout ----
+
+fn finding(title: &str, severity: Severity) -> ParsedFinding {
+    ParsedFinding {
+        title: title.to_string(),
+        severity,
+        body: "irrelevant body".to_string(),
+    }
+}
+
+fn coverage(title: &str, severity: Severity, commit_landed: bool) -> FindingCoverage {
+    FindingCoverage {
+        finding: finding(title, severity),
+        commit_landed,
+    }
+}
+
+fn note(title: &str) -> AgentNoteSection {
+    AgentNoteSection {
+        title: title.to_string(),
+        body: "irrelevant body".to_string(),
+    }
+}
+
+#[test]
+fn compute_coverage_violations_reports_no_violations_when_all_findings_addressed_in_code() {
+    // Happy path: every blocker/important finding produced a commit in
+    // its per-finding invocation. No agent-notes sections needed; no
+    // violations.
+    let cov = vec![
+        coverage("blocker title", Severity::Blocker, true),
+        coverage("important title", Severity::Important, true),
+    ];
+    let violations = compute_coverage_violations(&cov, &[]);
+    assert!(violations.is_empty(), "no violations expected: {:?}", violations);
+}
+
+#[test]
+fn compute_coverage_violations_reports_no_violations_when_uncommitted_findings_are_explained() {
+    // The agent declined to address a blocker in code but DID append a
+    // matching `## Unaddressed finding:` section. That's the
+    // address-OR-explain contract — explained, so no violation. The
+    // backstop fires only when neither code nor explanation is present.
+    let cov = vec![
+        coverage("blocker title", Severity::Blocker, false),
+        coverage("important title", Severity::Important, true),
+    ];
+    let sections = vec![note("blocker title")];
+    let violations = compute_coverage_violations(&cov, &sections);
+    assert!(violations.is_empty(), "explained finding is not a violation: {:?}", violations);
+}
+
+#[test]
+fn compute_coverage_violations_flags_blocker_without_commit_and_without_note() {
+    // The core silent-skip case: agent exited 0 with no commit AND no
+    // agent-notes section. The backstop must surface this so the runner
+    // forces agent-self-reported-failure rather than shipping it as
+    // Success — the exact failure mode that 4 consecutive bellows-on-
+    // bellows runs demonstrated cannot be closed by prompt language
+    // alone.
+    let cov = vec![
+        coverage("blocker title", Severity::Blocker, false),
+        coverage("important title", Severity::Important, true),
+    ];
+    let violations = compute_coverage_violations(&cov, &[]);
+    assert_eq!(violations.len(), 1, "exactly the unaddressed blocker should violate: {:?}", violations);
+    assert_eq!(violations[0].title, "blocker title");
+    assert_eq!(violations[0].severity, Severity::Blocker);
+}
+
+#[test]
+fn compute_coverage_violations_flags_important_without_commit_and_without_note() {
+    // Same shape as the blocker case but with `important` — the rule
+    // binds the top TWO severities, not just blocker, because important
+    // findings were the exact category the 4-PR silent-skip pattern
+    // exploited.
+    let cov = vec![coverage("important title", Severity::Important, false)];
+    let violations = compute_coverage_violations(&cov, &[]);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].severity, Severity::Important);
+}
+
+#[test]
+fn compute_coverage_violations_does_not_flag_unaddressed_nits() {
+    // `nit` findings are operator-discretionary. A nit with no commit
+    // and no agent-notes section is NOT a violation — silent skip is
+    // explicitly permitted for nits. The backstop must not over-fire
+    // on cosmetic findings, otherwise every run with a skipped nit
+    // would route to agent-self-reported-failure.
+    let cov = vec![coverage("nit title", Severity::Nit, false)];
+    let violations = compute_coverage_violations(&cov, &[]);
+    assert!(violations.is_empty(), "unaddressed nits are not violations: {:?}", violations);
+}
+
+#[test]
+fn compute_coverage_violations_title_comparison_is_verbatim_case_sensitive() {
+    // The parser-as-backstop matches titles character-for-character.
+    // A paraphrased section title ("blocker title" vs "Blocker title")
+    // does NOT count as an explanation — otherwise an agent could
+    // shorten or capitalise the title and the backstop would silently
+    // accept it.
+    let cov = vec![coverage("blocker title", Severity::Blocker, false)];
+    let sections = vec![note("Blocker title")]; // capitalisation differs
+    let violations = compute_coverage_violations(&cov, &sections);
+    assert_eq!(
+        violations.len(),
+        1,
+        "verbatim title match required; capitalisation drift must not be accepted: {:?}",
+        violations
+    );
+}
+
+#[test]
+fn synthesize_unaddressed_entries_produces_appendable_markdown_with_verbatim_titles() {
+    // When the backstop fires, bellows appends an `## Unaddressed
+    // finding:` section per violation so the existing `has_agent_notes
+    // → AgentSelfReportedFailure` precedence in classify_exit takes
+    // effect. The synthesized markdown must (a) use the verbatim
+    // finding title, (b) be appendable (no leading whitespace issues),
+    // and (c) carry a body explaining bellows synthesized this — so a
+    // human reading agent-notes.md later can see it wasn't written by
+    // claude.
+    let violations = vec![
+        finding("first violation", Severity::Blocker),
+        finding("second violation", Severity::Important),
+    ];
+    let appended = synthesize_unaddressed_entries(&violations);
+    assert!(
+        appended.contains("## Unaddressed finding: first violation"),
+        "synthesised markdown must include verbatim title #1: {appended}"
+    );
+    assert!(
+        appended.contains("## Unaddressed finding: second violation"),
+        "synthesised markdown must include verbatim title #2: {appended}"
+    );
+    // Bellows must distinguish synthesised entries from agent-written
+    // ones so a reader knows where the entry came from.
+    let lower = appended.to_lowercase();
+    assert!(
+        lower.contains("bellows") && (lower.contains("synthes") || lower.contains("backstop")),
+        "synthesised entry must identify bellows as the author: {appended}"
+    );
+}
+
+#[test]
+fn synthesize_unaddressed_entries_returns_empty_when_no_violations() {
+    // Defensive guard: the runner only calls synthesize_... when there
+    // are violations, but a zero-violation call must produce empty
+    // output rather than a header-only "## Unaddressed finding: " stub
+    // (which would itself satisfy parse_agent_notes_sections and route
+    // a clean run to agent-self-reported-failure).
+    let appended = synthesize_unaddressed_entries(&[]);
+    assert!(appended.is_empty() || appended.trim().is_empty(),
+        "no violations must produce empty (or whitespace-only) output: {appended:?}");
+}
+
+#[test]
+fn build_violation_callout_names_each_offending_finding_under_named_section() {
+    // The log comment must surface a `### Address-or-explain contract
+    // violated` callout naming the offending findings, so the operator
+    // reading the PR comment sees explicitly that the run was forced to
+    // agent-self-reported-failure by the bellows-side check (not by the
+    // agent itself).
+    let violations = vec![
+        finding("blocker with silent skip", Severity::Blocker),
+        finding("important also silently skipped", Severity::Important),
+    ];
+    let callout = build_violation_callout(&violations);
+    assert!(
+        callout.contains("### Address-or-explain contract violated"),
+        "callout must use the canonical heading: {callout}"
+    );
+    assert!(
+        callout.contains("blocker with silent skip"),
+        "callout must name the first violation: {callout}"
+    );
+    assert!(
+        callout.contains("important also silently skipped"),
+        "callout must name the second violation: {callout}"
+    );
+    // Severity should be surfaced too so the operator can prioritise.
+    assert!(
+        callout.contains("blocker") && callout.contains("important"),
+        "callout must surface each violation's severity: {callout}"
+    );
+}
+
+#[test]
+fn batch_review_fix_nit_prompt_permits_silent_skip_of_nits() {
+    // Slice 9.6: `nit` findings go through a separate batched
+    // invocation with a permissive prompt. Silent skip IS allowed for
+    // nits — the operator already sees every nit in the review-findings
+    // PR comment and can decide whether to follow up. The prompt MUST
+    // literally permit skipping; without that, a tightening of the
+    // per-finding prompt (which is imperative) could bleed into the nit
+    // path and the agent would burn time on cosmetic findings.
+    //
+    // This test is the load-bearing successor to slice-9.5's
+    // `review_fix_prompt_permits_silent_skip_of_nit_findings`, which
+    // pinned the permission on the old combined REVIEW_FIX_PROMPT.
+    // Slice 9.6 splits the two paths, so the permission for nits
+    // moves here.
+    assert!(
+        BATCH_REVIEW_FIX_NIT_PROMPT.contains("MAY skip a `nit`"),
+        "BATCH_REVIEW_FIX_NIT_PROMPT must literally permit skipping nits: {BATCH_REVIEW_FIX_NIT_PROMPT}"
+    );
+    assert!(
+        BATCH_REVIEW_FIX_NIT_PROMPT.contains("operator-discretionary"),
+        "BATCH_REVIEW_FIX_NIT_PROMPT must frame nits as operator-discretionary: {BATCH_REVIEW_FIX_NIT_PROMPT}"
+    );
+}
+
+#[test]
+fn batch_review_fix_nit_prompt_does_not_route_through_unaddressed_finding_path() {
+    // Nits MUST NOT use the `## Unaddressed finding:` escalation path —
+    // appending such a section routes the run to
+    // agent-self-reported-failure, which is far too heavy a signal for
+    // a nit the agent simply chose not to do. The prompt must explicitly
+    // tell the agent NOT to append for nits; otherwise a careful agent
+    // might apply the per-finding contract by analogy and escalate
+    // every skipped nit.
+    let lower = BATCH_REVIEW_FIX_NIT_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("do not append to agent-notes.md for nits"),
+        "BATCH_REVIEW_FIX_NIT_PROMPT must tell the agent not to append unaddressed-finding \
+         sections for nits: {BATCH_REVIEW_FIX_NIT_PROMPT}"
     );
 }
 
@@ -450,4 +732,303 @@ fn review_fix_prompt_preserves_commit_per_finding_convention() {
             || REVIEW_FIX_PROMPT.contains("one commit per finding"),
         "REVIEW_FIX_PROMPT must preserve the commit-per-finding convention: {REVIEW_FIX_PROMPT}"
     );
+}
+
+// ---- Slice 9.6: per-finding parser + parser-as-backstop ----
+
+#[test]
+fn parse_findings_extracts_all_three_severities_from_review_prompt_example_block() {
+    // The REVIEW_PROMPT vendored example shows one of each severity. The
+    // parser must recognise the three-element closed vocabulary AND keep
+    // them in source order so the runner can iterate blocker→important
+    // →nit in a predictable shape.
+    let text = "\
+## Findings
+
+### 1. status file leaks busy state — important
+
+The early-returns skip cleanup.
+
+**Suggestion:** wrap in a guard.
+
+### 2. unwrap on parsed config can panic — blocker
+
+Panics inside serde_json::from_str.
+
+**Suggestion:** map to ConfigError::Parse.
+
+### 3. helper function name shadows std::cmp::min — nit
+
+Reads fine locally but conflicts elsewhere.
+
+**Suggestion:** rename to min_nonzero.
+";
+    let result = parse_findings(text);
+    assert!(result.malformed_titles.is_empty());
+    let severities: Vec<Severity> = result.findings.iter().map(|f| f.severity).collect();
+    assert_eq!(severities, vec![Severity::Important, Severity::Blocker, Severity::Nit]);
+    let titles: Vec<&str> = result.findings.iter().map(|f| f.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        vec![
+            "status file leaks busy state",
+            "unwrap on parsed config can panic",
+            "helper function name shadows std::cmp::min",
+        ]
+    );
+}
+
+#[test]
+fn per_finding_kickoff_interpolates_title_severity_and_body_into_the_prompt() {
+    // The per-finding agent must see the specific finding it's there to
+    // handle. The kickoff renders the slice-9.6 single-finding prompt
+    // with the title / severity / body interpolated; the agent has no
+    // way to drift into "address everything" or "skip everything" because
+    // there is no list — only this one finding.
+    let finding = ParsedFinding {
+        title: "config parser panics on empty input".to_string(),
+        severity: Severity::Blocker,
+        body: "`Config::from_str(\"\")` panics inside serde_json.\n\n**Suggestion:** map to ConfigError::Parse.".to_string(),
+    };
+    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "agent-notes.md");
+
+    assert!(
+        kickoff.contains("config parser panics on empty input"),
+        "title must appear in the kickoff body: {kickoff}"
+    );
+    assert!(
+        kickoff.contains("blocker"),
+        "severity tag must appear in the kickoff body: {kickoff}"
+    );
+    assert!(
+        kickoff.contains("**Suggestion:** map to ConfigError::Parse"),
+        "finding body must be interpolated verbatim: {kickoff}"
+    );
+}
+
+#[test]
+fn per_finding_kickoff_instructs_exact_verbatim_unaddressed_finding_header() {
+    // The parser-as-backstop matches `## Unaddressed finding: <title>`
+    // verbatim. The kickoff must spell out the exact header the agent
+    // should append, with the SAME verbatim title — otherwise the agent
+    // might paraphrase ("# Unaddressed: short title") and the backstop
+    // would silently fail to match.
+    let finding = ParsedFinding {
+        title: "title with — em dashes — in it".to_string(),
+        severity: Severity::Important,
+        body: "body".to_string(),
+    };
+    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "agent-notes.md");
+    assert!(
+        kickoff.contains("## Unaddressed finding: title with — em dashes — in it"),
+        "kickoff must show the exact `## Unaddressed finding: <verbatim title>` header the agent should append: {kickoff}"
+    );
+    // The address-OR-explain framing must be present — the agent must
+    // see that there are exactly two options.
+    assert!(
+        kickoff.to_lowercase().contains("address") || kickoff.contains("code fix"),
+        "kickoff must mention the address-in-code option: {kickoff}"
+    );
+}
+
+#[test]
+fn per_finding_kickoff_carries_severity_tone_distinguishing_blocker_from_important() {
+    // The brief: "Severity-aware tone (blocker tone may be more urgent
+    // than important; nits don't go through this path — they stay in a
+    // batch)". The blocker kickoff must literally say "blocker" while
+    // the important one literally says "important", AND the urgency
+    // wording must differ — otherwise the gradient collapses and the
+    // top severity becomes indistinguishable from the second.
+    let blocker = ParsedFinding {
+        title: "t".into(),
+        severity: Severity::Blocker,
+        body: "b".into(),
+    };
+    let important = ParsedFinding {
+        title: "t".into(),
+        severity: Severity::Important,
+        body: "b".into(),
+    };
+    let blocker_kickoff = per_finding_kickoff(&blocker, "d", "n");
+    let important_kickoff = per_finding_kickoff(&important, "d", "n");
+    assert_ne!(
+        blocker_kickoff, important_kickoff,
+        "blocker and important kickoffs must differ in urgency wording, not just the severity tag"
+    );
+    assert!(blocker_kickoff.contains("blocker"));
+    assert!(important_kickoff.contains("important"));
+}
+
+#[test]
+fn per_finding_kickoff_silent_skip_is_explicitly_out_of_bounds() {
+    // The whole point of the per-finding shape: silent skip is
+    // prompt-out-of-bounds. The agent must see that doing nothing is
+    // NOT an option — only "address in code" or "write the unaddressed-
+    // finding section" are.
+    let finding = ParsedFinding {
+        title: "t".into(),
+        severity: Severity::Blocker,
+        body: "b".into(),
+    };
+    let kickoff = per_finding_kickoff(&finding, "d", "n");
+    let lower = kickoff.to_lowercase();
+    assert!(
+        lower.contains("out-of-bounds") || lower.contains("out of bounds"),
+        "kickoff must surface the prompt-out-of-bounds framing so the agent cannot read silent skip as permitted: {kickoff}"
+    );
+}
+
+#[test]
+fn parse_agent_notes_sections_extracts_unaddressed_finding_sections_by_verbatim_title() {
+    // The per-finding agent appends a `## Unaddressed finding: <title>`
+    // section per finding it deliberately chose not to address in code.
+    // The parser-as-backstop reads them to verify the address-OR-explain
+    // contract. Title comparison is verbatim — the section's title must
+    // match the finding's title character-for-character.
+    let text = "\
+# agent-notes.md
+
+Some preamble.
+
+## Unaddressed finding: unwrap on parsed config can panic on empty input
+
+Would need a redesign of the config parser path; out of scope for this PR.
+
+## Unaddressed finding: status file leaks busy state on Rust error returns
+
+Requires a guard-pattern refactor in run_one; deferred to a follow-up.
+";
+    let sections = parse_agent_notes_sections(text);
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0].title, "unwrap on parsed config can panic on empty input");
+    assert!(sections[0].body.contains("redesign of the config parser"));
+    assert_eq!(sections[1].title, "status file leaks busy state on Rust error returns");
+    assert!(sections[1].body.contains("guard-pattern refactor"));
+}
+
+#[test]
+fn parse_agent_notes_sections_ignores_other_headings_at_same_level() {
+    // agent-notes.md often carries general notes from the implement or
+    // review phases under unrelated `## ...` headings. The parser must
+    // only collect Unaddressed-finding sections — others end the
+    // current section (if any) but do NOT contribute a phantom entry.
+    let text = "\
+## Implement-phase notes
+
+Could not complete the foo refactor; left a TODO in src/foo.rs.
+
+## Unaddressed finding: real finding title here
+
+Body of the unaddressed-finding section.
+
+## Some other random heading
+
+Unrelated content that must not become a section.
+";
+    let sections = parse_agent_notes_sections(text);
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].title, "real finding title here");
+    assert!(sections[0].body.contains("Body of the unaddressed-finding section"));
+}
+
+#[test]
+fn parse_agent_notes_sections_returns_empty_for_file_with_no_unaddressed_sections() {
+    // A typical implement-phase agent-notes.md (general notes, no
+    // unaddressed-finding sections) must parse to an empty list — the
+    // parser-as-backstop will then see "no explained findings" and apply
+    // the address-OR-explain rule accordingly.
+    let text = "Just some notes from earlier phases.\nNothing structured.\n";
+    let sections = parse_agent_notes_sections(text);
+    assert!(sections.is_empty());
+}
+
+#[test]
+fn parse_findings_rejects_off_vocabulary_severity_tags_as_malformed() {
+    // The closed vocabulary lock means "medium" / "minor" / "follow-up"
+    // are off-list. The parser must NOT silently demote them to a
+    // ParsedFinding (that would let agents invent severities again and
+    // collapse the gradient back to "everything looks the same"). Instead
+    // they surface in malformed_titles so the runner can log the
+    // breakdown rather than silently dropping content.
+    let text = "\
+## Findings
+
+### 1. severity-typo finding — medium
+
+Body irrelevant to the test.
+
+### 2. real finding — important
+
+Body irrelevant.
+
+### 3. another bad one — follow-up
+
+Body irrelevant.
+";
+    let result = parse_findings(text);
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "only the well-formed `important` finding should parse: {:?}",
+        result.findings
+    );
+    assert_eq!(result.findings[0].severity, Severity::Important);
+    assert_eq!(result.malformed_titles.len(), 2, "two malformed titles: {:?}", result.malformed_titles);
+    // Each malformed title is surfaced verbatim so the operator can see
+    // exactly what the review agent produced.
+    let combined = result.malformed_titles.join(" | ");
+    assert!(combined.contains("medium"), "raw `medium` line missing: {combined}");
+    assert!(combined.contains("follow-up"), "raw `follow-up` line missing: {combined}");
+}
+
+#[test]
+fn parse_findings_treats_title_without_em_dash_separator_as_malformed() {
+    // If the agent forgot the ` — <tag>` suffix entirely (just wrote a
+    // bare title), the parser must not guess a severity. Such a line is
+    // recorded as malformed.
+    let text = "\
+## Findings
+
+### 1. forgot the severity tag entirely
+
+Some description.
+";
+    let result = parse_findings(text);
+    assert!(result.findings.is_empty(), "no finding should parse: {:?}", result.findings);
+    assert_eq!(result.malformed_titles.len(), 1);
+}
+
+#[test]
+fn parse_findings_returns_empty_result_for_no_findings_marker() {
+    // The review prompt instructs the agent to write `(no findings)`
+    // when nothing is worth flagging. The parser must return zero
+    // findings and zero malformed-titles for that input.
+    let result = parse_findings("(no findings)\n");
+    assert!(result.findings.is_empty());
+    assert!(result.malformed_titles.is_empty());
+}
+
+#[test]
+fn parse_findings_extracts_a_single_well_formed_blocker() {
+    // Tracer bullet for slice 9.6 parser. Findings file with one finding
+    // whose title ends in ` — blocker` per the locked grammar. Parser
+    // returns one ParsedFinding with the title (sans severity tag) and
+    // the severity classified into the Severity enum.
+    let text = "\
+## Findings
+
+### 1. unwrap on parsed config can panic on empty input — blocker
+
+`Config::from_str(\"\")` panics inside serde_json::from_str rather than returning the typed error.
+
+**Suggestion:** map the serde error into ConfigError::Parse.
+";
+    let result = parse_findings(text);
+    assert!(result.malformed_titles.is_empty(), "no malformed titles expected: {:?}", result.malformed_titles);
+    assert_eq!(result.findings.len(), 1, "exactly one finding expected: {:?}", result.findings);
+    let f = &result.findings[0];
+    assert_eq!(f.title, "unwrap on parsed config can panic on empty input");
+    assert_eq!(f.severity, Severity::Blocker);
+    assert!(f.body.contains("Config::from_str"), "body must include description: {:?}", f.body);
+    assert!(f.body.contains("Suggestion"), "body must include suggestion block: {:?}", f.body);
 }

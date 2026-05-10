@@ -98,6 +98,15 @@ pub struct PhaseOutcomes {
     /// when its deadline fired. Orthogonal to per-phase exit codes since
     /// the run was killed, not exited cleanly.
     pub wall_clock_exceeded: bool,
+    /// Slice 9.6: blocker/important findings that the parser-as-
+    /// backstop detected as neither addressed-in-code nor explained
+    /// via an `## Unaddressed finding:` section. Empty in the typical
+    /// path (address-OR-explain contract met). When non-empty the
+    /// runner appended synthetic agent-notes entries (which routes
+    /// the run to AgentSelfReportedFailure) and the log comment
+    /// includes the `### Address-or-explain contract violated`
+    /// callout that names each offending finding.
+    pub backstop_violations: Vec<ParsedFinding>,
 }
 
 /// Decide how a finished agent run should be classified.
@@ -217,6 +226,12 @@ pub const REVIEW_PROMPT: &str = r#"You are running as the **review phase** of a 
 
 Write your findings to `/workspace/.bellows-review-findings.md` in this markdown format. Each finding's title line MUST end with ` — ` followed by exactly one severity tag drawn from the closed vocabulary `blocker | important | nit` — use exactly one of these three values, never invent another tag (no "medium", "minor", "follow-up", etc.). The review-fix phase keys its address-OR-explain contract on these exact strings, so a missing or off-vocabulary tag silently demotes the finding.
 
+Additional title-format constraints (load-bearing for the bellows parser-as-backstop — the runner extracts the title verbatim and matches it against `## Unaddressed finding: <title>` sections in agent-notes.md, so any drift breaks the cross-reference):
+
+- The title MUST be on one line. No line breaks inside a title.
+- The title line MUST end with ` — <tag>` (space, em-dash, space, then the severity tag).
+- The title MUST NOT contain markdown links or backticks. Plain prose only — these characters break parser extraction and silently demote the finding.
+
 Severity meanings:
 
 - `blocker` — the change as written is wrong, unsafe, or breaks the brief's acceptance criteria. Must be fixed before merge.
@@ -258,64 +273,450 @@ You are read-only. Do NOT edit any files except `.bellows-review-findings.md` an
 If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from the implement phase that must remain visible to the human reviewer.
 "#;
 
-/// Vendored review-fix-phase prompt. Documents the findings file
-/// path, the address-OR-explain contract for `blocker` and
-/// `important` findings (silent skip is permitted only for `nit`), the
-/// commit-per-finding convention, the remove-on-completion contract,
-/// and the agent-notes append contract — including the explicit signal
-/// that an agent-notes.md present at end-of-pipeline routes the run to
-/// `agent-self-reported-failure` (draft PR with the `agent-failed`
-/// label).
-pub const REVIEW_FIX_PROMPT: &str = r#"You are running as the **review-fix phase** of a Bellows agent pipeline. The review phase wrote findings to a file; your job is to address each finding by making code changes and committing them.
+/// Vendored review-fix-phase prompt — slice 9.6 per-finding shape.
+///
+/// This is a TEMPLATE that `per_finding_kickoff` renders with a specific
+/// finding interpolated. The prompt scopes the agent to a SINGLE finding
+/// per invocation: there is no list to silently skip, only one finding
+/// and two options (address in code OR write an `## Unaddressed finding:
+/// <verbatim title>` section to agent-notes.md). The slice-9.5 prompt's
+/// "every finding marked blocker or important" framing is gone — that
+/// wording is exactly what enabled four consecutive silent-skip
+/// regressions (#26, #28, #30, #33), so the per-finding shape removes
+/// the discretion the agent kept exercising.
+///
+/// Placeholders rendered by `per_finding_kickoff`:
+///
+/// - `{title}` — the finding's verbatim title
+/// - `{severity}` — `blocker` or `important`
+/// - `{body}` — the finding's description + suggestion block
+/// - `{urgency}` — severity-flavoured tone line
+/// - `{diff_path}` — workspace-relative path to the review diff
+/// - `{agent_notes_path}` — workspace-relative path to agent-notes.md
+pub const REVIEW_FIX_PROMPT: &str = r#"You are running as a **single-finding review-fix invocation** of a Bellows agent pipeline. You have ONE finding to handle. That's the entire job.
 
-## The address-OR-explain rule
+## The finding
 
-You MUST address every finding marked `blocker` or `important`. Silent skip is not an option for these severities. For each `blocker` or `important` finding, exactly one of the following must be true at the end of this phase:
+**Title:** {title}
+**Severity:** {severity}
 
-1. **Addressed in code.** You made a code change that resolves the finding's root cause and committed it. This is the default and preferred path.
-2. **Explained in agent-notes.md.** You appended a clearly-labelled section to `/workspace/agent-notes.md` describing (a) what would be required to address the finding and (b) why you cannot address it in this run (missing context, architectural decision needed, requires human judgement, etc.).
+{body}
 
-Skipping a `blocker` or `important` finding without doing one of the above is prompt-out-of-bounds.
+{urgency}
 
-`nit` findings are operator-discretionary. You MAY skip a `nit` without explanation — the operator already sees every finding in the review-findings PR comment and can decide whether to follow up. Address nits when they are cheap and adjacent to other work; do not burn time on cosmetic findings if blocker/important work remains.
+## Your two options
 
-## What appending to agent-notes.md actually signals
+You MUST do exactly one of the following:
 
-The presence of `/workspace/agent-notes.md` at the end of the pipeline routes the run to `agent-self-reported-failure`: Bellows opens the resulting PR as a draft with the `agent-failed` label, attaches your notes, and surfaces the partial commits to the operator for review. This is the intended escalation path for `important` work you cannot complete — the operator sees the draft PR plus your notes plus the partial commits and decides what to do.
-
-Reach for agent-notes.md deliberately. It is not a "didn't get to it" note; it is a structured handoff that says "I am self-reporting this as incomplete and want a human to look."
-
-APPEND to agent-notes.md — do not overwrite. The file may already contain notes from the implement or review phases that must remain visible to the human reviewer.
-
-## Inputs
-
-- `/workspace/.bellows-review-findings.md` — the findings file written by the review phase. Each finding has a title ending in ` — blocker`, ` — important`, or ` — nit`, a description, and a suggestion. Read every finding and note its severity before making changes.
-- `/workspace/agent-notes.md` may exist with notes from earlier phases. Read it for context.
-
-## Process
-
-For each finding in the findings file:
-
-1. Read the title (note the severity tag), description, and suggestion.
-2. Decide whether the suggested change is correct (you are not bound to apply it verbatim — if a different change addresses the same root cause, that is fine).
-3. For `blocker` and `important`: make the change OR append a skip-with-reason section to agent-notes.md per the address-OR-explain rule above. For `nit`: make the change if cheap, otherwise skip.
-4. Run `cargo check` (or equivalent) after each code change to confirm you have not broken compilation.
-5. Commit each fix with a clear, scoped commit message. One commit per finding is ideal; bundling a few that touch the same file is acceptable. Per-finding commits let the operator map fixes back to the review-findings PR comment.
-
-After all findings are addressed (or explained), REMOVE the findings file:
+1. **Address the finding in code.** Make the change that resolves the finding's root cause, run `cargo check` (or equivalent), and commit it with a scoped commit message. One commit per finding so the operator can map your fix back to the review-findings PR comment.
+2. **Append an `## Unaddressed finding: <title>` section to `/workspace/{agent_notes_path}`.** Use the EXACT VERBATIM title from this finding — the bellows parser-as-backstop matches title strings character-for-character. The exact header you must append is:
 
 ```
-rm /workspace/.bellows-review-findings.md
+## Unaddressed finding: {title}
 ```
 
-Bellows treats a missing or empty findings file as "this phase completed cleanly." Do NOT remove the findings file if you left blocker/important findings unaddressed AND did not log a skip-with-reason for them — leaving the file in place is the signal that the phase did not complete its contract.
+Then a paragraph describing (a) what would be required to address the finding and (b) why you cannot address it in this run (missing context, architectural decision needed, requires human judgement, etc.).
+
+APPEND to `/workspace/{agent_notes_path}` — do not overwrite; the file may already contain notes from earlier phases.
+
+## Silent skip is out-of-bounds
+
+Exiting without either a code-fix commit OR an `## Unaddressed finding: {title}` section is prompt-out-of-bounds. The bellows parser-as-backstop will detect a silent skip after this phase ends and synthesize an `## Unaddressed finding:` entry on your behalf, forcing the run to agent-self-reported-failure anyway. It is strictly better to write the section yourself with the real reason than to let the synthetic entry replace it.
+
+## What appending to agent-notes.md signals
+
+The presence of `/workspace/{agent_notes_path}` at the end of the pipeline routes the run to **agent-self-reported-failure**: bellows opens the resulting PR as a draft with the `agent-failed` label, attaches your notes, and surfaces the partial commits to the operator for review. This is the intended escalation path for `blocker` / `important` work you cannot complete — the operator sees the draft PR plus your notes plus the partial commits and decides what to do.
+
+Reach for the unaddressed-finding section deliberately. It is not a "didn't get to it" note; it is a structured handoff that says "I am self-reporting this as incomplete and want a human to look."
+
+## What you must NOT do
+
+- Do NOT broaden scope to address other findings; you have exactly one finding to handle. Other findings are handled by other invocations of this same prompt with different findings interpolated.
+- Do NOT remove the findings file (`.bellows-review-findings.md`); other per-finding invocations may still need it as context.
+- Do NOT use a paraphrased title in the `## Unaddressed finding:` header. Verbatim match required.
+
+## Inputs for context
+
+- `/workspace/{diff_path}` contains the diff this finding is about — read it if you need disambiguation.
+- `/workspace/{agent_notes_path}` may exist with notes from earlier phases. Read it for context before appending.
 
 ## Stop conditions
 
-Stop when:
-
-- Every `blocker` and `important` finding is either addressed in code OR explained in agent-notes.md, AND `cargo test` is green, AND the findings file is removed (or left in place if you knowingly walked away from blocker/important work without an explanation, which should not happen if you followed the rule above).
+Stop when EITHER (1) you committed a code fix AND `cargo check` is green, OR (2) you appended the `## Unaddressed finding: {title}` section to `/workspace/{agent_notes_path}`.
 "#;
+
+/// Closed severity vocabulary for review findings. The review prompt
+/// instructs the agent to tag every finding with exactly one of these
+/// three values; the parser refuses anything else (it lands in
+/// `ParseFindingsResult::malformed_titles` instead). The per-finding
+/// enact path is keyed on the top two severities — `Nit` findings go
+/// through the batch path and are operator-discretionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Blocker,
+    Important,
+    Nit,
+}
+
+impl Severity {
+    /// The exact lower-case string the prompt instructs the review
+    /// agent to use as the tag at the end of each finding's title
+    /// (`blocker`, `important`, `nit`). Round-trips with
+    /// `Severity::from_tag`.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            Severity::Blocker => "blocker",
+            Severity::Important => "important",
+            Severity::Nit => "nit",
+        }
+    }
+
+    /// Parse a severity tag string from the end of a finding's title
+    /// line. Matches the closed vocabulary `blocker | important | nit`
+    /// exactly (case-insensitive). Anything else returns `None`, which
+    /// the parser treats as a malformed finding.
+    pub fn from_tag(s: &str) -> Option<Severity> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "blocker" => Some(Severity::Blocker),
+            "important" => Some(Severity::Important),
+            "nit" => Some(Severity::Nit),
+            _ => None,
+        }
+    }
+}
+
+/// One review finding extracted from the review-phase output file.
+/// `title` is the verbatim text between `### N. ` and ` — <tag>` on
+/// the title line — the per-finding kickoff and the agent-notes
+/// `## Unaddressed finding: <title>` contract both key on this exact
+/// string, so it must round-trip verbatim through the pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFinding {
+    pub title: String,
+    pub severity: Severity,
+    pub body: String,
+}
+
+/// Outcome of `parse_findings`. Carries the well-formed findings AND
+/// the title lines the parser rejected because they did not end in a
+/// valid severity tag. The runner logs the rejected lines so an operator
+/// can see "review produced a malformed finding" rather than the parser
+/// silently dropping the line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParseFindingsResult {
+    pub findings: Vec<ParsedFinding>,
+    pub malformed_titles: Vec<String>,
+}
+
+/// Parse a review-findings markdown file into a list of structured
+/// findings + the title lines that did not match the locked grammar.
+///
+/// The grammar (matching `REVIEW_PROMPT`'s instructions):
+///
+/// - Each finding's title line starts with `### ` and ends with
+///   ` — <tag>` where `<tag>` is one of `blocker | important | nit`.
+/// - The title is the text between `### ` (optionally followed by
+///   `N. ` numbering) and the ` — ` separator.
+/// - The body is every line between the title and the next `### `
+///   header (or EOF).
+///
+/// A `### ` header whose trailing ` — <tag>` is missing or off-vocabulary
+/// is rejected — the parser pushes the line into `malformed_titles` and
+/// does not produce a `ParsedFinding`. Bare `(no findings)` markers and
+/// lines outside any finding are ignored.
+pub fn parse_findings(text: &str) -> ParseFindingsResult {
+    let mut findings = Vec::new();
+    let mut malformed_titles = Vec::new();
+    let mut current: Option<(String, Severity, String)> = None;
+
+    let push_current = |current: &mut Option<(String, Severity, String)>,
+                        findings: &mut Vec<ParsedFinding>| {
+        if let Some((title, severity, body)) = current.take() {
+            findings.push(ParsedFinding {
+                title,
+                severity,
+                body: body.trim().to_string(),
+            });
+        }
+    };
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("### ") {
+            push_current(&mut current, &mut findings);
+            // Strip an optional leading `N. ` numbering so the parser
+            // matches both numbered and unnumbered title lines.
+            let after_number = strip_leading_numbering(rest);
+            if let Some((title, tag)) = after_number.rsplit_once(" — ") {
+                if let Some(severity) = Severity::from_tag(tag) {
+                    current = Some((title.trim().to_string(), severity, String::new()));
+                } else {
+                    malformed_titles.push(line.to_string());
+                }
+            } else {
+                malformed_titles.push(line.to_string());
+            }
+            continue;
+        }
+
+        if let Some((_, _, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    push_current(&mut current, &mut findings);
+
+    ParseFindingsResult {
+        findings,
+        malformed_titles,
+    }
+}
+
+/// Strip an optional leading `N. ` numbering from a title line. The
+/// example findings in REVIEW_PROMPT are numbered; the parser accepts
+/// either form so a future tweak to the prompt's example doesn't break
+/// extraction.
+fn strip_leading_numbering(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed
+        .split_once('.')
+        .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map(|(_, rest)| rest)
+    {
+        rest.trim_start()
+    } else {
+        trimmed
+    }
+}
+
+/// One `## Unaddressed finding: <title>` section parsed from an
+/// `agent-notes.md` file. The per-finding enact agent appends one of
+/// these per finding it deliberately chose not to address in code —
+/// the parser-as-backstop reads them to confirm the agent met the
+/// address-OR-explain contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentNoteSection {
+    pub title: String,
+    pub body: String,
+}
+
+/// Parse the `## Unaddressed finding: <title>` sections out of an
+/// `agent-notes.md` file. Title comparison is verbatim — the agent
+/// must use the exact title from the findings file for the section to
+/// match its finding. Other `## ...` headings (general notes from
+/// implement / review / earlier phases) are ignored.
+pub fn parse_agent_notes_sections(text: &str) -> Vec<AgentNoteSection> {
+    let mut sections = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    const PREFIX: &str = "## Unaddressed finding: ";
+
+    let push_current = |current: &mut Option<(String, String)>,
+                        sections: &mut Vec<AgentNoteSection>| {
+        if let Some((title, body)) = current.take() {
+            sections.push(AgentNoteSection {
+                title,
+                body: body.trim().to_string(),
+            });
+        }
+    };
+
+    for line in text.lines() {
+        if let Some(title) = line.strip_prefix(PREFIX) {
+            push_current(&mut current, &mut sections);
+            current = Some((title.trim().to_string(), String::new()));
+            continue;
+        }
+        // Any other `## ` heading closes the current section (without
+        // emitting a new one) — we only collect Unaddressed-finding
+        // sections.
+        if line.starts_with("## ") {
+            push_current(&mut current, &mut sections);
+            continue;
+        }
+        if let Some((_, body)) = current.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    push_current(&mut current, &mut sections);
+
+    sections
+}
+
+/// Pairing of one review finding with the bellows-side signal "did
+/// this finding's per-finding invocation produce a commit?". The
+/// runner accumulates one of these per `blocker`/`important` finding
+/// as it loops; `compute_coverage_violations` reads the list to
+/// produce the parser-as-backstop's findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingCoverage {
+    pub finding: ParsedFinding,
+    pub commit_landed: bool,
+}
+
+/// The parser-as-backstop. Returns the `blocker`/`important` findings
+/// that have neither an associated commit nor a matching `##
+/// Unaddressed finding: <title>` section in agent-notes.md.
+///
+/// `nit` findings are operator-discretionary and are never violations
+/// (silent skip is explicitly permitted for the nit severity).
+///
+/// Title comparison is verbatim — agents that paraphrase the title in
+/// their agent-notes section do NOT close the loop. This is intentional;
+/// the verbatim contract is what makes the cross-reference deterministic.
+pub fn compute_coverage_violations(
+    coverage: &[FindingCoverage],
+    sections: &[AgentNoteSection],
+) -> Vec<ParsedFinding> {
+    coverage
+        .iter()
+        .filter(|c| matches!(c.finding.severity, Severity::Blocker | Severity::Important))
+        .filter(|c| !c.commit_landed)
+        .filter(|c| !sections.iter().any(|s| s.title == c.finding.title))
+        .map(|c| c.finding.clone())
+        .collect()
+}
+
+/// Build the markdown bellows appends to agent-notes.md when the
+/// parser-as-backstop finds blocker/important findings that the
+/// per-finding agent silently skipped (no commit, no explanation
+/// section). The synthesised entries trigger the existing
+/// `has_agent_notes` → `AgentSelfReportedFailure` precedence in
+/// `classify_exit`, ensuring the run opens as a draft PR with the
+/// `agent-failed` label rather than shipping silently as Success.
+///
+/// Each entry uses the verbatim finding title so a reader can map it
+/// back to the review-findings PR comment. The body identifies bellows
+/// as the author so a human reviewing agent-notes.md doesn't mistake
+/// the synthesised entry for one the agent wrote.
+///
+/// Returns an empty string when there are no violations. The runner
+/// should only call this when violations are present, but the empty
+/// path is defined so a zero-violation call cannot accidentally
+/// produce a header-only stub that would itself route to
+/// AgentSelfReportedFailure.
+pub fn synthesize_unaddressed_entries(violations: &[ParsedFinding]) -> String {
+    if violations.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(
+        "\n\n<!-- bellows parser-as-backstop appended these entries because the per-finding \
+         review-fix invocations exited without addressing the findings in code and without \
+         appending an Unaddressed finding section. The presence of these entries forces the \
+         run to agent-self-reported-failure (draft PR + agent-failed label). -->\n",
+    );
+    for v in violations {
+        out.push_str(&format!(
+            "\n## Unaddressed finding: {title}\n\n\
+             Bellows-synthesised entry. The per-finding review-fix invocation for this \
+             {severity} finding exited without making a commit and without appending its \
+             own `## Unaddressed finding:` section. The address-OR-explain contract requires \
+             one of those; the parser-as-backstop synthesised this entry so the run routes \
+             to agent-self-reported-failure and a human reviewer sees the gap.\n",
+            title = v.title,
+            severity = v.severity.as_tag(),
+        ));
+    }
+    out
+}
+
+/// Build the `### Address-or-explain contract violated` callout that
+/// the runner injects into the PR's run-log comment when the
+/// parser-as-backstop fires. Names each offending finding (verbatim
+/// title + severity) so the operator can see exactly which findings
+/// the per-finding agent silently skipped — surfacing the violation
+/// explicitly is the difference between a confused "why is this
+/// agent-failed?" PR and an actionable "the agent silently skipped
+/// finding X" PR.
+pub fn build_violation_callout(violations: &[ParsedFinding]) -> String {
+    let mut out = String::from("\n### Address-or-explain contract violated\n\n");
+    out.push_str(
+        "The parser-as-backstop detected blocker/important findings that the per-finding \
+         review-fix invocations neither addressed in code nor explained via an `## \
+         Unaddressed finding:` section in agent-notes.md. Bellows synthesised the missing \
+         entries to force this run to agent-self-reported-failure. Offending findings:\n\n",
+    );
+    for v in violations {
+        out.push_str(&format!(
+            "- **{severity}** — {title}\n",
+            severity = v.severity.as_tag(),
+            title = v.title,
+        ));
+    }
+    out
+}
+
+/// Vendored single-nit-batch prompt for the review-fix phase's batched
+/// nit invocation. Permissive: silent skip is explicitly allowed for
+/// nits because the operator already sees every finding in the
+/// review-findings PR comment and can choose whether to follow up.
+pub const BATCH_REVIEW_FIX_NIT_PROMPT: &str = r#"You are running as the **batched nit-fix invocation** of a Bellows agent pipeline. The review phase produced one or more `nit`-severity findings; your job is to address the easy / adjacent ones and skip the rest.
+
+## The permissive contract
+
+`nit` findings are operator-discretionary. You MAY skip a `nit` without explanation — the operator already sees every finding in the review-findings PR comment and can decide whether to follow up. Silent skip IS allowed for nits.
+
+Apply the cheap, in-scope ones. Skip cosmetic findings that would burn time. Do NOT append to agent-notes.md for nits — appending routes the run to agent-self-reported-failure (draft PR + agent-failed label), which is too heavy for a nit you simply chose not to do.
+
+## Inputs
+
+- The list of nit findings is interpolated at the top of this kickoff (one per `### ` block).
+- `/workspace/agent-notes.md` may exist with notes from earlier phases. Read it for context. APPEND only — do not overwrite.
+
+## Process
+
+For each nit finding you decide to address:
+
+1. Read the title, description, and suggestion.
+2. Make the change. Run `cargo check` (or equivalent) after each change to confirm you have not broken compilation.
+3. Commit each fix with a clear, scoped commit message. One commit per finding is ideal so the operator can map fixes back to the review-findings PR comment.
+
+For the nits you skip: do nothing. No note, no commit.
+
+## Stop conditions
+
+Stop when you have made the changes you intend to make and `cargo test` is green. The operator sees the review-findings comment regardless; nothing here is mandatory.
+"#;
+
+/// Build the per-finding `claude -p` kickoff body for a single
+/// `blocker` or `important` finding. Pure function so it can be
+/// unit-tested without spinning up a container.
+///
+/// Renders `REVIEW_FIX_PROMPT` as a template with the specific finding
+/// interpolated. The agent sees exactly one finding — there is no list
+/// to silently skip — and must either address it in code OR append a
+/// `## Unaddressed finding: <verbatim title>` section to
+/// `agent-notes.md`. Severity flavours the urgency line so a `blocker`
+/// reads as more urgent than an `important`.
+///
+/// The `diff_path` and `agent_notes_path` arguments are interpolated
+/// into the inputs section so the agent knows where to read the diff
+/// and where to append the unaddressed-finding section. Passed as
+/// arguments rather than hardcoded so the function stays pure and the
+/// runner can re-use it across phase boundaries.
+pub fn per_finding_kickoff(
+    finding: &ParsedFinding,
+    diff_path: &str,
+    agent_notes_path: &str,
+) -> String {
+    let urgency = match finding.severity {
+        Severity::Blocker => "This is a **blocker**: the change as written is wrong, unsafe, or breaks the brief's acceptance criteria. It MUST be fixed before merge — escalation via the unaddressed-finding section is reserved for genuinely impossible cases, not for cases that are merely hard.",
+        Severity::Important => "This is an **important** finding: a real bug or design flaw that survives the test suite (logic gap, leaked resource, wrong invariant). It must be fixed or escalated via the unaddressed-finding section; it should not silently ship.",
+        // The per-finding path doesn't carry nits — they go through the
+        // batch nit prompt. Guard with permissive wording rather than
+        // panicking so a future caller passing a nit gets a sensible
+        // (if unintended) result.
+        Severity::Nit => "This is a nit: address it if cheap, otherwise skip.",
+    };
+
+    REVIEW_FIX_PROMPT
+        .replace("{title}", &finding.title)
+        .replace("{severity}", finding.severity.as_tag())
+        .replace("{body}", &finding.body)
+        .replace("{urgency}", urgency)
+        .replace("{diff_path}", diff_path)
+        .replace("{agent_notes_path}", agent_notes_path)
+}
 
 /// Render the kickoff prompt that gets fed into `claude -p` inside the
 /// sandbox. Pure function so it can be unit-tested without spinning up
