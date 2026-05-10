@@ -14,6 +14,17 @@
 /// known Anthropic API rate-limit signature. Operator-distinguishable
 /// from `Crash` because the appropriate response is "wait for the
 /// rate-limit window to clear and re-run" rather than "investigate."
+///
+/// `Cancelled` covers a run where `bellows kill <N>` (slice 10) flipped
+/// the issue's label out from under us during the pipeline. The
+/// runner detects this BEFORE opening the PR (via a lightweight GET
+/// on the issue's labels) and overrides the classification so the
+/// PR opens draft + the log body says "Cancelled" rather than
+/// whatever the pipeline-internal signals would have suggested
+/// (commonly `Success` — phases that completed naturally between the
+/// kill firing and the cancellation check would otherwise misclassify
+/// as a successful run, producing a ready-for-review PR a reviewer
+/// could plausibly merge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
     Success,
@@ -22,6 +33,7 @@ pub enum ExitReason {
     FinalTestsRed,
     WallClockExceeded,
     RateLimited,
+    Cancelled,
 }
 
 /// Outcome of the implement run: the first phase, where claude reads
