@@ -1,6 +1,6 @@
 use bellows::policy::{
     classify_exit, is_rate_limit_signature, render_kickoff, CheckResult, ExitReason, GateOutcome,
-    ImplementOutcome, PhaseOutcomes, ReviewOutcome,
+    ImplementOutcome, PhaseOutcomes, ReviewOutcome, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -300,5 +300,105 @@ fn classify_exit_returns_final_tests_red_when_cargo_test_failed() {
     assert_eq!(
         classify_exit(false, &slice5_shaped(0, Some(101))),
         ExitReason::FinalTestsRed
+    );
+}
+
+#[test]
+fn review_prompt_locks_severity_vocabulary_as_closed_set() {
+    // The review prompt must declare the severity vocabulary as a closed
+    // set of exactly three values. Without this, the implement-side agent
+    // can invent its own severity tags ("medium", "minor", "follow-up")
+    // and the review-fix agent's address-OR-explain rule — keyed on
+    // `blocker` and `important` — silently fails to bind.
+    assert!(
+        REVIEW_PROMPT.contains("blocker | important | nit"),
+        "REVIEW_PROMPT must declare the severity vocabulary blocker|important|nit: {REVIEW_PROMPT}"
+    );
+    assert!(
+        REVIEW_PROMPT.contains("use exactly one of these three values"),
+        "REVIEW_PROMPT must instruct exactly-one-of-three: {REVIEW_PROMPT}"
+    );
+}
+
+#[test]
+fn review_prompt_example_demonstrates_each_severity() {
+    // The example findings block in the prompt must show one of each
+    // severity so the agent has a concrete template, not just an abstract
+    // grammar. Without an example, agents tend to default to one severity
+    // (usually the harshest available) and the gradient collapses.
+    assert!(
+        REVIEW_PROMPT.contains("— blocker"),
+        "REVIEW_PROMPT example must include a blocker-tagged finding: {REVIEW_PROMPT}"
+    );
+    assert!(
+        REVIEW_PROMPT.contains("— important"),
+        "REVIEW_PROMPT example must include an important-tagged finding: {REVIEW_PROMPT}"
+    );
+    assert!(
+        REVIEW_PROMPT.contains("— nit"),
+        "REVIEW_PROMPT example must include a nit-tagged finding: {REVIEW_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_makes_blocker_and_important_findings_mandatory() {
+    // The address-OR-explain contract: imperative MUST language for the
+    // top two severities so silent skip is prompt-out-of-bounds. PR #26
+    // motivated this — the agent silently skipped an `important` finding
+    // and committed nothing; the maintainer caught it manually.
+    assert!(
+        REVIEW_FIX_PROMPT.contains("MUST"),
+        "REVIEW_FIX_PROMPT must use imperative MUST language: {REVIEW_FIX_PROMPT}"
+    );
+    assert!(
+        REVIEW_FIX_PROMPT.contains("blocker") && REVIEW_FIX_PROMPT.contains("important"),
+        "REVIEW_FIX_PROMPT must reference both blocker and important severities: {REVIEW_FIX_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_permits_silent_skip_of_nit_findings() {
+    // The address-OR-explain rule binds blocker and important. `nit`
+    // findings are explicitly opt-in: skipping one without a note is
+    // fine because the operator already sees the review-findings PR
+    // comment and can decide whether to follow up. The prompt must say
+    // so — otherwise the imperative language bleeds into nit territory
+    // and the agent burns time on cosmetic findings.
+    let lower = REVIEW_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("nit"),
+        "REVIEW_FIX_PROMPT must mention nit severity: {REVIEW_FIX_PROMPT}"
+    );
+    assert!(
+        lower.contains("skip") || lower.contains("without explanation"),
+        "REVIEW_FIX_PROMPT must explicitly permit skipping nit findings: {REVIEW_FIX_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_documents_agent_self_reported_failure_routing() {
+    // The agent must understand the consequence of appending to
+    // agent-notes.md: it routes the run to AgentSelfReportedFailure
+    // (draft PR with the agent-failed label). Without this, the prompt
+    // reads as "write a note when stuck" which understates the signal —
+    // appending IS the escalation, and the agent should reach for it
+    // deliberately.
+    let lower = REVIEW_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("agent-self-reported-failure")
+            || lower.contains("draft pr with agent-failed label"),
+        "REVIEW_FIX_PROMPT must surface the agent-self-reported-failure routing consequence: {REVIEW_FIX_PROMPT}"
+    );
+}
+
+#[test]
+fn review_fix_prompt_preserves_commit_per_finding_convention() {
+    // The "one commit per finding" convention from the prior prompt must
+    // survive this rewrite — operator-side review depends on per-finding
+    // commits to map fixes back to the review-findings PR comment.
+    assert!(
+        REVIEW_FIX_PROMPT.contains("commit per finding")
+            || REVIEW_FIX_PROMPT.contains("one commit per finding"),
+        "REVIEW_FIX_PROMPT must preserve the commit-per-finding convention: {REVIEW_FIX_PROMPT}"
     );
 }
