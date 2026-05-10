@@ -126,19 +126,29 @@ async fn run(config_path: &PathBuf) -> Result<()> {
     // Docker daemon shouldn't prevent bellows from running. Note that
     // GitHub issues stuck at agent-in-progress from the killed run
     // are NOT auto-reclaimed; the operator re-labels manually.
+    //
+    // Per-orphan lines are routed through `log()` so the operator
+    // running bellows interactively sees *which* container was cleaned
+    // up, not just the summary count.
     match bollard::Docker::connect_with_local_defaults() {
         Ok(docker) => {
             match sandbox::cleanup_orphan_containers(&docker, &mut log_file).await {
-                Ok(0) => log(
+                Ok(lines) if lines.is_empty() => log(
                     &mut log_file,
                     "bellows: no orphan containers from prior runs",
                 ),
-                Ok(n) => log(
-                    &mut log_file,
-                    &format!(
-                        "bellows: cleaned up {n} orphan containers from prior runs (any GitHub issues stuck at agent-in-progress need manual re-labelling to retry)",
-                    ),
-                ),
+                Ok(lines) => {
+                    for line in &lines {
+                        log(&mut log_file, line);
+                    }
+                    log(
+                        &mut log_file,
+                        &format!(
+                            "bellows: cleaned up {} orphan containers from prior runs (any GitHub issues stuck at agent-in-progress need manual re-labelling to retry)",
+                            lines.len(),
+                        ),
+                    );
+                }
                 Err(e) => log(
                     &mut log_file,
                     &format!(

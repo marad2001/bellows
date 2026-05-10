@@ -597,13 +597,19 @@ fn orphan_info_from_labels(id: &str, labels: &HashMap<String, String>) -> Orphan
 /// manually re-labels them — auto-reclaim could replay a partially-
 /// completed run on stale workspace state.
 ///
-/// Errors are best-effort: a failure removing one container is logged
-/// but doesn't stop the function attempting the rest. Returns the
-/// count of orphans successfully removed.
+/// Returns one already-formatted log line per successfully-removed
+/// orphan so the caller (main.rs) can route them through its own
+/// `log()` helper that fans out to both stdout and the log file —
+/// the operator running bellows interactively wants to see *which*
+/// container was cleaned up at a glance, not just a count.
+///
+/// Per-removal failures are logged to `log_writer` directly (file-
+/// only path) and do NOT stop the function attempting the rest;
+/// they're absent from the returned Vec.
 pub async fn cleanup_orphan_containers(
     docker: &Docker,
     log_writer: &mut dyn Write,
-) -> Result<usize, SandboxError> {
+) -> Result<Vec<String>, SandboxError> {
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
     filters.insert(
         "label".to_string(),
@@ -617,7 +623,7 @@ pub async fn cleanup_orphan_containers(
     let containers = docker.list_containers(Some(options)).await?;
     let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
 
-    let mut removed = 0usize;
+    let mut success_lines = Vec::new();
     for c in containers {
         let Some(id) = c.id else {
             continue;
@@ -629,8 +635,7 @@ pub async fn cleanup_orphan_containers(
             .await
         {
             Ok(()) => {
-                let _ = writeln!(log_writer, "{}", format_orphan_log_line(&info));
-                removed += 1;
+                success_lines.push(format_orphan_log_line(&info));
             }
             Err(e) => {
                 let _ = writeln!(
@@ -641,7 +646,7 @@ pub async fn cleanup_orphan_containers(
             }
         }
     }
-    Ok(removed)
+    Ok(success_lines)
 }
 
 #[cfg(test)]
