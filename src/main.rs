@@ -1154,6 +1154,192 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
+    fn cli_parses_setup_deploy_keys_add_with_default_ssh_host() {
+        // Issue #69 (ADR-0002) AC3 acceptance: `bellows
+        // setup-deploy-keys add <name>` parses with the ssh-host
+        // defaulting to `github.com`. The name is positional; the
+        // host is an optional `--ssh-host <host>` flag.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "add", "workboard-core"])
+            .expect("bellows setup-deploy-keys add <name> must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Add { name, ssh_host },
+            }) => {
+                assert_eq!(name, "workboard-core");
+                assert_eq!(ssh_host, "github.com", "default ssh-host must be github.com");
+            }
+            other => panic!("expected SetupDeployKeys::Add, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_add_with_explicit_ssh_host() {
+        // Acceptance: operators with self-hosted git servers can
+        // override the ssh-host via `--ssh-host`.
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "setup-deploy-keys",
+            "add",
+            "my-key",
+            "--ssh-host",
+            "git.example.com",
+        ])
+        .expect("bellows setup-deploy-keys add --ssh-host must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Add { name, ssh_host },
+            }) => {
+                assert_eq!(name, "my-key");
+                assert_eq!(ssh_host, "git.example.com");
+            }
+            _ => panic!("expected SetupDeployKeys::Add with custom ssh_host"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_list_subcommand() {
+        // Acceptance AC4: `bellows setup-deploy-keys list` must parse.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "list"])
+            .expect("bellows setup-deploy-keys list must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::List,
+            }) => {}
+            _ => panic!("expected SetupDeployKeys::List"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_remove_subcommand() {
+        // Acceptance AC5: `bellows setup-deploy-keys remove <name>`
+        // must parse, name is positional.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "remove", "workboard-core"])
+            .expect("bellows setup-deploy-keys remove <name> must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Remove { name },
+            }) => assert_eq!(name, "workboard-core"),
+            _ => panic!("expected SetupDeployKeys::Remove"),
+        }
+    }
+
+    #[test]
+    fn cli_help_lists_setup_deploy_keys_subcommand() {
+        // The new subcommand is discoverable from `bellows --help`.
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("setup-deploy-keys"),
+            "top-level --help must list setup-deploy-keys: {help}"
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_writes_to_volume_with_mode_600() {
+        // Acceptance AC3 pinning: the add script must (a) read stdin
+        // and write to /sshvol/<name>, (b) chmod 600 the result, and
+        // (c) idempotently ensure the Host stanza is in /sshvol/config
+        // pointing at IdentityFile /home/bellows/.ssh/<name> with
+        // IdentitiesOnly yes, (d) seed known_hosts via ssh-keyscan.
+        let script = build_deploy_keys_add_script("workboard-core", "github.com");
+        // (a) writes to /sshvol/<name>
+        assert!(
+            script.contains("/sshvol/workboard-core"),
+            "add script must write to /sshvol/<name>: {script}",
+        );
+        // (b) chmod 600
+        assert!(
+            script.contains("chmod 600"),
+            "add script must chmod 600 the key file: {script}",
+        );
+        // (c) Host stanza pointing at the in-container path
+        assert!(
+            script.contains("Host github.com"),
+            "add script must add Host stanza: {script}",
+        );
+        assert!(
+            script.contains("IdentityFile /home/bellows/.ssh/workboard-core"),
+            "Host stanza must reference the in-container identity path: {script}",
+        );
+        assert!(
+            script.contains("IdentitiesOnly yes"),
+            "Host stanza must include IdentitiesOnly yes: {script}",
+        );
+        // (d) ssh-keyscan seeds known_hosts
+        assert!(
+            script.contains("ssh-keyscan"),
+            "add script must seed known_hosts via ssh-keyscan: {script}",
+        );
+        assert!(
+            script.contains("github.com"),
+            "ssh-keyscan must target the configured host: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_is_idempotent_on_repeated_invocations() {
+        // Acceptance AC3: "Idempotent on subsequent adds." Pin the
+        // contract: the script must guard the Host-stanza append (and
+        // the known_hosts seeding) so running add twice for the same
+        // key doesn't duplicate either.
+        let script = build_deploy_keys_add_script("my-key", "github.com");
+        // The script must consult the config before appending — easiest
+        // shape is a grep for the IdentityFile line. Asserting `grep`
+        // or `if !` (or equivalent existence check against the config
+        // path) keeps the implementation free to use either while
+        // pinning the idempotence contract.
+        let lower = script.to_lowercase();
+        assert!(
+            lower.contains("grep") || lower.contains("if [") || lower.contains("if !"),
+            "add script must guard the Host append so it stays idempotent: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_remove_script_removes_key_and_host_stanza() {
+        // Acceptance AC5: remove must delete /sshvol/<name> AND the
+        // matching Host stanza from /sshvol/config. Idempotent on
+        // missing key.
+        let script = build_deploy_keys_remove_script("workboard-core");
+        assert!(
+            script.contains("/sshvol/workboard-core"),
+            "remove script must target the key file: {script}",
+        );
+        assert!(
+            script.contains("rm -f") || script.contains("rm --force"),
+            "remove must use -f so missing key is not an error: {script}",
+        );
+        // The config edit needs to know the IdentityFile path so it
+        // can locate the matching Host stanza.
+        assert!(
+            script.contains("/home/bellows/.ssh/workboard-core"),
+            "remove script must reference the in-container identity path to locate the Host stanza: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_list_script_emits_filenames_and_host_stanzas() {
+        // Acceptance AC4: list prints key filenames + Host stanzas
+        // from /sshvol/config. Operator who's lost track of which
+        // keys live in the volume runs this; the output is the
+        // tracking shape.
+        let script = build_deploy_keys_list_script();
+        assert!(
+            script.contains("ls") || script.contains("find"),
+            "list must enumerate files in /sshvol: {script}",
+        );
+        assert!(
+            script.contains("/sshvol"),
+            "list must operate inside /sshvol: {script}",
+        );
+        // The config has the Host stanzas; surfacing it is the whole
+        // point of `list` (per the brief).
+        assert!(
+            script.contains("config"),
+            "list must include the config file: {script}",
+        );
+    }
+
+    #[test]
     fn cli_parses_refresh_auth_subcommand() {
         // The new sibling subcommand must parse — operator typing
         // `bellows refresh-auth` should not be rejected by clap.
