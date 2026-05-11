@@ -920,12 +920,18 @@ async fn status_cmd() -> Result<()> {
 /// silently dropping a required step.
 fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
     let identity = format!("/home/bellows/.ssh/{name}");
-    // Note: the Host-stanza body uses `\\n` (escaped) because the
-    // outer Rust raw-ish format includes the literal backslash-n that
-    // `printf` then expands to a real newline at shell runtime.
-    // Idempotence comes from `grep -F -q` guards so re-running `add`
-    // for the same key does not duplicate the Host stanza or the
-    // known_hosts entry.
+    // Notes on idempotence:
+    //   * the Host-stanza guard greps for the unique IdentityFile
+    //     line, which is plaintext in `/sshvol/config`;
+    //   * the known_hosts guard uses `ssh-keygen -F` rather than
+    //     plain `grep`, because `ssh-keyscan -H` hashes hostnames in
+    //     its output (`|1|<b64>|<b64> ssh-ed25519 ...`) so a plain
+    //     `grep -F 'github.com '` would never match and every re-run
+    //     would append another triplet. `ssh-keygen -F` is the
+    //     canonical search and resolves hashed entries.
+    // The Host-stanza body uses `\\n` (escaped) because the outer Rust
+    // format includes the literal backslash-n that `printf` then
+    // expands to a real newline at shell runtime.
     format!(
         "set -e\n\
          umask 077\n\
@@ -938,7 +944,7 @@ fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
          fi\n\
          touch /sshvol/known_hosts\n\
          chmod 644 /sshvol/known_hosts\n\
-         if ! grep -F -q '{ssh_host} ' /sshvol/known_hosts; then\n\
+         if ! ssh-keygen -F {ssh_host} -f /sshvol/known_hosts >/dev/null 2>&1; then\n\
              ssh-keyscan -H {ssh_host} >> /sshvol/known_hosts 2>/dev/null\n\
          fi\n",
         name = name,
@@ -1504,19 +1510,38 @@ mod tests {
     #[test]
     fn build_deploy_keys_add_script_is_idempotent_on_repeated_invocations() {
         // Acceptance AC3: "Idempotent on subsequent adds." Pin the
-        // contract: the script must guard the Host-stanza append (and
-        // the known_hosts seeding) so running add twice for the same
-        // key doesn't duplicate either.
+        // contract: the script must guard BOTH the Host-stanza append
+        // AND the known_hosts seeding so running add twice for the
+        // same key doesn't duplicate either.
         let script = build_deploy_keys_add_script("my-key", "github.com");
-        // The script must consult the config before appending — easiest
-        // shape is a grep for the IdentityFile line. Asserting `grep`
-        // or `if !` (or equivalent existence check against the config
-        // path) keeps the implementation free to use either while
-        // pinning the idempotence contract.
-        let lower = script.to_lowercase();
+
+        // Host-stanza guard: the IdentityFile path is unique to this
+        // key, so greping for it before appending is the canonical
+        // shape.
         assert!(
-            lower.contains("grep") || lower.contains("if [") || lower.contains("if !"),
-            "add script must guard the Host append so it stays idempotent: {script}",
+            script.contains("grep -F -q 'IdentityFile /home/bellows/.ssh/my-key'"),
+            "Host-stanza append must be guarded by a grep for the unique IdentityFile line: {script}",
+        );
+
+        // known_hosts guard: ssh-keyscan -H hashes hostnames in its
+        // output (`|1|<b64>|<b64> ssh-ed25519 ...`) so a plain
+        // `grep -F 'github.com '` against the file will never match
+        // and every re-run will append another triplet. The guard
+        // must use `ssh-keygen -F` (which resolves hashed entries) or
+        // drop `-H` so plaintext matching works.
+        let uses_hashed_keyscan = script.contains("ssh-keyscan -H");
+        let uses_keygen_search = script.contains("ssh-keygen -F github.com");
+        let uses_broken_plain_grep_guard = script
+            .contains("grep -F -q 'github.com ' /sshvol/known_hosts");
+        assert!(
+            !uses_broken_plain_grep_guard,
+            "known_hosts guard `grep -F 'github.com '` cannot match hashed entries written by `ssh-keyscan -H` — \
+             every re-run will re-append. Use `ssh-keygen -F` instead, or drop `-H` from ssh-keyscan: {script}",
+        );
+        assert!(
+            uses_keygen_search || !uses_hashed_keyscan,
+            "known_hosts guard must locate entries written by `ssh-keyscan -H` (hashed) — \
+             use `ssh-keygen -F <host>` to search, or drop `-H` so plaintext matching works: {script}",
         );
     }
 
