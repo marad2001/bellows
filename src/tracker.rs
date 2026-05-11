@@ -31,11 +31,13 @@ pub struct Issue {
 /// Read-only bundle of issue state the triage agent sees in
 /// `/workspace/.bellows-triage-input.md`. Carries the issue body,
 /// the title (so the agent doesn't have to infer from the body),
-/// the current label set, and the full ordered comment history.
+/// the current label set, and the first 100 ordered comments.
 /// Order matters: a prior triage `needs-info` note may have asked a
 /// question that a later reporter comment answers — the agent must
 /// see the answer-after-the-question sequence to reach the right
-/// verdict on re-triage.
+/// verdict on re-triage. On very long issues (>100 comments) the
+/// newest comments past the page-1 cap may not be visible to the
+/// agent; see `fetch_issue_with_comments` for the rationale.
 #[derive(Debug, Clone)]
 pub struct IssueBundle {
     pub number: u64,
@@ -65,15 +67,18 @@ struct ListIssueCommentsParams {
     per_page: u32,
 }
 
-/// Fetch the issue body, labels, title, and full comment history for
-/// triage. Used by `bellows triage <N>` to build the in-container
+/// Fetch the issue body, labels, title, and the first 100 comments
+/// for triage. Used by `bellows triage <N>` to build the in-container
 /// input bundle. The container has no GitHub credentials — bellows
 /// owns this fetch on the host side and writes the result to a
 /// workspace file the agent reads.
 ///
 /// Comments come back in API-default order (oldest-first on the
 /// public GitHub API), which is the order a human reading the issue
-/// would see them.
+/// would see them. The `per_page=100` cap (with no follow-up
+/// pagination) matches the rest of bellows's GitHub-list calls; on
+/// the rare issue with >100 comments the newest comments past page 1
+/// will not be visible to the triage agent.
 pub async fn fetch_issue_with_comments(
     client: &octocrab::Octocrab,
     owner: &str,
