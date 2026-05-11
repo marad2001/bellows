@@ -2,10 +2,12 @@ use bellows::policy::{
     build_violation_callout, classify_exit, compute_coverage_violations, has_new_tests,
     is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections, parse_findings,
     per_finding_kickoff, render_kickoff, synthesize_implement_crash_entry,
-    synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection, CheckResult,
-    ExitReason, FindingCoverage, GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes,
-    ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE,
-    REVIEW_COMMIT_LOG_FILE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection,
+    AnalysisOutcome, CheckResult, ExitReason, FindingCoverage, FixOutcome, GateOutcome,
+    ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome, Severity,
+    BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE, REVIEW_COMMIT_LOG_FILE,
+    REVIEW_FIX_PROMPT, REVIEW_PROMPT, SECURITY_FINDINGS_FILE, SECURITY_FIX_PROMPT,
+    SECURITY_REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -70,6 +72,8 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -93,6 +97,8 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     }
 }
 
@@ -156,6 +162,8 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::WallClockExceeded);
 }
@@ -243,6 +251,8 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::RateLimited);
 }
@@ -269,6 +279,8 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -290,6 +302,8 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -313,6 +327,8 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -337,6 +353,8 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -1420,6 +1438,8 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: true,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -1459,6 +1479,8 @@ fn classify_exit_implement_crash_synth_preserves_agent_self_reported_failure_whe
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: true,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -1489,6 +1511,8 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -1657,4 +1681,251 @@ test commit, OR append an `## Unaddressed finding:` section to agent-notes.md.
         "verbatim-title section must close the address-or-explain loop for the \
          test-first finding: {violations:?}"
     );
+}
+
+
+// ---- Slice X2: security-review and security-fix prompt locks ----
+
+#[test]
+fn security_review_prompt_documents_diff_input_and_findings_output_paths() {
+    // Acceptance criterion (brief): SECURITY_REVIEW_PROMPT must instruct
+    // the agent to read `.bellows-review-diff.patch` (regenerated
+    // post-review-fix) and write findings to `.bellows-security-findings.md`.
+    // Without these path locks the runner-side handoff breaks: the agent
+    // would write findings to a path bellows doesn't read, or read from a
+    // path that no longer reflects the post-fix workspace state.
+    assert!(
+        SECURITY_REVIEW_PROMPT.contains(".bellows-review-diff.patch"),
+        "SECURITY_REVIEW_PROMPT must name the diff input file: {SECURITY_REVIEW_PROMPT}",
+    );
+    assert!(
+        SECURITY_REVIEW_PROMPT.contains(".bellows-security-findings.md"),
+        "SECURITY_REVIEW_PROMPT must name the findings output file: {SECURITY_REVIEW_PROMPT}",
+    );
+}
+
+#[test]
+fn security_review_prompt_names_five_focus_categories() {
+    // Acceptance criterion (brief): "Focus categories: input validation,
+    // auth, crypto, injection, data exposure". Naming each category
+    // explicitly in the prompt is the only way to keep the security
+    // review's scope tight — without enumeration the agent would drift
+    // into general code review and dilute the signal.
+    let lower = SECURITY_REVIEW_PROMPT.to_lowercase();
+    assert!(lower.contains("input validation"), "missing category: input validation");
+    assert!(
+        lower.contains("authentication") || lower.contains("authorisation") || lower.contains("authorization") || lower.contains("auth"),
+        "missing category: auth",
+    );
+    assert!(
+        lower.contains("cryptograph") || lower.contains("crypto"),
+        "missing category: crypto",
+    );
+    assert!(lower.contains("injection"), "missing category: injection");
+    assert!(
+        lower.contains("data exposure") || lower.contains("secret"),
+        "missing category: data exposure",
+    );
+}
+
+#[test]
+fn security_review_prompt_locks_same_severity_vocabulary_as_review() {
+    // The brief: write findings "in the same markdown format as review
+    // findings (so the existing finding-parser machinery, if reused,
+    // applies cleanly)". That implies the same closed severity
+    // vocabulary so `parse_findings` round-trips security findings
+    // identically.
+    assert!(
+        SECURITY_REVIEW_PROMPT.contains("blocker | important | nit"),
+        "SECURITY_REVIEW_PROMPT must use the same severity vocabulary as REVIEW_PROMPT: {SECURITY_REVIEW_PROMPT}",
+    );
+}
+
+#[test]
+fn security_review_prompt_instructs_agent_notes_append_when_unclear() {
+    // Acceptance criterion (brief): the agent must append to
+    // `agent-notes.md` if any finding can't be expressed cleanly.
+    // The prompt must spell out the APPEND-not-overwrite contract so a
+    // partial security-review run doesn't clobber implementation /
+    // review notes already in the file.
+    let lower = SECURITY_REVIEW_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("agent-notes.md") || lower.contains("agent notes"),
+        "SECURITY_REVIEW_PROMPT must reference agent-notes.md: {SECURITY_REVIEW_PROMPT}",
+    );
+    assert!(
+        lower.contains("append"),
+        "SECURITY_REVIEW_PROMPT must explicitly tell the agent to APPEND, not overwrite: {SECURITY_REVIEW_PROMPT}",
+    );
+}
+
+#[test]
+fn security_review_prompt_is_read_only() {
+    // Same contract as REVIEW_PROMPT: the security-review phase is
+    // read-only and must not commit, push, or edit files outside the
+    // findings file + agent-notes.md. Without this lock the phase could
+    // drift into "fix and review" semantics and collide with the
+    // dedicated security-fix phase.
+    let lower = SECURITY_REVIEW_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("read-only") || lower.contains("read only"),
+        "SECURITY_REVIEW_PROMPT must declare the phase read-only: {SECURITY_REVIEW_PROMPT}",
+    );
+    assert!(
+        lower.contains("do not create commits") || lower.contains("not create commits") || lower.contains("not commit") || lower.contains("no commits"),
+        "SECURITY_REVIEW_PROMPT must forbid committing: {SECURITY_REVIEW_PROMPT}",
+    );
+}
+
+#[test]
+fn security_fix_prompt_documents_findings_path_and_removal_step() {
+    // Acceptance criterion (brief): "read findings, address each, commit
+    // each fix, remove the findings file". The prompt must name the
+    // findings file path AND the removal step — without removal, the
+    // file would survive into the PR diff (the defensive cleanup is a
+    // backstop, not the primary contract).
+    assert!(
+        SECURITY_FIX_PROMPT.contains(".bellows-security-findings.md"),
+        "SECURITY_FIX_PROMPT must name the findings file: {SECURITY_FIX_PROMPT}",
+    );
+    let lower = SECURITY_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("remove") || lower.contains("delete"),
+        "SECURITY_FIX_PROMPT must instruct removal of the findings file: {SECURITY_FIX_PROMPT}",
+    );
+}
+
+#[test]
+fn security_fix_prompt_preserves_commit_per_finding_convention() {
+    // Mirrors REVIEW_FIX_PROMPT: one commit per finding so the operator
+    // can map fixups back to the security-findings PR comment.
+    assert!(
+        SECURITY_FIX_PROMPT.contains("commit per finding")
+            || SECURITY_FIX_PROMPT.contains("one commit per finding"),
+        "SECURITY_FIX_PROMPT must preserve the commit-per-finding convention: {SECURITY_FIX_PROMPT}",
+    );
+}
+
+#[test]
+fn security_fix_prompt_routes_unaddressable_findings_through_agent_notes_section() {
+    // Acceptance criterion (brief): "append to agent-notes.md if any
+    // finding can't be addressed." The prompt must demand the verbatim
+    // `## Unaddressed finding: <title>` header so a future parser-as-
+    // backstop could cross-reference the same way the review-fix path
+    // does.
+    assert!(
+        SECURITY_FIX_PROMPT.contains("## Unaddressed finding:"),
+        "SECURITY_FIX_PROMPT must spell out the canonical Unaddressed-finding header: {SECURITY_FIX_PROMPT}",
+    );
+    let lower = SECURITY_FIX_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("verbatim"),
+        "SECURITY_FIX_PROMPT must require verbatim title for the section header: {SECURITY_FIX_PROMPT}",
+    );
+}
+
+#[test]
+fn security_findings_file_const_is_a_bellows_internal_dotfile() {
+    // The findings file must use the `.bellows-` prefix so the
+    // workspace's `.git/info/exclude` rule keeps it out of `git add -A`.
+    // Same contract as `REVIEW_FINDINGS_FILE` and `REVIEW_DIFF_FILE`.
+    assert!(
+        SECURITY_FINDINGS_FILE.starts_with(".bellows-"),
+        "SECURITY_FINDINGS_FILE must use the `.bellows-` prefix to stay excluded from commits: {SECURITY_FINDINGS_FILE}",
+    );
+}
+
+#[test]
+fn parse_findings_round_trips_a_security_finding_via_the_same_parser() {
+    // Acceptance criterion (brief): "same markdown format as review
+    // findings (so the existing finding-parser machinery applies
+    // cleanly)". Pin the round-trip here so a future "tidy up the
+    // security prompt" PR cannot accidentally drift away from the
+    // shared format.
+    let text = "\
+## Findings
+
+### 1. shell call interpolates untrusted branch name — blocker
+
+`format!(\"git log {}\", branch_name)` is passed straight to a shell, so an attacker-controlled branch name like `master; rm -rf /` would execute verbatim.
+
+**Suggestion:** call `git` with `args([...])` instead of building a shell string.
+";
+    let result = parse_findings(text);
+    assert!(
+        result.malformed_titles.is_empty(),
+        "security finding must parse cleanly via the shared parser: {:?}",
+        result.malformed_titles,
+    );
+    assert_eq!(result.findings.len(), 1);
+    let f = &result.findings[0];
+    assert_eq!(f.severity, Severity::Blocker);
+    assert_eq!(f.title, "shell call interpolates untrusted branch name");
+}
+
+#[test]
+fn analysis_outcome_default_construction_in_phase_outcomes_holds_security_as_none() {
+    // PhaseOutcomes::default() must leave the new security fields as
+    // None so existing helpers that produce a base outcomes via Default
+    // (or set only the fields they care about) continue to compile and
+    // behave as if the security phases simply didn't run.
+    let outcomes = PhaseOutcomes::default();
+    assert!(outcomes.security.is_none(), "default security must be None");
+    assert!(outcomes.security_fix.is_none(), "default security_fix must be None");
+}
+
+#[test]
+fn classify_exit_returns_success_for_clean_security_review_and_fix() {
+    // Acceptance criterion (a) from the brief: security with findings +
+    // successful fix → Success. The existing classify_exit precedence
+    // chain must not regress; clean security outcomes do not flip the
+    // routing.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: Some(ReviewOutcome { findings_text: None, exit_code: 0 }),
+        review_fix: None,
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        }),
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: Some(AnalysisOutcome {
+            findings_text: Some("findings".to_string()),
+            exit_code: 0,
+        }),
+        security_fix: Some(FixOutcome { exit_code: 0 }),
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
+}
+
+#[test]
+fn classify_exit_security_review_clean_with_no_findings_is_success() {
+    // Acceptance criterion (d) from the brief: empty / missing security
+    // findings file short-circuits the security-fix run cleanly as a
+    // success path.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        }),
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: Some(AnalysisOutcome { findings_text: None, exit_code: 0 }),
+        security_fix: None,
+    };
+    assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }

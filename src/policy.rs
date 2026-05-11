@@ -70,6 +70,21 @@ pub struct ReviewOutcome {
     pub exit_code: i64,
 }
 
+/// Outcome of a generic analysis phase that reads a diff and writes a
+/// findings file (slice X2: security-review). Same shape as
+/// `ReviewOutcome` but kept as a distinct type so `PhaseOutcomes` carries
+/// a clearly-named field for each phase — a glance at the struct shows
+/// which phase produced which signal.
+///
+/// `findings_text` is `Some` when the phase produced a non-empty findings
+/// file; `None` means the analysis found nothing to flag (clean diff) and
+/// the runner skipped the corresponding fix phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisOutcome {
+    pub findings_text: Option<String>,
+    pub exit_code: i64,
+}
+
 /// Outcome of the review-fix phase. Only present in `PhaseOutcomes` when
 /// review produced findings and the fix run was actually launched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +106,18 @@ pub struct PhaseOutcomes {
     pub post_implement_gate: GateOutcome,
     pub review: Option<ReviewOutcome>,
     pub review_fix: Option<FixOutcome>,
+    /// Slice X2: outcome of the security-review phase. Sits between
+    /// review-fix and the end-of-pipeline cargo gate; reads the
+    /// post-review-fix diff and writes findings to
+    /// `SECURITY_FINDINGS_FILE`. `None` when the runner halted before
+    /// the security-review phase ran (e.g. implement crashed,
+    /// post-implement gate failed, or review/review-fix crashed).
+    pub security: Option<AnalysisOutcome>,
+    /// Slice X2: outcome of the security-fix phase. Only present when
+    /// the security-review phase produced findings AND the fix run was
+    /// actually launched. `None` means either no findings to fix or the
+    /// runner halted before the fix phase could run.
+    pub security_fix: Option<FixOutcome>,
     pub end_pipeline_gate: Option<GateOutcome>,
     /// True when the runner short-circuited the pipeline because the
     /// per-issue wall-clock budget was exceeded — either the budget hit
@@ -232,6 +259,15 @@ pub const REVIEW_DIFF_FILE: &str = ".bellows-review-diff.patch";
 /// contents as a `## Review findings` PR comment. Review-fix removes
 /// the file when all findings are addressed.
 pub const REVIEW_FINDINGS_FILE: &str = ".bellows-review-findings.md";
+
+/// Workspace-relative path of the findings file the security-review
+/// prompt writes (slice X2). Sibling of `REVIEW_FINDINGS_FILE`, but for
+/// the security-review phase: the runner reads it after the
+/// security-review run and posts the contents as a `## Security findings`
+/// PR comment. The security-fix phase removes the file when all findings
+/// are addressed; defensive cleanup at the end of the pipeline catches
+/// any leftover so the file never lands in the PR diff.
+pub const SECURITY_FINDINGS_FILE: &str = ".bellows-security-findings.md";
 
 /// Workspace-relative path of the commit-log file the runner writes
 /// before the review phase. Read-only input to the review prompt
@@ -390,6 +426,119 @@ Reach for the unaddressed-finding section deliberately. It is not a "didn't get 
 ## Stop conditions
 
 Stop when EITHER (1) you committed a code fix AND `cargo check` is green, OR (2) you appended the `## Unaddressed finding: {title}` section to `/workspace/{agent_notes_path}`.
+"#;
+
+/// Vendored security-review-phase prompt (slice X2). Sibling of
+/// `REVIEW_PROMPT`. Same input file (`REVIEW_DIFF_FILE`, regenerated from
+/// the post-review-fix workspace state so it reflects review fixups) and
+/// the same markdown findings format (so the existing finding-parser
+/// machinery applies cleanly), but the analysis scope is the five
+/// security focus categories: input validation, authentication, crypto,
+/// injection, and data exposure.
+pub const SECURITY_REVIEW_PROMPT: &str = r#"You are running as the **security-review phase** of a Bellows agent pipeline. The implement → review → review-fix phases have already run; your job is to review the resulting diff for security concerns.
+
+## Focus categories (closed list)
+
+Look for issues in exactly these five categories. Do not expand the scope:
+
+1. **Input validation** — untrusted input flowing into parsers, file paths, command arguments, or deserialisation without bounds checks, sanitisation, or whitelisting.
+2. **Authentication and authorisation** — missing auth checks, hard-coded credentials, weakened-on-error fallbacks, broken session handling, token leakage in logs.
+3. **Cryptography** — broken or homegrown crypto, hard-coded keys, weak hash algorithms, missing integrity checks, predictable nonces or random sources.
+4. **Injection** — command, SQL, shell, or template injection via string interpolation that mixes untrusted input with code paths.
+5. **Data exposure** — secrets in logs, error messages, or commit content; sensitive data written to world-readable locations; PII or credentials traversing unintended boundaries.
+
+A finding outside these five categories is out of scope for this phase — flag it as a `## Unaddressed finding` section in agent-notes.md only if it materially blocks the review, otherwise leave it for the standard review phase.
+
+## Inputs
+
+- `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` regenerated from the POST-review-fix workspace state — the entire delta the implement + review-fix phases produced. Read this file as the primary input. Do not browse the wider codebase except to disambiguate symbols referenced in the diff.
+- `/workspace/agent-notes.md` may exist (prior phases may have appended to it). Read it for context on deliberate gaps or known limitations.
+
+## Output
+
+Write your findings to `/workspace/.bellows-security-findings.md` in the SAME markdown format as the review phase. Each finding's title line MUST end with ` — ` followed by exactly one severity tag drawn from the closed vocabulary `blocker | important | nit` — use exactly one of these three values, never invent another tag (no "medium", "minor", "follow-up", etc.). The downstream security-fix phase keys on these exact strings.
+
+Additional title-format constraints (same load-bearing rules as the review phase, so the same parser machinery applies):
+
+- The title MUST be on one line. No line breaks inside a title.
+- The title line MUST end with ` — <tag>` (space, em-dash, space, then the severity tag).
+- The title MUST NOT contain markdown links or backticks. Plain prose only.
+
+Severity meanings (same closed vocabulary as the review phase):
+
+- `blocker` — the change as written introduces a security vulnerability that must be fixed before merge.
+- `important` — a real security weakness that survives the test suite (missing validation, weak auth boundary, leaked secret). Must be fixed or escalated.
+- `nit` — minor hardening opportunity (defence-in-depth, naming, comment). Operator-discretionary.
+
+Example findings file:
+
+```
+## Findings
+
+### 1. shell call interpolates untrusted input without escaping — blocker
+
+`src/runner.rs` constructs `format!("git log {}", branch_name)` and passes it to `Command::new("sh").arg("-c").arg(...)`; an attacker-controlled branch name like `master; rm -rf /` would be executed verbatim. This is the canonical command-injection shape.
+
+**Suggestion:** pass arguments as a `&[&str]` slice to `Command::new("git").args([...])` so the shell never sees the user-controlled value.
+
+### 2. agent-notes.md may contain secrets and is committed to the PR diff — important
+
+The implement-phase synth embeds a prefix of the agent's stderr tail in agent-notes.md. If the agent printed an API key or OAuth token to stderr before crashing, that secret would be committed to the PR's branch and visible in the diff.
+
+**Suggestion:** scrub well-known secret shapes (Bearer tokens, AWS keys, OAuth refresh tokens) from the embedded tail before writing it to agent-notes.md.
+```
+
+If you find no issues worth flagging, write the file with a single line: `(no findings)`. The file MUST exist either way — Bellows reads it after the run and treats it as the contract for the security-fix phase.
+
+## What this phase does NOT do
+
+You are read-only. Do NOT edit any files except `.bellows-security-findings.md` and (optionally) `agent-notes.md`. Do NOT create commits. Do NOT push. The security-fix phase that follows you will read your findings and address them.
+
+## When you cannot complete
+
+If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from earlier phases that must remain visible to the human reviewer.
+"#;
+
+/// Vendored security-fix-phase prompt (slice X2). Sibling of
+/// `REVIEW_FIX_PROMPT` but in the batch shape (single invocation handling
+/// all findings) — the security-fix phase reads the findings file
+/// written by `SECURITY_REVIEW_PROMPT`, addresses each finding, commits
+/// each fix, and removes the findings file. Appends to `agent-notes.md`
+/// if any finding can't be addressed cleanly.
+pub const SECURITY_FIX_PROMPT: &str = r#"You are running as the **security-fix phase** of a Bellows agent pipeline. The security-review phase produced findings; your job is to address each one and remove the findings file.
+
+## Inputs
+
+- `/workspace/.bellows-security-findings.md` contains the security findings produced by the security-review phase. Each finding has a title ending in ` — blocker | important | nit`, a description, and a suggested remediation.
+- `/workspace/.bellows-review-diff.patch` contains the post-review-fix diff that the security review was performed against. Read it if you need disambiguation.
+- `/workspace/agent-notes.md` may exist with notes from earlier phases. Read it for context; APPEND only, never overwrite.
+
+## Your job
+
+For each finding in `.bellows-security-findings.md`:
+
+1. Read the title, description, and suggestion.
+2. Make the change that resolves the finding's root cause.
+3. Run `cargo check` (or equivalent) after each change to confirm you have not broken compilation.
+4. Commit each fix with a clear, scoped commit message — one commit per finding is ideal so the operator can map fixes back to the security-findings PR comment.
+
+When every finding has been addressed (or explicitly escalated to agent-notes.md), delete `/workspace/.bellows-security-findings.md`. The runner uses the absence of this file as the signal that the security-fix phase is complete; leaving it behind would cause a downstream readability problem (the file would ship in the PR diff).
+
+## When a finding cannot be addressed
+
+If you cannot address a finding in this run (requires architectural decision, missing context, etc.), APPEND an `## Unaddressed finding: <title>` section to `/workspace/agent-notes.md` using the EXACT VERBATIM title from the finding. Then move on to the next finding. The presence of an `## Unaddressed finding:` section at the end of the pipeline routes the run to **agent-self-reported-failure** (draft PR with the `agent-failed` label), surfacing the gap to a human reviewer.
+
+Do NOT silently skip a finding — either address it in code or escalate it via the unaddressed-finding section.
+
+## What you must NOT do
+
+- Do NOT broaden scope outside the five security focus categories (input validation, auth, crypto, injection, data exposure).
+- Do NOT introduce new functionality beyond what's needed to address the findings — security fixes only.
+- Do NOT paraphrase the finding title when writing an `## Unaddressed finding:` header; verbatim match is required.
+
+## Stop conditions
+
+Stop when EITHER (1) every finding has been addressed in code AND `cargo check` is green AND `.bellows-security-findings.md` has been removed, OR (2) every finding has been routed (some to code commits, the remainder to `## Unaddressed finding:` sections in agent-notes.md) AND the findings file has been removed.
 "#;
 
 /// Closed severity vocabulary for review findings. The review prompt
