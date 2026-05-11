@@ -644,7 +644,7 @@ fn resolve_kill_target(
         // `<owner>/<name>/<issue>` shape — match against configured repos.
         let mut found: Option<(String, String)> = None;
         for r in repos {
-            let (owner, repo) = runner::parse_owner_repo(&r.url).map_err(|e| anyhow!("{e}"))?;
+            let (owner, repo) = parse_owner_repo(&r.url)?;
             let slug = format!("{}/{}", owner, repo);
             if slug == qualifier {
                 found = Some((slug, r.url.clone()));
@@ -655,7 +655,7 @@ fn resolve_kill_target(
             let configured: Vec<String> = repos
                 .iter()
                 .filter_map(|r| {
-                    runner::parse_owner_repo(&r.url)
+                    parse_owner_repo(&r.url)
                         .ok()
                         .map(|(o, n)| format!("{}/{}", o, n))
                 })
@@ -684,7 +684,7 @@ fn resolve_kill_target(
             );
         }
         let r = &repos[0];
-        let (owner, repo) = runner::parse_owner_repo(&r.url).map_err(|e| anyhow!("{e}"))?;
+        let (owner, repo) = parse_owner_repo(&r.url)?;
         Ok(ResolvedKillTarget {
             repo_label: format!("{}/{}", owner, repo),
             repo_url: r.url.clone(),
