@@ -8,4 +8,5 @@ policy-image/Dockerfile text eol=lf
 policy-image/run-agent text eol=lf
 policy-image/run-cargo-checks text eol=lf
 policy-image/entrypoint text eol=lf
+policy-image/entrypoint-user text eol=lf
 policy-image/CLAUDE.md text eol=lf
