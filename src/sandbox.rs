@@ -1266,6 +1266,109 @@ mod tests {
     }
 
     #[test]
+    fn validate_deploy_keys_passes_when_every_referenced_key_is_present() {
+        // Issue #69 (ADR-0002) acceptance criterion: startup validation
+        // succeeds when every name listed under any `[[repo]]
+        // deploy_keys` is present in the volume. The validator does
+        // not care about the order of keys or about extra keys in the
+        // volume that aren't referenced — only that every referenced
+        // key has a file on disk.
+        let repos: Vec<DeployKeyRepo> = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/workboard-financial-advice".to_string(),
+                deploy_keys: vec!["workboard-core".to_string(), "workboard-shared".to_string()],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/bellows".to_string(),
+                deploy_keys: vec![],
+            },
+        ];
+        let present: std::collections::HashSet<String> = [
+            "workboard-core",
+            "workboard-shared",
+            "an-extra-key-nobody-references",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let result = validate_deploy_keys_against_present(&repos, &present);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn validate_deploy_keys_fails_when_a_referenced_key_is_missing() {
+        // Acceptance: refuse to start when any `[[repo]] deploy_keys`
+        // references a key name that's not present in the volume. The
+        // error message must name the missing key AND the repo that
+        // referenced it — a generic "missing keys" error would leave
+        // the operator hunting through the config to find the
+        // offending [[repo]].
+        let repos = vec![DeployKeyRepo {
+            url: "https://github.com/marad2001/workboard-financial-advice".to_string(),
+            deploy_keys: vec!["workboard-core".to_string()],
+        }];
+        let present: std::collections::HashSet<String> =
+            ["unrelated-key"].into_iter().map(String::from).collect();
+        let err = validate_deploy_keys_against_present(&repos, &present).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workboard-core"),
+            "error must name the missing key: {msg}",
+        );
+        assert!(
+            msg.contains("workboard-financial-advice"),
+            "error must name the offending repo URL: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_deploy_keys_lists_every_missing_reference_in_one_error() {
+        // Fail-fast on the first miss is tempting, but reporting every
+        // missing key in one pass lets the operator run
+        // `bellows setup-deploy-keys add` for each gap in one sitting
+        // rather than re-running validation N times. Pin the contract
+        // here so a future "simplification" can't quietly regress it.
+        let repos = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-a".to_string(),
+                deploy_keys: vec!["key-a".to_string()],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-b".to_string(),
+                deploy_keys: vec!["key-b".to_string(), "key-c".to_string()],
+            },
+        ];
+        let present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let err = validate_deploy_keys_against_present(&repos, &present).unwrap_err();
+        let msg = format!("{err}");
+        for needle in ["key-a", "key-b", "key-c", "repo-a", "repo-b"] {
+            assert!(msg.contains(needle), "error must mention {needle}: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_deploy_keys_passes_when_no_repo_opts_in() {
+        // The volume can be totally empty when no [[repo]] references
+        // any deploy key. The brief: "no creds in sandbox by default"
+        // means the absence of an SSH volume must not block bellows
+        // from running. Validation walks every [[repo]] and finds
+        // nothing to check.
+        let repos = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-a".to_string(),
+                deploy_keys: vec![],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-b".to_string(),
+                deploy_keys: vec![],
+            },
+        ];
+        let present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let result = validate_deploy_keys_against_present(&repos, &present);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
     fn build_ssh_keys_mount_returns_none_when_deploy_keys_empty() {
         // Issue #69 (ADR-0002) acceptance: containers spawned for
         // `[[repo]]` entries with empty or unset `deploy_keys` get no
