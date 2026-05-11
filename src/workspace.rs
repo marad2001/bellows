@@ -323,6 +323,43 @@ pub async fn generate_diff(
     Ok(())
 }
 
+/// Capture `git log --name-status <default_branch>...HEAD` and write
+/// it to `dest_filename` (a workspace-relative path). Sibling of
+/// `generate_diff` for the test-first review backstop: the reviewer
+/// reads this file alongside the squashed diff to reason about commit
+/// *ordering* (which the diff cannot show), so mega-commit and
+/// source-before-test violations become flaggable.
+///
+/// Uses three dots (`<base>...HEAD`) so the range matches what the PR
+/// would show — only commits unique to this branch since divergence.
+/// `--name-status` annotates each commit with the touched files plus
+/// their status (`A`/`M`/`D`), which is what makes test-file vs
+/// source-file ordering inspectable. An empty range (branch at parity
+/// with base) produces an empty file rather than an error — the
+/// reviewer sees "no commits to reason about" rather than a missing
+/// artefact.
+pub async fn generate_commit_log(
+    workspace: &Workspace,
+    dest_filename: &str,
+) -> Result<(), WorkspaceError> {
+    let spec = format!("{}...HEAD", workspace.default_branch);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["log", "--name-status", &spec])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec!["log".into(), "--name-status".into(), spec.clone()],
+            status: output.status,
+        });
+    }
+    let log_text = String::from_utf8_lossy(&output.stdout);
+    tokio::fs::write(workspace.path().join(dest_filename), log_text.as_bytes()).await?;
+    Ok(())
+}
+
 /// Capture `git diff <default_branch>...HEAD` and return it as a
 /// String. Sibling of `generate_diff` for callers that want to scan
 /// the diff directly (the slice-8 weak-test guard) rather than write

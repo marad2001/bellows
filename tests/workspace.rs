@@ -8,7 +8,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::workspace::{
     commit_all, commit_all_and_push_if_advanced, commit_to_branch, compute_diff_against_base,
-    diff_between_touches_only_agent_notes, head_sha, open_pr, prepare, push_branch, OpenPrRequest,
+    diff_between_touches_only_agent_notes, generate_commit_log, head_sha, open_pr, prepare,
+    push_branch, OpenPrRequest,
 };
 
 fn init_remote_repo(path: &Path) {
@@ -780,5 +781,243 @@ async fn commit_all_and_push_if_advanced_does_not_push_when_head_did_not_advance
     assert!(
         !remote_has_branch(remote_dir.path(), "agent/52-no-op"),
         "remote must not receive a push when HEAD did not advance"
+    );
+}
+
+// ---- Issue #40: generate_commit_log for the test-first review backstop ----
+
+#[tokio::test]
+async fn generate_commit_log_captures_clean_test_first_ordering_with_file_status() {
+    // Acceptance criterion (brief): "workspace::generate_commit_log
+    // writes the commit log over the `<default_branch>...HEAD` range to
+    // that file." The clean test-first case has two commits on the
+    // agent branch — a failing-test commit followed by a make-it-pass
+    // commit. The reviewer must be able to read the file and see the
+    // test-file paths arrived in the first commit, the source-file
+    // paths in the second. `git log --name-status` is the wire format
+    // the runner feeds the reviewer; we pin that the commit-log file
+    // contains both commit subjects AND the touched paths so the
+    // reviewer can reason about ordering.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/40-test-first")
+        .await
+        .unwrap();
+
+    std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
+    std::fs::write(
+        workspace.path().join("tests").join("foo.rs"),
+        "#[test]\nfn foo_returns_42() { assert_eq!(crate::foo(), 42); }\n",
+    )
+    .unwrap();
+    run_git(workspace.path(), &["add", "tests/foo.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "add failing test for foo_returns_42"],
+    );
+
+    std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+    std::fs::write(
+        workspace.path().join("src").join("foo.rs"),
+        "pub fn foo() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    run_git(workspace.path(), &["add", "src/foo.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "implement foo() to make foo_returns_42 pass"],
+    );
+
+    let dest = ".bellows-review-commit-log.txt";
+    generate_commit_log(&workspace, dest)
+        .await
+        .expect("generate_commit_log should succeed");
+
+    let log = std::fs::read_to_string(workspace.path().join(dest)).unwrap();
+
+    assert!(
+        log.contains("add failing test for foo_returns_42"),
+        "commit log must include the failing-test commit subject: {log}"
+    );
+    assert!(
+        log.contains("implement foo() to make foo_returns_42 pass"),
+        "commit log must include the make-it-pass commit subject: {log}"
+    );
+    assert!(
+        log.contains("tests/foo.rs"),
+        "commit log must include test-file path (needs --name-status or equivalent): {log}"
+    );
+    assert!(
+        log.contains("src/foo.rs"),
+        "commit log must include source-file path (needs --name-status or equivalent): {log}"
+    );
+    // Ordering invariant: the failing-test commit appears in the log
+    // BEFORE the make-it-pass commit, in some traversal direction.
+    // `git log` defaults to reverse-chronological (newest first), so
+    // we just assert both substrings exist; the reviewer-claude
+    // applies its own ordering reasoning based on the commit headers.
+    let test_pos = log.find("add failing test").unwrap();
+    let impl_pos = log.find("implement foo()").unwrap();
+    assert_ne!(
+        test_pos, impl_pos,
+        "the two commits must be distinguishable in the log: {log}"
+    );
+}
+
+#[tokio::test]
+async fn generate_commit_log_makes_mega_commit_ordering_visible_via_name_status() {
+    // The mega-commit violation shape: a single commit on the agent
+    // branch that touches both test files and source files. The
+    // commit-log artefact must surface this — the reviewer cannot
+    // reason about test-first ordering if `--name-status` (or
+    // equivalent) is omitted, because the squashed diff alone shows
+    // both files but not the fact that they landed in one commit.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/40-mega-commit")
+        .await
+        .unwrap();
+
+    std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
+    std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+    std::fs::write(
+        workspace.path().join("tests").join("foo.rs"),
+        "#[test]\nfn foo_returns_42() { assert_eq!(crate::foo(), 42); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("src").join("foo.rs"),
+        "pub fn foo() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    run_git(workspace.path(), &["add", "tests/foo.rs", "src/foo.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "implement and test the foo flow"],
+    );
+
+    let dest = ".bellows-review-commit-log.txt";
+    generate_commit_log(&workspace, dest)
+        .await
+        .expect("generate_commit_log should succeed");
+
+    let log = std::fs::read_to_string(workspace.path().join(dest)).unwrap();
+
+    assert!(
+        log.contains("implement and test the foo flow"),
+        "mega-commit subject must appear in the log: {log}"
+    );
+    // Both paths appear under ONE commit's name-status block. The
+    // reviewer-claude infers the violation from the combination; the
+    // bellows-side contract is that both paths are present.
+    assert!(
+        log.contains("tests/foo.rs") && log.contains("src/foo.rs"),
+        "mega-commit log must include both test-file and source-file paths so the \
+         reviewer can detect the single-commit violation: {log}"
+    );
+    // Sanity: there should be exactly one commit-header line on the
+    // agent branch (the mega-commit). `git log` formats commit headers
+    // with `commit <sha>` in its default output, which makes the
+    // single-commit shape inspectable.
+    let commit_headers = log.lines().filter(|l| l.starts_with("commit ")).count();
+    assert_eq!(
+        commit_headers, 1,
+        "mega-commit case must have exactly one commit header in the log: {log}"
+    );
+}
+
+#[tokio::test]
+async fn generate_commit_log_captures_source_before_test_ordering() {
+    // The source-before-test violation shape: source files landed in
+    // an earlier commit than their corresponding tests. The commit-log
+    // artefact must let the reviewer-claude see the chronological
+    // order of file additions across commits, so this ordering shows
+    // up as a flaggable signal.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/40-source-first")
+        .await
+        .unwrap();
+
+    std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+    std::fs::write(
+        workspace.path().join("src").join("foo.rs"),
+        "pub fn foo() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    run_git(workspace.path(), &["add", "src/foo.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "implement foo() function (no tests yet)"],
+    );
+
+    std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
+    std::fs::write(
+        workspace.path().join("tests").join("foo.rs"),
+        "#[test]\nfn foo_returns_42() { assert_eq!(crate::foo(), 42); }\n",
+    )
+    .unwrap();
+    run_git(workspace.path(), &["add", "tests/foo.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "add test for the foo() function we already shipped"],
+    );
+
+    let dest = ".bellows-review-commit-log.txt";
+    generate_commit_log(&workspace, dest)
+        .await
+        .expect("generate_commit_log should succeed");
+
+    let log = std::fs::read_to_string(workspace.path().join(dest)).unwrap();
+
+    assert!(log.contains("implement foo() function"));
+    assert!(log.contains("add test for the foo() function"));
+    assert!(log.contains("src/foo.rs"));
+    assert!(log.contains("tests/foo.rs"));
+    // Pin the chronological ordering: `git log` defaults to
+    // reverse-chronological (newest first), so the test-addition
+    // commit appears BEFORE the source-addition commit in the file.
+    // The reviewer-claude reading this file sees that the source
+    // commit is the older of the two — i.e. tests trailed source.
+    let src_pos = log.find("implement foo() function").unwrap();
+    let test_pos = log.find("add test for the foo() function").unwrap();
+    assert!(
+        test_pos < src_pos,
+        "reverse-chronological default: the newer test-add commit must appear \
+         before the older src-add commit in the log file (so the reviewer sees \
+         tests trailed source): test_pos={test_pos}, src_pos={src_pos}, log:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn generate_commit_log_is_empty_when_branch_is_at_parity_with_base() {
+    // Edge case: a workspace with no commits beyond the base branch
+    // (e.g. an implement phase that crashed before producing any
+    // commits, or a tracer-bullet run) produces an empty commit log.
+    // The reviewer sees "no commits to reason about" rather than a
+    // missing file or a file containing every commit on master.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/40-no-commits")
+        .await
+        .unwrap();
+
+    let dest = ".bellows-review-commit-log.txt";
+    generate_commit_log(&workspace, dest)
+        .await
+        .expect("generate_commit_log should succeed on an empty range");
+
+    let log = std::fs::read_to_string(workspace.path().join(dest)).unwrap();
+    assert!(
+        log.trim().is_empty(),
+        "branch at parity with base must produce an empty commit log, got: {log:?}"
     );
 }

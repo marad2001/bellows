@@ -233,6 +233,17 @@ pub const REVIEW_DIFF_FILE: &str = ".bellows-review-diff.patch";
 /// the file when all findings are addressed.
 pub const REVIEW_FINDINGS_FILE: &str = ".bellows-review-findings.md";
 
+/// Workspace-relative path of the commit-log file the runner writes
+/// before the review phase. Read-only input to the review prompt
+/// alongside REVIEW_DIFF_FILE — the diff shows the squashed end-state,
+/// the commit log shows ordering. The reviewer-claude reads it to
+/// reason about test-first commit shape (one failing-test commit then
+/// one make-it-pass commit, per acceptance criterion); mega-commits
+/// and source-before-test orderings are visible from this file but
+/// not from the squashed diff. The runner removes the file after the
+/// review-fix phase completes so it never lands in the PR diff.
+pub const REVIEW_COMMIT_LOG_FILE: &str = ".bellows-review-commit-log.txt";
+
 /// Vendored review-phase prompt. Documents the input file path
 /// (REVIEW_DIFF_FILE), the output file path (REVIEW_FINDINGS_FILE),
 /// the findings markdown format with a closed `blocker | important |
@@ -244,7 +255,19 @@ pub const REVIEW_PROMPT: &str = r#"You are running as the **review phase** of a 
 ## Inputs
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta the implement phase produced. Read this file as the primary input. Do not browse the wider codebase except to disambiguate symbols referenced in the diff; the patch is the contract.
+- `/workspace/.bellows-review-commit-log.txt` contains `git log --name-status <base>...HEAD` — the commit-by-commit history of the agent branch since it diverged from the base. Use this to reason about commit *ordering* (which the squashed diff cannot show): which files arrived in which commit, in what order. Required for the test-first check below.
 - `/workspace/agent-notes.md` may exist (the implement phase appended to it if it could not complete some part of the brief). Read it for context on deliberate gaps or known limitations.
+
+## Test-first commit-shape check
+
+The implement-phase kickoff mandates a test-first commit shape: one failing-test commit, then one make-it-pass commit, per acceptance criterion. Use `.bellows-review-commit-log.txt` to verify that shape. Flag a finding tagged ` — important` when you see either of these test-first violations:
+
+- **mega-commit**: a single commit on the agent branch touches BOTH test files (`tests/**`, files containing `#[test]` / `#[tokio::test]` attributes) AND non-trivial source files at the same time. The two should land in separate commits so the make-it-pass commit demonstrates the test transitioning from red to green.
+- **source-before-test**: a source-file commit lands earlier in the agent-branch history than the corresponding test commit. Tests added after the implementation are not test-first — they post-hoc rationalise whatever the implementation happens to do.
+
+If the entire branch is a single mega-commit, that one commit is the violation; if individual commits ordered source-before-test, name each offending pair. Use the existing finding format and the `important` severity tag so the run's per-finding review-fix loop can route the finding through unchanged: the agent will get one invocation to either rewrite history to be test-first OR append an `## Unaddressed finding: <verbatim title>` section to agent-notes.md.
+
+A diff with no test files at all is out of scope for this check — the slice-8 weak-test guard handles "no tests added" separately. Briefs that the operator labelled with the skip-label are also out of scope here; the bellows runner will already have skipped the weak-test guard for those, but the test-first check is a stylistic recommendation rather than a hard gate, so it is acceptable to skip flagging where the brief makes test-first ordering impractical (e.g. pure-docs PRs).
 
 ## Output
 
@@ -952,6 +975,15 @@ pub fn render_kickoff(brief: &str, repo_url: &str, branch_name: &str) -> String 
          \n\
          Use the `tdd` skill: write failing tests first, then implement to green, then refactor.\n\
          The skill is available in your skills directory; invoke it before doing implementation work.\n\
+         \n\
+         ## Commit shape (test-first)\n\
+         \n\
+         The TDD skill is not just a guideline here — it is a load-bearing requirement on the *commit shape* of this branch, because the review phase reads the commit log and flags violations as `important` findings:\n\
+         \n\
+         - For each acceptance criterion in the brief, produce TWO commits in order: first a **failing-test commit** that adds the test(s) and would fail against the unchanged source, then a **make-it-pass commit** that changes the source so those tests pass.\n\
+         - One failing-test commit then one make-it-pass commit, per acceptance criterion. Do NOT bundle tests and source into a single mega-commit. Do NOT land source-file changes before their corresponding tests.\n\
+         - It is fine to add small refactors as separate follow-up commits after the make-it-pass commit. The constraint is on test-vs-source ordering, not on commit count overall.\n\
+         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), call that out in `agent-notes.md` rather than silently bundling tests and source.\n\
          \n\
          ## Stop conditions\n\
          \n\
