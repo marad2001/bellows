@@ -5,7 +5,7 @@
 //! drain logic is testable independently of a live container.
 //!
 //! Serial-by-design: workspace state flows between issues. If issue N
-//! produces a `wontfix-enhancement` verdict that commits a new
+//! produces a `wontfix` verdict that commits a new
 //! `.out-of-scope/` precedent and pushes it, issue N+1's container
 //! picks up the updated workspace state because bellows's working
 //! copy on the host reflects the commit. Parallelising the drain
@@ -17,14 +17,12 @@ use std::fmt;
 use crate::tracker::Issue;
 
 /// The four canonical triage roles in docs/agents/triage-labels.md.
-/// `wontfix-enhancement` is the renamed `wontfix` role used by the
-/// triage skill — a deliberate verdict, not a CLI flag's typo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verdict {
     ReadyForAgent,
     NeedsInfo,
     ReadyForHuman,
-    WontfixEnhancement,
+    Wontfix,
 }
 
 impl Verdict {
@@ -35,7 +33,7 @@ impl Verdict {
             Verdict::ReadyForAgent => "ready-for-agent",
             Verdict::NeedsInfo => "needs-info",
             Verdict::ReadyForHuman => "ready-for-human",
-            Verdict::WontfixEnhancement => "wontfix-enhancement",
+            Verdict::Wontfix => "wontfix",
         }
     }
 }
@@ -56,7 +54,7 @@ impl fmt::Display for Verdict {
 pub struct BacklogSummary {
     pub ready_for_agent: u32,
     pub needs_info: u32,
-    pub wontfix_enhancement: u32,
+    pub wontfix: u32,
     pub ready_for_human: u32,
     pub failed: u32,
 }
@@ -65,7 +63,7 @@ impl BacklogSummary {
     pub fn total(&self) -> u32 {
         self.ready_for_agent
             + self.needs_info
-            + self.wontfix_enhancement
+            + self.wontfix
             + self.ready_for_human
             + self.failed
     }
@@ -75,7 +73,7 @@ impl BacklogSummary {
             Verdict::ReadyForAgent => self.ready_for_agent += 1,
             Verdict::NeedsInfo => self.needs_info += 1,
             Verdict::ReadyForHuman => self.ready_for_human += 1,
-            Verdict::WontfixEnhancement => self.wontfix_enhancement += 1,
+            Verdict::Wontfix => self.wontfix += 1,
         }
     }
 
@@ -93,7 +91,7 @@ impl fmt::Display for BacklogSummary {
         writeln!(f, "bellows triage: processed {} issue(s)", self.total())?;
         writeln!(f, "  {} -> ready-for-agent", self.ready_for_agent)?;
         writeln!(f, "  {} -> needs-info", self.needs_info)?;
-        writeln!(f, "  {} -> wontfix-enhancement", self.wontfix_enhancement)?;
+        writeln!(f, "  {} -> wontfix", self.wontfix)?;
         writeln!(f, "  {} -> ready-for-human", self.ready_for_human)?;
         if self.failed > 0 {
             writeln!(f, "  {} failed", self.failed)?;

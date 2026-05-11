@@ -29,7 +29,7 @@ fn verdict_label_renders_canonical_strings_from_triage_labels_doc() {
     assert_eq!(Verdict::ReadyForAgent.label(), "ready-for-agent");
     assert_eq!(Verdict::NeedsInfo.label(), "needs-info");
     assert_eq!(Verdict::ReadyForHuman.label(), "ready-for-human");
-    assert_eq!(Verdict::WontfixEnhancement.label(), "wontfix-enhancement");
+    assert_eq!(Verdict::Wontfix.label(), "wontfix");
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn backlog_summary_starts_empty() {
     assert_eq!(s.total(), 0);
     assert_eq!(s.ready_for_agent, 0);
     assert_eq!(s.needs_info, 0);
-    assert_eq!(s.wontfix_enhancement, 0);
+    assert_eq!(s.wontfix, 0);
     assert_eq!(s.ready_for_human, 0);
     assert_eq!(s.failed, 0);
 }
@@ -49,12 +49,12 @@ fn backlog_summary_tallies_each_verdict_into_its_own_bucket() {
     s.record_verdict(Verdict::ReadyForAgent);
     s.record_verdict(Verdict::ReadyForAgent);
     s.record_verdict(Verdict::NeedsInfo);
-    s.record_verdict(Verdict::WontfixEnhancement);
+    s.record_verdict(Verdict::Wontfix);
     s.record_verdict(Verdict::ReadyForHuman);
 
     assert_eq!(s.ready_for_agent, 2);
     assert_eq!(s.needs_info, 1);
-    assert_eq!(s.wontfix_enhancement, 1);
+    assert_eq!(s.wontfix, 1);
     assert_eq!(s.ready_for_human, 1);
     assert_eq!(s.failed, 0);
     assert_eq!(s.total(), 5);
@@ -84,7 +84,7 @@ fn backlog_summary_display_shows_total_and_per_verdict_counts() {
     s.record_verdict(Verdict::ReadyForAgent);
     s.record_verdict(Verdict::NeedsInfo);
     s.record_verdict(Verdict::NeedsInfo);
-    s.record_verdict(Verdict::WontfixEnhancement);
+    s.record_verdict(Verdict::Wontfix);
     s.record_verdict(Verdict::ReadyForHuman);
 
     let rendered = format!("{}", s);
@@ -102,8 +102,8 @@ fn backlog_summary_display_shows_total_and_per_verdict_counts() {
         "summary must name needs-info: {rendered}"
     );
     assert!(
-        rendered.contains("wontfix-enhancement"),
-        "summary must name wontfix-enhancement: {rendered}"
+        rendered.contains("wontfix"),
+        "summary must name wontfix: {rendered}"
     );
     assert!(
         rendered.contains("ready-for-human"),
@@ -263,7 +263,7 @@ async fn drain_backlog_passes_each_issues_number_to_the_per_issue_path() {
 #[tokio::test]
 async fn drain_backlog_tallies_a_mix_of_verdicts_and_failures_realistically() {
     // The brief's own worked example:
-    //   "3 → ready-for-agent, 2 → needs-info, 1 → wontfix-enhancement,
+    //   "3 → ready-for-agent, 2 → needs-info, 1 → wontfix,
     //    1 → ready-for-human, 1 verdict-failed"
     // The drain must reproduce that breakdown faithfully.
     let issues: Vec<Issue> = (1..=8).map(|n| issue(n, "x")).collect();
@@ -272,7 +272,7 @@ async fn drain_backlog_tallies_a_mix_of_verdicts_and_failures_realistically() {
         match n {
             1..=3 => Ok(Verdict::ReadyForAgent),
             4..=5 => Ok(Verdict::NeedsInfo),
-            6 => Ok(Verdict::WontfixEnhancement),
+            6 => Ok(Verdict::Wontfix),
             7 => Ok(Verdict::ReadyForHuman),
             _ => Err("bad verdict".to_string()),
         }
@@ -281,7 +281,7 @@ async fn drain_backlog_tallies_a_mix_of_verdicts_and_failures_realistically() {
 
     assert_eq!(summary.ready_for_agent, 3);
     assert_eq!(summary.needs_info, 2);
-    assert_eq!(summary.wontfix_enhancement, 1);
+    assert_eq!(summary.wontfix, 1);
     assert_eq!(summary.ready_for_human, 1);
     assert_eq!(summary.failed, 1);
     assert_eq!(summary.total(), 8);

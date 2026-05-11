@@ -49,7 +49,7 @@ struct ListNeedsTriageParams<'a> {
 ///
 /// Oldest-first is part of the contract — workspace state flows
 /// between issues, and an older issue's verdict may set a precedent
-/// (e.g. `wontfix-enhancement` writing to `.out-of-scope/`) that a
+/// (e.g. `wontfix` writing to `.out-of-scope/`) that a
 /// later issue's triage should see. Walking newest-first would invert
 /// that "earlier issues set precedent" intuition.
 pub async fn list_needs_triage_issues(
