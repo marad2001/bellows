@@ -590,7 +590,6 @@ pub async fn run_once(
     // `None`-when-skipped contract as `review` / `review_fix`.
     let mut security_outcome: Option<AnalysisOutcome> = None;
     let mut security_fix_outcome: Option<FixOutcome> = None;
-    let mut security_findings_for_comment: Option<String> = None;
     let mut end_pipeline_gate: Option<GateOutcome> = None;
     // Slice 9.6: parser-as-backstop violations. Populated after the
     // per-finding/nit-batch review-fix invocations complete and the
@@ -1002,7 +1001,6 @@ pub async fn run_once(
                 None
             };
             let has_security_findings = security_findings_text.is_some();
-            security_findings_for_comment = security_findings_text.clone();
             security_outcome = Some(AnalysisOutcome {
                 findings_text: security_findings_text,
                 exit_code: security_agent_run.exit_code,
@@ -1247,12 +1245,13 @@ pub async fn run_once(
     // Slice X2: post the security findings as a separate `## Security
     // findings` PR comment if the security-review phase produced any.
     // Posted regardless of whether security-fix succeeded so the reader
-    // always sees what was flagged, mirroring the review-findings post.
-    // `security_findings_for_comment` was captured during the
-    // security-review phase since we move the findings text into the
-    // `outcomes` struct above; reading from that local variable here
-    // avoids a clone-from-Option-of-Option dance.
-    if let Some(security_findings) = &security_findings_for_comment {
+    // always sees what was flagged, mirroring the review-findings post
+    // immediately above.
+    if let Some(security_findings) = outcomes
+        .security
+        .as_ref()
+        .and_then(|r| r.findings_text.as_deref())
+    {
         let comment_body = format!("## Security findings\n\n{security_findings}");
         tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
     }
@@ -1628,11 +1627,13 @@ impl WallClockBudget {
     }
 }
 
-/// Remove the slice-X1 phase handoff files from the workspace. The
-/// review diff (input to the review prompt) and the review findings
-/// file (output of review, input of review-fix) are both Bellows-
-/// internal — they must never land in any subsequent commit. Called
-/// after review-fix and as a defensive sweep on the halt path.
+/// Remove the slice-X1 + X2 phase handoff files from the workspace.
+/// The review diff (input to the review prompt), the review findings
+/// file (output of review, input of review-fix), the review commit
+/// log, and the security findings file (output of security-review,
+/// input of security-fix) are all Bellows-internal — they must never
+/// land in any subsequent commit. Called after review-fix /
+/// security-fix and as a defensive sweep on the halt path.
 ///
 /// Best-effort: a missing file is not an error. A genuinely failing
 /// remove (permissions, IO error) is propagated.
