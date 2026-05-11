@@ -1,0 +1,145 @@
+name: Auto-merge bellows PRs
+
+# Direct auto-merge for bellows-authored PRs.
+#
+# Per ADR-0001 (docs/adr/0001-direct-vs-enable-auto-merge.md), this
+# workflow IS the CI gate: it fires from `workflow_run` once `CI`
+# completes with `conclusion == success`, then directly calls the
+# merge API. The `workflow_run` trigger is the only safe choice here
+# because it runs in the context of the default branch's workflow
+# definition, so a PR cannot alter what this workflow does. We do
+# NOT use GitHub's native "Enable auto-merge" feature (which would
+# depend on branch protection to know what counts as ready).
+#
+# To opt out as an operator: delete this file, or comment out the
+# `on:` trigger below. No bellows binary changes are required to
+# disable auto-merge.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  auto-merge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge bellows-authored PRs
+        uses: actions/github-script@v7
+        with:
+          # Uses the default GITHUB_TOKEN — no PAT needed. Scopes are
+          # the `permissions:` block above.
+          script: |
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run;
+            const headSha = run.head_sha;
+
+            // The `workflow_run` payload carries an associated
+            // pull_requests array. For PRs from forks it can be
+            // empty, so we fall back to looking up open PRs by their
+            // head SHA via the search API.
+            let prSummaries = run.pull_requests || [];
+            if (prSummaries.length === 0) {
+              core.info(`workflow_run payload had no pull_requests; ` +
+                `falling back to head-SHA lookup for ${headSha}`);
+              const search = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${owner}/${repo} is:pr is:open ${headSha}`,
+              });
+              prSummaries = search.data.items.map(item => ({ number: item.number }));
+            }
+
+            if (prSummaries.length === 0) {
+              core.info(`No PRs associated with head SHA ${headSha}; nothing to merge.`);
+              return;
+            }
+
+            const { data: repoData } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoData.default_branch;
+
+            for (const summary of prSummaries) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: summary.number,
+              });
+
+              // Filter: head.repo MUST equal base.repo. Bellows only
+              // ever pushes to `origin` (workspace::push_branch), so a
+              // legitimate bellows PR is never from a fork. A fork PR
+              // matching the `agent/` prefix would otherwise be merged
+              // to the base repo with base-repo authority, bypassing
+              // review — the supply-chain risk ADR-0001 calls out lives
+              // at the merge step regardless of how the workflow runs.
+              // `pr.head.repo` is `null` when the source repo has been
+              // deleted, which we also treat as a skip.
+              if (pr.head.repo == null ||
+                  pr.head.repo.full_name !== pr.base.repo.full_name) {
+                const headRepoName = pr.head.repo
+                  ? pr.head.repo.full_name
+                  : '<deleted>';
+                core.info(`Skipping PR #${pr.number}: head.repo ` +
+                  `"${headRepoName}" != base.repo ` +
+                  `"${pr.base.repo.full_name}" (fork PR).`);
+                continue;
+              }
+              // Filter: head.ref MUST start with `agent/` (the bellows
+              // branch convention; non-`agent/*` PRs are not auto-merged).
+              if (!pr.head.ref.startsWith('agent/')) {
+                core.info(`Skipping PR #${pr.number}: head.ref ` +
+                  `"${pr.head.ref}" does not start with "agent/".`);
+                continue;
+              }
+              // Filter: draft PRs are NOT merged. Bellows opens draft
+              // PRs on non-Success outcomes; those sit open for
+              // operator review.
+              if (pr.draft) {
+                core.info(`Skipping PR #${pr.number}: draft.`);
+                continue;
+              }
+              // Filter: only open PRs are candidates.
+              if (pr.state !== 'open') {
+                core.info(`Skipping PR #${pr.number}: state "${pr.state}".`);
+                continue;
+              }
+              // Filter: must target the repo's default branch.
+              if (pr.base.ref !== defaultBranch) {
+                core.info(`Skipping PR #${pr.number}: base.ref ` +
+                  `"${pr.base.ref}" != default branch "${defaultBranch}".`);
+                continue;
+              }
+
+              core.info(`Squash-merging PR #${pr.number} ` +
+                `(head.ref="${pr.head.ref}", base.ref="${pr.base.ref}", ` +
+                `sha="${headSha}").`);
+              try {
+                // Pin the merge to the SHA that workflow_run reported
+                // CI passed on. Without `sha`, the merge API takes
+                // whatever the PR's head is at merge time — so a push
+                // that lands between CI completing and this job firing
+                // would slip new commits in under CI's green light
+                // without being tested, breaking the "this workflow IS
+                // the CI gate" claim from ADR-0001. With `sha`, the API
+                // returns 409 if the head has moved, which is the
+                // correct behaviour: the next CI run for the new head
+                // will re-fire this workflow.
+                await github.rest.pulls.merge({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  sha: headSha,
+                  merge_method: 'squash',
+                });
+                core.info(`Squash-merged PR #${pr.number}.`);
+              } catch (err) {
+                // A merge conflict, head-moved 409, or any other
+                // GitHub API error is logged but does not fail the
+                // workflow — the PR sits open for manual resolution
+                // (or for the next CI run on the new head to re-fire
+                // this workflow), per the brief.
+                core.warning(`Failed to squash-merge PR #${pr.number}: ` +
+                  `${err.message}. The PR remains open for manual handling.`);
+              }
+            }

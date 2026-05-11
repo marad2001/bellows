@@ -337,8 +337,26 @@ single issue moves like this:
    The outcome label (`agent-done` / `agent-failed` /
    `agent-rate-limited` / `agent-cancelled`) is applied to the
    **issue**, not the PR — bellows-opened PRs are unlabeled.
-6. **A human reviews** the PR — bellows never merges. Squash-on-merge
-   keeps the agent's intermediate commits out of `main`'s history.
+6. **The PR merges.** A bellows-authored Success PR auto-squash-merges
+   to the default branch once `ci.yml` passes — see the auto-merge
+   note below. Draft PRs (failure / rate-limited / cancelled runs)
+   sit open for a human to review and either merge manually or close.
+   Squash-on-merge keeps the agent's intermediate commits out of
+   `master`'s history.
+
+Bellows-authored Success PRs (non-draft, on `agent/*` branches, targeting
+the default branch) auto-merge via the GitHub Actions workflow at
+[`.github/workflows/auto-merge.yml`](.github/workflows/auto-merge.yml).
+The workflow watches `ci.yml` via a `workflow_run` trigger and, on a
+green CI run, calls the squash-merge API directly — closing the
+bellows-on-bellows loop so the operator does not have to click "merge"
+by hand. This is a **workflow-file feature, not a bellows-binary
+feature**: the bellows runtime is unchanged, and an operator can opt
+out — delete `auto-merge.yml` (or comment out its `on:` trigger) —
+without rebuilding bellows. Draft PRs, PRs whose branch does not start
+with `agent/`, PRs targeting a non-default branch, and PRs whose CI
+failed are all skipped — so human-authored PRs and bellows failure
+PRs still need a human merge.
 
 Bellows does **not** auto-retry. If a run lands at `agent-failed` and
 you want to try again, fix whatever needs fixing (the agent brief, the
