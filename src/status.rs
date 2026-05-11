@@ -238,21 +238,57 @@ impl StatusContext {
     }
 }
 
-/// Tracks whether the polling loop has already logged the current
-/// "blocked" state, so the operator's log doesn't flood with one
-/// "blocked by PR #N" line every 30 seconds during a 5-minute CI cycle.
-/// A fresh log line fires only on a transition — either the block set
-/// changes or bellows moves between blocked and unblocked.
-#[derive(Debug, Default)]
-pub struct BlockTransition {
-    last_block_set: Option<Vec<u64>>,
+/// The single idle line the polling loop emits on transition into idle.
+/// Exposed so callers (and tests) can match against the canonical
+/// wording without duplicating the literal.
+pub const IDLE_LINE: &str = "bellows: idle (no ready-for-agent issues)";
+
+const RESUME_LINE: &str =
+    "bellows: no longer blocked by open agent PRs; resuming normal claim behaviour";
+
+/// The "ongoing" outcome states whose log lines are deduplicated. A
+/// continuation tick in any of these states stays silent; only a
+/// transition between distinct shapes emits a fresh line.
+///
+/// Per-event outcomes (Finalised, Contended, Cancelled) are NOT
+/// modelled here: they reset the tracker via `observe_event` so the
+/// next ongoing-state tick is treated as a fresh transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OngoingState {
+    Idle,
+    Blocked(Vec<u64>),
+    /// A `RunError` whose shape (variant + payload, see
+    /// `RunError::shape`) matches this key. Two consecutive `Err`s
+    /// with the same shape key are treated as a continuation.
+    Err(String),
 }
 
-impl BlockTransition {
+/// Transition-only logger for the polling loop's "ongoing" outcomes.
+///
+/// Without dedup, a 30s polling interval floods the operator's terminal
+/// and `bellows.log` with one identical line per tick — `Idle` between
+/// events (the common case), or repeated `MissingAgentBrief(N)` while
+/// the operator drafts a brief. `OutcomeTransition` collapses runs of
+/// identical "ongoing" outcomes into a single line emitted on the
+/// transition into that state, restoring signal in the log.
+///
+/// Per-event outcomes (Finalised, Contended, Cancelled) bypass dedup
+/// via `observe_event`: each one represents a discrete happening, not
+/// an ongoing state, so the caller always logs them. `observe_event`
+/// still returns the resume-from-blocked line when leaving the
+/// `Blocked` state so the operator sees the transition.
+///
+/// Generalises the original `BlockTransition` introduced for issue
+/// #42 — same transition-only contract for `Blocked`, now extended to
+/// `Idle` and identical-`Err` runs per issue #50.
+#[derive(Debug, Default)]
+pub struct OutcomeTransition {
+    last: Option<OngoingState>,
+}
+
+impl OutcomeTransition {
     pub fn new() -> Self {
-        Self {
-            last_block_set: None,
-        }
+        Self::default()
     }
 
     /// Observe a tick that returned `RunOutcome::Blocked` with these
@@ -260,21 +296,78 @@ impl BlockTransition {
     /// (the block set differs from the previous tick) or `None` if the
     /// tick is a same-state continuation that should stay silent.
     pub fn observe_blocked(&mut self, pr_numbers: &[u64]) -> Option<String> {
-        if self.last_block_set.as_deref() == Some(pr_numbers) {
+        let new = OngoingState::Blocked(pr_numbers.to_vec());
+        if self.last.as_ref() == Some(&new) {
             return None;
         }
-        self.last_block_set = Some(pr_numbers.to_vec());
+        self.last = Some(new);
         Some(format_blocked_line(pr_numbers))
     }
 
-    /// Observe a tick that did NOT return `RunOutcome::Blocked`. Returns
-    /// `Some(line)` only if the prior state was blocked (i.e. we've
-    /// transitioned out of blocked and the operator wants to know that
-    /// normal claim behaviour has resumed); `None` for an idle-to-idle
-    /// tick.
-    pub fn observe_unblocked(&mut self) -> Option<String> {
-        if self.last_block_set.take().is_some() {
-            Some("bellows: no longer blocked by open agent PRs; resuming normal claim behaviour".to_string())
+    /// Observe a tick that returned `RunOutcome::Idle`. Returns the
+    /// lines to log on this tick:
+    /// - empty when the prior tick was also idle (the dedup case);
+    /// - one element on a fresh transition into idle from an error or
+    ///   from startup;
+    /// - two elements when leaving the blocked state into idle: the
+    ///   resume-from-blocked line first, then the idle line, so the
+    ///   operator sees both that the block cleared and that the loop
+    ///   has returned to its steady-state idle pattern.
+    pub fn observe_idle(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if matches!(self.last, Some(OngoingState::Idle)) {
+            return lines;
+        }
+        if matches!(self.last, Some(OngoingState::Blocked(_))) {
+            lines.push(RESUME_LINE.to_string());
+        }
+        self.last = Some(OngoingState::Idle);
+        lines.push(IDLE_LINE.to_string());
+        lines
+    }
+
+    /// Observe a tick that returned `Err(_)` from `run_once`. The
+    /// caller passes a `shape_key` (typically `RunError::shape()`) plus
+    /// the formatted log line. Returns the lines to log:
+    /// - empty when the prior tick had the same shape key (the dedup
+    ///   case — a `MissingAgentBrief(42)` recurring until the operator
+    ///   fixes the brief);
+    /// - one element on a fresh error or a transition between
+    ///   different error shapes;
+    /// - two elements when leaving the blocked state into an error:
+    ///   the resume-from-blocked line first, then the error line, so
+    ///   the operator sees the block cleared and the new failure
+    ///   context.
+    pub fn observe_error(&mut self, shape_key: &str, line: String) -> Vec<String> {
+        let mut lines = Vec::new();
+        let new = OngoingState::Err(shape_key.to_string());
+        if self.last.as_ref() == Some(&new) {
+            return lines;
+        }
+        if matches!(self.last, Some(OngoingState::Blocked(_))) {
+            lines.push(RESUME_LINE.to_string());
+        }
+        self.last = Some(new);
+        lines.push(line);
+        lines
+    }
+
+    /// Observe a tick that returned a per-event outcome (`Finalised`,
+    /// `Contended`, or `Cancelled`). These outcomes are inherently
+    /// one-shot and the caller always logs their own line; the tracker
+    /// is responsible only for:
+    /// - returning the resume-from-blocked line when transitioning out
+    ///   of the blocked state, so the operator sees that transition
+    ///   even on a tick whose primary log line is the event itself;
+    /// - resetting the ongoing-state tracker so that the next
+    ///   idle/error/blocked tick is treated as a fresh transition
+    ///   (per brief AC #2: "re-enters idle after some other outcome"
+    ///   must emit a fresh idle line).
+    pub fn observe_event(&mut self) -> Option<String> {
+        let was_blocked = matches!(self.last, Some(OngoingState::Blocked(_)));
+        self.last = None;
+        if was_blocked {
+            Some(RESUME_LINE.to_string())
         } else {
             None
         }
@@ -796,11 +889,11 @@ mod tests {
     }
 
     #[test]
-    fn block_transition_idle_to_blocked_emits_log_line() {
+    fn outcome_transition_idle_to_blocked_emits_log_line() {
         // Brief: "The polling loop's log emits a 'blocked by PR #...' line
         // only on state transitions — not on every tick." On the
         // first tick that sees an open agent/* PR, the line fires.
-        let mut tracker = BlockTransition::new();
+        let mut tracker = OutcomeTransition::new();
         let line = tracker.observe_blocked(&[41]);
         let line = line.expect("expected a transition log line");
         assert!(line.contains("blocked"), "{}", line);
@@ -808,11 +901,11 @@ mod tests {
     }
 
     #[test]
-    fn block_transition_same_block_set_twice_in_a_row_is_silent() {
+    fn outcome_transition_same_block_set_twice_in_a_row_is_silent() {
         // The whole point of transition-only logging: a 5-minute CI cycle
         // would otherwise flood the log with ~10 identical "blocked"
         // lines, drowning out everything else.
-        let mut tracker = BlockTransition::new();
+        let mut tracker = OutcomeTransition::new();
         let _ = tracker.observe_blocked(&[41]);
         let line = tracker.observe_blocked(&[41]);
         assert!(
@@ -823,11 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn block_transition_block_set_changing_emits_a_fresh_log_line() {
+    fn outcome_transition_block_set_changing_emits_a_fresh_log_line() {
         // If a second agent/* PR opens (or the prior one merges and a new
         // one opens), the block set changes and the operator wants a
         // fresh line saying so.
-        let mut tracker = BlockTransition::new();
+        let mut tracker = OutcomeTransition::new();
         let _ = tracker.observe_blocked(&[41]);
         let line = tracker.observe_blocked(&[60]);
         let line = line.expect("set changed; expected a transition line");
@@ -835,24 +928,245 @@ mod tests {
     }
 
     #[test]
-    fn block_transition_blocked_to_unblocked_emits_a_resume_line() {
-        let mut tracker = BlockTransition::new();
+    fn outcome_transition_blocked_to_idle_emits_resume_then_idle_line() {
+        // Transitioning out of blocked into idle: the operator needs to
+        // see both that the block has cleared (resume line) AND that the
+        // loop is back to the steady-state idle pattern.
+        let mut tracker = OutcomeTransition::new();
         let _ = tracker.observe_blocked(&[41]);
-        let line = tracker.observe_unblocked();
-        let line = line.expect("blocked->unblocked transition expected a line");
+        let lines = tracker.observe_idle();
+        assert_eq!(
+            lines.len(),
+            2,
+            "blocked->idle must emit resume + idle, got {:?}",
+            lines,
+        );
         assert!(
-            line.to_lowercase().contains("no longer blocked")
-                || line.to_lowercase().contains("resuming"),
-            "expected resume/no-longer-blocked wording: {line}",
+            lines[0].to_lowercase().contains("no longer blocked")
+                || lines[0].to_lowercase().contains("resuming"),
+            "first line must be the resume line: {:?}",
+            lines,
+        );
+        assert!(
+            lines[1].contains("idle"),
+            "second line must be the idle line: {:?}",
+            lines,
         );
     }
 
     #[test]
-    fn block_transition_unblocked_to_unblocked_is_silent() {
-        // Idle→Idle ticks must not log — only transitions speak.
-        let mut tracker = BlockTransition::new();
-        assert!(tracker.observe_unblocked().is_none());
-        assert!(tracker.observe_unblocked().is_none());
+    fn outcome_transition_blocked_to_event_emits_only_resume_line() {
+        // For per-event outcomes (Finalised/Contended/Cancelled) the
+        // event itself is logged by the caller; the tracker is only
+        // responsible for the resume-from-blocked line.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_blocked(&[41]);
+        let line = tracker.observe_event();
+        let line = line.expect("blocked->event must emit a resume line");
+        assert!(
+            line.to_lowercase().contains("no longer blocked")
+                || line.to_lowercase().contains("resuming"),
+            "expected resume wording: {line}",
+        );
+    }
+
+    #[test]
+    fn outcome_transition_first_idle_emits_the_idle_line() {
+        // On startup, the very first idle tick must emit the idle line
+        // so the operator knows the polling loop is running and seeing
+        // an empty queue.
+        let mut tracker = OutcomeTransition::new();
+        let lines = tracker.observe_idle();
+        assert_eq!(lines.len(), 1, "first idle must emit one line, got {:?}", lines);
+        assert!(lines[0].contains("idle"), "{:?}", lines);
+        assert!(
+            lines[0].contains("no ready-for-agent"),
+            "idle line must explain why it's idle: {:?}",
+            lines,
+        );
+    }
+
+    #[test]
+    fn outcome_transition_idle_to_idle_is_silent() {
+        // Brief AC #1: a polling loop that stays idle for N consecutive
+        // ticks emits the idle log line at most ONCE — on transition
+        // into idle. The whole point of this slice.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_idle();
+        let lines = tracker.observe_idle();
+        assert!(
+            lines.is_empty(),
+            "idle->idle must be silent, got {:?}",
+            lines,
+        );
+        let lines = tracker.observe_idle();
+        assert!(
+            lines.is_empty(),
+            "idle->idle->idle must stay silent, got {:?}",
+            lines,
+        );
+    }
+
+    #[test]
+    fn outcome_transition_event_then_idle_emits_fresh_idle_line() {
+        // Brief AC #2: re-entering idle after some other outcome
+        // (Finalised, Contended, Cancelled) emits a fresh idle line.
+        // Events reset the tracker so the next idle counts as a
+        // transition.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_idle(); // first idle line emitted
+        let _ = tracker.observe_event(); // simulate a finalised event
+        let lines = tracker.observe_idle();
+        assert_eq!(
+            lines.len(),
+            1,
+            "post-event idle must emit a fresh idle line, got {:?}",
+            lines,
+        );
+        assert!(lines[0].contains("idle"), "{:?}", lines);
+    }
+
+    #[test]
+    fn outcome_transition_error_to_idle_emits_idle_line() {
+        // After a persistent error clears (operator fixed the brief),
+        // the next idle tick must announce the recovery.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "err".to_string());
+        let lines = tracker.observe_idle();
+        assert_eq!(
+            lines.len(),
+            1,
+            "error->idle must emit the idle line, got {:?}",
+            lines,
+        );
+        assert!(lines[0].contains("idle"), "{:?}", lines);
+    }
+
+    #[test]
+    fn outcome_transition_first_error_emits_the_error_line() {
+        let mut tracker = OutcomeTransition::new();
+        let lines = tracker.observe_error(
+            "missing_agent_brief:42",
+            "bellows: error: brief missing".to_string(),
+        );
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert_eq!(lines[0], "bellows: error: brief missing");
+    }
+
+    #[test]
+    fn outcome_transition_same_error_twice_is_silent() {
+        // Brief AC #3: repeated `Err(MissingAgentBrief(N))` for the same
+        // issue number emits the error line at most once. The 2026-05-11
+        // exemplar in the brief was 5 identical lines back-to-back; the
+        // dedup makes that one.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "err line".to_string());
+        let lines = tracker.observe_error("missing_agent_brief:42", "err line".to_string());
+        assert!(
+            lines.is_empty(),
+            "same error shape must be silent, got {:?}",
+            lines,
+        );
+        // And a third tick still silent.
+        let lines = tracker.observe_error("missing_agent_brief:42", "err line".to_string());
+        assert!(lines.is_empty(), "{:?}", lines);
+    }
+
+    #[test]
+    fn outcome_transition_error_with_different_payload_emits_fresh_line() {
+        // Brief AC #4: same variant + different issue number = different
+        // shape = fresh line. MissingAgentBrief(42) → MissingAgentBrief(43).
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "err 42".to_string());
+        let lines = tracker.observe_error("missing_agent_brief:43", "err 43".to_string());
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert_eq!(lines[0], "err 43");
+    }
+
+    #[test]
+    fn outcome_transition_error_to_different_variant_emits_fresh_line() {
+        // Brief AC #4: different variant = different shape, fresh line.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "brief err".to_string());
+        let lines = tracker.observe_error("octocrab:rate limited", "rate err".to_string());
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert_eq!(lines[0], "rate err");
+    }
+
+    #[test]
+    fn outcome_transition_idle_to_error_emits_the_error_line() {
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_idle();
+        let lines = tracker.observe_error("io:disk full", "io err".to_string());
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert_eq!(lines[0], "io err");
+    }
+
+    #[test]
+    fn outcome_transition_blocked_to_error_emits_resume_then_error() {
+        // If the polling loop transitions from blocked straight into an
+        // error state, the operator still wants the resume line so they
+        // know the block cleared — followed by the new error context.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_blocked(&[41]);
+        let lines = tracker.observe_error("missing_agent_brief:42", "brief err".to_string());
+        assert_eq!(
+            lines.len(),
+            2,
+            "blocked->error must emit resume + error, got {:?}",
+            lines,
+        );
+        assert!(
+            lines[0].to_lowercase().contains("no longer blocked")
+                || lines[0].to_lowercase().contains("resuming"),
+            "first line must be the resume line: {:?}",
+            lines,
+        );
+        assert_eq!(lines[1], "brief err");
+    }
+
+    #[test]
+    fn outcome_transition_event_then_error_emits_fresh_error_line() {
+        // Brief AC #2 sibling: events reset the tracker. If an error
+        // recurs after a successful run, the operator sees it again.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "err".to_string());
+        let _ = tracker.observe_event();
+        let lines = tracker.observe_error("missing_agent_brief:42", "err".to_string());
+        assert_eq!(
+            lines.len(),
+            1,
+            "post-event same error must re-emit, got {:?}",
+            lines,
+        );
+    }
+
+    #[test]
+    fn outcome_transition_event_after_idle_returns_no_resume_line() {
+        // The resume line is specifically about leaving the blocked
+        // state. Going from idle into a per-event outcome must not
+        // emit a misleading "no longer blocked" line.
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_idle();
+        let line = tracker.observe_event();
+        assert!(line.is_none(), "idle->event must not emit resume, got {:?}", line);
+    }
+
+    #[test]
+    fn outcome_transition_event_after_error_returns_no_resume_line() {
+        let mut tracker = OutcomeTransition::new();
+        let _ = tracker.observe_error("missing_agent_brief:42", "err".to_string());
+        let line = tracker.observe_event();
+        assert!(line.is_none(), "error->event must not emit resume, got {:?}", line);
+    }
+
+    #[test]
+    fn outcome_transition_back_to_back_events_both_return_no_resume_line() {
+        // Two finalised runs in a row: no ongoing-state line in
+        // between, the events themselves are logged by the caller.
+        let mut tracker = OutcomeTransition::new();
+        assert!(tracker.observe_event().is_none());
+        assert!(tracker.observe_event().is_none());
     }
 
     #[test]
