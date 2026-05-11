@@ -47,6 +47,17 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 bellows
 # Baked policy: skills + CLAUDE.md live here. The entrypoint copies them
 # into the bellows user's claude home at container start so they layer
 # with the OAuth state in the credentials volume.
+#
+# Skills baked into the image (each its own subdirectory under skills/):
+#   - tdd       — red/green/refactor discipline; referenced by every
+#                 bellows agent kickoff.
+#   - diagnose  — debug-loop discipline for hard bugs and perf regressions.
+#   - triage    — canonical source for the role taxonomy, brief templates,
+#                 AI-disclaimer wording, and decision heuristics consumed
+#                 by `bellows triage`. The triage kickoff prompt in
+#                 `src/triage.rs` defers to this skill rather than
+#                 re-implementing the taxonomy, so edits propagate on
+#                 the next policy-image rebuild.
 RUN mkdir -p /opt/bellows-policy/skills
 COPY skills/ /opt/bellows-policy/skills/
 COPY CLAUDE.md /opt/bellows-policy/CLAUDE.md

@@ -346,6 +346,254 @@ fn triage_prompt_describes_the_wontfix_enhancement_out_of_scope_path() {
     );
 }
 
+// ----------------------------------------------------------------------
+// Slice #61: the kickoff prompt is now a thin shim that defers to the
+// baked /triage skill at `~/.claude/skills/triage/` and applies a
+// headless-override layer on top. The skill is the canonical source
+// for the role taxonomy / brief templates / AI-disclaimer wording /
+// when-to-needs-info heuristics; the kickoff stays narrow to (a) the
+// bellows-specific JSON verdict schema, and (b) headless-mode
+// constraints (no `gh`, no human-wait).
+// ----------------------------------------------------------------------
+
+#[test]
+fn triage_prompt_references_baked_canonical_triage_skill_directory() {
+    // The kickoff must point the agent at the baked skill so it picks up
+    // the role taxonomy / brief templates / AI-disclaimer wording from
+    // the canonical source rather than a vendored reimplementation. The
+    // policy image's `entrypoint-user` copies the baked skill into
+    // `~/.claude/skills/triage/` at container start; the prompt must
+    // name that path so the agent knows where to read.
+    use bellows::triage::TRIAGE_PROMPT;
+    assert!(
+        TRIAGE_PROMPT.contains("~/.claude/skills/triage")
+            || TRIAGE_PROMPT.contains("/home/bellows/.claude/skills/triage"),
+        "kickoff prompt must reference the baked triage skill's path so the agent reads the \
+         canonical taxonomy + heuristics from it: {TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
+fn triage_prompt_applies_headless_override_naming_no_gh_and_no_human_wait() {
+    // The kickoff's whole purpose post-#61 is to layer a headless
+    // override on top of the baked skill: (a) no `gh` CLI / GitHub
+    // credentials in this container, (b) no human will respond to a
+    // follow-up question. Both constraints must be spelled out so the
+    // agent does not blindly follow the skill's gh-CLI-oriented steps.
+    use bellows::triage::TRIAGE_PROMPT;
+    let lower = TRIAGE_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("no `gh`")
+            || lower.contains("no gh cli")
+            || lower.contains("no `gh` cli")
+            || lower.contains("`gh` is not available")
+            || lower.contains("gh cli is not available"),
+        "headless override must explicitly state there is no `gh` CLI in the container: \
+         {TRIAGE_PROMPT}"
+    );
+    assert!(
+        lower.contains("no human") || lower.contains("headless"),
+        "headless override must explicitly state no human will respond / this is a headless \
+         run: {TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
+fn triage_prompt_documents_the_verdict_json_schema_inline() {
+    // The verdict JSON schema is the bellows-host-side contract (the
+    // `#[derive(Deserialize)]` struct in src/triage.rs). It MUST stay
+    // documented in the kickoff itself rather than living in the skill,
+    // because the skill is the gh-CLI-oriented sibling and does not
+    // know about the verdict-file flow. Pin the contract by asserting
+    // every required schema key name appears in the prompt.
+    use bellows::triage::TRIAGE_PROMPT;
+    for schema_key in [
+        "category",
+        "state",
+        "reasoning",
+        "comment_body",
+        "agent_brief",
+        "human_brief",
+        "out_of_scope_filename",
+        "out_of_scope_content",
+        "close_issue",
+    ] {
+        assert!(
+            TRIAGE_PROMPT.contains(schema_key),
+            "verdict JSON schema key `{schema_key}` missing from kickoff (the kickoff is the \
+             schema's source-of-truth for the agent): {TRIAGE_PROMPT}"
+        );
+    }
+}
+
+#[test]
+fn triage_prompt_is_a_thin_shim_not_a_self_contained_reimplementation() {
+    // The acceptance criterion: "no longer contains a self-contained
+    // reimplementation of the role taxonomy, brief template, or
+    // AI-disclaimer wording." Length is a proxy for that — the old
+    // vendored prompt clocked in around 3,500 characters; a thin shim
+    // (skill reference + JSON schema + headless override) should be
+    // materially smaller. Pin a generous upper bound so genuinely small
+    // future edits stay green but a backslide to a self-contained
+    // re-implementation surfaces.
+    use bellows::triage::TRIAGE_PROMPT;
+    assert!(
+        TRIAGE_PROMPT.len() < 3_000,
+        "kickoff prompt has grown back toward the old self-contained vendored prompt \
+         ({} chars); the slice-#61 contract is that the role taxonomy / brief templates / \
+         AI-disclaimer wording live in the baked skill, not the kickoff. Either shrink the \
+         kickoff or move new content into `policy-image/skills/triage/`. Current prompt:\n\
+         {TRIAGE_PROMPT}",
+        TRIAGE_PROMPT.len()
+    );
+}
+
+#[test]
+fn triage_prompt_does_not_reimplement_the_ai_disclaimer_wording() {
+    // The canonical AI-disclaimer literal lives in the baked skill (and
+    // is applied host-side by `tracker::apply_verdict`). The kickoff
+    // must not carry that exact literal — otherwise an edit to the
+    // disclaimer wording in the skill drifts from the kickoff. Pinned
+    // here so a future copy-paste regression surfaces.
+    use bellows::triage::TRIAGE_PROMPT;
+    assert!(
+        !TRIAGE_PROMPT.contains("> *This was generated by AI during triage.*"),
+        "kickoff prompt must not embed the canonical AI-disclaimer literal — that lives in \
+         the baked skill and is applied host-side: {TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
+fn triage_prompt_does_not_reimplement_the_agent_brief_template_body() {
+    // The `## Agent Brief` template (with its **Summary:** / **Current
+    // behavior:** / **Acceptance criteria:** sections) lives in the
+    // baked skill. The kickoff is allowed to name the `## Agent Brief`
+    // header as a JSON-schema cross-reference, but it must not embed
+    // the template body — otherwise a skill edit drifts from the kickoff.
+    use bellows::triage::TRIAGE_PROMPT;
+    let bullets_unique_to_the_template = [
+        "**Summary:**",
+        "**Current behavior:**",
+        "**Desired behavior:**",
+        "**Acceptance criteria:**",
+    ];
+    let embedded: Vec<&str> = bullets_unique_to_the_template
+        .iter()
+        .copied()
+        .filter(|s| TRIAGE_PROMPT.contains(s))
+        .collect();
+    assert!(
+        embedded.is_empty(),
+        "kickoff prompt embeds the agent-brief template body (sections: {embedded:?}); the \
+         template lives in the baked skill, the kickoff only cross-references it. Current \
+         prompt:\n{TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
+fn render_triage_kickoff_is_the_thin_shim_too() {
+    // `render_triage_kickoff` is what gets written to
+    // `.bellows-kickoff.md`; it must also be a thin shim, not a
+    // composition that re-introduces the verbose taxonomy via a
+    // wrapper. Pin the same upper bound + the same skill reference.
+    use bellows::triage::render_triage_kickoff;
+    let kickoff = render_triage_kickoff();
+    assert!(
+        kickoff.contains("~/.claude/skills/triage")
+            || kickoff.contains("/home/bellows/.claude/skills/triage"),
+        "rendered kickoff must point the agent at the baked triage skill: {kickoff}"
+    );
+    assert!(
+        kickoff.len() < 3_500,
+        "rendered kickoff has grown back toward the old self-contained prompt \
+         ({} chars):\n{kickoff}",
+        kickoff.len()
+    );
+}
+
+#[test]
+fn policy_image_bakes_triage_skill_with_canonical_taxonomy_content() {
+    // The slice-#61 contract is that the triage kickoff defers to the
+    // baked skill for the role taxonomy / brief templates / AI-
+    // disclaimer wording. That contract is meaningless if the skill is
+    // not actually baked into the policy image, so pin its presence
+    // and the canonical content the kickoff relies on.
+    let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("policy-image")
+        .join("skills")
+        .join("triage")
+        .join("SKILL.md");
+    let body = std::fs::read_to_string(&skill_path).unwrap_or_else(|e| {
+        panic!(
+            "triage skill not baked at {}: {e}. The slice-#61 kickoff prompt defers to this \
+             skill for the role taxonomy / brief templates / AI-disclaimer wording — losing \
+             the bake silently breaks every `bellows triage` run.",
+            skill_path.display(),
+        )
+    });
+
+    // Role taxonomy: bellows keys label transitions on these exact
+    // strings; the skill must surface all four state names.
+    for state in [
+        "needs-info",
+        "ready-for-agent",
+        "ready-for-human",
+        "wontfix",
+    ] {
+        assert!(
+            body.contains(state),
+            "baked triage skill must name state `{state}`: {skill_path:?}"
+        );
+    }
+
+    // The canonical AI-disclaimer wording — bellows's
+    // `tracker::apply_verdict` prepends this exact literal host-side
+    // (`TRIAGE_AI_DISCLAIMER`), the skill is the authoring-side source
+    // of truth for it.
+    assert!(
+        body.contains("> *This was generated by AI during triage.*"),
+        "baked triage skill must contain the canonical AI-disclaimer wording so the kickoff \
+         can defer to it without re-implementing: {skill_path:?}"
+    );
+
+    // Brief templates — both header literals must be present so the
+    // skill can guide the agent on what to write into `agent_brief`
+    // and `human_brief` of the verdict JSON.
+    for header in ["## Agent Brief", "## Human Brief"] {
+        assert!(
+            body.contains(header),
+            "baked triage skill must document the `{header}` template: {skill_path:?}"
+        );
+    }
+}
+
+#[test]
+fn policy_image_dockerfile_bakes_skills_directory_so_triage_skill_propagates() {
+    // The triage skill at `policy-image/skills/triage/` only reaches
+    // the running container if the Dockerfile's `COPY skills/ ...`
+    // bake survives. Pin the bake here so a future Dockerfile edit
+    // cannot silently drop the skills directory and leave the
+    // triage-kickoff prompt's `~/.claude/skills/triage/` reference
+    // dangling at runtime.
+    let dockerfile_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("policy-image")
+        .join("Dockerfile");
+    let dockerfile = std::fs::read_to_string(&dockerfile_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile_path.display()));
+    assert!(
+        dockerfile.contains("COPY skills/")
+            || dockerfile.contains("COPY skills/triage/"),
+        "policy-image/Dockerfile must bake the skills directory (or the triage skill \
+         specifically) so the triage kickoff's `~/.claude/skills/triage/` reference \
+         resolves at runtime. Current Dockerfile:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("/opt/bellows-policy/skills"),
+        "policy-image/Dockerfile must bake skills to /opt/bellows-policy/skills (the path \
+         `entrypoint-user` copies from): {dockerfile}"
+    );
+}
+
 #[test]
 fn render_triage_input_includes_issue_number_title_body_labels_and_comments() {
     use bellows::tracker::IssueBundle;
