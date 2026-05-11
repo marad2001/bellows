@@ -124,6 +124,7 @@ async fn triage_one_cmd(
     // its per-issue triage path will live here; until then, `bellows
     // triage <N>` returns the explicit T1-not-on-master diagnostic
     // rather than running silently in an unimplemented state.
+    eprintln!("{}", TRIAGE_ONE_STUB_WARNING);
     match call_triage_one(client, owner, repo, issue, dry_run).await {
         Ok(v) => {
             println!("bellows triage: issue #{} -> {}", issue, v);
@@ -160,6 +161,12 @@ async fn triage_backlog_cmd(
         return Ok(());
     }
 
+    // Surface the stub status BEFORE the drain begins so an operator
+    // does not read the inevitable "N failed" summary and file a fresh
+    // bug about "all my issues failed". When T1 lands and replaces
+    // call_triage_one, `TRIAGE_ONE_STUB_WARNING` is deleted; the
+    // unresolved references here flag the call sites for cleanup.
+    eprintln!("{}", TRIAGE_ONE_STUB_WARNING);
     println!(
         "bellows triage: draining {} open `{}` issue(s){}",
         issues.len(),
@@ -187,6 +194,18 @@ async fn triage_backlog_cmd(
     print!("{}", summary);
     Ok(())
 }
+
+/// Operator-facing banner printed before any code path that engages
+/// the `call_triage_one` stub. Without this banner the targeted form
+/// looks like a per-issue error and the backlog form looks like every
+/// issue genuinely failed — both misleading enough to invite a bug
+/// report. When slice T1 (#21) lands and the stub is replaced, delete
+/// this constant; the unresolved references at the call sites flag
+/// the now-stale `eprintln!` lines for cleanup at the same time.
+const TRIAGE_ONE_STUB_WARNING: &str =
+    "bellows triage: warning: per-issue triage path is stubbed \
+     (slice T1 / issue #21 not yet on master); every invocation will \
+     fail with the T1-not-on-master diagnostic until T1 merges";
 
 /// Per-issue triage entry point. Slice T1 (issue #21) will replace
 /// this stub with the real implementation: dispatch the triage skill
