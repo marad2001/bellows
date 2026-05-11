@@ -38,6 +38,16 @@ enum Command {
     /// credentials volume with an OAuth session via an interactive
     /// `claude login` flow.
     SetupAuth,
+    /// Manage the per-repo SSH deploy-keys volume (issue #69 /
+    /// ADR-0002). Operators populate the volume via `add`, inspect
+    /// what's in it via `list`, and clean up via `remove`. Each arm
+    /// runs inside a one-shot container with the deploy-keys volume
+    /// mounted, so file modes and known_hosts seeding work
+    /// consistently regardless of host OS.
+    SetupDeployKeys {
+        #[command(subcommand)]
+        action: SetupDeployKeysAction,
+    },
     /// Re-authenticate when your Claude Code refresh token has expired.
     /// Same flow as `setup-auth` (interactive container, `claude login`,
     /// credentials volume seeded); different name for the situation.
@@ -110,6 +120,37 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SetupDeployKeysAction {
+    /// Read a private SSH key from stdin (paste-then-EOF), write it
+    /// to the deploy-keys volume at `/<name>` with mode 600, ensure
+    /// the volume's `/config` has a Host stanza pointing at
+    /// `IdentityFile /home/bellows/.ssh/<name>` with `IdentitiesOnly
+    /// yes`, and seed `/known_hosts` via `ssh-keyscan <ssh-host>`.
+    /// Idempotent on repeated invocations: re-running `add` for the
+    /// same key does not duplicate the Host stanza.
+    Add {
+        /// Name to give this key inside the volume. Operators
+        /// reference this name from `[[repo]] deploy_keys = [...]`.
+        name: String,
+        /// Host the key authenticates against. Defaults to
+        /// `github.com`; override for self-hosted GitHub Enterprise
+        /// or other git servers.
+        #[arg(long, default_value = "github.com")]
+        ssh_host: String,
+    },
+    /// Print every key filename present in the deploy-keys volume
+    /// and the Host stanzas in the volume's `/config`.
+    List,
+    /// Remove a key from the deploy-keys volume — both the key file
+    /// at `/<name>` and the matching Host stanza in `/config`.
+    /// Removing a non-existent key is not an error.
+    Remove {
+        /// Name of the key to remove (the same name passed to `add`).
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -126,6 +167,7 @@ async fn main() -> Result<()> {
         // the same underlying flow (interactive `claude login` against
         // the credentials volume).
         Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
+        Command::SetupDeployKeys { action } => setup_deploy_keys_cmd(&config_path, action).await,
         Command::Status => status_cmd().await,
         Command::Kill { target } => kill_cmd(&config_path, &target).await,
         Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
@@ -863,6 +905,190 @@ async fn status_cmd() -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Shell script the `add` arm runs inside a one-shot container with
+/// the deploy-keys volume mounted at `/sshvol` (issue #69 / ADR-0002).
+/// stdin is piped through to the container, so `cat > /sshvol/<name>`
+/// captures the operator's paste; the rest of the script chmod's the
+/// key, idempotently ensures the Host stanza is in `/sshvol/config`,
+/// and idempotently seeds `/sshvol/known_hosts` via `ssh-keyscan`.
+///
+/// Pure function — the value is the text of the script run via
+/// `sh -c "..."`. Tested for shape (paths, chmod 600, Host stanza
+/// fields, idempotence guard) so the contract can evolve without
+/// silently dropping a required step.
+fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
+    let identity = format!("/home/bellows/.ssh/{name}");
+    // Note: the Host-stanza body uses `\\n` (escaped) because the
+    // outer Rust raw-ish format includes the literal backslash-n that
+    // `printf` then expands to a real newline at shell runtime.
+    // Idempotence comes from `grep -F -q` guards so re-running `add`
+    // for the same key does not duplicate the Host stanza or the
+    // known_hosts entry.
+    format!(
+        "set -e\n\
+         umask 077\n\
+         cat > /sshvol/{name}\n\
+         chmod 600 /sshvol/{name}\n\
+         touch /sshvol/config\n\
+         chmod 600 /sshvol/config\n\
+         if ! grep -F -q 'IdentityFile {identity}' /sshvol/config; then\n\
+             printf 'Host {ssh_host}\\n    IdentityFile {identity}\\n    IdentitiesOnly yes\\n\\n' >> /sshvol/config\n\
+         fi\n\
+         touch /sshvol/known_hosts\n\
+         chmod 644 /sshvol/known_hosts\n\
+         if ! grep -F -q '{ssh_host} ' /sshvol/known_hosts; then\n\
+             ssh-keyscan -H {ssh_host} >> /sshvol/known_hosts 2>/dev/null\n\
+         fi\n",
+        name = name,
+        identity = identity,
+        ssh_host = ssh_host,
+    )
+}
+
+/// Shell script the `list` arm runs inside the one-shot container.
+/// Prints filenames in `/sshvol/` (one per line) under a `keys:`
+/// header, then the `config` file under a `config:` header so the
+/// operator can read every Host stanza at a glance.
+fn build_deploy_keys_list_script() -> String {
+    "set -e\n\
+     echo 'keys:'\n\
+     ls -1A /sshvol 2>/dev/null | grep -v -x -e config -e known_hosts || true\n\
+     echo ''\n\
+     echo 'config:'\n\
+     cat /sshvol/config 2>/dev/null || echo '(no /sshvol/config — run `bellows setup-deploy-keys add <name>` to create it)'\n"
+        .to_string()
+}
+
+/// Shell script the `remove` arm runs inside the one-shot container.
+/// Removes the key file at `/sshvol/<name>` (rm -f so a missing key
+/// is not an error) AND the matching Host stanza from `/sshvol/config`
+/// (located by its `IdentityFile /home/bellows/.ssh/<name>` line; the
+/// awk filter spans from the preceding `Host` line through the next
+/// blank line so the block is removed cleanly).
+fn build_deploy_keys_remove_script(name: &str) -> String {
+    let identity = format!("/home/bellows/.ssh/{name}");
+    format!(
+        "set -e\n\
+         rm -f /sshvol/{name}\n\
+         if [ -f /sshvol/config ]; then\n\
+             awk -v identity='{identity}' 'BEGIN {{ in_block=0 }}\n\
+                 /^Host / {{ block=$0; in_block=0; next }}\n\
+                 $0 ~ \"IdentityFile \" identity {{ in_block=1; next }}\n\
+                 in_block && /^$/ {{ in_block=0; next }}\n\
+                 in_block {{ next }}\n\
+                 /^$/ {{ if (block != \"\") {{ print block }} block=\"\"; print; next }}\n\
+                 {{ if (block != \"\") {{ print block; block=\"\" }} print }}\n\
+                 END {{ if (block != \"\") print block }}\n\
+             ' /sshvol/config > /sshvol/config.new\n\
+             mv /sshvol/config.new /sshvol/config\n\
+             chmod 600 /sshvol/config\n\
+         fi\n",
+        name = name,
+        identity = identity,
+    )
+}
+
+/// Dispatch for `bellows setup-deploy-keys add | list | remove`
+/// (issue #69 / ADR-0002 ACs 3, 4, 5). Each arm builds the
+/// corresponding shell script and runs it inside a one-shot
+/// policy-image container with the deploy-keys volume mounted at
+/// `/sshvol`. `add` is run with `-i` so stdin is piped through to the
+/// container; `list` and `remove` don't read stdin.
+async fn setup_deploy_keys_cmd(
+    config_path: &PathBuf,
+    action: SetupDeployKeysAction,
+) -> Result<()> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config at {}", config_path.display()))?;
+    let config = Config::from_str(&config_text)
+        .with_context(|| format!("parse config at {}", config_path.display()))?;
+    let volume = &config.auth.ssh_keys_volume;
+
+    let image_tag = sandbox::ensure_policy_image()
+        .await
+        .context("build/check policy image")?;
+
+    match action {
+        SetupDeployKeysAction::Add { name, ssh_host } => {
+            println!(
+                "bellows: importing deploy key `{name}` into volume `{volume}` (host: {ssh_host})."
+            );
+            println!("bellows: paste the PRIVATE half of the key, then press Ctrl-D (EOF).");
+            let script = build_deploy_keys_add_script(&name, &ssh_host);
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "-i",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run -i` for setup-deploy-keys add")?;
+            if !status.success() {
+                anyhow::bail!("docker run (add) exited with {}", status);
+            }
+            println!("bellows: deploy key `{name}` added.");
+        }
+        SetupDeployKeysAction::List => {
+            let script = build_deploy_keys_list_script();
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol:ro"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run` for setup-deploy-keys list")?;
+            if !status.success() {
+                anyhow::bail!("docker run (list) exited with {}", status);
+            }
+        }
+        SetupDeployKeysAction::Remove { name } => {
+            let script = build_deploy_keys_remove_script(&name);
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run` for setup-deploy-keys remove")?;
+            if !status.success() {
+                anyhow::bail!("docker run (remove) exited with {}", status);
+            }
+            println!("bellows: deploy key `{name}` removed (no-op if it was already absent).");
+        }
+    }
+    Ok(())
 }
 
 async fn setup_auth(config_path: &PathBuf) -> Result<()> {
