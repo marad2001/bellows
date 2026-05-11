@@ -157,7 +157,7 @@ is per-repo opt-in SSH deploy keys mounted read-only at
 the credentials volume), default name `bellows-deploy-keys`,
 overridable via `[auth].ssh_keys_volume`.
 
-The three steps per shared private crate:
+The four steps per shared private crate:
 
 1. **Generate or pick a deploy key.** A deploy key is a single
    SSH keypair scoped to one private GitHub repo (the one carrying
