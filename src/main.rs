@@ -69,6 +69,36 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Inspect or delete Bellows-managed cache volumes. With no flags,
+    /// prints a table of every per-repo `bellows-target-*` and the
+    /// shared `bellows-cargo-registry` volume — does NOT remove anything
+    /// (the default invocation is a dry-run by design, so an unrelated
+    /// `bellows prune` never deletes cache data by surprise). `--all`
+    /// removes every cache volume (with confirmation; combine with
+    /// `--yes` to skip the prompt). `--target <slug>` removes one
+    /// per-repo target volume by slug. `--registry` removes the shared
+    /// cargo registry volume. The credentials volume is never touched
+    /// by any flag combination.
+    Prune {
+        /// Remove every Bellows-managed cache volume (per-repo target
+        /// volumes + the shared cargo registry). Prompts for
+        /// confirmation unless `--yes` is also passed.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+        /// With `--all`, skip the confirmation prompt. Useful for
+        /// scripts / CI. Ignored without `--all`.
+        #[arg(long)]
+        yes: bool,
+        /// Remove exactly one per-repo target volume by slug. No
+        /// confirmation prompt — the explicit slug IS the confirmation.
+        /// Cannot be combined with `--all` or `--registry`.
+        #[arg(long, value_name = "SLUG", conflicts_with_all = ["all", "registry"])]
+        target: Option<String>,
+        /// Remove the shared cargo registry volume
+        /// (`bellows-cargo-registry`). No confirmation prompt.
+        #[arg(long, conflicts_with = "target")]
+        registry: bool,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +120,12 @@ async fn main() -> Result<()> {
         Command::Status => status_cmd().await,
         Command::Kill { issue } => kill_cmd(&config_path, issue).await,
         Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
+        Command::Prune {
+            all,
+            yes,
+            target,
+            registry,
+        } => prune_cmd(all, yes, target, registry).await,
     }
 }
 
@@ -334,6 +370,196 @@ async fn call_triage_one(
         .map_err(|e| format!("apply_verdict: {e}"))?;
 
     Ok(verdict_to_summary_bucket(&verdict))
+}
+
+/// Dispatch for `bellows prune` (issue #13 / slice 11). Reads no
+/// orchestrator config: prune is a one-shot CLI that talks to Docker
+/// only. Behaviour matrix:
+///
+///   • no flags         — list every cache volume, no removal (dry-run).
+///   • --all (+--yes)   — remove every cache volume; prompt unless --yes.
+///   • --target <slug>  — remove one per-repo target volume.
+///   • --registry       — remove the shared cargo registry volume.
+///
+/// Flag combinations that would be ambiguous (`--target` with `--all`
+/// or `--registry`) are rejected at the clap layer; this function only
+/// sees the four legal shapes above.
+async fn prune_cmd(
+    all: bool,
+    yes: bool,
+    target: Option<String>,
+    registry: bool,
+) -> Result<()> {
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .context("connect to local docker daemon")?;
+
+    if let Some(slug) = target {
+        let name = bellows::target_volume_name_from_slug(&slug);
+        return remove_one_volume(&docker, &name, "target").await;
+    }
+    if registry {
+        return remove_one_volume(
+            &docker,
+            sandbox::CARGO_REGISTRY_VOLUME_NAME,
+            "registry",
+        )
+        .await;
+    }
+
+    let volumes = sandbox::list_cache_volumes(&docker)
+        .await
+        .context("list bellows-managed cache volumes")?;
+
+    if !all {
+        // Dry-run / inspect mode: print the table and exit. The brief
+        // pins this as "an unrelated `bellows prune` invocation should
+        // never delete cache data by surprise" — the table is the only
+        // side effect.
+        print!("{}", format_volume_table(&volumes));
+        Ok(())
+    } else {
+        prune_all(&docker, volumes, yes).await
+    }
+}
+
+/// Removes the shared cargo registry OR a per-repo target volume by
+/// name. Shared between the `--registry` and `--target <slug>` paths
+/// so the not-found / in-use error mapping reads the same in both.
+async fn remove_one_volume(
+    docker: &bollard::Docker,
+    name: &str,
+    label: &str,
+) -> Result<()> {
+    match sandbox::remove_cache_volume(docker, name).await {
+        Ok(()) => {
+            println!("bellows prune: removed {} volume `{}`", label, name);
+            Ok(())
+        }
+        Err(sandbox::SandboxError::VolumeNotFound { .. }) => {
+            eprintln!("bellows prune: {} volume `{}` does not exist", label, name);
+            std::process::exit(1);
+        }
+        Err(e) => Err(anyhow!("remove {} volume `{}`: {}", label, name, e)),
+    }
+}
+
+/// `--all` body: optionally prompt, then remove every cache volume the
+/// discovery returned. Confirmation reads a single line from stdin —
+/// any line starting with `y`/`Y` proceeds; everything else aborts.
+async fn prune_all(
+    docker: &bollard::Docker,
+    volumes: Vec<sandbox::CacheVolume>,
+    yes: bool,
+) -> Result<()> {
+    if volumes.is_empty() {
+        println!("bellows prune: no Bellows-managed cache volumes to remove");
+        return Ok(());
+    }
+
+    println!("bellows prune: the following cache volumes will be removed:");
+    print!("{}", format_volume_table(&volumes));
+
+    if !yes && !confirm_destructive_action()? {
+        println!("bellows prune: aborted; no volumes removed");
+        return Ok(());
+    }
+
+    let mut failures = 0u32;
+    for v in &volumes {
+        match sandbox::remove_cache_volume(docker, &v.name).await {
+            Ok(()) => println!("bellows prune: removed `{}`", v.name),
+            Err(e) => {
+                eprintln!("bellows prune: failed to remove `{}`: {}", v.name, e);
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!(
+            "bellows prune: {failures} of {} volumes failed to remove",
+            volumes.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Read one line from stdin and accept it as confirmation if it starts
+/// with `y` (case-insensitive). Anything else (including a bare RET) is
+/// "no". Pulled out so the prune-all body stays readable; the prompt
+/// text is intentionally explicit about what's about to happen.
+fn confirm_destructive_action() -> Result<bool> {
+    use std::io::{BufRead, Write as _};
+    print!("Remove every Bellows-managed cache volume listed above? [y/N]: ");
+    std::io::stdout()
+        .flush()
+        .context("flush stdout before confirmation prompt")?;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read confirmation from stdin")?;
+    Ok(line.trim_start().chars().next().is_some_and(|c| c == 'y' || c == 'Y'))
+}
+
+/// Render a list of cache volumes as a stdout table. Always emits a
+/// header line so an empty list still tells the operator that bellows
+/// looked and found nothing — easier to read than a silent exit.
+///
+/// Columns: NAME (full volume name), KIND (`target` / `cargo-registry`),
+/// REPO-SLUG (empty for the shared registry), SIZE (only when Docker
+/// returned UsageData — usually absent on the `/volumes` list endpoint).
+fn format_volume_table(volumes: &[sandbox::CacheVolume]) -> String {
+    let mut rows: Vec<[String; 4]> = Vec::with_capacity(volumes.len() + 1);
+    rows.push([
+        "NAME".to_string(),
+        "KIND".to_string(),
+        "REPO-SLUG".to_string(),
+        "SIZE".to_string(),
+    ]);
+    for v in volumes {
+        let (kind, slug) = match &v.kind {
+            sandbox::CacheVolumeKind::Target { repo_slug } => {
+                ("target".to_string(), repo_slug.clone())
+            }
+            sandbox::CacheVolumeKind::CargoRegistry => {
+                ("cargo-registry".to_string(), "-".to_string())
+            }
+        };
+        let size = match v.size_bytes {
+            Some(b) => format!("{}", b),
+            None => "-".to_string(),
+        };
+        rows.push([v.name.clone(), kind, slug, size]);
+    }
+
+    let mut widths = [0usize; 4];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if cell.len() > widths[i] {
+                widths[i] = cell.len();
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                out.push_str("  ");
+            }
+            out.push_str(cell);
+            if i + 1 < row.len() {
+                for _ in cell.len()..widths[i] {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push('\n');
+    }
+    if volumes.is_empty() {
+        out.push_str("(no Bellows-managed cache volumes found)\n");
+    }
+    out
 }
 
 async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
@@ -875,6 +1101,211 @@ mod tests {
         assert!(
             lower.contains("dry-run"),
             "triage help must surface --dry-run: {triage_help}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_prune_without_flags_for_dry_run_listing() {
+        // `bellows prune` (no flags) is the safe default: list every
+        // cache volume, remove nothing. The brief calls this out
+        // explicitly — an unrelated invocation must not delete data
+        // by surprise, so the dry-run path is reachable from the bare
+        // subcommand.
+        let cli = Cli::try_parse_from(["bellows", "prune"])
+            .expect("bellows prune (no flags) must parse for dry-run listing");
+        match cli.command {
+            Some(Command::Prune {
+                all: false,
+                yes: false,
+                target: None,
+                registry: false,
+            }) => {}
+            _ => panic!("expected Prune with all=false, yes=false, target=None, registry=false"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_prune_with_all_flag() {
+        let cli = Cli::try_parse_from(["bellows", "prune", "--all"])
+            .expect("bellows prune --all must parse");
+        match cli.command {
+            Some(Command::Prune {
+                all: true,
+                yes: false,
+                target: None,
+                registry: false,
+            }) => {}
+            _ => panic!("expected Prune with all=true, yes=false"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_prune_with_all_and_yes_for_script_mode() {
+        // `--yes` combined with `--all` is the scriptable / CI form:
+        // remove everything without prompting. Both flags must parse
+        // together.
+        let cli = Cli::try_parse_from(["bellows", "prune", "--all", "--yes"])
+            .expect("bellows prune --all --yes must parse");
+        match cli.command {
+            Some(Command::Prune {
+                all: true,
+                yes: true,
+                target: None,
+                registry: false,
+            }) => {}
+            _ => panic!("expected Prune with all=true, yes=true"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_prune_with_target_slug() {
+        let cli =
+            Cli::try_parse_from(["bellows", "prune", "--target", "marad2001-bellows"])
+                .expect("bellows prune --target <slug> must parse");
+        match cli.command {
+            Some(Command::Prune {
+                all: false,
+                yes: false,
+                target: Some(slug),
+                registry: false,
+            }) if slug == "marad2001-bellows" => {}
+            _ => panic!("expected Prune with target=Some(marad2001-bellows)"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_prune_with_registry_flag() {
+        let cli = Cli::try_parse_from(["bellows", "prune", "--registry"])
+            .expect("bellows prune --registry must parse");
+        match cli.command {
+            Some(Command::Prune {
+                all: false,
+                yes: false,
+                target: None,
+                registry: true,
+            }) => {}
+            _ => panic!("expected Prune with registry=true"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_prune_with_target_and_all_combined() {
+        // Brief: mixing `--target` with `--all` is a clap-level usage
+        // error so the intent is unambiguous. A single-volume scope and
+        // a wipe-everything scope cannot coexist.
+        let result =
+            Cli::try_parse_from(["bellows", "prune", "--all", "--target", "some-slug"]);
+        assert!(
+            result.is_err(),
+            "bellows prune --all --target <slug> must be a clap usage error",
+        );
+    }
+
+    #[test]
+    fn cli_rejects_prune_with_target_and_registry_combined() {
+        // Brief: mixing `--target` with `--registry` is also a usage
+        // error — the per-repo target volume and the shared registry
+        // volume are different things; the operator must pick one.
+        let result = Cli::try_parse_from([
+            "bellows",
+            "prune",
+            "--target",
+            "some-slug",
+            "--registry",
+        ]);
+        assert!(
+            result.is_err(),
+            "bellows prune --target <slug> --registry must be a clap usage error",
+        );
+    }
+
+    #[test]
+    fn cli_help_lists_the_prune_subcommand() {
+        // An operator scanning `bellows --help` must see `prune` so the
+        // cache-volume tooling is discoverable without reading the
+        // README.
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("prune"),
+            "top-level --help must list prune: {help}"
+        );
+    }
+
+    #[test]
+    fn cli_prune_help_documents_default_dry_run_and_destructive_flags() {
+        // The Prune subcommand's help text is the operator's first
+        // line of defense against running the wrong shape. The brief
+        // pins the no-flag invocation as a dry-run by design and lists
+        // the destructive flags; the help must surface both so the
+        // safety bias is visible at the CLI.
+        let mut cmd = Cli::command();
+        let prune_help = cmd
+            .find_subcommand_mut("prune")
+            .expect("prune subcommand missing")
+            .render_help()
+            .to_string();
+        let lower = prune_help.to_lowercase();
+        assert!(
+            lower.contains("dry-run") || lower.contains("does not remove") || lower.contains("does not delete"),
+            "prune help must communicate that no-flag is a dry-run: {prune_help}"
+        );
+        for flag in ["--all", "--target", "--registry"] {
+            assert!(
+                prune_help.contains(flag),
+                "prune help must list {flag}: {prune_help}",
+            );
+        }
+    }
+
+    #[test]
+    fn format_volume_table_lists_each_volume_with_kind_and_repo_slug() {
+        // The default `bellows prune` invocation prints a table of
+        // every Bellows-managed cache volume. Pin the columns the
+        // brief asks for (name, kind, repo-slug for target volumes)
+        // and the inclusion of both kinds in the body.
+        let volumes = vec![
+            sandbox::CacheVolume {
+                name: "bellows-target-marad2001-bellows".to_string(),
+                kind: sandbox::CacheVolumeKind::Target {
+                    repo_slug: "marad2001-bellows".to_string(),
+                },
+                size_bytes: None,
+            },
+            sandbox::CacheVolume {
+                name: "bellows-cargo-registry".to_string(),
+                kind: sandbox::CacheVolumeKind::CargoRegistry,
+                size_bytes: Some(1_048_576),
+            },
+        ];
+        let rendered = format_volume_table(&volumes);
+        // Header columns from the brief.
+        assert!(rendered.contains("NAME"), "missing NAME column: {rendered}");
+        assert!(rendered.contains("KIND"), "missing KIND column: {rendered}");
+        assert!(
+            rendered.contains("REPO-SLUG"),
+            "missing REPO-SLUG column: {rendered}"
+        );
+        // Body rows include both volume names + kinds + the per-repo
+        // target's repo slug.
+        assert!(rendered.contains("bellows-target-marad2001-bellows"));
+        assert!(rendered.contains("bellows-cargo-registry"));
+        assert!(rendered.contains("target"));
+        assert!(rendered.contains("cargo-registry"));
+        assert!(rendered.contains("marad2001-bellows"));
+        // Size column populated when Docker reported usage data.
+        assert!(rendered.contains("1048576"));
+    }
+
+    #[test]
+    fn format_volume_table_handles_empty_list_with_explicit_message() {
+        // Better to emit a header + "(no volumes found)" line than a
+        // silent exit — the operator needs to know bellows looked.
+        let rendered = format_volume_table(&[]);
+        assert!(rendered.contains("NAME"));
+        assert!(
+            rendered.to_lowercase().contains("no")
+                && rendered.to_lowercase().contains("found"),
+            "empty list rendering must explicitly say nothing was found: {rendered}"
         );
     }
 
