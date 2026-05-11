@@ -258,6 +258,21 @@ pub async fn run_once(
         log_writer,
         "bellows: phase 1/5 — implement (running claude in sandbox container, this is the long one)",
     );
+    // Issue #52 asymmetry audit: capture HEAD before the implement
+    // agent invocation for the same reason the per-finding and nit-batch
+    // sites do. The agent brief discourages self-committing inside the
+    // sandbox but does not prevent it; if the implement agent self-
+    // commits and leaves nothing else staged, `commit_all` returns
+    // `NoChangesToCommit` and the legacy
+    // `commit_all().await?; push_branch().await?;` shape aborts the run
+    // outright — strictly worse than the silent-drop case, because the
+    // self-committed work lives on local HEAD but never reaches origin
+    // and the pipeline dies before producing a PR. The shared
+    // `commit_all_and_push_if_advanced` helper collapses the four-corner
+    // pattern (agent self-commit / bellows-on-behalf / mixed / no-op)
+    // so this site is tolerant of every commit shape the implement
+    // agent can leave behind.
+    let head_before_implement = workspace::head_sha(&workspace).await?;
     let implement_agent_run = sandbox::run_agent(
         &workspace,
         &auth,
@@ -293,8 +308,8 @@ pub async fn run_once(
     };
 
     announce(log_writer, "bellows: committing + pushing implement branch");
-    workspace::commit_all(&workspace).await?;
-    workspace::push_branch(&workspace).await?;
+    let _ =
+        workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
 
     // ---- Phase 2: Post-implement cargo checks gate ----
     let post_implement_gate: GateOutcome = if !budget.exceeded
