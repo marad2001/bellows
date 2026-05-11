@@ -339,6 +339,8 @@ async fn call_triage_one(
         issue,
         &repo_label,
         &repo_slug,
+        &config.auth.ssh_keys_volume,
+        &primary_repo.deploy_keys,
         &mut log_writer,
         deadline,
     )

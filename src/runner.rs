@@ -336,6 +336,20 @@ pub async fn run_once(
 
     let repo_slug = crate::repo_slug(&repo_url);
 
+    // Per-repo SSH deploy-keys opt-in (issue #69 / ADR-0002). The
+    // matching `[[repo]]` block's `deploy_keys` decides whether the
+    // sandbox containers (run_agent + run_cargo_checks) get the
+    // deploy-keys volume mounted read-only at /home/bellows/.ssh/.
+    // Cloned because the candidate was moved out of `config.repos`
+    // above; cheap because the typical list is one or two key names.
+    let deploy_keys: Vec<String> = config
+        .repos
+        .iter()
+        .find(|r| r.url == repo_url)
+        .map(|r| r.deploy_keys.clone())
+        .unwrap_or_default();
+    let ssh_keys_volume = config.auth.ssh_keys_volume.clone();
+
     let kickoff = policy::render_kickoff(&brief, &repo_url, &branch_name);
     tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
 
@@ -378,6 +392,8 @@ pub async fn run_once(
         claimed.number,
         &repo_label,
         &repo_slug,
+        &ssh_keys_volume,
+        &deploy_keys,
         log_writer,
         budget.deadline_or_halt(),
     )
@@ -491,6 +507,8 @@ pub async fn run_once(
             claimed.number,
             &repo_label,
             &repo_slug,
+            &ssh_keys_volume,
+            &deploy_keys,
             log_writer,
             budget.deadline_or_halt(),
         )
@@ -617,6 +635,8 @@ pub async fn run_once(
             claimed.number,
             &repo_label,
             &repo_slug,
+            &ssh_keys_volume,
+            &deploy_keys,
             log_writer,
             budget.deadline_or_halt(),
         )
@@ -771,6 +791,8 @@ pub async fn run_once(
                     claimed.number,
                     &repo_label,
                     &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
                     log_writer,
                     budget.deadline_or_halt(),
                 )
@@ -876,6 +898,8 @@ pub async fn run_once(
                     claimed.number,
                     &repo_label,
                     &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
                     log_writer,
                     budget.deadline_or_halt(),
                 )
@@ -977,6 +1001,8 @@ pub async fn run_once(
                 claimed.number,
                 &repo_label,
                 &repo_slug,
+                &ssh_keys_volume,
+                &deploy_keys,
                 log_writer,
                 budget.deadline_or_halt(),
             )
@@ -1042,6 +1068,8 @@ pub async fn run_once(
                     claimed.number,
                     &repo_label,
                     &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
                     log_writer,
                     budget.deadline_or_halt(),
                 )
@@ -1090,6 +1118,8 @@ pub async fn run_once(
                 claimed.number,
                 &repo_label,
                 &repo_slug,
+                &ssh_keys_volume,
+                &deploy_keys,
                 log_writer,
                 budget.deadline_or_halt(),
             )

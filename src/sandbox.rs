@@ -21,6 +21,12 @@ use crate::workspace::Workspace;
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
 
+/// Where the deploy-keys volume mounts inside the container (issue #69
+/// / ADR-0002). The path is the bellows-user's `~/.ssh/`, so cargo /
+/// git can pick up the `config` + `known_hosts` + key files at the
+/// standard openssh location with no extra config inside the sandbox.
+const SSH_KEYS_PATH_IN_CONTAINER: &str = "/home/bellows/.ssh";
+
 /// Name of the single shared cargo registry volume mounted on every
 /// agent container. Holds the cargo registry index plus downloaded
 /// crate sources; safe to share across all repos because cargo is
@@ -307,6 +313,8 @@ pub async fn run_agent(
     issue_number: u64,
     repo: &str,
     repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<AgentRun, SandboxError> {
@@ -329,6 +337,8 @@ pub async fn run_agent(
     // collision with bind syntax's `:` separator on Windows drive
     // letters. Auth contributes credentials volumes; build_cache_mounts
     // contributes the per-repo target + shared cargo registry caches.
+    // build_ssh_keys_mount contributes the read-only deploy-keys mount
+    // when (and only when) the active [[repo]] opted in via deploy_keys.
     let mut mounts = vec![Mount {
         target: Some("/workspace".to_string()),
         source: Some(workspace_path),
@@ -337,6 +347,9 @@ pub async fn run_agent(
     }];
     mounts.extend(auth.extra_mounts());
     mounts.extend(build_cache_mounts(repo_slug));
+    if let Some(m) = build_ssh_keys_mount(ssh_keys_volume, deploy_keys) {
+        mounts.push(m);
+    }
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -408,6 +421,8 @@ pub async fn run_cargo_checks(
     issue_number: u64,
     repo: &str,
     repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<CargoChecksRun, SandboxError> {
@@ -427,6 +442,13 @@ pub async fn run_cargo_checks(
         ..Default::default()
     }];
     mounts.extend(build_cache_mounts(repo_slug));
+    // Same per-repo SSH deploy-keys mount as the agent container —
+    // both phases need private-dep access via cargo. Brief: "Applies
+    // symmetrically to run_agent and run_cargo_checks. Both phases
+    // need private-dep access."
+    if let Some(m) = build_ssh_keys_mount(ssh_keys_volume, deploy_keys) {
+        mounts.push(m);
+    }
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -633,6 +655,33 @@ fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
             registry_labels,
         ),
     ]
+}
+
+/// Mount filter for the per-repo SSH deploy keys (issue #69 / ADR-0002).
+/// Returns `Some(Mount)` only when the active `[[repo]]` block opted in
+/// by declaring at least one name in `deploy_keys`; otherwise `None`,
+/// preserving the "no creds in sandbox by default" posture for every
+/// repo (including bellows-on-bellows) that did not opt in.
+///
+/// The mount is always READ-ONLY: that is the security boundary per
+/// ADR-0002 — an escaping agent cannot tamper with the keys.
+///
+/// The names inside `deploy_keys` are not consulted here; they're
+/// resolved against the volume's filesystem at startup
+/// (`validate_deploy_keys_exist`), where a missing key short-circuits
+/// the run with a clear error. This function only decides "mount or
+/// no mount" based on whether the list is empty.
+fn build_ssh_keys_mount(ssh_keys_volume: &str, deploy_keys: &[String]) -> Option<Mount> {
+    if deploy_keys.is_empty() {
+        return None;
+    }
+    Some(Mount {
+        target: Some(SSH_KEYS_PATH_IN_CONTAINER.to_string()),
+        source: Some(ssh_keys_volume.to_string()),
+        typ: Some(MountType::VOLUME),
+        read_only: Some(true),
+        ..Default::default()
+    })
 }
 
 /// The entrypoint override applied to the cargo-checks container.
