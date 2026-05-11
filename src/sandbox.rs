@@ -457,6 +457,13 @@ async fn run_container(
     lifecycle
 }
 
+// Issue #69 added two more arguments (ssh_keys_volume + deploy_keys);
+// the existing call surface was already at clippy's
+// too_many_arguments boundary. Bundling into a struct would just
+// rename the boilerplate without simplifying it, so suppressed here
+// — the runner is the only caller and the call sites are kept tidy
+// with their own one-line summaries.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     workspace: &Workspace,
     auth: &Auth,
@@ -566,6 +573,8 @@ pub struct CargoChecksRun {
 /// set on the returned `CargoChecksRun`.
 ///
 /// No credentials volume — the gate has no Anthropic dependency.
+// See run_agent's note on the too_many_arguments suppression.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cargo_checks(
     workspace: &Workspace,
     issue_number: u64,
