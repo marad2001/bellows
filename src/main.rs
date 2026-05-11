@@ -11,7 +11,7 @@ use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
 use bellows::config::Config;
 use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
-use bellows::status::{self, BlockTransition, KillPrecheck, StatusContext};
+use bellows::status::{self, KillPrecheck, OutcomeTransition, StatusContext};
 use bellows::tracker;
 
 #[derive(Parser)]
@@ -353,33 +353,35 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         }
     };
 
-    // #42 pre-claim PR check transition tracker. Lives across ticks so
-    // that a 5-minute CI cycle on an open agent PR doesn't produce ~10
-    // identical "blocked by PR #N" log lines drowning out everything
-    // else; a fresh line fires only when the block set changes or when
-    // bellows moves between blocked and unblocked.
-    let mut block_transition = BlockTransition::new();
+    // Polling-loop transition tracker (issues #42 and #50). Without
+    // dedup, a 30s tick floods the log with identical "idle (no
+    // ready-for-agent issues)" lines between events and identical
+    // "blocked by PR #N" / `MissingAgentBrief(N)` lines while an
+    // ongoing condition persists. `OutcomeTransition` collapses each
+    // ongoing-state run to a single line emitted on transition into
+    // that state; per-event outcomes (Finalised/Contended/Cancelled)
+    // bypass dedup and always log.
+    let mut transition = OutcomeTransition::new();
 
     loop {
         let outcome = runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref()).await;
         match outcome {
             Ok(RunOutcome::Blocked { pr_numbers }) => {
-                if let Some(line) = block_transition.observe_blocked(&pr_numbers) {
+                if let Some(line) = transition.observe_blocked(&pr_numbers) {
                     log(&mut log_file, &line);
                 }
             }
             Ok(RunOutcome::Idle) => {
-                if let Some(line) = block_transition.observe_unblocked() {
+                for line in transition.observe_idle() {
                     log(&mut log_file, &line);
                 }
-                log(&mut log_file, "bellows: idle (no ready-for-agent issues)");
             }
             Ok(RunOutcome::Finalised {
                 issue_number,
                 pr_number,
                 reason,
             }) => {
-                if let Some(line) = block_transition.observe_unblocked() {
+                if let Some(line) = transition.observe_event() {
                     log(&mut log_file, &line);
                 }
                 log(
@@ -391,7 +393,7 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                 );
             }
             Ok(RunOutcome::Contended { issue_number }) => {
-                if let Some(line) = block_transition.observe_unblocked() {
+                if let Some(line) = transition.observe_event() {
                     log(&mut log_file, &line);
                 }
                 log(
@@ -406,7 +408,7 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                 issue_number,
                 pr_number,
             }) => {
-                if let Some(line) = block_transition.observe_unblocked() {
+                if let Some(line) = transition.observe_event() {
                     log(&mut log_file, &line);
                 }
                 log(
@@ -418,10 +420,11 @@ async fn run(config_path: &PathBuf) -> Result<()> {
                 );
             }
             Err(e) => {
-                log(
-                    &mut log_file,
-                    &format!("bellows: error: {}", format_error_chain(&e)),
-                );
+                let shape = e.shape();
+                let line = format!("bellows: error: {}", format_error_chain(&e));
+                for line in transition.observe_error(&shape, line) {
+                    log(&mut log_file, &line);
+                }
                 // Finding #1 (review of PR #26): if run_once returned Err
                 // between write_busy and write_idle (any of ~24 `?`
                 // propagations — workspace ops, sandbox calls, tokio::fs,

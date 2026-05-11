@@ -31,6 +31,39 @@ pub enum RunError {
     MissingAgentBrief(u64),
 }
 
+impl RunError {
+    /// A normalised dedup key for this error. Used by the polling loop's
+    /// `OutcomeTransition` tracker so that ~30s ticks repeatedly hitting
+    /// the same failure (e.g. `MissingAgentBrief(42)` until an operator
+    /// posts the brief) collapse to a single log line per uninterrupted
+    /// run of identical errors. The contract:
+    ///
+    /// - Same variant + same payload → same shape (silenced).
+    /// - Same variant + different payload → different shape (fresh line).
+    /// - Different variant → different shape (fresh line).
+    ///
+    /// `MissingAgentBrief(N)` is the only variant with a stable
+    /// per-issue payload — exactly the case the brief calls out
+    /// (transition from `MissingAgentBrief(42)` to `MissingAgentBrief(43)`
+    /// must emit a fresh line). For the network/IO/sandbox variants the
+    /// shape key folds in the `Display` string so two genuinely
+    /// identical failures dedup while transient-detail changes
+    /// (different rate-limit message, different sandbox container id)
+    /// surface as a fresh transition. The cost of a few extra fresh
+    /// lines on transient-detail churn is worth less to operators than
+    /// the cost of silencing a legitimate change.
+    pub fn shape(&self) -> String {
+        match self {
+            RunError::Octocrab(e) => format!("octocrab:{e}"),
+            RunError::Workspace(e) => format!("workspace:{e}"),
+            RunError::Sandbox(e) => format!("sandbox:{e}"),
+            RunError::Io(e) => format!("io:{e}"),
+            RunError::InvalidRepoUrl(url) => format!("invalid_repo_url:{url}"),
+            RunError::MissingAgentBrief(n) => format!("missing_agent_brief:{n}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RunOutcome {
     Idle,
@@ -1357,6 +1390,37 @@ mod tests {
     fn parse_owner_repo_rejects_url_with_too_few_segments() {
         let err = parse_owner_repo("https://github.com/marad2001").unwrap_err();
         assert!(matches!(err, RunError::InvalidRepoUrl(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn run_error_shape_same_missing_brief_issue_matches() {
+        // Brief AC #3: `Err(MissingAgentBrief(N))` recurring on the same
+        // issue must collapse to a single log line. The shape key is the
+        // tracker's input for that dedup; identical issue numbers must
+        // produce identical shape keys.
+        let a = RunError::MissingAgentBrief(42).shape();
+        let b = RunError::MissingAgentBrief(42).shape();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn run_error_shape_distinguishes_different_missing_brief_issue() {
+        // Brief AC #4: `MissingAgentBrief(42)` → `MissingAgentBrief(43)`
+        // must emit a fresh line because the payload differs. The shape
+        // key carries the issue number so the tracker can tell.
+        let a = RunError::MissingAgentBrief(42).shape();
+        let b = RunError::MissingAgentBrief(43).shape();
+        assert_ne!(a, b, "shape keys for different issue numbers must differ");
+    }
+
+    #[test]
+    fn run_error_shape_distinguishes_different_variants() {
+        // Brief AC #4: different variant = different shape, even if a
+        // payload happens to match. MissingAgentBrief(42) and
+        // InvalidRepoUrl("42") must not collapse.
+        let a = RunError::MissingAgentBrief(42).shape();
+        let b = RunError::InvalidRepoUrl("42".to_string()).shape();
+        assert_ne!(a, b);
     }
 
     /// Construct a slice-5-shaped `PhaseOutcomes` for build_log_body tests:
