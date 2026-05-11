@@ -138,11 +138,41 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Startup validation entry point for `bellows run` and
+/// `bellows triage` (issue #69 / ADR-0002 AC9). Maps the Config's
+/// `[[repo]]` blocks into the borrow-friendly `DeployKeyRepo` shape
+/// the sandbox-side validator consumes, then dispatches. The map step
+/// lives in main.rs (not in config or sandbox) so neither module has
+/// to know about the other's types.
+async fn validate_deploy_keys_at_startup(config: &Config) -> Result<()> {
+    let repos: Vec<sandbox::DeployKeyRepo> = config
+        .repos
+        .iter()
+        .map(|r| sandbox::DeployKeyRepo {
+            url: r.url.clone(),
+            deploy_keys: r.deploy_keys.clone(),
+        })
+        .collect();
+    sandbox::validate_deploy_keys(&repos, &config.auth.ssh_keys_volume)
+        .await
+        .map_err(|e| anyhow!("{e}"))
+}
+
 async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // Issue #69 (ADR-0002) AC9: refuse to start when any [[repo]]
+    // deploy_keys references a key name that's not present in the
+    // configured ssh_keys_volume. Doing this here — before `bellows
+    // triage` claims any work — keeps the failure mode operator-
+    // legible rather than surfacing as a confusing cargo-fetch crash
+    // inside a container minutes later. No-op when no [[repo]] opts in.
+    validate_deploy_keys_at_startup(&config)
+        .await
+        .context("validate deploy keys")?;
 
     let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
         anyhow!(
@@ -881,6 +911,15 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // Issue #69 (ADR-0002) AC9: refuse to start when any [[repo]]
+    // deploy_keys references a key name that's not present in the
+    // configured ssh_keys_volume. Fail-fast here is much friendlier
+    // than letting the agent crash mid-cargo-fetch later. No-op when
+    // no [[repo]] opts in.
+    validate_deploy_keys_at_startup(&config)
+        .await
+        .context("validate deploy keys")?;
 
     let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
         anyhow!(

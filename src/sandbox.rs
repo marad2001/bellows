@@ -119,6 +119,85 @@ impl OutputTail {
     }
 }
 
+/// Borrow-friendly view of one `[[repo]]` block, just the fields the
+/// deploy-keys validator needs (issue #69 / ADR-0002). Decoupled from
+/// `config::RepoConfig` so the validator is callable from tests
+/// without round-tripping through TOML, and from production code by
+/// mapping `&[RepoConfig]` → `Vec<DeployKeyRepo>`.
+#[derive(Debug, Clone)]
+pub struct DeployKeyRepo {
+    pub url: String,
+    pub deploy_keys: Vec<String>,
+}
+
+/// One missing reference: a `[[repo]] deploy_keys` name that wasn't
+/// found in the configured `ssh_keys_volume`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDeployKey {
+    pub key: String,
+    pub repo_url: String,
+}
+
+/// The error raised when one or more `[[repo]] deploy_keys` references
+/// have no matching file in the deploy-keys volume. Carries the full
+/// list of misses so the operator can fix every gap in one sitting
+/// rather than rerunning startup validation N times.
+#[derive(Debug, Clone, thiserror::Error)]
+pub struct MissingDeployKeysError {
+    pub missing: Vec<MissingDeployKey>,
+}
+
+impl std::fmt::Display for MissingDeployKeysError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "bellows: refusing to start — {} deploy-key reference{} in `[[repo]] deploy_keys` not present in the deploy-keys volume:",
+            self.missing.len(),
+            if self.missing.len() == 1 { "" } else { "s" },
+        )?;
+        for m in &self.missing {
+            write!(f, "\n  - key `{}` referenced by repo `{}`", m.key, m.repo_url)?;
+        }
+        write!(
+            f,
+            "\nrun `bellows setup-deploy-keys add <name>` for each missing key, or remove the reference from `[[repo]] deploy_keys` if the repo no longer needs it.",
+        )?;
+        Ok(())
+    }
+}
+
+/// Pure validator: every name in any `[[repo]] deploy_keys` list must
+/// be present as a key in `present` (typically the set of regular
+/// filenames in the `ssh_keys_volume`). Returns Ok when every
+/// reference resolves; otherwise an error carrying every miss so the
+/// operator sees the full list in one pass.
+///
+/// Pure function — the docker-side wrapper
+/// (`validate_deploy_keys_against_volume`) is responsible for asking
+/// the daemon what filenames exist, then delegating to this function
+/// for the pure logic.
+pub fn validate_deploy_keys_against_present(
+    repos: &[DeployKeyRepo],
+    present: &std::collections::HashSet<String>,
+) -> Result<(), MissingDeployKeysError> {
+    let mut missing = Vec::new();
+    for r in repos {
+        for k in &r.deploy_keys {
+            if !present.contains(k) {
+                missing.push(MissingDeployKey {
+                    key: k.clone(),
+                    repo_url: r.url.clone(),
+                });
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(MissingDeployKeysError { missing })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error("docker: {0}")]
@@ -139,6 +218,77 @@ pub enum SandboxError {
     VolumeInUse { name: String },
     #[error("volume `{name}` does not exist")]
     VolumeNotFound { name: String },
+    #[error(transparent)]
+    MissingDeployKeys(#[from] MissingDeployKeysError),
+    #[error("could not list filenames in deploy-keys volume `{volume}`: docker run exited with status {status}")]
+    DeployKeysVolumeListFailed { volume: String, status: String },
+}
+
+/// List every regular filename in the named deploy-keys volume (issue
+/// #69 / ADR-0002 startup validation). Spawns a one-shot policy-image
+/// container with the volume mounted read-only and runs `ls -1A`
+/// inside it; that path is portable across Docker Desktop (where the
+/// host filesystem cannot reach the volume's mountpoint) and Linux
+/// Docker Engine alike. If the volume does not exist yet, docker
+/// creates it empty on first mount — the validator then sees an
+/// empty `present` set and surfaces every reference as missing.
+pub async fn list_deploy_keys_in_volume(
+    volume: &str,
+) -> Result<std::collections::HashSet<String>, SandboxError> {
+    let image_tag = ensure_policy_image().await?;
+    // `--user 0` so root inside the container can read regardless of
+    // whether the volume was populated with bellows uid 1000 ownership.
+    // `ls -1A` prints one filename per line and omits `.`/`..`.
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--volume",
+            &format!("{volume}:/sshvol:ro"),
+            "--entrypoint",
+            "sh",
+            &image_tag,
+            "-c",
+            "ls -1A /sshvol 2>/dev/null || true",
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(SandboxError::DeployKeysVolumeListFailed {
+            volume: volume.to_string(),
+            status: format!("{}", output.status),
+        });
+    }
+    let present = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(present)
+}
+
+/// Startup validation entry point (issue #69 / ADR-0002 AC9). Walks
+/// every `[[repo]] deploy_keys` reference; if every name resolves to
+/// a file in the configured `ssh_keys_volume`, returns Ok. Otherwise
+/// returns `SandboxError::MissingDeployKeys` carrying every miss so
+/// the operator sees the full punch list and can rerun
+/// `setup-deploy-keys add` for each in one sitting.
+///
+/// Short-circuits without touching docker when no `[[repo]]` opted in
+/// — both the cheap path AND the preservation of the "no creds in
+/// sandbox by default" posture (we don't spawn a container at all).
+pub async fn validate_deploy_keys(
+    repos: &[DeployKeyRepo],
+    ssh_keys_volume: &str,
+) -> Result<(), SandboxError> {
+    if repos.iter().all(|r| r.deploy_keys.is_empty()) {
+        return Ok(());
+    }
+    let present = list_deploy_keys_in_volume(ssh_keys_volume).await?;
+    validate_deploy_keys_against_present(repos, &present)?;
+    Ok(())
 }
 
 /// Build (or reuse the cached) policy image and return its tag. Used by
