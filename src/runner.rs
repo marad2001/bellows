@@ -134,6 +134,8 @@ pub async fn run_once(
 
     let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
 
+    let repo_slug = crate::repo_slug(&config.repo.url);
+
     let kickoff = policy::render_kickoff(&brief, &config.repo.url, &branch_name);
     tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
 
@@ -159,6 +161,7 @@ pub async fn run_once(
         &workspace,
         &auth,
         claimed.number,
+        &repo_slug,
         log_writer,
         budget.deadline_or_halt(),
     )
@@ -203,6 +206,7 @@ pub async fn run_once(
         let run = sandbox::run_cargo_checks(
             &workspace,
             claimed.number,
+            &repo_slug,
             log_writer,
             budget.deadline_or_halt(),
         )
@@ -248,6 +252,7 @@ pub async fn run_once(
             &workspace,
             &auth,
             claimed.number,
+            &repo_slug,
             log_writer,
             budget.deadline_or_halt(),
         )
@@ -400,6 +405,7 @@ pub async fn run_once(
                     &workspace,
                     &auth,
                     claimed.number,
+                    &repo_slug,
                     log_writer,
                     budget.deadline_or_halt(),
                 )
@@ -490,6 +496,7 @@ pub async fn run_once(
                     &workspace,
                     &auth,
                     claimed.number,
+                    &repo_slug,
                     log_writer,
                     budget.deadline_or_halt(),
                 )
@@ -562,6 +569,7 @@ pub async fn run_once(
             let run = sandbox::run_cargo_checks(
                 &workspace,
                 claimed.number,
+                &repo_slug,
                 log_writer,
                 budget.deadline_or_halt(),
             )

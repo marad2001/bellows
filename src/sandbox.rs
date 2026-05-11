@@ -21,6 +21,23 @@ use crate::workspace::Workspace;
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
 
+/// Name of the single shared cargo registry volume mounted on every
+/// agent container. Holds the cargo registry index plus downloaded
+/// crate sources; safe to share across all repos because cargo is
+/// invoked one container at a time (concurrency=1 in v1).
+pub const CARGO_REGISTRY_VOLUME_NAME: &str = "bellows-cargo-registry";
+
+/// Cargo registry path inside the container. Inherited from the
+/// `rust:1.95-slim` base image's `CARGO_HOME=/usr/local/cargo` —
+/// `policy-image/Dockerfile` doesn't override that. If the base
+/// image ever moves CARGO_HOME, this constant follows the image.
+const CARGO_REGISTRY_PATH_IN_CONTAINER: &str = "/usr/local/cargo/registry";
+
+const WORKSPACE_TARGET_PATH_IN_CONTAINER: &str = "/workspace/target";
+
+const VOLUME_KIND_TARGET: &str = "target";
+const VOLUME_KIND_CARGO_REGISTRY: &str = "cargo-registry";
+
 /// How many bytes of agent stdout/stderr to retain for the failure log
 /// comment. Streaming to the log_writer is unaffected — this is a tee
 /// for the post-run summary, not a cap on what's written.
@@ -261,6 +278,7 @@ pub async fn run_agent(
     workspace: &Workspace,
     auth: &Auth,
     issue_number: u64,
+    repo_slug: &str,
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<AgentRun, SandboxError> {
@@ -281,7 +299,8 @@ pub async fn run_agent(
 
     // Structured Mount API rather than `binds: Vec<String>` to avoid
     // collision with bind syntax's `:` separator on Windows drive
-    // letters. Auth contributes any credentials/cache volumes it needs.
+    // letters. Auth contributes credentials volumes; build_cache_mounts
+    // contributes the per-repo target + shared cargo registry caches.
     let mut mounts = vec![Mount {
         target: Some("/workspace".to_string()),
         source: Some(workspace_path),
@@ -289,6 +308,7 @@ pub async fn run_agent(
         ..Default::default()
     }];
     mounts.extend(auth.extra_mounts());
+    mounts.extend(build_cache_mounts(repo_slug));
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -358,6 +378,7 @@ pub struct CargoChecksRun {
 pub async fn run_cargo_checks(
     workspace: &Workspace,
     issue_number: u64,
+    repo_slug: &str,
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<CargoChecksRun, SandboxError> {
@@ -370,13 +391,16 @@ pub async fn run_cargo_checks(
 
     let labels = build_managed_labels(&run_id, issue_number, Some("cargo-checks-gate"));
 
+    let mut mounts = vec![Mount {
+        target: Some("/workspace".to_string()),
+        source: Some(workspace_path),
+        typ: Some(MountType::BIND),
+        ..Default::default()
+    }];
+    mounts.extend(build_cache_mounts(repo_slug));
+
     let host_config = HostConfig {
-        mounts: Some(vec![Mount {
-            target: Some("/workspace".to_string()),
-            source: Some(workspace_path),
-            typ: Some(MountType::BIND),
-            ..Default::default()
-        }]),
+        mounts: Some(mounts),
         ..Default::default()
     };
 
@@ -538,6 +562,55 @@ async fn ensure_image_built(hash: &str, tag: &str) -> Result<(), SandboxError> {
         return Err(SandboxError::ImageBuildFailed(status));
     }
     Ok(())
+}
+
+/// Build the two cache-volume mounts every agent container carries:
+/// a per-repo `target/` volume and the shared cargo registry volume.
+///
+/// Docker stamps the `volume_options` labels onto the volume at
+/// first-create only — existing volumes are not retroactively
+/// re-labelled. Acceptable because the very first run on a repo
+/// creates the volume, and `bellows prune` (issue #13) only needs
+/// to find volumes that bellows itself created.
+fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
+    let target_labels = HashMap::from([
+        ("bellows-managed".to_string(), "true".to_string()),
+        ("bellows-volume-kind".to_string(), VOLUME_KIND_TARGET.to_string()),
+        ("bellows-repo-slug".to_string(), repo_slug.to_string()),
+    ]);
+    let registry_labels = HashMap::from([
+        ("bellows-managed".to_string(), "true".to_string()),
+        (
+            "bellows-volume-kind".to_string(),
+            VOLUME_KIND_CARGO_REGISTRY.to_string(),
+        ),
+    ]);
+
+    vec![
+        labelled_volume_mount(
+            WORKSPACE_TARGET_PATH_IN_CONTAINER,
+            &crate::target_volume_name_from_slug(repo_slug),
+            target_labels,
+        ),
+        labelled_volume_mount(
+            CARGO_REGISTRY_PATH_IN_CONTAINER,
+            CARGO_REGISTRY_VOLUME_NAME,
+            registry_labels,
+        ),
+    ]
+}
+
+fn labelled_volume_mount(target: &str, source: &str, labels: HashMap<String, String>) -> Mount {
+    Mount {
+        target: Some(target.to_string()),
+        source: Some(source.to_string()),
+        typ: Some(MountType::VOLUME),
+        volume_options: Some(bollard::models::MountVolumeOptions {
+            labels: Some(labels),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// Build the label set every Bellows-managed container carries. Pulled
@@ -934,6 +1007,89 @@ mod tests {
         assert_eq!(
             labels.get("bellows-purpose").map(String::as_str),
             Some("cargo-checks-gate"),
+        );
+    }
+
+    #[test]
+    fn build_cache_mounts_produces_target_and_registry_volumes() {
+        // Slice 4 acceptance: every agent container is spawned with
+        // two named-volume mounts, one per-repo (target/) and one
+        // shared (cargo registry). Pin both shapes in one assertion
+        // so the helper can't silently drop a mount or swap them.
+        let mounts = build_cache_mounts("marad2001-bellows");
+        assert_eq!(mounts.len(), 2, "expected target + registry: {:?}", mounts);
+
+        let target = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(WORKSPACE_TARGET_PATH_IN_CONTAINER))
+            .expect("target mount missing");
+        assert_eq!(target.typ, Some(MountType::VOLUME));
+        assert_eq!(
+            target.source.as_deref(),
+            Some("bellows-target-marad2001-bellows"),
+        );
+
+        let registry = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(CARGO_REGISTRY_PATH_IN_CONTAINER))
+            .expect("registry mount missing");
+        assert_eq!(registry.typ, Some(MountType::VOLUME));
+        assert_eq!(registry.source.as_deref(), Some(CARGO_REGISTRY_VOLUME_NAME));
+    }
+
+    #[test]
+    fn build_cache_mounts_target_volume_carries_managed_kind_and_repo_slug_labels() {
+        // Slice 4 acceptance: per-repo target volume labels are the
+        // discovery key for `bellows prune` (issue #13). The brief
+        // pins three label keys: bellows-managed=true,
+        // bellows-volume-kind=target, bellows-repo-slug=<slug>.
+        let mounts = build_cache_mounts("marad2001-bellows");
+        let target = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(WORKSPACE_TARGET_PATH_IN_CONTAINER))
+            .expect("target mount missing");
+        let labels = target
+            .volume_options
+            .as_ref()
+            .and_then(|v| v.labels.as_ref())
+            .expect("target mount must carry volume_options.labels");
+        assert_eq!(labels.get("bellows-managed").map(String::as_str), Some("true"));
+        assert_eq!(
+            labels.get("bellows-volume-kind").map(String::as_str),
+            Some(VOLUME_KIND_TARGET),
+        );
+        assert_eq!(
+            labels.get("bellows-repo-slug").map(String::as_str),
+            Some("marad2001-bellows"),
+        );
+    }
+
+    #[test]
+    fn build_cache_mounts_registry_volume_carries_managed_and_kind_labels_but_no_repo_slug() {
+        // Slice 4 acceptance: the shared cargo registry is not
+        // per-repo — labelling it with a single repo's slug would
+        // mis-direct `bellows prune` into removing it whenever that
+        // one repo's per-repo volumes are pruned. The registry
+        // carries only bellows-managed + bellows-volume-kind.
+        let mounts = build_cache_mounts("marad2001-bellows");
+        let registry = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some(CARGO_REGISTRY_PATH_IN_CONTAINER))
+            .expect("registry mount missing");
+        let labels = registry
+            .volume_options
+            .as_ref()
+            .and_then(|v| v.labels.as_ref())
+            .expect("registry mount must carry volume_options.labels");
+        assert_eq!(labels.get("bellows-managed").map(String::as_str), Some("true"));
+        assert_eq!(
+            labels.get("bellows-volume-kind").map(String::as_str),
+            Some(VOLUME_KIND_CARGO_REGISTRY),
+        );
+        assert!(
+            !labels.contains_key("bellows-repo-slug"),
+            "shared registry must not carry bellows-repo-slug: {:?}",
+            labels,
         );
     }
 

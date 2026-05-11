@@ -196,19 +196,24 @@ fn readme_documents_tos_posture_and_api_key_fallback() {
 }
 
 #[test]
-fn readme_troubleshooting_documents_cold_cache_with_issue_6_reference() {
+fn readme_troubleshooting_documents_cold_cache_with_cache_volumes_mitigation() {
     let body = read_readme();
-    // Brief 7: cold-cache build cost is the single biggest Rust-
-    // specific operational risk. README must document the
-    // manual-prewarm workaround and reference issue #6 (cache
-    // volumes) as the future fix.
+    // Slice 4 (issue #6): per-repo `target/` named volume + shared
+    // cargo registry named volume now mount on every agent container,
+    // so the second run on a repo is warm-cache. The README must
+    // still document the cold-cache risk on a new repo's FIRST run
+    // (the volumes exist but populate during that run) plus the
+    // pre-warm `cargo build` workaround, AND it must name the two
+    // volume conventions so an operator can spot them via
+    // `docker volume ls`.
     assert_contains_all(
         &body,
         &[
             "## Troubleshooting",
             "cold",
             "cargo build",
-            "#6",
+            "bellows-target-",
+            "bellows-cargo-registry",
         ],
         "troubleshooting / cold-cache",
     );

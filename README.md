@@ -347,21 +347,37 @@ test environment, an upstream dep) and re-label the issue back to
 
 ### Cold-cache build time on first run for a repo
 
-The single biggest Rust-specific operational hazard. A fresh
-agent-side workspace has no `target/` directory and no warm cargo
-registry, so the agent's first `cargo build` on a new repo recompiles
-every dependency from scratch — easily 15–25 minutes for a non-trivial
-project, which eats most of the default 60-minute wall-clock budget
-before the agent has done anything useful.
+A fresh agent-side workspace has no warm cargo registry and no
+`target/` directory the very first time bellows runs against a given
+repo, so that first `cargo build` recompiles every dependency from
+scratch — easily 15–25 minutes for a non-trivial project, which can
+eat most of the default 60-minute wall-clock budget before the agent
+has done anything useful.
 
-**Workaround until issue #6 lands** (per-repo `target/` named volume
-and a shared cargo registry volume): manually pre-warm the workspace
-before bellows picks up the first issue. From a fresh clone of the
-target repo, run `cargo build` once on your host, then make sure
-bellows is configured against that same repo. The next agent run still
-clones fresh inside the sandbox, so this is a partial fix — the real
-remedy is cache volumes, tracked in
-[issue #6](https://github.com/marad2001/bellows/issues/6).
+Bellows mitigates this by mounting two persistent Docker named volumes
+on every agent container:
+
+- a per-repo `target/` cache at the workspace's `target/` directory,
+  named `bellows-target-<owner-repo>` (the suffix is the slugified
+  `owner/repo` segment of `[repo].url`);
+- a host-wide shared cargo registry cache at `/usr/local/cargo/registry`,
+  named `bellows-cargo-registry`.
+
+Both volumes are created lazily by Docker on first mount — no manual
+setup needed — and tagged with `bellows-managed=true` plus a
+`bellows-volume-kind=target|cargo-registry` label so future tooling
+(`bellows prune`, planned in issue #13) can find them. The second
+and every subsequent run against the same repo reuses these caches:
+the registry index is not re-fetched and dependency crates are not
+recompiled.
+
+**First-run workaround.** The very first run on a new repo still pays
+the cold-cache cost — the volumes get *populated* during that run.
+If you'd rather pay this cost outside the agent's wall-clock budget,
+run `cargo build` once on a fresh host clone of the target repo
+before kicking off the first bellows run. The agent's clone is still
+fresh inside the sandbox, so this is a partial mitigation; subsequent
+runs are warm regardless of pre-warm.
 
 If you're seeing repeated wall-clock-cap failures on a new repo and
 you haven't pre-warmed, that's almost certainly why — see the
@@ -481,9 +497,10 @@ chip away at them.
 - multi-repo (the config field exists, only the first repo is read);
 - multi-host orchestration / true 24/7 AFK from a VPS;
 - parallelism / concurrent issues (concurrency stays at 1);
-- `sccache` or other build caches beyond what the agent's own
-  `target/` directory provides
-  (per-repo cache volumes are tracked in issue #6);
+- `sccache` integration — bellows already mounts per-repo `target/`
+  and shared cargo-registry named volumes on every agent container
+  (see [Cold-cache build time](#cold-cache-build-time-on-first-run-for-a-repo)
+  in Troubleshooting); sccache on top of that is deferred to v1.5;
 - Windows or macOS CI runners (the workflow is Linux-only in v1);
 - `cargo fmt --check`, code coverage reporting, or release-packaging
   steps in CI (all future additions to the workflow);
