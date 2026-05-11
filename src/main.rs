@@ -1021,13 +1021,19 @@ fn build_deploy_keys_list_script() -> String {
 /// blank line so the block is removed cleanly).
 fn build_deploy_keys_remove_script(name: &str) -> String {
     let identity = format!("/home/bellows/.ssh/{name}");
+    // Clear `block` when the matching IdentityFile arms `in_block`:
+    // otherwise the deferred Host header survives in `block` past the
+    // body, and if the target stanza is the file's last entry the END
+    // rule resurrects the orphaned `Host ...` line. Clearing on entry
+    // makes the END rule's `if (block != "")` correctly skip the
+    // doomed header in every case.
     format!(
         "set -e\n\
          rm -f /sshvol/{name}\n\
          if [ -f /sshvol/config ]; then\n\
              awk -v identity='{identity}' 'BEGIN {{ in_block=0 }}\n\
                  /^Host / {{ block=$0; in_block=0; next }}\n\
-                 $0 ~ \"IdentityFile \" identity {{ in_block=1; next }}\n\
+                 $0 ~ \"IdentityFile \" identity {{ in_block=1; block=\"\"; next }}\n\
                  in_block && /^$/ {{ in_block=0; next }}\n\
                  in_block {{ next }}\n\
                  /^$/ {{ if (block != \"\") {{ print block }} block=\"\"; print; next }}\n\
@@ -1665,6 +1671,22 @@ mod tests {
         assert!(
             script.contains("/home/bellows/.ssh/workboard-core"),
             "remove script must reference the in-container identity path to locate the Host stanza: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_remove_script_clears_deferred_host_header_on_match() {
+        // Regression: if the awk filter sets `in_block=1` without
+        // clearing `block`, the END rule resurrects the matching
+        // stanza's Host header when the file does not end with a
+        // trailing blank line — leaving an orphan `Host github.com`
+        // with no IdentityFile. Pin the contract: the IdentityFile-
+        // match rule must clear `block`.
+        let script = build_deploy_keys_remove_script("workboard-core");
+        assert!(
+            script.contains("in_block=1; block=\"\""),
+            "remove script must clear `block` when entering in_block so the \
+             END rule does not resurrect an orphan Host header: {script}",
         );
     }
 
