@@ -156,18 +156,30 @@ pub struct AgentConfig {
     /// runner converts this to `Duration` via `.get() * 60`.
     #[serde(default = "default_wall_clock_minutes")]
     pub wall_clock_minutes: NonZeroU64,
+    /// Slice 8: when an issue carries this label, the post-implement
+    /// weak-test guard is short-circuited entirely. The cargo gate
+    /// still runs as normal. Default `"refactor"` — appropriate for
+    /// briefs that legitimately produce no new tests (renames, pure
+    /// refactors, dependency bumps).
+    #[serde(default = "default_weak_test_guard_skip_label")]
+    pub weak_test_guard_skip_label: String,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             wall_clock_minutes: default_wall_clock_minutes(),
+            weak_test_guard_skip_label: default_weak_test_guard_skip_label(),
         }
     }
 }
 
 fn default_wall_clock_minutes() -> NonZeroU64 {
     NonZeroU64::new(60).expect("60 is non-zero")
+}
+
+fn default_weak_test_guard_skip_label() -> String {
+    "refactor".to_string()
 }
 
 impl FromStr for Config {

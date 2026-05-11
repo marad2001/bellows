@@ -103,6 +103,15 @@ pub async fn run_once(
         Err(ClaimError::Octocrab(e)) => return Err(RunError::Octocrab(e)),
     };
 
+    // Slice 8: record whether the weak-test-guard skip-label is on the
+    // issue at claim time. The post-implement guard reads this flag; we
+    // snapshot here so a label flip mid-run cannot accidentally bypass
+    // or trigger the guard.
+    let weak_test_guard_skipped = claimed
+        .labels
+        .iter()
+        .any(|l| l.name == config.agent.weak_test_guard_skip_label);
+
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
@@ -216,6 +225,67 @@ pub async fn run_once(
     } else {
         GateOutcome::default()
     };
+
+    // Slice 8: weak-test guard. After the implement-phase commit lands
+    // and the cargo gate has run, scan `git diff <base>...HEAD` for new
+    // Rust test attributes. A run with implementation code but no new
+    // tests trips a green cargo gate (passing tests over an unchanged
+    // test suite) but is otherwise indistinguishable from a real
+    // Success — falling through to a non-draft PR a reviewer might
+    // merge. The guard catches this by synthesising an `## Unaddressed
+    // finding: no new tests added` section in agent-notes.md, which
+    // routes the run to AgentSelfReportedFailure via the existing
+    // slice-9.6 has_agent_notes precedence in classify_exit.
+    //
+    // Short-circuited when the issue carries the configurable skip-
+    // label (default `refactor`): renames / dependency bumps / pure
+    // refactors legitimately produce no new tests, so the cargo gate
+    // alone is the right contract for those briefs.
+    //
+    // Gated on a clean implement + post-implement-gate path: running
+    // the guard on a crashed implement or failing cargo gate would
+    // misattribute the failure mode (the run was already going to
+    // route to Crash / FinalTestsRed before notes-precedence took
+    // over). Skipping here keeps the operator-facing classification
+    // accurate.
+    if !weak_test_guard_skipped
+        && implement_agent_run.exit_code == 0
+        && !policy::gate_failed(&post_implement_gate)
+        && !budget.exceeded
+    {
+        let diff = workspace::compute_diff_against_base(&workspace).await?;
+        if !policy::has_new_tests(&diff) {
+            announce(
+                log_writer,
+                "bellows: weak-test guard fired — diff against base has no new Rust test attributes; synthesising agent-notes entry to force agent-self-reported-failure",
+            );
+            let notes_path = workspace.path().join("agent-notes.md");
+            let existing = if notes_path.exists() {
+                tokio::fs::read_to_string(&notes_path).await?
+            } else {
+                String::new()
+            };
+            let mut new_notes = existing;
+            if !new_notes.is_empty() && !new_notes.ends_with('\n') {
+                new_notes.push('\n');
+            }
+            new_notes.push_str(&policy::synthesize_no_new_tests_entry());
+            tokio::fs::write(&notes_path, new_notes).await?;
+            match workspace::commit_all(&workspace).await {
+                Ok(()) => workspace::push_branch(&workspace).await?,
+                Err(WorkspaceError::NoChangesToCommit) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    } else if weak_test_guard_skipped {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: weak-test guard short-circuited — issue carries the `{}` skip-label",
+                config.agent.weak_test_guard_skip_label,
+            ),
+        );
+    }
 
     // Halt-on-phase-failure: if implement crashed, the post-implement
     // gate failed, OR the wall-clock budget is already spent, skip

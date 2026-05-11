@@ -7,8 +7,8 @@ use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::workspace::{
-    commit_all, diff_between_touches_only_agent_notes, head_sha, open_pr, prepare, push_branch,
-    OpenPrRequest,
+    commit_all, compute_diff_against_base, diff_between_touches_only_agent_notes, head_sha,
+    open_pr, prepare, push_branch, OpenPrRequest,
 };
 
 fn init_remote_repo(path: &Path) {
@@ -250,6 +250,77 @@ async fn diff_between_returns_false_when_base_equals_head() {
     assert!(
         !only_notes,
         "base==head is the empty diff; cannot be exactly [agent-notes.md]"
+    );
+}
+
+#[tokio::test]
+async fn compute_diff_against_base_returns_full_branch_diff_as_string() {
+    // Slice 8: the weak-test guard scans `git diff <base>...HEAD` for
+    // new Rust test attributes. It needs the diff as a String (rather
+    // than written to a tempfile) so the scan can run synchronously in
+    // the runner without an extra file IO round-trip. Pin the
+    // round-trip here: a commit that adds a `#[test]` function appears
+    // verbatim in the returned diff.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/42-fix-the-foo-bug")
+        .await
+        .unwrap();
+
+    std::fs::write(
+        workspace.path().join("tests").join("new.rs"),
+        "#[test]\nfn slice_8_smoke() {\n    assert_eq!(1, 1);\n}\n",
+    )
+    .or_else(|_| {
+        std::fs::create_dir_all(workspace.path().join("tests"))?;
+        std::fs::write(
+            workspace.path().join("tests").join("new.rs"),
+            "#[test]\nfn slice_8_smoke() {\n    assert_eq!(1, 1);\n}\n",
+        )
+    })
+    .unwrap();
+    commit_all(&workspace).await.unwrap();
+
+    let diff = compute_diff_against_base(&workspace)
+        .await
+        .expect("compute_diff_against_base should succeed");
+
+    assert!(
+        diff.contains("#[test]"),
+        "diff should contain the added test attribute line: {diff}"
+    );
+    assert!(
+        diff.contains("slice_8_smoke"),
+        "diff should contain the added function name: {diff}"
+    );
+}
+
+#[tokio::test]
+async fn compute_diff_against_base_returns_empty_string_when_branch_has_no_extra_commits() {
+    // Edge case the runner guards against indirectly: a workspace
+    // with no commits beyond the base branch produces an empty diff.
+    // The weak-test guard's has_new_tests scan returns false on the
+    // empty string (no `+` lines to inspect), which is the right
+    // semantics — a no-op run has no new tests but also has no
+    // implementation code, so the guard's gating in the runner
+    // skips it on the halt path.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/42-fix-the-foo-bug")
+        .await
+        .unwrap();
+
+    let diff = compute_diff_against_base(&workspace)
+        .await
+        .expect("compute_diff_against_base should succeed");
+
+    assert!(
+        diff.trim().is_empty(),
+        "branch at parity with base must produce empty diff, got: {diff:?}"
     );
 }
 

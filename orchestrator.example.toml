@@ -41,3 +41,11 @@ path = "bellows.log"
 # the deadline fires mid-container, the run halts and routes to a
 # draft PR with the `agent-failed` label. Default: 60 minutes.
 wall_clock_minutes = 60
+# Issue-label that short-circuits the slice-8 weak-test guard. The
+# guard scans `git diff <base>...HEAD` after the implement phase and
+# routes the run to `agent-self-reported-failure` (draft PR + the
+# `agent-failed` label) when no new Rust test attributes are detected.
+# Briefs that legitimately produce no new tests (renames, pure
+# refactors, dependency bumps) should carry this label so the guard
+# skips them. Default: "refactor".
+weak_test_guard_skip_label = "refactor"

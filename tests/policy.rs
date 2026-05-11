@@ -1,9 +1,10 @@
 use bellows::policy::{
-    build_violation_callout, classify_exit, compute_coverage_violations, is_auth_error_signature,
-    is_rate_limit_signature, parse_agent_notes_sections, parse_findings, per_finding_kickoff,
-    render_kickoff, synthesize_unaddressed_entries, AgentNoteSection, CheckResult, ExitReason,
-    FindingCoverage, GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome,
-    Severity, BATCH_REVIEW_FIX_NIT_PROMPT, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    build_violation_callout, classify_exit, compute_coverage_violations, has_new_tests,
+    is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections, parse_findings,
+    per_finding_kickoff, render_kickoff, synthesize_no_new_tests_entry,
+    synthesize_unaddressed_entries, AgentNoteSection, CheckResult, ExitReason, FindingCoverage,
+    GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome, Severity,
+    BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -1031,4 +1032,279 @@ fn parse_findings_extracts_a_single_well_formed_blocker() {
     assert_eq!(f.severity, Severity::Blocker);
     assert!(f.body.contains("Config::from_str"), "body must include description: {:?}", f.body);
     assert!(f.body.contains("Suggestion"), "body must include suggestion block: {:?}", f.body);
+}
+
+// ---- Slice 8: weak-test guard (has_new_tests + synthesize_no_new_tests_entry) ----
+
+#[test]
+fn has_new_tests_returns_true_for_added_plain_test_attribute() {
+    // Acceptance criterion: a diff that adds a new `#[test]` line is
+    // recognised as having new tests. Standard unified-diff shape:
+    // file headers + hunk header + a single added line.
+    let diff = "\
+diff --git a/tests/new.rs b/tests/new.rs
+index 0000000..1111111 100644
+--- a/tests/new.rs
++++ b/tests/new.rs
+@@ -0,0 +1,4 @@
++#[test]
++fn my_new_test() {
++    assert_eq!(1, 1);
++}
+";
+    assert!(
+        has_new_tests(diff),
+        "added `#[test]` line must register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_true_for_added_tokio_test_attribute() {
+    // The repo's existing tests use `#[tokio::test]` heavily — recognising
+    // it is essential for the guard to be useful here.
+    let diff = "\
+diff --git a/tests/new.rs b/tests/new.rs
+--- a/tests/new.rs
++++ b/tests/new.rs
+@@ -0,0 +1,4 @@
++#[tokio::test]
++async fn my_async_test() {
++    assert_eq!(1, 1);
++}
+";
+    assert!(
+        has_new_tests(diff),
+        "added `#[tokio::test]` line must register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_true_for_tokio_test_with_attribute_arguments() {
+    // `#[tokio::test(flavor = "multi_thread")]` is a common variant. The
+    // detector should still match even when the attribute carries args.
+    let diff = "\
+diff --git a/tests/new.rs b/tests/new.rs
+--- a/tests/new.rs
++++ b/tests/new.rs
+@@ -0,0 +1,2 @@
++#[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]
++async fn parameterised() {}
+";
+    assert!(
+        has_new_tests(diff),
+        "parameterised `#[tokio::test(..)]` must register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_false_for_diff_with_no_test_attributes() {
+    // The core silent-skip case: agent wrote implementation code only,
+    // no new tests. The guard must fire to force the run to
+    // agent-self-reported-failure.
+    let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,5 @@
+ pub fn existing() {}
++
++pub fn new_function() -> i32 {
++    42
++}
+";
+    assert!(
+        !has_new_tests(diff),
+        "diff with only implementation code must NOT register as having new tests: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_false_when_a_test_attribute_was_only_removed() {
+    // Negative-test for the +/- prefix discipline: a removed `#[test]`
+    // line is NOT a new test. Without this check, a refactor that
+    // renames a test by deleting one declaration and adding a different
+    // (non-test) one would falsely pass.
+    let diff = "\
+diff --git a/tests/old.rs b/tests/old.rs
+--- a/tests/old.rs
++++ b/tests/old.rs
+@@ -1,4 +1,1 @@
+-#[test]
+-fn was_a_test() {
+-    assert_eq!(1, 1);
+-}
++pub fn now_a_plain_function() {}
+";
+    assert!(
+        !has_new_tests(diff),
+        "removed-only `#[test]` line must NOT register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_false_for_context_lines_containing_test_attribute() {
+    // Context lines (those starting with a single space) are unchanged
+    // surroundings, not additions. The detector must scan only `+`
+    // lines — otherwise an edit that touches code near an existing
+    // `#[test]` block would falsely pass.
+    let diff = "\
+diff --git a/tests/existing.rs b/tests/existing.rs
+--- a/tests/existing.rs
++++ b/tests/existing.rs
+@@ -1,5 +1,6 @@
+ #[test]
+ fn existing_test() {
++    // an added line that is not itself a test attribute
+     assert_eq!(1, 1);
+ }
+";
+    assert!(
+        !has_new_tests(diff),
+        "context-line test attribute must NOT register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_false_when_test_attribute_appears_only_inside_a_line_comment() {
+    // False-positive case explicitly called out by the brief: a line
+    // like `// #[test]` inside a comment is documentation, not a real
+    // test attribute. The detector must skip lines whose first
+    // non-whitespace content is `//`.
+    let diff = "\
+diff --git a/src/notes.rs b/src/notes.rs
+--- a/src/notes.rs
++++ b/src/notes.rs
+@@ -0,0 +1,3 @@
++// Example usage in tests:
++// #[test]
++// fn example() {}
+";
+    assert!(
+        !has_new_tests(diff),
+        "test attributes inside line comments must NOT register as new tests: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_ignores_file_header_plus_plus_plus_lines() {
+    // A unified diff's `+++ b/path` file-header line starts with `+`
+    // and may end in `test.rs`. The detector must NOT treat it as an
+    // added content line — otherwise every diff that touches a file
+    // named `*test*` (e.g. `tests/foo.rs`, `src/test_helpers.rs`)
+    // would falsely pass.
+    let diff = "\
+diff --git a/src/test_helpers.rs b/src/test_helpers.rs
+--- a/src/test_helpers.rs
++++ b/src/test_helpers.rs
+@@ -0,0 +1,1 @@
++pub fn helper() {}
+";
+    assert!(
+        !has_new_tests(diff),
+        "file-header `+++ b/...test*` line must NOT count as a new test attribute: {diff}"
+    );
+}
+
+#[test]
+fn has_new_tests_returns_true_for_test_case_parametric_variant() {
+    // `#[test_case]` (and its parametric form `#[test_case(arg)]`) is
+    // a common third-party test attribute. The detector should accept
+    // it so a brief that asks for parametric coverage isn't penalised
+    // by the guard.
+    let diff = "\
+diff --git a/tests/p.rs b/tests/p.rs
+--- a/tests/p.rs
++++ b/tests/p.rs
+@@ -0,0 +1,3 @@
++#[test_case(1 => 1; \"identity\")]
++#[test_case(2 => 4; \"doubled\")]
++fn parametric(input: u32) -> u32 { input * input.min(2) }
+";
+    assert!(
+        has_new_tests(diff),
+        "added `#[test_case(...)]` line must register as a new test: {diff}"
+    );
+}
+
+#[test]
+fn synthesize_no_new_tests_entry_uses_canonical_unaddressed_finding_title() {
+    // Acceptance criterion: the synthesised markdown must use the
+    // canonical title `no new tests added` so a future parser-as-
+    // backstop iteration can cross-reference it deterministically (the
+    // same verbatim-title contract the slice-9.6 backstop established).
+    let entry = synthesize_no_new_tests_entry();
+    assert!(
+        entry.contains(&format!("## Unaddressed finding: {NO_NEW_TESTS_FINDING_TITLE}")),
+        "synthesised entry must use the canonical `## Unaddressed finding: {NO_NEW_TESTS_FINDING_TITLE}` header: {entry}"
+    );
+    assert_eq!(
+        NO_NEW_TESTS_FINDING_TITLE, "no new tests added",
+        "title constant must match the brief's spelling verbatim",
+    );
+}
+
+#[test]
+fn synthesize_no_new_tests_entry_identifies_bellows_as_the_author() {
+    // Sibling contract to synthesize_unaddressed_entries: a human
+    // reading agent-notes.md must be able to tell that the entry was
+    // synthesised by bellows, not written by claude. Otherwise the
+    // operator could mistake a guard-driven failure for an agent-
+    // initiated handoff.
+    let entry = synthesize_no_new_tests_entry();
+    let lower = entry.to_lowercase();
+    assert!(
+        lower.contains("bellows") && (lower.contains("synthes") || lower.contains("guard")),
+        "synthesised entry must identify bellows as the author: {entry}"
+    );
+}
+
+#[test]
+fn synthesize_no_new_tests_entry_routes_through_classify_exit_to_self_reported_failure() {
+    // Integration of the slice-8 guard with the existing slice-9.6
+    // precedence: appending the synthesised entry to agent-notes.md
+    // must, in turn, make `parse_agent_notes_sections` see an
+    // Unaddressed-finding section with the canonical title. Without
+    // that, `classify_exit(has_agent_notes=true, ...)` would still
+    // fire (notes present), but the per-finding cross-reference any
+    // future caller might run would silently miss the section. Pin
+    // the round-trip here so a future "clean up the wording" PR
+    // cannot accidentally break it.
+    let entry = synthesize_no_new_tests_entry();
+    let sections = parse_agent_notes_sections(&entry);
+    assert_eq!(
+        sections.len(),
+        1,
+        "synthesised entry must parse to exactly one Unaddressed-finding section: {sections:?}"
+    );
+    assert_eq!(sections[0].title, NO_NEW_TESTS_FINDING_TITLE);
+}
+
+#[test]
+fn weak_test_guard_and_parser_as_backstop_entries_coexist_in_a_single_agent_notes_file() {
+    // Acceptance criterion: "The slice-9.6 parser-as-backstop continues
+    // to function — the weak-test guard's synthesis path does not
+    // interfere with the per-finding loop's coverage-violation
+    // synthesis." Both synthesis helpers produce `## Unaddressed
+    // finding:` sections; the parser must see them all when both
+    // pathways have appended to the same file.
+    let mut notes = synthesize_no_new_tests_entry();
+    notes.push_str(&synthesize_unaddressed_entries(&[
+        finding("blocker silently skipped", Severity::Blocker),
+        finding("important silently skipped", Severity::Important),
+    ]));
+    let sections = parse_agent_notes_sections(&notes);
+    let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+    assert!(
+        titles.contains(&NO_NEW_TESTS_FINDING_TITLE),
+        "weak-test guard section must survive coexistence: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"blocker silently skipped"),
+        "parser-as-backstop section #1 must survive coexistence: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"important silently skipped"),
+        "parser-as-backstop section #2 must survive coexistence: {titles:?}"
+    );
+    assert_eq!(sections.len(), 3, "exactly three sections expected: {sections:?}");
 }
