@@ -3,8 +3,8 @@ use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
-    claim, fetch_agent_brief, finalise, find_next_issue, list_open_agent_prs, post_pr_comment,
-    transition_to_cancelled, ClaimError, FinaliseRequest,
+    claim, fetch_agent_brief, finalise, find_next_issue, list_needs_triage_issues,
+    list_open_agent_prs, post_pr_comment, transition_to_cancelled, ClaimError, FinaliseRequest,
 };
 use wiremock::matchers::body_string_contains;
 
@@ -560,6 +560,76 @@ async fn list_open_agent_prs_surfaces_github_errors() {
 
     let client = octocrab_pointed_at(mock.uri());
     let result = list_open_agent_prs(&client, "marad2001", "test-repo").await;
+    assert!(result.is_err(), "expected Err, got {:?}", result.map(|_| "Ok"));
+}
+
+#[tokio::test]
+async fn list_needs_triage_issues_filters_to_open_issues_with_needs_triage_label_oldest_first() {
+    // Slice T2 (#22): the backlog-drain CLI queries this endpoint for
+    // every open `needs-triage` issue oldest-first. The query params
+    // are part of the contract — `sort=created&direction=asc` is what
+    // produces the oldest-first ordering, and `state=open` ensures
+    // closed issues don't leak in.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "needs-triage"))
+        .and(query_param("state", "open"))
+        .and(query_param("sort", "created"))
+        .and(query_param("direction", "asc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "number": 3, "title": "filed first",  "labels": [{ "name": "needs-triage" }] },
+            { "number": 7, "title": "filed later",  "labels": [{ "name": "needs-triage" }] }
+        ])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let issues = list_needs_triage_issues(&client, "marad2001", "test-repo", "needs-triage")
+        .await
+        .expect("call should succeed");
+
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].number, 3, "oldest must come first");
+    assert_eq!(issues[1].number, 7);
+}
+
+#[tokio::test]
+async fn list_needs_triage_issues_returns_empty_when_no_needs_triage_issues_open() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "needs-triage"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let issues = list_needs_triage_issues(&client, "marad2001", "test-repo", "needs-triage")
+        .await
+        .expect("call should succeed");
+
+    assert!(issues.is_empty(), "expected empty, got {:?}", issues);
+}
+
+#[tokio::test]
+async fn list_needs_triage_issues_surfaces_github_errors() {
+    // Slice T2 backlog drain must distinguish "empty backlog" from
+    // "GitHub call failed" so the operator sees the failure rather
+    // than a misleading "0 issues processed" summary.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("server exploded"))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let result = list_needs_triage_issues(&client, "marad2001", "test-repo", "needs-triage").await;
     assert!(result.is_err(), "expected Err, got {:?}", result.map(|_| "Ok"));
 }
 

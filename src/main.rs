@@ -13,6 +13,7 @@ use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
 use bellows::status::{self, KillPrecheck, OutcomeTransition, StatusContext};
 use bellows::tracker;
+use bellows::triage::{self, Verdict};
 
 #[derive(Parser)]
 #[command(name = "bellows", about = "AFK Claude Code orchestrator for Rust repos")]
@@ -49,6 +50,21 @@ enum Command {
         /// GitHub issue number to cancel.
         issue: u64,
     },
+    /// Run the triage skill against one issue or walk the whole
+    /// `needs-triage` backlog. With an issue number, triages just that
+    /// one (slice T1 / issue #21). With no issue number, walks every
+    /// open `needs-triage` issue serially, oldest-first (slice T2 /
+    /// issue #22). Per-issue failures are isolated — the backlog drain
+    /// keeps going and tallies failures in the end-of-run summary.
+    Triage {
+        /// GitHub issue number to triage. Omit to drain the whole
+        /// open `needs-triage` backlog (oldest-first).
+        issue: Option<u64>,
+        /// Skip the apply step on every per-issue invocation: print
+        /// each verdict and the summary, but make no mutations.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -69,7 +85,139 @@ async fn main() -> Result<()> {
         Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
         Command::Status => status_cmd().await,
         Command::Kill { issue } => kill_cmd(&config_path, issue).await,
+        Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
     }
+}
+
+async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) -> Result<()> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config at {}", config_path.display()))?;
+    let config = Config::from_str(&config_text)
+        .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
+        anyhow!(
+            "env var {} (configured in [github].pat_env_var) is not set",
+            config.github.pat_env_var
+        )
+    })?;
+    let client = octocrab::OctocrabBuilder::new()
+        .personal_token(pat)
+        .build()
+        .context("build octocrab client")?;
+    let (owner, repo) = parse_owner_repo(&config.repo.url)?;
+
+    match issue {
+        Some(n) => triage_one_cmd(&client, &owner, &repo, n, dry_run).await,
+        None => triage_backlog_cmd(&client, &owner, &repo, dry_run).await,
+    }
+}
+
+async fn triage_one_cmd(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue: u64,
+    dry_run: bool,
+) -> Result<()> {
+    // Targeted form (slice T1 / issue #21). When T1 lands on master,
+    // its per-issue triage path will live here; until then, `bellows
+    // triage <N>` returns the explicit T1-not-on-master diagnostic
+    // rather than running silently in an unimplemented state.
+    match call_triage_one(client, owner, repo, issue, dry_run).await {
+        Ok(v) => {
+            println!("bellows triage: issue #{} -> {}", issue, v);
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "bellows triage: issue #{} failed: {}",
+            issue,
+            e,
+        )),
+    }
+}
+
+async fn triage_backlog_cmd(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    dry_run: bool,
+) -> Result<()> {
+    // Backlog drain (slice T2 / issue #22). Lists every open
+    // `needs-triage` issue oldest-first, then iterates serially
+    // through T1's per-issue triage path, tallying verdicts and
+    // failures into a single end-of-run summary.
+    let needs_triage_label = "needs-triage";
+    let issues = tracker::list_needs_triage_issues(client, owner, repo, needs_triage_label)
+        .await
+        .context("list open needs-triage issues")?;
+
+    if issues.is_empty() {
+        println!(
+            "bellows triage: no open `{}` issues to drain",
+            needs_triage_label,
+        );
+        return Ok(());
+    }
+
+    println!(
+        "bellows triage: draining {} open `{}` issue(s){}",
+        issues.len(),
+        needs_triage_label,
+        if dry_run { " (dry-run)" } else { "" },
+    );
+
+    let summary = triage::drain_backlog(issues, dry_run, |n, dr| async move {
+        println!("bellows triage: processing issue #{}", n);
+        match call_triage_one(client, owner, repo, n, dr).await {
+            Ok(v) => {
+                println!("bellows triage: issue #{} -> {}", n, v);
+                Ok(v)
+            }
+            Err(e) => {
+                // The brief calls out logging failures explicitly:
+                // "failures are logged and tallied in the summary."
+                eprintln!("bellows triage: issue #{} failed: {}", n, e);
+                Err(e)
+            }
+        }
+    })
+    .await;
+
+    print!("{}", summary);
+    Ok(())
+}
+
+/// Per-issue triage entry point. Slice T1 (issue #21) will replace
+/// this stub with the real implementation: dispatch the triage skill
+/// against the issue in a sandbox container, parse the verdict from
+/// the agent's structured output, and optionally apply it (label
+/// swap / `.out-of-scope/` write / etc.) unless `dry_run`.
+///
+/// Until T1 lands on master, this returns the explicit
+/// "T1 not yet implemented" diagnostic so that:
+///   - `bellows triage <N>` exits with a clear error rather than a
+///     silent-pass or panic;
+///   - `bellows triage` (backlog mode) still demonstrates the slice-T2
+///     iteration / isolation / summary contract end-to-end against
+///     real `needs-triage` issues — every issue tallies as `failed`
+///     with a uniform diagnostic, which is informative and harmless;
+///   - the T1 PR is a one-function swap, with the T2 wiring already
+///     in place (signature carries the full dependency footprint T1
+///     will need: client, owner, repo, issue, dry_run).
+async fn call_triage_one(
+    _client: &octocrab::Octocrab,
+    _owner: &str,
+    _repo: &str,
+    _issue: u64,
+    _dry_run: bool,
+) -> Result<Verdict, String> {
+    Err(
+        "slice T1 (issue #21) per-issue triage path is not yet on master; \
+         the T2 backlog-drain wiring is in place but cannot dispatch the \
+         triage skill until T1 merges"
+            .to_string(),
+    )
 }
 
 async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
@@ -505,6 +653,112 @@ mod tests {
         assert!(
             help.contains("refresh-auth"),
             "top-level --help must list refresh-auth: {help}"
+        );
+    }
+
+    #[test]
+    fn cli_parses_triage_without_issue_argument_for_backlog_mode() {
+        // Slice T2 (#22): `bellows triage` (no arg) walks every open
+        // `needs-triage` issue. Clap must accept the issue argument
+        // as optional.
+        let cli = Cli::try_parse_from(["bellows", "triage"])
+            .expect("bellows triage (no issue arg) must parse for backlog mode");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                dry_run: false,
+            }) => {}
+            other => panic!(
+                "expected Triage with issue=None, dry_run=false; got {:?}",
+                match other {
+                    Some(Command::Triage { issue, dry_run }) =>
+                        format!("Triage {{ issue: {:?}, dry_run: {} }}", issue, dry_run),
+                    _ => "non-Triage variant".to_string(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn cli_parses_triage_with_issue_argument_for_targeted_mode() {
+        // Slice T1 (#21) targeted form: `bellows triage <N>` triages
+        // just one issue.
+        let cli = Cli::try_parse_from(["bellows", "triage", "42"])
+            .expect("bellows triage 42 must parse for targeted mode");
+        match cli.command {
+            Some(Command::Triage {
+                issue: Some(42),
+                dry_run: false,
+            }) => {}
+            other => panic!(
+                "expected Triage with issue=Some(42), dry_run=false; got {:?}",
+                match other {
+                    Some(Command::Triage { issue, dry_run }) =>
+                        format!("Triage {{ issue: {:?}, dry_run: {} }}", issue, dry_run),
+                    _ => "non-Triage variant".to_string(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn cli_parses_triage_with_dry_run_in_backlog_mode() {
+        let cli = Cli::try_parse_from(["bellows", "triage", "--dry-run"])
+            .expect("bellows triage --dry-run must parse");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                dry_run: true,
+            }) => {}
+            _ => panic!("expected Triage with issue=None, dry_run=true"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_triage_with_issue_and_dry_run_in_targeted_mode() {
+        let cli = Cli::try_parse_from(["bellows", "triage", "42", "--dry-run"])
+            .expect("bellows triage 42 --dry-run must parse");
+        match cli.command {
+            Some(Command::Triage {
+                issue: Some(42),
+                dry_run: true,
+            }) => {}
+            _ => panic!("expected Triage with issue=Some(42), dry_run=true"),
+        }
+    }
+
+    #[test]
+    fn cli_help_lists_the_triage_subcommand() {
+        // An operator scanning `bellows --help` must see `triage` so
+        // the backlog drain is discoverable without reading the
+        // README.
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("triage"),
+            "top-level --help must list triage: {help}"
+        );
+    }
+
+    #[test]
+    fn cli_triage_help_documents_both_targeted_and_backlog_modes() {
+        // The Triage subcommand's help text must communicate that the
+        // issue argument is optional — present means targeted, absent
+        // means backlog. The two modes are subtle enough that help-text
+        // signal beats requiring an operator to consult the README.
+        let mut cmd = Cli::command();
+        let triage_help = cmd
+            .find_subcommand_mut("triage")
+            .expect("triage subcommand missing")
+            .render_help()
+            .to_string();
+        let lower = triage_help.to_lowercase();
+        assert!(
+            lower.contains("backlog") || lower.contains("needs-triage"),
+            "triage help must reference the backlog-drain mode: {triage_help}"
+        );
+        assert!(
+            lower.contains("dry-run"),
+            "triage help must surface --dry-run: {triage_help}"
         );
     }
 

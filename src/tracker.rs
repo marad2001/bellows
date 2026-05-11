@@ -27,6 +27,48 @@ struct ListIssuesParams<'a> {
     state: &'a str,
 }
 
+/// Query params for the oldest-first `needs-triage` listing used by the
+/// slice-T2 backlog drain (issue #22). Sibling of `ListIssuesParams`
+/// — separate struct because `sort` / `direction` only apply when the
+/// caller cares about ordering, and the existing `find_next_issue`
+/// path explicitly does not (its tiebreak is "first un-claimed in
+/// API-default order", and surfacing GitHub's sort/direction defaults
+/// on every list call would be churn).
+#[derive(serde::Serialize)]
+struct ListNeedsTriageParams<'a> {
+    labels: &'a str,
+    state: &'a str,
+    sort: &'a str,
+    direction: &'a str,
+}
+
+/// List every open issue carrying `needs_triage_label`, ordered
+/// oldest-first. Used by slice T2 (`bellows triage` with no issue
+/// argument) to walk the `needs-triage` backlog serially through T1's
+/// per-issue triage path.
+///
+/// Oldest-first is part of the contract — workspace state flows
+/// between issues, and an older issue's verdict may set a precedent
+/// (e.g. `wontfix-enhancement` writing to `.out-of-scope/`) that a
+/// later issue's triage should see. Walking newest-first would invert
+/// that "earlier issues set precedent" intuition.
+pub async fn list_needs_triage_issues(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    needs_triage_label: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
+    let params = ListNeedsTriageParams {
+        labels: needs_triage_label,
+        state: "open",
+        sort: "created",
+        direction: "asc",
+    };
+    let route = format!("/repos/{owner}/{repo}/issues");
+    let issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    Ok(issues)
+}
+
 pub async fn find_next_issue(
     client: &octocrab::Octocrab,
     owner: &str,

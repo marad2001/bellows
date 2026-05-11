@@ -5,6 +5,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod status;
 pub mod tracker;
+pub mod triage;
 pub mod workspace;
 
 const MAX_SLUG_LEN: usize = 50;
