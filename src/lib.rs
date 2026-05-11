@@ -51,6 +51,13 @@ fn slug_alnum_hyphens(s: &str) -> String {
 /// the URL in different cases doesn't double the on-disk footprint;
 /// `.git` is stripped so `bar.git` and `bar` share one cache. Total
 /// function — non-URL inputs slugify whatever resembles `owner/repo`.
+///
+/// Lossy: every non-alphanumeric char collapses to `-` and the owner/
+/// repo segments are then rejoined with `-`, so `foo/bar.baz` and
+/// `foo-bar/baz` both slugify to `foo-bar-baz` and share one cache
+/// volume. The collision is benign (Cargo.lock mismatch triggers a
+/// cold rebuild rather than a correctness failure) but worth flagging
+/// for operators picking volume names off the slug.
 pub fn repo_slug(repo_url: &str) -> String {
     let trimmed = repo_url.trim().trim_end_matches('/');
     let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed);
