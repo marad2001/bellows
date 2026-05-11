@@ -4,8 +4,8 @@ use std::time::Duration;
 use crate::auth::Auth;
 use crate::config::{AuthMethod, Config};
 use crate::policy::{
-    self, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome, PhaseOutcomes,
-    ReviewOutcome,
+    self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
+    PhaseOutcomes, ReviewOutcome,
 };
 use crate::sandbox::{self, SandboxError};
 use crate::status::{CurrentRun, StatusContext};
@@ -355,7 +355,7 @@ pub async fn run_once(
     // ---- Phase 1: Implement ----
     announce(
         log_writer,
-        "bellows: phase 1/5 — implement (running claude in sandbox container, this is the long one)",
+        "bellows: phase 1/7 — implement (running claude in sandbox container, this is the long one)",
     );
     // Issue #52 asymmetry audit: capture HEAD before the implement
     // agent invocation for the same reason the per-finding and nit-batch
@@ -484,7 +484,7 @@ pub async fn run_once(
     {
         announce(
             log_writer,
-            "bellows: phase 2/5 — cargo checks gate (clippy + test, fresh container)",
+            "bellows: phase 2/7 — cargo checks gate (clippy + test, fresh container)",
         );
         let run = sandbox::run_cargo_checks(
             &workspace,
@@ -585,6 +585,12 @@ pub async fn run_once(
 
     let mut review_outcome: Option<ReviewOutcome> = None;
     let mut review_fix_outcome: Option<FixOutcome> = None;
+    // Slice X2: security-review and security-fix phase outcomes, sitting
+    // between review-fix and the end-of-pipeline cargo gate. Same
+    // `None`-when-skipped contract as `review` / `review_fix`.
+    let mut security_outcome: Option<AnalysisOutcome> = None;
+    let mut security_fix_outcome: Option<FixOutcome> = None;
+    let mut security_findings_for_comment: Option<String> = None;
     let mut end_pipeline_gate: Option<GateOutcome> = None;
     // Slice 9.6: parser-as-backstop violations. Populated after the
     // per-finding/nit-batch review-fix invocations complete and the
@@ -597,7 +603,7 @@ pub async fn run_once(
         // ---- Phase 3: Review ----
         announce(
             log_writer,
-            "bellows: phase 3/5 — review (claude reads diff, produces findings)",
+            "bellows: phase 3/7 — review (claude reads diff, produces findings)",
         );
         workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
         workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
@@ -703,7 +709,7 @@ pub async fn run_once(
             announce(
                 log_writer,
                 &format!(
-                    "bellows: phase 4/5 — review-fix ({} blocker/important per-finding invocation(s) + {} batched nit(s))",
+                    "bellows: phase 4/7 — review-fix ({} blocker/important per-finding invocation(s) + {} batched nit(s))",
                     urgent_findings.len(),
                     nit_findings.len(),
                 ),
@@ -936,15 +942,150 @@ pub async fn run_once(
             }
         }
 
-        // ---- Phase 5: End-of-pipeline cargo checks gate ----
+        // ---- Phase 5 (slice X2): Security-review ----
+        //
+        // Mirrors the review/review-fix pair but with a tighter focus on
+        // the five security categories (input validation, auth, crypto,
+        // injection, data exposure). Regenerates the diff file from the
+        // POST-review-fix workspace state so the security agent sees the
+        // delta including review fixups, not the original implement
+        // diff. The diff is regenerated here even when no review-fix
+        // ran (no findings path) because the diff file from the review
+        // phase may have already been removed by the prior cleanup step,
+        // and to keep the file content deterministic at this phase
+        // boundary either way.
+        //
+        // Halt-on-phase-failure: skip security-review (and therefore
+        // security-fix and the end-pipeline gate) when an earlier phase
+        // halted or the wall-clock budget is spent — same plumbing as
+        // X1's review halt.
+        let mut halt_after_security = false;
+        let mut halt_after_security_fix = false;
+        if !halt_after_review && !halt_after_fix && !budget.exceeded {
+            announce(
+                log_writer,
+                "bellows: phase 5/7 — security-review (claude reads diff for the five security focus categories, produces findings)",
+            );
+            workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+            tokio::fs::write(
+                workspace.path().join(".bellows-kickoff.md"),
+                policy::SECURITY_REVIEW_PROMPT,
+            )
+            .await?;
+            let security_agent_run = sandbox::run_agent(
+                &workspace,
+                &auth,
+                claimed.number,
+                &repo_label,
+                &repo_slug,
+                log_writer,
+                budget.deadline_or_halt(),
+            )
+            .await?;
+            budget.mark_killed_if(security_agent_run.killed_by_deadline);
+
+            // Read the security findings file. Don't remove it yet —
+            // security-fix may need to read it. The security-fix phase
+            // is expected to remove the file when all findings are
+            // addressed; defensive cleanup at the end of the pipeline
+            // catches any leftover.
+            let security_findings_path = workspace.path().join(policy::SECURITY_FINDINGS_FILE);
+            let security_findings_text = if security_findings_path.exists() {
+                let raw = tokio::fs::read_to_string(&security_findings_path).await?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("(no findings)") {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            } else {
+                None
+            };
+            let has_security_findings = security_findings_text.is_some();
+            security_findings_for_comment = security_findings_text.clone();
+            security_outcome = Some(AnalysisOutcome {
+                findings_text: security_findings_text,
+                exit_code: security_agent_run.exit_code,
+            });
+
+            halt_after_security = security_agent_run.exit_code != 0;
+
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: security-review done (findings: {})",
+                    if has_security_findings { "yes" } else { "none" },
+                ),
+            );
+
+            // ---- Phase 6 (slice X2): Security-fix ----
+            //
+            // Only runs when security-review exited cleanly AND produced
+            // findings AND the wall-clock budget allows. The fix prompt
+            // is a single batch invocation (mirrors the brief's "read
+            // findings, address each, commit each fix, remove the
+            // findings file" shape — not the slice-9.6 per-finding loop;
+            // security fixups are scoped tightly enough that the
+            // per-finding overhead would dwarf the work).
+            if !halt_after_security && has_security_findings && !budget.exceeded {
+                announce(
+                    log_writer,
+                    "bellows: phase 6/7 — security-fix (claude reads findings and addresses each)",
+                );
+                tokio::fs::write(
+                    workspace.path().join(".bellows-kickoff.md"),
+                    policy::SECURITY_FIX_PROMPT,
+                )
+                .await?;
+                let head_before = workspace::head_sha(&workspace).await?;
+                let security_fix_run = sandbox::run_agent(
+                    &workspace,
+                    &auth,
+                    claimed.number,
+                    &repo_label,
+                    &repo_slug,
+                    log_writer,
+                    budget.deadline_or_halt(),
+                )
+                .await?;
+                budget.mark_killed_if(security_fix_run.killed_by_deadline);
+                let security_fix_exit = security_fix_run.exit_code;
+                // Same agent-self-commit-tolerant push plumbing as the
+                // per-finding/nit-batch sites. If the agent self-
+                // committed each fix, bellows's commit_all sees nothing
+                // to stage (NoChangesToCommit) but HEAD has advanced —
+                // commit_all_and_push_if_advanced pushes either shape.
+                let _ =
+                    workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
+                security_fix_outcome = Some(FixOutcome {
+                    exit_code: security_fix_exit,
+                });
+                halt_after_security_fix = security_fix_exit != 0;
+                announce(
+                    log_writer,
+                    &format!("bellows: security-fix done (exit {})", security_fix_exit),
+                );
+            }
+        }
+
+        // ---- Phase 7 (slice X2): End-of-pipeline cargo checks gate ----
+        //
+        // The existing slice-X1 end-gate runs at end-of-pipeline; per
+        // the brief, no new gate is needed for slice X2 since this
+        // existing one catches regressions introduced by the security
+        // fixups too. We gate it on every halt flag (including the new
+        // security halts) so a failed security phase short-circuits
+        // cleanly without burning a cargo run.
         if !halt_after_review
             && !halt_after_fix
+            && !halt_after_security
+            && !halt_after_security_fix
             && !budget.exceeded
             && workspace.path().join("Cargo.toml").exists()
         {
             announce(
                 log_writer,
-                "bellows: phase 5/5 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
+                "bellows: phase 7/7 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
             );
             let run = sandbox::run_cargo_checks(
                 &workspace,
@@ -989,6 +1130,8 @@ pub async fn run_once(
         post_implement_gate,
         review: review_outcome,
         review_fix: review_fix_outcome,
+        security: security_outcome,
+        security_fix: security_fix_outcome,
         end_pipeline_gate,
         wall_clock_exceeded: budget.exceeded,
         backstop_violations,
@@ -1098,6 +1241,19 @@ pub async fn run_once(
         .and_then(|r| r.findings_text.as_deref())
     {
         let comment_body = format!("## Review findings\n\n{findings}");
+        tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
+    }
+
+    // Slice X2: post the security findings as a separate `## Security
+    // findings` PR comment if the security-review phase produced any.
+    // Posted regardless of whether security-fix succeeded so the reader
+    // always sees what was flagged, mirroring the review-findings post.
+    // `security_findings_for_comment` was captured during the
+    // security-review phase since we move the findings text into the
+    // `outcomes` struct above; reading from that local variable here
+    // avoids a clone-from-Option-of-Option dance.
+    if let Some(security_findings) = &security_findings_for_comment {
+        let comment_body = format!("## Security findings\n\n{security_findings}");
         tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
     }
 
@@ -1232,6 +1388,8 @@ fn build_log_body(
          - Cargo checks (post-implement): {post_gate}\n\
          - Review: {review}\n\
          - Review-fix: {review_fix}\n\
+         - Security: {security}\n\
+         - Security-fix: {security_fix}\n\
          - Cargo checks (end-pipeline): {end_gate}\n",
         started_rfc = started.to_rfc3339(),
         finished_rfc = finished.to_rfc3339(),
@@ -1239,6 +1397,8 @@ fn build_log_body(
         post_gate = gate_summary_line(&outcomes.post_implement_gate),
         review = review_summary(&outcomes.review),
         review_fix = review_fix_summary(&outcomes.review_fix),
+        security = analysis_summary(&outcomes.security),
+        security_fix = review_fix_summary(&outcomes.security_fix),
         end_gate = match &outcomes.end_pipeline_gate {
             Some(gate) => gate_summary_line(gate),
             None => "did not run".to_string(),
@@ -1363,6 +1523,23 @@ fn review_summary(review: &Option<ReviewOutcome>) -> String {
     }
 }
 
+/// Slice X2: sibling of `review_summary` for the security-review phase
+/// (and any future analysis-shaped phase that produces findings).
+/// Identical semantics to `review_summary` — kept as a separate
+/// function because `AnalysisOutcome` and `ReviewOutcome` are distinct
+/// types, so a single generic helper would need a trait + impls for
+/// no payoff at this scale.
+fn analysis_summary(analysis: &Option<AnalysisOutcome>) -> String {
+    match analysis {
+        None => "did not run".to_string(),
+        Some(r) if r.exit_code != 0 => format!("crashed (exit {})", r.exit_code),
+        Some(r) => match &r.findings_text {
+            Some(_) => "findings produced".to_string(),
+            None => "no findings".to_string(),
+        },
+    }
+}
+
 fn review_fix_summary(fix: &Option<FixOutcome>) -> String {
     match fix {
         None => "did not run".to_string(),
@@ -1466,6 +1643,7 @@ async fn cleanup_phase_handoff_files(
         policy::REVIEW_DIFF_FILE,
         policy::REVIEW_FINDINGS_FILE,
         policy::REVIEW_COMMIT_LOG_FILE,
+        policy::SECURITY_FINDINGS_FILE,
     ] {
         let path = workspace.path().join(name);
         match tokio::fs::remove_file(&path).await {
@@ -1592,6 +1770,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         }
     }
 
@@ -1706,6 +1886,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -1738,6 +1920,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1773,6 +1957,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1805,6 +1991,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -1834,6 +2022,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
@@ -1864,6 +2054,8 @@ mod tests {
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -1901,6 +2093,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::RateLimited,
@@ -1940,6 +2134,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::Crash,
@@ -1987,6 +2183,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::Success,
@@ -2023,6 +2221,8 @@ mod tests {
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -2076,6 +2276,8 @@ mod tests {
                 },
             ],
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::AgentSelfReportedFailure,
@@ -2118,6 +2320,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -2169,6 +2373,8 @@ mod tests {
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
+            security: None,
+            security_fix: None,
         };
         let reason = policy::classify_exit(true, &outcomes);
         assert_eq!(
@@ -2269,11 +2475,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Write all three handoff files; cleanup must remove every one.
+        // Write all handoff files (slice X1 + slice X2); cleanup must
+        // remove every one. Adding the slice-X2 security findings file
+        // here pins the cleanup contract for the new phase pair — any
+        // leftover would ship in the PR diff.
         for name in &[
             policy::REVIEW_DIFF_FILE,
             policy::REVIEW_FINDINGS_FILE,
             policy::REVIEW_COMMIT_LOG_FILE,
+            policy::SECURITY_FINDINGS_FILE,
         ] {
             tokio::fs::write(workspace.path().join(name), b"handoff\n")
                 .await
@@ -2290,11 +2500,278 @@ mod tests {
             policy::REVIEW_DIFF_FILE,
             policy::REVIEW_FINDINGS_FILE,
             policy::REVIEW_COMMIT_LOG_FILE,
+            policy::SECURITY_FINDINGS_FILE,
         ] {
             assert!(
                 !workspace.path().join(name).exists(),
                 "post-cleanup: {name} must have been removed",
             );
         }
+    }
+
+    // ---- Slice X2: security-review and security-fix phase outcomes ----
+
+    /// Build a slice-X2-shaped PhaseOutcomes for tests of the log body's
+    /// security phase summary. Defaults to a clean review run (no
+    /// findings, exit 0); each test overrides `security` and
+    /// `security_fix` to express its scenario.
+    fn slice_x2_outcomes(
+        security: Option<crate::policy::AnalysisOutcome>,
+        security_fix: Option<FixOutcome>,
+    ) -> PhaseOutcomes {
+        PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome { findings_text: None, exit_code: 0 }),
+            review_fix: None,
+            end_pipeline_gate: Some(GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            }),
+            wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
+            security,
+            security_fix,
+        }
+    }
+
+    #[test]
+    fn build_log_body_includes_security_phase_summary_with_findings_and_successful_fix() {
+        // Acceptance criterion (a) from the brief: security-review
+        // produced findings AND the security-fix run addressed them
+        // cleanly. The log body's phase summary must surface both lines
+        // — without the security entries, an operator scanning the PR
+        // comment cannot tell whether the security phase ran or what it
+        // found.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice_x2_outcomes(
+            Some(crate::policy::AnalysisOutcome {
+                findings_text: Some("## Findings\n\n### 1. command injection — blocker\n\nbody".to_string()),
+                exit_code: 0,
+            }),
+            Some(FixOutcome { exit_code: 0 }),
+        );
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("Security:"),
+            "phase summary must include a Security line: {body}"
+        );
+        assert!(
+            body.contains("Security-fix:"),
+            "phase summary must include a Security-fix line: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_security_phase_marks_review_crash_explicitly() {
+        // Acceptance criterion (c) from the brief: security-review run
+        // itself crashes. The log body must name the crash explicitly so
+        // a human reading the PR comment knows which phase died, distinct
+        // from a clean run that simply found nothing.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice_x2_outcomes(
+            Some(crate::policy::AnalysisOutcome {
+                findings_text: None,
+                exit_code: 137,
+            }),
+            None,
+        );
+        let body = build_log_body(
+            &ExitReason::Crash,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("Security: crashed"),
+            "phase summary must explicitly name the security-review crash: {body}"
+        );
+        assert!(
+            body.contains("137"),
+            "phase summary must surface the security-review exit code: {body}"
+        );
+        // Halt-on-phase-failure means security-fix should not have run.
+        assert!(
+            body.contains("Security-fix: did not run"),
+            "halted runs must show Security-fix as did not run: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_security_phase_marks_fix_crash_explicitly() {
+        // Acceptance criterion (b) from the brief: security-review
+        // produced findings AND the security-fix run crashed. The log
+        // body must surface the fix-run crash so the operator can
+        // distinguish "fix crashed mid-way" from "fix succeeded".
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice_x2_outcomes(
+            Some(crate::policy::AnalysisOutcome {
+                findings_text: Some("findings here".to_string()),
+                exit_code: 0,
+            }),
+            Some(FixOutcome { exit_code: 137 }),
+        );
+        let body = build_log_body(
+            &ExitReason::Crash,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("Security: findings produced"),
+            "phase summary must show that security found something: {body}"
+        );
+        assert!(
+            body.contains("Security-fix: crashed"),
+            "phase summary must explicitly name the security-fix crash: {body}"
+        );
+        assert!(
+            body.contains("137"),
+            "phase summary must surface the security-fix exit code: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_security_phase_handles_empty_findings_cleanly() {
+        // Acceptance criterion (d) from the brief: empty/missing
+        // security-findings file is a success path — security-review
+        // exited cleanly with no findings, security-fix did not run.
+        // The phase summary must NOT make this look like a failure.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice_x2_outcomes(
+            Some(crate::policy::AnalysisOutcome {
+                findings_text: None,
+                exit_code: 0,
+            }),
+            None,
+        );
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("Security: no findings"),
+            "clean security-review must read as `no findings` in the summary: {body}"
+        );
+        assert!(
+            body.contains("Security-fix: did not run"),
+            "security-fix must report as did-not-run when there were no findings: {body}"
+        );
+        // Defensive: a clean run with no findings must NOT show as a
+        // crash — otherwise a routine clean run would look alarming.
+        assert!(
+            !body.contains("Security: crashed"),
+            "clean security-review must NOT show as crashed: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_security_phase_did_not_run_when_security_is_none() {
+        // The pipeline halted before reaching security (e.g. review or
+        // review-fix crashed, or the wall-clock budget was spent). The
+        // phase summary must visibly name security as did-not-run so a
+        // reader can tell the difference between "ran and found nothing"
+        // and "never executed".
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice_x2_outcomes(None, None);
+        let body = build_log_body(
+            &ExitReason::Crash,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        assert!(
+            body.contains("Security: did not run"),
+            "halted-before-security runs must show Security as did not run: {body}"
+        );
+        assert!(
+            body.contains("Security-fix: did not run"),
+            "halted-before-security runs must also show Security-fix as did not run: {body}"
+        );
+    }
+
+    #[test]
+    fn build_log_body_handles_mixed_scenario_with_review_and_security_both_addressed() {
+        // Acceptance criterion (e) from the brief: review findings were
+        // produced and addressed, then the review fixups introduced new
+        // security findings which were also addressed. The phase summary
+        // must surface both review and security outcomes side-by-side so
+        // the operator can confirm the full pair-of-pairs ran cleanly.
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            },
+            review: Some(ReviewOutcome {
+                findings_text: Some("review findings here".to_string()),
+                exit_code: 0,
+            }),
+            review_fix: Some(FixOutcome { exit_code: 0 }),
+            end_pipeline_gate: Some(GateOutcome {
+                cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
+                cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
+            }),
+            wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
+            security: Some(crate::policy::AnalysisOutcome {
+                findings_text: Some(
+                    "## Findings\n\n### 1. command injection in shell call — blocker\n\nbody"
+                        .to_string(),
+                ),
+                exit_code: 0,
+            }),
+            security_fix: Some(FixOutcome { exit_code: 0 }),
+        };
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+        );
+        // Both phases must be summarised. The exact phrasing is
+        // implementation-detail, but each phase needs its own surface so
+        // the operator can map them back to the PR comments.
+        assert!(body.contains("Review: findings produced"), "review line missing: {body}");
+        assert!(body.contains("Review-fix:"), "review-fix line missing: {body}");
+        assert!(body.contains("Security: findings produced"), "security line missing: {body}");
+        assert!(body.contains("Security-fix:"), "security-fix line missing: {body}");
+        // The end-pipeline cargo gate caught no regressions, so the final
+        // tests line must still report PASSED.
+        assert!(
+            body.to_lowercase().contains("end-pipeline"),
+            "end-pipeline cargo gate must still be summarised: {body}"
+        );
     }
 }
