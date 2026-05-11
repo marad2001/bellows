@@ -38,6 +38,15 @@ const WORKSPACE_TARGET_PATH_IN_CONTAINER: &str = "/workspace/target";
 const VOLUME_KIND_TARGET: &str = "target";
 const VOLUME_KIND_CARGO_REGISTRY: &str = "cargo-registry";
 
+/// Root-mode prep entrypoint baked into the policy image. Chowns the
+/// cache-volume mount points (Docker creates a fresh named volume's
+/// _data dir as root:root; bellows uid 1000 needs to write) and then
+/// `exec runuser -u bellows -- "$@"`'s whatever was passed. Used as
+/// the first element of the cargo-checks entrypoint override so the
+/// chown step still runs when we bypass the default ENTRYPOINT.
+const POLICY_PREP_ENTRYPOINT: &str = "/usr/local/bin/entrypoint";
+const CARGO_CHECKS_USER_SCRIPT: &str = "/usr/local/bin/run-cargo-checks";
+
 /// How many bytes of agent stdout/stderr to retain for the failure log
 /// comment. Streaming to the log_writer is unaffected — this is a tee
 /// for the post-run summary, not a cap on what's written.
@@ -404,9 +413,15 @@ pub async fn run_cargo_checks(
         ..Default::default()
     };
 
+    // Route through the policy image's root-mode entrypoint so the
+    // cache-volume mount points get chowned to bellows before
+    // run-cargo-checks runs as bellows. Skipping the prep here would
+    // re-introduce the EACCES-on-first-write regression that
+    // `/workspace/target` and `/usr/local/cargo/registry` are exposed
+    // to whenever Docker freshly creates one of those named volumes.
     let config = ContainerCreateBody {
         image: Some(image_tag),
-        entrypoint: Some(vec!["/usr/local/bin/run-cargo-checks".to_string()]),
+        entrypoint: Some(build_cargo_checks_entrypoint()),
         cmd: Some(vec![]),
         working_dir: Some("/workspace".to_string()),
         labels: Some(labels),
@@ -597,6 +612,16 @@ fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
             CARGO_REGISTRY_VOLUME_NAME,
             registry_labels,
         ),
+    ]
+}
+
+/// The entrypoint override applied to the cargo-checks container.
+/// Front-loaded with the root-mode prep so the cache-volume mount
+/// points get chowned to bellows before `run-cargo-checks` runs.
+fn build_cargo_checks_entrypoint() -> Vec<String> {
+    vec![
+        POLICY_PREP_ENTRYPOINT.to_string(),
+        CARGO_CHECKS_USER_SCRIPT.to_string(),
     ]
 }
 
@@ -1090,6 +1115,32 @@ mod tests {
             !labels.contains_key("bellows-repo-slug"),
             "shared registry must not carry bellows-repo-slug: {:?}",
             labels,
+        );
+    }
+
+    #[test]
+    fn build_cargo_checks_entrypoint_runs_prep_then_user_script() {
+        // The cargo-checks gate overrides the policy image's default
+        // ENTRYPOINT, so without explicitly re-applying the root-mode
+        // prep here the chown step would be skipped — and the bellows
+        // user would hit EACCES on the first cargo write into either
+        // cache volume. Pin: prep is element 0, user script is element 1,
+        // both are absolute paths into /usr/local/bin/ (where the policy
+        // image actually installs them).
+        let entrypoint = build_cargo_checks_entrypoint();
+        assert_eq!(
+            entrypoint.len(),
+            2,
+            "expected [prep, user-script]: {:?}",
+            entrypoint,
+        );
+        assert_eq!(
+            entrypoint[0], "/usr/local/bin/entrypoint",
+            "prep entrypoint must come first so chown runs before the user script",
+        );
+        assert_eq!(
+            entrypoint[1], "/usr/local/bin/run-cargo-checks",
+            "second arg must be the cargo-checks user script",
         );
     }
 

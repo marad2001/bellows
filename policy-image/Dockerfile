@@ -52,15 +52,29 @@ COPY skills/ /opt/bellows-policy/skills/
 COPY CLAUDE.md /opt/bellows-policy/CLAUDE.md
 
 COPY entrypoint /usr/local/bin/entrypoint
+COPY entrypoint-user /usr/local/bin/entrypoint-user
 COPY run-agent /usr/local/bin/run-agent
 COPY run-cargo-checks /usr/local/bin/run-cargo-checks
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/run-agent /usr/local/bin/run-cargo-checks
+RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/entrypoint-user /usr/local/bin/run-agent /usr/local/bin/run-cargo-checks
 
 # Pre-create the bellows user's claude home with the right ownership so
 # the named-volume mount inherits these permissions on first attach.
 RUN mkdir -p /home/bellows/.claude/skills \
     && chown -R bellows:bellows /home/bellows
 
-USER bellows
+# Pre-create the cache-volume mount points and chown them to bellows.
+# /usr/local/cargo/registry benefits directly: it's not in the base
+# image, so Docker propagates the image's permissions to the volume on
+# first attach. /workspace/target gets shadowed by the workspace bind
+# mount at runtime so this `mkdir` doesn't reach the live mount point —
+# the entrypoint's runtime `chown` is what actually fixes that one —
+# but creating it here keeps the two paths visible side-by-side and
+# matches what an operator inspecting the image would expect to see.
+RUN mkdir -p /workspace/target /usr/local/cargo/registry \
+    && chown bellows:bellows /workspace/target /usr/local/cargo/registry
+
+# NOTE: no `USER bellows` here. The entrypoint runs as root so it can
+# chown the named-volume mount points (which Docker creates as
+# root:root) before dropping privileges via `runuser -u bellows`.
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
