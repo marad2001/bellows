@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
-    KillContainerOptions, ListContainersOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder,
+    KillContainerOptions, ListContainersOptionsBuilder, ListVolumesOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
 };
 use bollard::Docker;
 use sha2::{Digest, Sha256};
@@ -35,8 +35,22 @@ const CARGO_REGISTRY_PATH_IN_CONTAINER: &str = "/usr/local/cargo/registry";
 
 const WORKSPACE_TARGET_PATH_IN_CONTAINER: &str = "/workspace/target";
 
-const VOLUME_KIND_TARGET: &str = "target";
-const VOLUME_KIND_CARGO_REGISTRY: &str = "cargo-registry";
+/// Docker label key that flags a volume (or container) as Bellows-managed.
+/// Both `bellows prune` discovery and the slice-7 orphan cleanup match on
+/// this; one literal so a rename can't desync the two.
+pub const BELLOWS_MANAGED_LABEL: &str = "bellows-managed";
+/// Docker label key naming the **kind** of cache volume — `target` (per-repo)
+/// or `cargo-registry` (shared). Absence of this label is the signal that a
+/// volume is NOT a cache volume (e.g. the credentials volume), so `prune`
+/// post-filters on its presence + value to never touch credentials.
+pub const VOLUME_KIND_LABEL: &str = "bellows-volume-kind";
+/// Docker label key on per-repo `target/` volumes carrying the repo slug
+/// the volume belongs to. Read by `bellows prune` to render the per-repo
+/// volume row's `repo-slug` column.
+pub const REPO_SLUG_LABEL: &str = "bellows-repo-slug";
+
+pub(crate) const VOLUME_KIND_TARGET: &str = "target";
+pub(crate) const VOLUME_KIND_CARGO_REGISTRY: &str = "cargo-registry";
 
 /// Root-mode prep entrypoint baked into the policy image. Chowns the
 /// cache-volume mount points (Docker creates a fresh named volume's
@@ -115,6 +129,10 @@ pub enum SandboxError {
         "cargo checks gate produced no results file (container exit {exit_code}); the run-cargo-checks script likely crashed before recording exit codes"
     )]
     CargoChecksScriptCrashed { exit_code: i64 },
+    #[error("volume `{name}` is currently in use by a container and cannot be removed")]
+    VolumeInUse { name: String },
+    #[error("volume `{name}` does not exist")]
+    VolumeNotFound { name: String },
 }
 
 /// Build (or reuse the cached) policy image and return its tag. Used by
@@ -589,14 +607,14 @@ async fn ensure_image_built(hash: &str, tag: &str) -> Result<(), SandboxError> {
 /// to find volumes that bellows itself created.
 fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
     let target_labels = HashMap::from([
-        ("bellows-managed".to_string(), "true".to_string()),
-        ("bellows-volume-kind".to_string(), VOLUME_KIND_TARGET.to_string()),
-        ("bellows-repo-slug".to_string(), repo_slug.to_string()),
+        (BELLOWS_MANAGED_LABEL.to_string(), "true".to_string()),
+        (VOLUME_KIND_LABEL.to_string(), VOLUME_KIND_TARGET.to_string()),
+        (REPO_SLUG_LABEL.to_string(), repo_slug.to_string()),
     ]);
     let registry_labels = HashMap::from([
-        ("bellows-managed".to_string(), "true".to_string()),
+        (BELLOWS_MANAGED_LABEL.to_string(), "true".to_string()),
         (
-            "bellows-volume-kind".to_string(),
+            VOLUME_KIND_LABEL.to_string(),
             VOLUME_KIND_CARGO_REGISTRY.to_string(),
         ),
     ]);
@@ -829,6 +847,128 @@ pub async fn cleanup_orphan_containers(
         }
     }
     Ok(success_lines)
+}
+
+/// Kind of Bellows-managed cache volume discovered by `bellows prune`.
+/// Cache volumes are the only thing prune touches; the credentials volume
+/// does NOT match any of these variants (it lacks `bellows-volume-kind`),
+/// so a label-filter discovery cannot reach it by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheVolumeKind {
+    /// Per-repo `target/` cache. Slug is the same value used in the
+    /// volume name (`bellows-target-<slug>`) and in `--target <slug>`.
+    Target { repo_slug: String },
+    /// Shared cargo registry cache (`bellows-cargo-registry`). One per host.
+    CargoRegistry,
+}
+
+/// One Bellows-managed cache volume, as surfaced by `bellows prune`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheVolume {
+    pub name: String,
+    pub kind: CacheVolumeKind,
+    /// Size in bytes if the Docker daemon reported it (volumes API
+    /// returns `UsageData` only when called against `/system/df`-style
+    /// queries; for a label-filtered `list_volumes` it's typically
+    /// absent). `None` when not available.
+    pub size_bytes: Option<i64>,
+}
+
+/// Build the bollard list-volumes label filter for finding every
+/// Bellows-managed volume. Returns one literal label predicate
+/// (`bellows-managed=true`) so the daemon does the matching; the
+/// post-filter in `classify_volume_from_labels` then drops anything
+/// that isn't a cache volume (e.g. the credentials volume).
+///
+/// Pure function so the filter shape is unit-testable without docker.
+fn build_cache_volume_list_filter() -> HashMap<String, Vec<String>> {
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
+    );
+    filters
+}
+
+/// Classify a volume by its labels into one of the prune-eligible
+/// `CacheVolumeKind` variants. Returns `None` when the volume is
+/// Bellows-managed but is NOT a cache volume — most importantly the
+/// credentials volume, which carries no `bellows-volume-kind` label
+/// and therefore cannot be touched by `prune`. Also returns `None`
+/// for any unknown `bellows-volume-kind` value, future-proofing
+/// against a new kind being added later without prune learning to
+/// handle it.
+///
+/// Pure function so the classification logic is unit-testable without
+/// docker.
+pub fn classify_volume_from_labels(
+    labels: &HashMap<String, String>,
+) -> Option<CacheVolumeKind> {
+    let kind = labels.get(VOLUME_KIND_LABEL)?;
+    match kind.as_str() {
+        VOLUME_KIND_TARGET => {
+            let slug = labels.get(REPO_SLUG_LABEL)?.clone();
+            Some(CacheVolumeKind::Target { repo_slug: slug })
+        }
+        VOLUME_KIND_CARGO_REGISTRY => Some(CacheVolumeKind::CargoRegistry),
+        _ => None,
+    }
+}
+
+/// List every Bellows-managed cache volume on the host.
+///
+/// Uses the `bellows-managed=true` server-side label filter so the
+/// daemon does the bulk match, then post-filters with
+/// `classify_volume_from_labels` to keep ONLY volumes that carry a
+/// `bellows-volume-kind=target|cargo-registry` label. This two-step
+/// shape is the credentials-volume guard: even if a future credentials
+/// volume picks up `bellows-managed=true` (it does not today), it has
+/// no `bellows-volume-kind`, so it will be dropped here.
+///
+/// Volumes returned with `size_bytes = None` are normal — the `/volumes`
+/// list endpoint typically does not populate `UsageData` (only the
+/// `/system/df` summary does), so prune's table omits the column when
+/// the daemon didn't report it.
+pub async fn list_cache_volumes(docker: &Docker) -> Result<Vec<CacheVolume>, SandboxError> {
+    let filters = build_cache_volume_list_filter();
+    let options = ListVolumesOptionsBuilder::default().filters(&filters).build();
+    let response = docker.list_volumes(Some(options)).await?;
+
+    let mut out = Vec::new();
+    for v in response.volumes.unwrap_or_default() {
+        if let Some(kind) = classify_volume_from_labels(&v.labels) {
+            out.push(CacheVolume {
+                name: v.name,
+                kind,
+                size_bytes: v.usage_data.map(|u| u.size).filter(|s| *s >= 0),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Remove a single Docker volume by name. Maps the two failure modes
+/// the operator might hit into concrete `SandboxError` variants:
+/// `VolumeNotFound` for a 404 (operator typed a slug that doesn't
+/// exist) and `VolumeInUse` for a 409 (some container still has it
+/// mounted — shouldn't happen with concurrency=1, but worth surfacing
+/// clearly rather than as a generic docker error).
+pub async fn remove_cache_volume(docker: &Docker, name: &str) -> Result<(), SandboxError> {
+    let options = RemoveVolumeOptionsBuilder::default().force(false).build();
+    match docker.remove_volume(name, Some(options)).await {
+        Ok(()) => Ok(()),
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            Err(SandboxError::VolumeNotFound {
+                name: name.to_string(),
+            })
+        }
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => {
+            Err(SandboxError::VolumeInUse {
+                name: name.to_string(),
+            })
+        }
+        Err(other) => Err(SandboxError::Bollard(other)),
+    }
 }
 
 #[cfg(test)]
@@ -1142,6 +1282,102 @@ mod tests {
             entrypoint[1], "/usr/local/bin/run-cargo-checks",
             "second arg must be the cargo-checks user script",
         );
+    }
+
+    #[test]
+    fn build_cache_volume_list_filter_uses_bellows_managed_label_only() {
+        // The list filter is the first half of prune's discovery: it
+        // asks the daemon for every Bellows-managed volume. The second
+        // half — `classify_volume_from_labels` — drops anything that
+        // isn't a cache volume. Pin the filter shape so a future edit
+        // doesn't accidentally widen it (e.g. dropping `=true` and
+        // catching unrelated labels).
+        let filter = build_cache_volume_list_filter();
+        let label_values = filter.get("label").expect("label key required");
+        assert_eq!(
+            label_values,
+            &vec!["bellows-managed=true".to_string()],
+            "list filter must scope to bellows-managed=true only: {:?}",
+            label_values,
+        );
+    }
+
+    #[test]
+    fn classify_volume_from_labels_returns_target_with_repo_slug() {
+        // Per-repo target volume: kind=target + repo-slug=<slug>.
+        let mut labels = HashMap::new();
+        labels.insert("bellows-managed".to_string(), "true".to_string());
+        labels.insert("bellows-volume-kind".to_string(), "target".to_string());
+        labels.insert(
+            "bellows-repo-slug".to_string(),
+            "marad2001-bellows".to_string(),
+        );
+        let kind = classify_volume_from_labels(&labels);
+        assert_eq!(
+            kind,
+            Some(CacheVolumeKind::Target {
+                repo_slug: "marad2001-bellows".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn classify_volume_from_labels_returns_cargo_registry_for_registry_kind() {
+        // Shared cargo registry: kind=cargo-registry, no repo slug.
+        let mut labels = HashMap::new();
+        labels.insert("bellows-managed".to_string(), "true".to_string());
+        labels.insert(
+            "bellows-volume-kind".to_string(),
+            "cargo-registry".to_string(),
+        );
+        let kind = classify_volume_from_labels(&labels);
+        assert_eq!(kind, Some(CacheVolumeKind::CargoRegistry));
+    }
+
+    #[test]
+    fn classify_volume_from_labels_returns_none_for_credentials_volume() {
+        // Acceptance criterion from the brief: the credentials volume
+        // is NEVER touched by prune. The credentials volume today
+        // carries no `bellows-volume-kind` label at all (and even if a
+        // future revision tags it `bellows-managed=true`, it would
+        // still lack the kind). `classify_volume_from_labels` returns
+        // None for that shape — so the discovery pipeline drops the
+        // credentials volume before any removal can happen.
+        let mut labels = HashMap::new();
+        labels.insert("bellows-managed".to_string(), "true".to_string());
+        // Deliberately no bellows-volume-kind.
+        assert_eq!(classify_volume_from_labels(&labels), None);
+
+        // Sanity check the inverse: an empty labels map also classifies
+        // as None (an unrelated docker volume picked up by some other
+        // filter would land here too).
+        assert_eq!(classify_volume_from_labels(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn classify_volume_from_labels_returns_none_for_unknown_kind() {
+        // Future-proofing: a new kind value that prune does not know
+        // about must not be classified as a cache volume. Tomorrow's
+        // bellows-volume-kind=workspace would otherwise be silently
+        // removed by `--all`.
+        let mut labels = HashMap::new();
+        labels.insert("bellows-managed".to_string(), "true".to_string());
+        labels.insert(
+            "bellows-volume-kind".to_string(),
+            "some-future-kind".to_string(),
+        );
+        assert_eq!(classify_volume_from_labels(&labels), None);
+    }
+
+    #[test]
+    fn classify_volume_from_labels_returns_none_when_target_missing_repo_slug() {
+        // Defensive: a target volume must carry its repo-slug for prune
+        // to render the row. A malformed volume (kind=target but no
+        // slug) classifies as not-a-cache-volume so prune ignores it
+        // rather than panicking on a missing label.
+        let mut labels = HashMap::new();
+        labels.insert("bellows-volume-kind".to_string(), "target".to_string());
+        assert_eq!(classify_volume_from_labels(&labels), None);
     }
 
     #[test]

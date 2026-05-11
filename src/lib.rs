@@ -79,7 +79,7 @@ pub fn repo_target_volume_name(repo_url: &str) -> String {
     target_volume_name_from_slug(&repo_slug(repo_url))
 }
 
-pub(crate) fn target_volume_name_from_slug(slug: &str) -> String {
+pub fn target_volume_name_from_slug(slug: &str) -> String {
     format!("bellows-target-{}", slug)
 }
 
