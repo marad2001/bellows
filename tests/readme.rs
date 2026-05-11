@@ -435,6 +435,33 @@ fn readme_v1_scope_lists_ci_gate_as_in_scope() {
 }
 
 #[test]
+fn readme_documents_auto_merge_workflow_in_operational_flow() {
+    let body = read_readme();
+    // Issue #43 acceptance criterion: the README gains a short note
+    // (one paragraph in the operational-flow section) explaining
+    // that bellows-authored Success PRs auto-merge on green CI via a
+    // workflow file (NOT a bellows-binary feature), and that an
+    // operator can opt out by deleting the workflow.
+    //
+    // The note must:
+    //  - mention the workflow file path so a reader can find it;
+    //  - mention squash-merge (the existing convention);
+    //  - mention that it is a workflow, not a binary feature;
+    //  - explain how to opt out (delete the workflow file).
+    assert_contains_all(
+        &body,
+        &[
+            ".github/workflows/auto-merge.yml",
+            "auto-merge",
+            "squash",
+            "delete",
+            "agent/",
+        ],
+        "operational-flow / auto-merge note",
+    );
+}
+
+#[test]
 fn readme_opens_with_overview_explaining_what_bellows_is() {
     let body = read_readme();
     // The README must answer "what is this thing?" before anything
