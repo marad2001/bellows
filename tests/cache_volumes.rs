@@ -37,8 +37,8 @@ fn repo_slug_lowercases_owner_and_repo() {
 fn repo_slug_replaces_dots_in_repo_name_with_hyphens() {
     // Repo names commonly contain dots (`foo.rs`, `lib.bar`). Docker
     // volume names allow dots, but the brief asks for the slug to be
-    // restricted to alphanumerics + hyphens + underscores so the
-    // label value doesn't smuggle a "." into prune-side regex matches.
+    // restricted to alphanumerics + hyphens so the label value doesn't
+    // smuggle a "." into prune-side regex matches.
     assert_eq!(
         repo_slug("https://github.com/foo/bar.baz"),
         "foo-bar-baz",
