@@ -38,6 +38,16 @@ enum Command {
     /// credentials volume with an OAuth session via an interactive
     /// `claude login` flow.
     SetupAuth,
+    /// Manage the per-repo SSH deploy-keys volume (issue #69 /
+    /// ADR-0002). Operators populate the volume via `add`, inspect
+    /// what's in it via `list`, and clean up via `remove`. Each arm
+    /// runs inside a one-shot container with the deploy-keys volume
+    /// mounted, so file modes and known_hosts seeding work
+    /// consistently regardless of host OS.
+    SetupDeployKeys {
+        #[command(subcommand)]
+        action: SetupDeployKeysAction,
+    },
     /// Re-authenticate when your Claude Code refresh token has expired.
     /// Same flow as `setup-auth` (interactive container, `claude login`,
     /// credentials volume seeded); different name for the situation.
@@ -110,6 +120,37 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SetupDeployKeysAction {
+    /// Read a private SSH key from stdin (paste-then-EOF), write it
+    /// to the deploy-keys volume at `/<name>` with mode 600, ensure
+    /// the volume's `/config` has a Host stanza pointing at
+    /// `IdentityFile /home/bellows/.ssh/<name>` with `IdentitiesOnly
+    /// yes`, and seed `/known_hosts` via `ssh-keyscan <ssh-host>`.
+    /// Idempotent on repeated invocations: re-running `add` for the
+    /// same key does not duplicate the Host stanza.
+    Add {
+        /// Name to give this key inside the volume. Operators
+        /// reference this name from `[[repo]] deploy_keys = [...]`.
+        name: String,
+        /// Host the key authenticates against. Defaults to
+        /// `github.com`; override for self-hosted GitHub Enterprise
+        /// or other git servers.
+        #[arg(long, default_value = "github.com")]
+        ssh_host: String,
+    },
+    /// Print every key filename present in the deploy-keys volume
+    /// and the Host stanzas in the volume's `/config`.
+    List,
+    /// Remove a key from the deploy-keys volume — both the key file
+    /// at `/<name>` and the matching Host stanza in `/config`.
+    /// Removing a non-existent key is not an error.
+    Remove {
+        /// Name of the key to remove (the same name passed to `add`).
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -126,6 +167,7 @@ async fn main() -> Result<()> {
         // the same underlying flow (interactive `claude login` against
         // the credentials volume).
         Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
+        Command::SetupDeployKeys { action } => setup_deploy_keys_cmd(&config_path, action).await,
         Command::Status => status_cmd().await,
         Command::Kill { target } => kill_cmd(&config_path, &target).await,
         Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
@@ -138,11 +180,41 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Startup validation entry point for `bellows run` and
+/// `bellows triage` (issue #69 / ADR-0002 AC9). Maps the Config's
+/// `[[repo]]` blocks into the borrow-friendly `DeployKeyRepo` shape
+/// the sandbox-side validator consumes, then dispatches. The map step
+/// lives in main.rs (not in config or sandbox) so neither module has
+/// to know about the other's types.
+async fn validate_deploy_keys_at_startup(config: &Config) -> Result<()> {
+    let repos: Vec<sandbox::DeployKeyRepo> = config
+        .repos
+        .iter()
+        .map(|r| sandbox::DeployKeyRepo {
+            url: r.url.clone(),
+            deploy_keys: r.deploy_keys.clone(),
+        })
+        .collect();
+    sandbox::validate_deploy_keys(&repos, &config.auth.ssh_keys_volume)
+        .await
+        .map_err(|e| anyhow!("{e}"))
+}
+
 async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // Issue #69 (ADR-0002) AC9: refuse to start when any [[repo]]
+    // deploy_keys references a key name that's not present in the
+    // configured ssh_keys_volume. Doing this here — before `bellows
+    // triage` claims any work — keeps the failure mode operator-
+    // legible rather than surfacing as a confusing cargo-fetch crash
+    // inside a container minutes later. No-op when no [[repo]] opts in.
+    validate_deploy_keys_at_startup(&config)
+        .await
+        .context("validate deploy keys")?;
 
     let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
         anyhow!(
@@ -339,6 +411,8 @@ async fn call_triage_one(
         issue,
         &repo_label,
         &repo_slug,
+        &config.auth.ssh_keys_volume,
+        &primary_repo.deploy_keys,
         &mut log_writer,
         deadline,
     )
@@ -833,6 +907,376 @@ async fn status_cmd() -> Result<()> {
     }
 }
 
+/// Validate a deploy-key `name` at CLI-parse time. The name becomes a
+/// filename in the deploy-keys volume and is interpolated into shell
+/// scripts (single-quoted in `docker run -c "..."`), so reject anything
+/// that could break out of either context. The allowed set is
+/// `[A-Za-z0-9._-]+`, which covers every realistic crate/repo handle
+/// without leaving room for `'`, `$`, `/`, `\n`, or other shell-special
+/// or path-traversal characters.
+///
+/// Additionally rejects the reserved metadata filenames `config` and
+/// `known_hosts` (the volume's SSH config and known-hosts files) and the
+/// path-resolution literals `.` and `..` — a name like `config` would
+/// pass the character-class check but pipe the operator's private key
+/// through `cat > /sshvol/config`, clobbering the volume's SSH config;
+/// `known_hosts` would do the same and then `chmod 644` the private key
+/// world-readable. `.` and `..` would resolve to `/sshvol` / the parent
+/// directory under `cat > /sshvol/<name>`.
+fn validate_deploy_key_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("deploy key name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(anyhow!(
+            "deploy key name `{name}` contains characters outside `[A-Za-z0-9._-]`; \
+             the name becomes a filename in the deploy-keys volume and a shell argument, \
+             so only those characters are allowed",
+        ));
+    }
+    if matches!(name, "config" | "known_hosts" | "." | "..") {
+        return Err(anyhow!(
+            "deploy key name `{name}` is reserved (the deploy-keys volume uses \
+             `config` and `known_hosts` for its SSH metadata, and `.`/`..` resolve \
+             to directory paths); pick a different name like the crate or repo handle",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an `ssh-host` value at CLI-parse time. The host is
+/// interpolated into shell scripts (Host stanza, `ssh-keyscan`,
+/// `ssh-keygen -F`), so reject anything outside a conservative
+/// hostname character class. `[A-Za-z0-9.-]+` covers `github.com`,
+/// `git.example.com`, and any reasonable GHE host; nothing else is
+/// needed.
+///
+/// Also rejects values starting with `-`: while the character class
+/// already prevents shell-injection escapes, a leading dash makes
+/// `ssh-keyscan -H <host>` and `ssh-keygen -F <host>` parse the value
+/// as an option (e.g. `-V` prints version and exits), silently
+/// bypassing the known_hosts seeding step and leaving the agent unable
+/// to verify the real host key. The `--` separator inside the add
+/// script catches the same case as defence-in-depth, but rejecting it
+/// up-front gives the operator a clear error message.
+fn validate_ssh_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(anyhow!("ssh-host must not be empty"));
+    }
+    if host.starts_with('-') {
+        return Err(anyhow!(
+            "ssh-host `{host}` must not start with `-`; \
+             a leading dash makes ssh-keyscan / ssh-keygen treat the value as an \
+             option flag, silently skipping the host-key seeding step",
+        ));
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return Err(anyhow!(
+            "ssh-host `{host}` contains characters outside `[A-Za-z0-9.-]`; \
+             use a plain hostname like `github.com` or `git.example.com`",
+        ));
+    }
+    Ok(())
+}
+
+/// Shell script the `add` arm runs inside a one-shot container with
+/// the deploy-keys volume mounted at `/sshvol` (issue #69 / ADR-0002).
+/// stdin is piped through to the container, so `cat > /sshvol/<name>`
+/// captures the operator's paste; the rest of the script chmod's the
+/// key, idempotently ensures the Host stanza is in `/sshvol/config`,
+/// and idempotently seeds `/sshvol/known_hosts` via `ssh-keyscan`.
+///
+/// Pure function — the value is the text of the script run via
+/// `sh -c "..."`. Tested for shape (paths, chmod 600, Host stanza
+/// fields, idempotence guard, host-key seeding) so the contract can
+/// evolve without silently dropping a required step.
+fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
+    let identity = format!("/home/bellows/.ssh/{name}");
+    // Notes on idempotence:
+    //   * the Host-stanza guard greps for the unique IdentityFile
+    //     line, which is plaintext in `/sshvol/config`;
+    //   * the known_hosts guard uses `ssh-keygen -F` rather than
+    //     plain `grep`, because `ssh-keyscan -H` hashes hostnames in
+    //     its output (`|1|<b64>|<b64> ssh-ed25519 ...`) so a plain
+    //     `grep -F 'github.com '` would never match and every re-run
+    //     would append another triplet. `ssh-keygen -F` is the
+    //     canonical search and resolves hashed entries.
+    // The Host-stanza body uses `\\n` (escaped) because the outer Rust
+    // format includes the literal backslash-n that `printf` then
+    // expands to a real newline at shell runtime.
+    //
+    // The seeding block is built separately so the github.com arm can
+    // verify ssh-keyscan output against the pinned fingerprint table
+    // before appending — defeating a network-position attacker who
+    // substitutes a host key during the first `bellows setup-deploy-keys
+    // add` invocation.
+    let seeding = build_known_hosts_seeding_block(ssh_host);
+    format!(
+        "set -e\n\
+         umask 077\n\
+         cat > /sshvol/{name}\n\
+         chmod 600 /sshvol/{name}\n\
+         touch /sshvol/config\n\
+         chmod 600 /sshvol/config\n\
+         if ! grep -F -q 'IdentityFile {identity}' /sshvol/config; then\n\
+             printf 'Host {ssh_host}\\n    IdentityFile {identity}\\n    IdentitiesOnly yes\\n\\n' >> /sshvol/config\n\
+         fi\n\
+         touch /sshvol/known_hosts\n\
+         chmod 644 /sshvol/known_hosts\n\
+         if ! ssh-keygen -F {ssh_host} -f /sshvol/known_hosts >/dev/null 2>&1; then\n\
+         {seeding}\
+         fi\n",
+        name = name,
+        identity = identity,
+        ssh_host = ssh_host,
+        seeding = seeding,
+    )
+}
+
+/// Pinned SHA256 host-key fingerprints for well-known SSH hosts. The
+/// add script verifies `ssh-keyscan` output against this table before
+/// trusting it, so a network-position attacker who substitutes a host
+/// key at first contact cannot poison `/sshvol/known_hosts`.
+///
+/// Source: <https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints>
+/// (ed25519, ECDSA, RSA — the three host key types github.com publishes).
+fn pinned_host_key_fingerprints(ssh_host: &str) -> Option<&'static [&'static str]> {
+    match ssh_host {
+        "github.com" => Some(&[
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+            "SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
+            "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
+        ]),
+        _ => None,
+    }
+}
+
+/// Shell fragment that seeds `/sshvol/known_hosts` for `ssh_host`. The
+/// fragment is inlined into the `add` script's `if ! ssh-keygen -F ...`
+/// branch so it only runs on first seeding for a given host.
+///
+/// For pinned hosts (currently `github.com`), the fragment runs
+/// `ssh-keyscan` to a temp file, computes the SHA256 fingerprints, and
+/// aborts unless every returned fingerprint matches a value in the
+/// pinned table — closing the trust-on-first-use gap. For unpinned
+/// hosts the fragment still runs `ssh-keyscan` but prints the
+/// fingerprints to stderr so the operator can verify them out-of-band
+/// before relying on the host.
+///
+/// `--` separates options from the positional host so a `-V`-style
+/// host name (caught up-front by `validate_ssh_host` but kept here as
+/// defence-in-depth) cannot be parsed as a flag by `ssh-keyscan`.
+fn build_known_hosts_seeding_block(ssh_host: &str) -> String {
+    // Lines have no leading whitespace — shell does not care about
+    // indentation, and Rust's `\<newline>` continuation eats leading
+    // whitespace on the next source line anyway.
+    let common_preamble = format!(
+        "KEYSCAN_TMP=$(mktemp)\n\
+         ssh-keyscan -H -- {ssh_host} > \"$KEYSCAN_TMP\" 2>/dev/null\n\
+         if [ ! -s \"$KEYSCAN_TMP\" ]; then\n\
+         rm -f \"$KEYSCAN_TMP\"\n\
+         echo 'bellows: ssh-keyscan returned no host keys for {ssh_host}' >&2\n\
+         exit 1\n\
+         fi\n",
+        ssh_host = ssh_host,
+    );
+    let body = match pinned_host_key_fingerprints(ssh_host) {
+        Some(expected_fps) => {
+            let expected = expected_fps.join("\n");
+            format!(
+                "EXPECTED_FPS='{expected}'\n\
+                 GOT_FPS=$(ssh-keygen -lf \"$KEYSCAN_TMP\" | awk '{{print $2}}')\n\
+                 for fp in $GOT_FPS; do\n\
+                 if ! printf '%s\\n' \"$EXPECTED_FPS\" | grep -F -q -x -- \"$fp\"; then\n\
+                 echo \"bellows: SECURITY: ssh-keyscan returned fingerprint $fp which is NOT in the pinned list for {ssh_host}\" >&2\n\
+                 echo 'bellows: expected one of:' >&2\n\
+                 printf '%s\\n' \"$EXPECTED_FPS\" >&2\n\
+                 echo 'bellows: refusing to trust this host key (possible MitM); aborting' >&2\n\
+                 rm -f \"$KEYSCAN_TMP\"\n\
+                 exit 1\n\
+                 fi\n\
+                 done\n",
+                expected = expected,
+                ssh_host = ssh_host,
+            )
+        }
+        None => format!(
+            "echo 'bellows: {ssh_host} is not in the pinned-fingerprint table; trusting on first use.' >&2\n\
+             echo 'bellows: fingerprints being added to /sshvol/known_hosts:' >&2\n\
+             ssh-keygen -lf \"$KEYSCAN_TMP\" >&2\n\
+             echo 'bellows: verify these against an out-of-band source before depending on this host.' >&2\n",
+            ssh_host = ssh_host,
+        ),
+    };
+    format!(
+        "{common_preamble}\
+         {body}\
+         cat \"$KEYSCAN_TMP\" >> /sshvol/known_hosts\n\
+         rm -f \"$KEYSCAN_TMP\"\n",
+        common_preamble = common_preamble,
+        body = body,
+    )
+}
+
+/// Shell script the `list` arm runs inside the one-shot container.
+/// Prints filenames in `/sshvol/` (one per line) under a `keys:`
+/// header, then the `config` file under a `config:` header so the
+/// operator can read every Host stanza at a glance.
+fn build_deploy_keys_list_script() -> String {
+    "set -e\n\
+     echo 'keys:'\n\
+     ls -1A /sshvol 2>/dev/null | grep -v -x -e config -e known_hosts || true\n\
+     echo ''\n\
+     echo 'config:'\n\
+     cat /sshvol/config 2>/dev/null || echo '(no /sshvol/config — run `bellows setup-deploy-keys add <name>` to create it)'\n"
+        .to_string()
+}
+
+/// Shell script the `remove` arm runs inside the one-shot container.
+/// Removes the key file at `/sshvol/<name>` (rm -f so a missing key
+/// is not an error) AND the matching Host stanza from `/sshvol/config`
+/// (located by its `IdentityFile /home/bellows/.ssh/<name>` line; the
+/// awk filter spans from the preceding `Host` line through the next
+/// blank line so the block is removed cleanly).
+fn build_deploy_keys_remove_script(name: &str) -> String {
+    let identity = format!("/home/bellows/.ssh/{name}");
+    // Clear `block` when the matching IdentityFile arms `in_block`:
+    // otherwise the deferred Host header survives in `block` past the
+    // body, and if the target stanza is the file's last entry the END
+    // rule resurrects the orphaned `Host ...` line. Clearing on entry
+    // makes the END rule's `if (block != "")` correctly skip the
+    // doomed header in every case.
+    format!(
+        "set -e\n\
+         rm -f /sshvol/{name}\n\
+         if [ -f /sshvol/config ]; then\n\
+             awk -v identity='{identity}' 'BEGIN {{ in_block=0 }}\n\
+                 /^Host / {{ block=$0; in_block=0; next }}\n\
+                 $0 ~ \"IdentityFile \" identity {{ in_block=1; block=\"\"; next }}\n\
+                 in_block && /^$/ {{ in_block=0; next }}\n\
+                 in_block {{ next }}\n\
+                 /^$/ {{ if (block != \"\") {{ print block }} block=\"\"; print; next }}\n\
+                 {{ if (block != \"\") {{ print block; block=\"\" }} print }}\n\
+                 END {{ if (block != \"\") print block }}\n\
+             ' /sshvol/config > /sshvol/config.new\n\
+             mv /sshvol/config.new /sshvol/config\n\
+             chmod 600 /sshvol/config\n\
+         fi\n",
+        name = name,
+        identity = identity,
+    )
+}
+
+/// Dispatch for `bellows setup-deploy-keys add | list | remove`
+/// (issue #69 / ADR-0002 ACs 3, 4, 5). Each arm builds the
+/// corresponding shell script and runs it inside a one-shot
+/// policy-image container with the deploy-keys volume mounted at
+/// `/sshvol`. `add` is run with `-i` so stdin is piped through to the
+/// container; `list` and `remove` don't read stdin.
+async fn setup_deploy_keys_cmd(
+    config_path: &PathBuf,
+    action: SetupDeployKeysAction,
+) -> Result<()> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config at {}", config_path.display()))?;
+    let config = Config::from_str(&config_text)
+        .with_context(|| format!("parse config at {}", config_path.display()))?;
+    let volume = &config.auth.ssh_keys_volume;
+
+    let image_tag = sandbox::ensure_policy_image()
+        .await
+        .context("build/check policy image")?;
+
+    match action {
+        SetupDeployKeysAction::Add { name, ssh_host } => {
+            validate_deploy_key_name(&name)?;
+            validate_ssh_host(&ssh_host)?;
+            println!(
+                "bellows: importing deploy key `{name}` into volume `{volume}` (host: {ssh_host})."
+            );
+            println!("bellows: paste the PRIVATE half of the key, then press Ctrl-D (EOF).");
+            let script = build_deploy_keys_add_script(&name, &ssh_host);
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "-i",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run -i` for setup-deploy-keys add")?;
+            if !status.success() {
+                anyhow::bail!("docker run (add) exited with {}", status);
+            }
+            println!("bellows: deploy key `{name}` added.");
+        }
+        SetupDeployKeysAction::List => {
+            let script = build_deploy_keys_list_script();
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol:ro"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run` for setup-deploy-keys list")?;
+            if !status.success() {
+                anyhow::bail!("docker run (list) exited with {}", status);
+            }
+        }
+        SetupDeployKeysAction::Remove { name } => {
+            validate_deploy_key_name(&name)?;
+            let script = build_deploy_keys_remove_script(&name);
+            let status = tokio::process::Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--volume",
+                    &format!("{volume}:/sshvol"),
+                    "--entrypoint",
+                    "sh",
+                    &image_tag,
+                    "-c",
+                    &script,
+                ])
+                .status()
+                .await
+                .context("spawn `docker run` for setup-deploy-keys remove")?;
+            if !status.success() {
+                anyhow::bail!("docker run (remove) exited with {}", status);
+            }
+            println!("bellows: deploy key `{name}` removed (no-op if it was already absent).");
+        }
+    }
+    Ok(())
+}
+
 async fn setup_auth(config_path: &PathBuf) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
@@ -879,6 +1323,15 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // Issue #69 (ADR-0002) AC9: refuse to start when any [[repo]]
+    // deploy_keys references a key name that's not present in the
+    // configured ssh_keys_volume. Fail-fast here is much friendlier
+    // than letting the agent crash mid-cargo-fetch later. No-op when
+    // no [[repo]] opts in.
+    validate_deploy_keys_at_startup(&config)
+        .await
+        .context("validate deploy keys")?;
 
     let pat = std::env::var(&config.github.pat_env_var).map_err(|_| {
         anyhow!(
@@ -1111,6 +1564,377 @@ fn log(file: &mut File, line: &str) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_add_with_default_ssh_host() {
+        // Issue #69 (ADR-0002) AC3 acceptance: `bellows
+        // setup-deploy-keys add <name>` parses with the ssh-host
+        // defaulting to `github.com`. The name is positional; the
+        // host is an optional `--ssh-host <host>` flag.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "add", "workboard-core"])
+            .expect("bellows setup-deploy-keys add <name> must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Add { name, ssh_host },
+            }) => {
+                assert_eq!(name, "workboard-core");
+                assert_eq!(ssh_host, "github.com", "default ssh-host must be github.com");
+            }
+            other => panic!("expected SetupDeployKeys::Add, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_add_with_explicit_ssh_host() {
+        // Acceptance: operators with self-hosted git servers can
+        // override the ssh-host via `--ssh-host`.
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "setup-deploy-keys",
+            "add",
+            "my-key",
+            "--ssh-host",
+            "git.example.com",
+        ])
+        .expect("bellows setup-deploy-keys add --ssh-host must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Add { name, ssh_host },
+            }) => {
+                assert_eq!(name, "my-key");
+                assert_eq!(ssh_host, "git.example.com");
+            }
+            _ => panic!("expected SetupDeployKeys::Add with custom ssh_host"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_list_subcommand() {
+        // Acceptance AC4: `bellows setup-deploy-keys list` must parse.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "list"])
+            .expect("bellows setup-deploy-keys list must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::List,
+            }) => {}
+            _ => panic!("expected SetupDeployKeys::List"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_deploy_keys_remove_subcommand() {
+        // Acceptance AC5: `bellows setup-deploy-keys remove <name>`
+        // must parse, name is positional.
+        let cli = Cli::try_parse_from(["bellows", "setup-deploy-keys", "remove", "workboard-core"])
+            .expect("bellows setup-deploy-keys remove <name> must parse");
+        match cli.command {
+            Some(Command::SetupDeployKeys {
+                action: SetupDeployKeysAction::Remove { name },
+            }) => assert_eq!(name, "workboard-core"),
+            _ => panic!("expected SetupDeployKeys::Remove"),
+        }
+    }
+
+    #[test]
+    fn cli_help_lists_setup_deploy_keys_subcommand() {
+        // The new subcommand is discoverable from `bellows --help`.
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("setup-deploy-keys"),
+            "top-level --help must list setup-deploy-keys: {help}"
+        );
+    }
+
+    #[test]
+    fn validate_deploy_key_name_accepts_realistic_handles() {
+        for name in ["workboard-core", "my_key", "v2.0", "abc123", "a"] {
+            assert!(
+                validate_deploy_key_name(name).is_ok(),
+                "expected `{name}` to validate",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_deploy_key_name_rejects_shell_special_and_path_chars() {
+        // Each of these would break the shell scripts that interpolate
+        // the name into single-quoted `docker run -c "..."` text, or
+        // would escape the /sshvol/ prefix.
+        for name in [
+            "",
+            "foo'bar",
+            "foo$IFS",
+            "foo/bar",
+            "../etc/passwd",
+            "foo bar",
+            "foo\nbar",
+            "foo;rm",
+        ] {
+            assert!(
+                validate_deploy_key_name(name).is_err(),
+                "expected `{name}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_deploy_key_name_rejects_reserved_metadata_filenames() {
+        // `config` and `known_hosts` are the volume's SSH metadata files;
+        // accepting either as a deploy-key name would route the operator's
+        // private-key paste into the metadata file (overwriting config or
+        // leaving the key world-readable under chmod 644 of known_hosts).
+        // `.` and `..` resolve to directory paths under `cat > /sshvol/<name>`.
+        for name in ["config", "known_hosts", ".", ".."] {
+            assert!(
+                validate_deploy_key_name(name).is_err(),
+                "expected reserved name `{name}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_accepts_realistic_hosts() {
+        for host in ["github.com", "git.example.com", "ghe.internal", "host-1.io"] {
+            assert!(
+                validate_ssh_host(host).is_ok(),
+                "expected `{host}` to validate",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_shell_special_chars() {
+        for host in ["", "foo'bar", "foo$x", "foo bar", "foo;rm", "foo/bar", "foo_bar"] {
+            assert!(
+                validate_ssh_host(host).is_err(),
+                "expected `{host}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_leading_dash() {
+        // Values starting with `-` pass the character-class check but
+        // get parsed as option flags by ssh-keyscan / ssh-keygen,
+        // silently bypassing the known_hosts seeding step. The
+        // validator must reject them up-front (with `--` as a
+        // defence-in-depth shield inside the script).
+        for host in ["-V", "--help", "-G", "-foo.com"] {
+            assert!(
+                validate_ssh_host(host).is_err(),
+                "expected leading-dash host `{host}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_uses_double_dash_before_keyscan_host() {
+        // Defence-in-depth: even though validate_ssh_host rejects
+        // leading-dash hosts, `ssh-keyscan -H -- <host>` halts option
+        // parsing so a future relaxation of the character class cannot
+        // re-open the flag-injection gap.
+        let script = build_deploy_keys_add_script("my-key", "github.com");
+        assert!(
+            script.contains("ssh-keyscan -H -- github.com"),
+            "add script must pass `--` before the ssh-keyscan host: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_pins_github_fingerprints() {
+        // Closes the trust-on-first-use gap for github.com: the add
+        // script must verify ssh-keyscan output against GitHub's
+        // published SHA256 host-key fingerprints before appending to
+        // /sshvol/known_hosts. Source:
+        // https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+        let script = build_deploy_keys_add_script("my-key", "github.com");
+        for expected in [
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+            "SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
+            "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
+        ] {
+            assert!(
+                script.contains(expected),
+                "github.com add script must pin fingerprint `{expected}`: {script}",
+            );
+        }
+        // The script must actually compare returned fingerprints
+        // against the pinned list, not merely contain the constants.
+        assert!(
+            script.contains("ssh-keygen -lf"),
+            "add script must compute fingerprints with `ssh-keygen -lf`: {script}",
+        );
+        assert!(
+            script.contains("EXPECTED_FPS"),
+            "add script must bind the pinned list to EXPECTED_FPS for comparison: {script}",
+        );
+        assert!(
+            script.contains("refusing to trust this host key"),
+            "add script must abort (not warn) on fingerprint mismatch: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_does_not_pin_unknown_hosts() {
+        // For hosts not in the pinned-fingerprint table the script
+        // still seeds known_hosts (TOFU, matching the OpenSSH default)
+        // but must print the fingerprints to stderr so the operator
+        // can verify them out-of-band.
+        let script = build_deploy_keys_add_script("my-key", "ghe.internal");
+        assert!(
+            !script.contains("SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"),
+            "unpinned host must not carry github.com's pinned fingerprints: {script}",
+        );
+        assert!(
+            script.contains("ssh-keygen -lf"),
+            "unpinned host script must still print fingerprints via `ssh-keygen -lf`: {script}",
+        );
+        assert!(
+            script.contains("trusting on first use"),
+            "unpinned host script must surface its TOFU posture to the operator: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_writes_to_volume_with_mode_600() {
+        // Acceptance AC3 pinning: the add script must (a) read stdin
+        // and write to /sshvol/<name>, (b) chmod 600 the result, and
+        // (c) idempotently ensure the Host stanza is in /sshvol/config
+        // pointing at IdentityFile /home/bellows/.ssh/<name> with
+        // IdentitiesOnly yes, (d) seed known_hosts via ssh-keyscan.
+        let script = build_deploy_keys_add_script("workboard-core", "github.com");
+        // (a) writes to /sshvol/<name>
+        assert!(
+            script.contains("/sshvol/workboard-core"),
+            "add script must write to /sshvol/<name>: {script}",
+        );
+        // (b) chmod 600
+        assert!(
+            script.contains("chmod 600"),
+            "add script must chmod 600 the key file: {script}",
+        );
+        // (c) Host stanza pointing at the in-container path
+        assert!(
+            script.contains("Host github.com"),
+            "add script must add Host stanza: {script}",
+        );
+        assert!(
+            script.contains("IdentityFile /home/bellows/.ssh/workboard-core"),
+            "Host stanza must reference the in-container identity path: {script}",
+        );
+        assert!(
+            script.contains("IdentitiesOnly yes"),
+            "Host stanza must include IdentitiesOnly yes: {script}",
+        );
+        // (d) ssh-keyscan seeds known_hosts
+        assert!(
+            script.contains("ssh-keyscan"),
+            "add script must seed known_hosts via ssh-keyscan: {script}",
+        );
+        assert!(
+            script.contains("github.com"),
+            "ssh-keyscan must target the configured host: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_add_script_is_idempotent_on_repeated_invocations() {
+        // Acceptance AC3: "Idempotent on subsequent adds." Pin the
+        // contract: the script must guard BOTH the Host-stanza append
+        // AND the known_hosts seeding so running add twice for the
+        // same key doesn't duplicate either.
+        let script = build_deploy_keys_add_script("my-key", "github.com");
+
+        // Host-stanza guard: the IdentityFile path is unique to this
+        // key, so greping for it before appending is the canonical
+        // shape.
+        assert!(
+            script.contains("grep -F -q 'IdentityFile /home/bellows/.ssh/my-key'"),
+            "Host-stanza append must be guarded by a grep for the unique IdentityFile line: {script}",
+        );
+
+        // known_hosts guard: ssh-keyscan -H hashes hostnames in its
+        // output (`|1|<b64>|<b64> ssh-ed25519 ...`) so a plain
+        // `grep -F 'github.com '` against the file will never match
+        // and every re-run will append another triplet. The guard
+        // must use `ssh-keygen -F` (which resolves hashed entries) or
+        // drop `-H` so plaintext matching works.
+        let uses_hashed_keyscan = script.contains("ssh-keyscan -H");
+        let uses_keygen_search = script.contains("ssh-keygen -F github.com");
+        let uses_broken_plain_grep_guard = script
+            .contains("grep -F -q 'github.com ' /sshvol/known_hosts");
+        assert!(
+            !uses_broken_plain_grep_guard,
+            "known_hosts guard `grep -F 'github.com '` cannot match hashed entries written by `ssh-keyscan -H` — \
+             every re-run will re-append. Use `ssh-keygen -F` instead, or drop `-H` from ssh-keyscan: {script}",
+        );
+        assert!(
+            uses_keygen_search || !uses_hashed_keyscan,
+            "known_hosts guard must locate entries written by `ssh-keyscan -H` (hashed) — \
+             use `ssh-keygen -F <host>` to search, or drop `-H` so plaintext matching works: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_remove_script_removes_key_and_host_stanza() {
+        // Acceptance AC5: remove must delete /sshvol/<name> AND the
+        // matching Host stanza from /sshvol/config. Idempotent on
+        // missing key.
+        let script = build_deploy_keys_remove_script("workboard-core");
+        assert!(
+            script.contains("/sshvol/workboard-core"),
+            "remove script must target the key file: {script}",
+        );
+        assert!(
+            script.contains("rm -f") || script.contains("rm --force"),
+            "remove must use -f so missing key is not an error: {script}",
+        );
+        // The config edit needs to know the IdentityFile path so it
+        // can locate the matching Host stanza.
+        assert!(
+            script.contains("/home/bellows/.ssh/workboard-core"),
+            "remove script must reference the in-container identity path to locate the Host stanza: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_remove_script_clears_deferred_host_header_on_match() {
+        // Regression: if the awk filter sets `in_block=1` without
+        // clearing `block`, the END rule resurrects the matching
+        // stanza's Host header when the file does not end with a
+        // trailing blank line — leaving an orphan `Host github.com`
+        // with no IdentityFile. Pin the contract: the IdentityFile-
+        // match rule must clear `block`.
+        let script = build_deploy_keys_remove_script("workboard-core");
+        assert!(
+            script.contains("in_block=1; block=\"\""),
+            "remove script must clear `block` when entering in_block so the \
+             END rule does not resurrect an orphan Host header: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_list_script_emits_filenames_and_host_stanzas() {
+        // Acceptance AC4: list prints key filenames + Host stanzas
+        // from /sshvol/config. Operator who's lost track of which
+        // keys live in the volume runs this; the output is the
+        // tracking shape.
+        let script = build_deploy_keys_list_script();
+        assert!(
+            script.contains("ls") || script.contains("find"),
+            "list must enumerate files in /sshvol: {script}",
+        );
+        assert!(
+            script.contains("/sshvol"),
+            "list must operate inside /sshvol: {script}",
+        );
+        // The config has the Host stanzas; surfacing it is the whole
+        // point of `list` (per the brief).
+        assert!(
+            script.contains("config"),
+            "list must include the config file: {script}",
+        );
+    }
 
     #[test]
     fn cli_parses_refresh_auth_subcommand() {

@@ -26,6 +26,17 @@
 
 [[repo]]
 url = "https://github.com/marad2001/bellows-test"
+# Optional. Per-repo opt-in for SSH deploy keys (ADR-0002 / issue #69)
+# — when this list is non-empty, the agent and cargo-checks gate
+# containers spawned for THIS repo get the `[auth].ssh_keys_volume`
+# mounted read-only at `/home/bellows/.ssh/` so cargo can fetch
+# private git deps via `ssh://git@github.com/...` URLs. Each entry is
+# a key NAME (the same name passed to `bellows setup-deploy-keys
+# add`); bellows refuses to start when any name listed here is not
+# present in the volume. Omit / leave empty for repos that don't need
+# private-dep access — that preserves the "no creds in sandbox by
+# default" posture.
+# deploy_keys = ["workboard-core"]
 
 # [[repo]]
 # url = "https://github.com/marad2001/another-repo"
@@ -57,6 +68,22 @@ agent_cancelled   = "agent-cancelled"
 [logging]
 # Single log file path. Default: "bellows.log" in cwd.
 path = "bellows.log"
+
+[auth]
+# Auth method for the in-container Claude Code agent. Only
+# `"subscription"` is implemented in v1.
+method = "subscription"
+# Docker volume holding the Claude Code OAuth session, seeded via
+# `bellows setup-auth`. Default: `bellows-claude-credentials`.
+credentials_volume = "bellows-claude-credentials"
+# Docker volume holding per-repo SSH deploy keys (ADR-0002 /
+# issue #69). Populated via `bellows setup-deploy-keys add <name>`
+# and mounted read-only at `/home/bellows/.ssh/` into agent and
+# cargo-checks containers spawned for `[[repo]]` blocks whose
+# `deploy_keys = [...]` list is non-empty. Parallel to but distinct
+# from `credentials_volume` — separate lifecycle, separate setup
+# command, separate purpose. Default: `bellows-deploy-keys`.
+ssh_keys_volume = "bellows-deploy-keys"
 
 [agent]
 # Per-issue wall-clock budget. Bellows tracks elapsed time across all

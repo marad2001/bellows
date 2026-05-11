@@ -142,7 +142,83 @@ future agent run mounts the same volume read-write. Concurrency=1
 prevents container races on the volume. If the refresh token expires
 later, [`bellows refresh-auth`](#daily-use) re-seeds it the same way.
 
-### 4. Create the GitHub label vocabulary
+### 4. (Optional) Seed SSH deploy keys for private cross-repo deps
+
+Skip this step if every repo bellows polls has its dependency tree
+fully on crates.io or in the same monorepo. Reach for it when a
+target repo's `Cargo.toml` references private git deps via SSH URLs
+(`ssh://git@github.com/owner/repo.git`) — without credentials, cargo
+inside the sandbox cannot fetch those deps and the agent + the
+cargo-checks gate both crash on `cargo fetch`. The cure (per
+[ADR-0002](docs/adr/0002-ssh-deploy-keys-for-private-cross-repo-deps.md))
+is per-repo opt-in SSH deploy keys mounted read-only at
+`/home/bellows/.ssh/` into the containers spawned for the opted-in
+`[[repo]]`. Keys live in a bellows-managed Docker volume (parallel to
+the credentials volume), default name `bellows-deploy-keys`,
+overridable via `[auth].ssh_keys_volume`.
+
+The four steps per shared private crate:
+
+1. **Generate or pick a deploy key.** A deploy key is a single
+   SSH keypair scoped to one private GitHub repo (the one carrying
+   the shared crate). Generate one with `ssh-keygen -t ed25519 -f
+   ./deploy_key_workboard_core -C "bellows deploy key for workboard-core"`
+   if you don't have one to hand. The private half stays on the
+   operator's machine; the public half (`*.pub`) goes onto GitHub
+   in step 2.
+
+2. **Register the public half on GitHub.** On the shared crate's
+   repo (e.g. `marad2001/workboard-core`), go to **Settings → Deploy keys → Add deploy key**, paste the contents of the `*.pub` file,
+   give it a clear title (the bellows volume key name is a good
+   match — e.g. `workboard-core`), and leave **Allow write access**
+   unchecked. Cargo only needs read access; an escaping agent with
+   write would be much worse.
+
+3. **Import the private half into the bellows volume.** Pipe the
+   private half into `bellows setup-deploy-keys add <name>` — the
+   `<name>` is what the consuming `[[repo]]` block will reference,
+   and what shows up in `bellows setup-deploy-keys list` later.
+
+   ```bash
+   bellows setup-deploy-keys add workboard-core < ./deploy_key_workboard_core
+   ```
+
+   The subcommand runs inside a one-shot container with the
+   deploy-keys volume mounted: it writes the key with mode 600,
+   ensures `/home/bellows/.ssh/config` has a `Host github.com` stanza
+   pointing at the new key with `IdentitiesOnly yes`, and seeds
+   `/home/bellows/.ssh/known_hosts` via `ssh-keyscan`. Re-running
+   `add` for the same name is idempotent.
+
+   For a self-hosted git server, override the host:
+   `bellows setup-deploy-keys add my-key --ssh-host git.example.com`.
+
+   `bellows setup-deploy-keys list` shows every key the volume holds
+   plus the Host stanzas; `bellows setup-deploy-keys remove <name>`
+   reverses an `add` (idempotent on a missing key).
+
+4. **Reference the key from the consuming repo's `[[repo]]` block.**
+   In `orchestrator.toml`, add `deploy_keys = [...]` to every
+   `[[repo]]` that depends on the private crate:
+
+   ```toml
+   [[repo]]
+   url = "https://github.com/marad2001/workboard-financial-advice"
+   deploy_keys = ["workboard-core"]
+   ```
+
+   This is the explicit opt-in. `[[repo]]` blocks without a
+   `deploy_keys` list (or with an empty list) get no SSH mount —
+   preserving the "no creds in sandbox by default" posture for
+   every repo that doesn't need private-dep access. Bellows
+   validates at startup that every name in every `deploy_keys =
+   [...]` references a key actually present in the volume, and
+   refuses to start when one is missing — naming the missing key
+   and the offending repo so you can re-run `setup-deploy-keys add`
+   immediately instead of hitting a confusing cargo-fetch crash
+   later inside the sandbox.
+
+### 5. Create the GitHub label vocabulary
 
 Bellows operates a label state machine on the target repo, so the
 labels need to exist before bellows starts polling. There are two
@@ -189,7 +265,7 @@ for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug
 done
 ```
 
-### 5. Branch protection setup
+### 6. Branch protection setup
 
 Bellows runs its own `cargo clippy` + `cargo test` gate inside the
 sandbox on every agent commit, but that gate doesn't run on commits a

@@ -21,6 +21,12 @@ use crate::workspace::Workspace;
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
 
+/// Where the deploy-keys volume mounts inside the container (issue #69
+/// / ADR-0002). The path is the bellows-user's `~/.ssh/`, so cargo /
+/// git can pick up the `config` + `known_hosts` + key files at the
+/// standard openssh location with no extra config inside the sandbox.
+const SSH_KEYS_PATH_IN_CONTAINER: &str = "/home/bellows/.ssh";
+
 /// Name of the single shared cargo registry volume mounted on every
 /// agent container. Holds the cargo registry index plus downloaded
 /// crate sources; safe to share across all repos because cargo is
@@ -113,6 +119,85 @@ impl OutputTail {
     }
 }
 
+/// Borrow-friendly view of one `[[repo]]` block, just the fields the
+/// deploy-keys validator needs (issue #69 / ADR-0002). Decoupled from
+/// `config::RepoConfig` so the validator is callable from tests
+/// without round-tripping through TOML, and from production code by
+/// mapping `&[RepoConfig]` → `Vec<DeployKeyRepo>`.
+#[derive(Debug, Clone)]
+pub struct DeployKeyRepo {
+    pub url: String,
+    pub deploy_keys: Vec<String>,
+}
+
+/// One missing reference: a `[[repo]] deploy_keys` name that wasn't
+/// found in the configured `ssh_keys_volume`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDeployKey {
+    pub key: String,
+    pub repo_url: String,
+}
+
+/// The error raised when one or more `[[repo]] deploy_keys` references
+/// have no matching file in the deploy-keys volume. Carries the full
+/// list of misses so the operator can fix every gap in one sitting
+/// rather than rerunning startup validation N times.
+#[derive(Debug, Clone, thiserror::Error)]
+pub struct MissingDeployKeysError {
+    pub missing: Vec<MissingDeployKey>,
+}
+
+impl std::fmt::Display for MissingDeployKeysError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "bellows: refusing to start — {} deploy-key reference{} in `[[repo]] deploy_keys` not present in the deploy-keys volume:",
+            self.missing.len(),
+            if self.missing.len() == 1 { "" } else { "s" },
+        )?;
+        for m in &self.missing {
+            write!(f, "\n  - key `{}` referenced by repo `{}`", m.key, m.repo_url)?;
+        }
+        write!(
+            f,
+            "\nrun `bellows setup-deploy-keys add <name>` for each missing key, or remove the reference from `[[repo]] deploy_keys` if the repo no longer needs it.",
+        )?;
+        Ok(())
+    }
+}
+
+/// Pure validator: every name in any `[[repo]] deploy_keys` list must
+/// be present as a key in `present` (typically the set of regular
+/// filenames in the `ssh_keys_volume`). Returns Ok when every
+/// reference resolves; otherwise an error carrying every miss so the
+/// operator sees the full list in one pass.
+///
+/// Pure function — the docker-side wrapper
+/// (`validate_deploy_keys_against_volume`) is responsible for asking
+/// the daemon what filenames exist, then delegating to this function
+/// for the pure logic.
+pub fn validate_deploy_keys_against_present(
+    repos: &[DeployKeyRepo],
+    present: &std::collections::HashSet<String>,
+) -> Result<(), MissingDeployKeysError> {
+    let mut missing = Vec::new();
+    for r in repos {
+        for k in &r.deploy_keys {
+            if !present.contains(k) {
+                missing.push(MissingDeployKey {
+                    key: k.clone(),
+                    repo_url: r.url.clone(),
+                });
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(MissingDeployKeysError { missing })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error("docker: {0}")]
@@ -133,6 +218,82 @@ pub enum SandboxError {
     VolumeInUse { name: String },
     #[error("volume `{name}` does not exist")]
     VolumeNotFound { name: String },
+    #[error(transparent)]
+    MissingDeployKeys(#[from] MissingDeployKeysError),
+    #[error("could not list filenames in deploy-keys volume `{volume}`: docker run exited with status {status}")]
+    DeployKeysVolumeListFailed { volume: String, status: String },
+}
+
+/// List every regular filename in the named deploy-keys volume (issue
+/// #69 / ADR-0002 startup validation). Spawns a one-shot policy-image
+/// container with the volume mounted read-only and runs `ls -1A`
+/// inside it; that path is portable across Docker Desktop (where the
+/// host filesystem cannot reach the volume's mountpoint) and Linux
+/// Docker Engine alike. If the volume does not exist yet, docker
+/// creates it empty on first mount — the validator then sees an
+/// empty `present` set and surfaces every reference as missing.
+pub async fn list_deploy_keys_in_volume(
+    volume: &str,
+) -> Result<std::collections::HashSet<String>, SandboxError> {
+    let image_tag = ensure_policy_image().await?;
+    // `--user 0` so root inside the container can read regardless of
+    // whether the volume was populated with bellows uid 1000 ownership.
+    // `ls -1A` prints one filename per line and omits `.`/`..`.
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--volume",
+            &format!("{volume}:/sshvol:ro"),
+            "--entrypoint",
+            "sh",
+            &image_tag,
+            "-c",
+            "ls -1A /sshvol 2>/dev/null || true",
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(SandboxError::DeployKeysVolumeListFailed {
+            volume: volume.to_string(),
+            status: format!("{}", output.status),
+        });
+    }
+    // Filter the volume's own metadata files (`config`, `known_hosts`)
+    // out of the present-set so the validator and the operator-facing
+    // `setup-deploy-keys list` agree on what counts as a key. Without
+    // this, `[[repo]] deploy_keys = ["config"]` would validate falsely
+    // and then mount-shadow the config file at container startup.
+    let present = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && l != "config" && l != "known_hosts")
+        .collect();
+    Ok(present)
+}
+
+/// Startup validation entry point (issue #69 / ADR-0002 AC9). Walks
+/// every `[[repo]] deploy_keys` reference; if every name resolves to
+/// a file in the configured `ssh_keys_volume`, returns Ok. Otherwise
+/// returns `SandboxError::MissingDeployKeys` carrying every miss so
+/// the operator sees the full punch list and can rerun
+/// `setup-deploy-keys add` for each in one sitting.
+///
+/// Short-circuits without touching docker when no `[[repo]]` opted in
+/// — both the cheap path AND the preservation of the "no creds in
+/// sandbox by default" posture (we don't spawn a container at all).
+pub async fn validate_deploy_keys(
+    repos: &[DeployKeyRepo],
+    ssh_keys_volume: &str,
+) -> Result<(), SandboxError> {
+    if repos.iter().all(|r| r.deploy_keys.is_empty()) {
+        return Ok(());
+    }
+    let present = list_deploy_keys_in_volume(ssh_keys_volume).await?;
+    validate_deploy_keys_against_present(repos, &present)?;
+    Ok(())
 }
 
 /// Build (or reuse the cached) policy image and return its tag. Used by
@@ -301,12 +462,21 @@ async fn run_container(
     lifecycle
 }
 
+// Issue #69 added two more arguments (ssh_keys_volume + deploy_keys);
+// the existing call surface was already at clippy's
+// too_many_arguments boundary. Bundling into a struct would just
+// rename the boilerplate without simplifying it, so suppressed here
+// — the runner is the only caller and the call sites are kept tidy
+// with their own one-line summaries.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     workspace: &Workspace,
     auth: &Auth,
     issue_number: u64,
     repo: &str,
     repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<AgentRun, SandboxError> {
@@ -329,6 +499,8 @@ pub async fn run_agent(
     // collision with bind syntax's `:` separator on Windows drive
     // letters. Auth contributes credentials volumes; build_cache_mounts
     // contributes the per-repo target + shared cargo registry caches.
+    // build_ssh_keys_mount contributes the read-only deploy-keys mount
+    // when (and only when) the active [[repo]] opted in via deploy_keys.
     let mut mounts = vec![Mount {
         target: Some("/workspace".to_string()),
         source: Some(workspace_path),
@@ -337,6 +509,9 @@ pub async fn run_agent(
     }];
     mounts.extend(auth.extra_mounts());
     mounts.extend(build_cache_mounts(repo_slug));
+    if let Some(m) = build_ssh_keys_mount(ssh_keys_volume, deploy_keys) {
+        mounts.push(m);
+    }
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -403,11 +578,15 @@ pub struct CargoChecksRun {
 /// set on the returned `CargoChecksRun`.
 ///
 /// No credentials volume — the gate has no Anthropic dependency.
+// See run_agent's note on the too_many_arguments suppression.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cargo_checks(
     workspace: &Workspace,
     issue_number: u64,
     repo: &str,
     repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<CargoChecksRun, SandboxError> {
@@ -427,6 +606,13 @@ pub async fn run_cargo_checks(
         ..Default::default()
     }];
     mounts.extend(build_cache_mounts(repo_slug));
+    // Same per-repo SSH deploy-keys mount as the agent container —
+    // both phases need private-dep access via cargo. Brief: "Applies
+    // symmetrically to run_agent and run_cargo_checks. Both phases
+    // need private-dep access."
+    if let Some(m) = build_ssh_keys_mount(ssh_keys_volume, deploy_keys) {
+        mounts.push(m);
+    }
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -633,6 +819,33 @@ fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
             registry_labels,
         ),
     ]
+}
+
+/// Mount filter for the per-repo SSH deploy keys (issue #69 / ADR-0002).
+/// Returns `Some(Mount)` only when the active `[[repo]]` block opted in
+/// by declaring at least one name in `deploy_keys`; otherwise `None`,
+/// preserving the "no creds in sandbox by default" posture for every
+/// repo (including bellows-on-bellows) that did not opt in.
+///
+/// The mount is always READ-ONLY: that is the security boundary per
+/// ADR-0002 — an escaping agent cannot tamper with the keys.
+///
+/// The names inside `deploy_keys` are not consulted here; they're
+/// resolved against the volume's filesystem at startup
+/// (`validate_deploy_keys`), where a missing key short-circuits
+/// the run with a clear error. This function only decides "mount or
+/// no mount" based on whether the list is empty.
+fn build_ssh_keys_mount(ssh_keys_volume: &str, deploy_keys: &[String]) -> Option<Mount> {
+    if deploy_keys.is_empty() {
+        return None;
+    }
+    Some(Mount {
+        target: Some(SSH_KEYS_PATH_IN_CONTAINER.to_string()),
+        source: Some(ssh_keys_volume.to_string()),
+        typ: Some(MountType::VOLUME),
+        read_only: Some(true),
+        ..Default::default()
+    })
 }
 
 /// The entrypoint override applied to the cargo-checks container.
@@ -1214,6 +1427,157 @@ mod tests {
             Some("marad2001/repo-b"),
             "cargo-checks-gate container must carry bellows-repo=<owner>/<name>",
         );
+    }
+
+    #[test]
+    fn validate_deploy_keys_passes_when_every_referenced_key_is_present() {
+        // Issue #69 (ADR-0002) acceptance criterion: startup validation
+        // succeeds when every name listed under any `[[repo]]
+        // deploy_keys` is present in the volume. The validator does
+        // not care about the order of keys or about extra keys in the
+        // volume that aren't referenced — only that every referenced
+        // key has a file on disk.
+        let repos: Vec<DeployKeyRepo> = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/workboard-financial-advice".to_string(),
+                deploy_keys: vec!["workboard-core".to_string(), "workboard-shared".to_string()],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/bellows".to_string(),
+                deploy_keys: vec![],
+            },
+        ];
+        let present: std::collections::HashSet<String> = [
+            "workboard-core",
+            "workboard-shared",
+            "an-extra-key-nobody-references",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let result = validate_deploy_keys_against_present(&repos, &present);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn validate_deploy_keys_fails_when_a_referenced_key_is_missing() {
+        // Acceptance: refuse to start when any `[[repo]] deploy_keys`
+        // references a key name that's not present in the volume. The
+        // error message must name the missing key AND the repo that
+        // referenced it — a generic "missing keys" error would leave
+        // the operator hunting through the config to find the
+        // offending [[repo]].
+        let repos = vec![DeployKeyRepo {
+            url: "https://github.com/marad2001/workboard-financial-advice".to_string(),
+            deploy_keys: vec!["workboard-core".to_string()],
+        }];
+        let present: std::collections::HashSet<String> =
+            ["unrelated-key"].into_iter().map(String::from).collect();
+        let err = validate_deploy_keys_against_present(&repos, &present).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("workboard-core"),
+            "error must name the missing key: {msg}",
+        );
+        assert!(
+            msg.contains("workboard-financial-advice"),
+            "error must name the offending repo URL: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_deploy_keys_lists_every_missing_reference_in_one_error() {
+        // Fail-fast on the first miss is tempting, but reporting every
+        // missing key in one pass lets the operator run
+        // `bellows setup-deploy-keys add` for each gap in one sitting
+        // rather than re-running validation N times. Pin the contract
+        // here so a future "simplification" can't quietly regress it.
+        let repos = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-a".to_string(),
+                deploy_keys: vec!["key-a".to_string()],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-b".to_string(),
+                deploy_keys: vec!["key-b".to_string(), "key-c".to_string()],
+            },
+        ];
+        let present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let err = validate_deploy_keys_against_present(&repos, &present).unwrap_err();
+        let msg = format!("{err}");
+        for needle in ["key-a", "key-b", "key-c", "repo-a", "repo-b"] {
+            assert!(msg.contains(needle), "error must mention {needle}: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_deploy_keys_passes_when_no_repo_opts_in() {
+        // The volume can be totally empty when no [[repo]] references
+        // any deploy key. The brief: "no creds in sandbox by default"
+        // means the absence of an SSH volume must not block bellows
+        // from running. Validation walks every [[repo]] and finds
+        // nothing to check.
+        let repos = vec![
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-a".to_string(),
+                deploy_keys: vec![],
+            },
+            DeployKeyRepo {
+                url: "https://github.com/marad2001/repo-b".to_string(),
+                deploy_keys: vec![],
+            },
+        ];
+        let present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let result = validate_deploy_keys_against_present(&repos, &present);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn build_ssh_keys_mount_returns_none_when_deploy_keys_empty() {
+        // Issue #69 (ADR-0002) acceptance: containers spawned for
+        // `[[repo]]` entries with empty or unset `deploy_keys` get no
+        // SSH mount — that's how the "no creds in sandbox by default"
+        // posture is preserved. The mount filter is the single
+        // chokepoint enforcing this; if it ever returned a mount for an
+        // empty list, every container (including bellows-on-bellows)
+        // would get the keys.
+        let mount = build_ssh_keys_mount("bellows-deploy-keys", &[]);
+        assert!(mount.is_none(), "empty deploy_keys must produce no mount: {:?}", mount);
+    }
+
+    #[test]
+    fn build_ssh_keys_mount_returns_read_only_mount_when_deploy_keys_non_empty() {
+        // Issue #69 (ADR-0002) acceptance: a `[[repo]]` block that
+        // declares at least one deploy key gets the configured
+        // ssh_keys_volume mounted READ-ONLY at /home/bellows/.ssh/ —
+        // read-only so an escaping agent cannot tamper with the keys
+        // (the brief calls this out explicitly as the security
+        // boundary).
+        let mount = build_ssh_keys_mount("bellows-deploy-keys", &["workboard-core".to_string()])
+            .expect("non-empty deploy_keys must produce a mount");
+        assert_eq!(mount.typ, Some(MountType::VOLUME));
+        assert_eq!(mount.source.as_deref(), Some("bellows-deploy-keys"));
+        assert_eq!(mount.target.as_deref(), Some("/home/bellows/.ssh"));
+        assert_eq!(
+            mount.read_only,
+            Some(true),
+            "the deploy-keys mount must be read-only (security boundary per ADR-0002): {:?}",
+            mount,
+        );
+    }
+
+    #[test]
+    fn build_ssh_keys_mount_honours_custom_volume_name() {
+        // Acceptance criterion implication: the volume name is
+        // configurable via `[auth].ssh_keys_volume`. The mount filter
+        // must pipe that name through verbatim — if it hard-coded
+        // "bellows-deploy-keys", an operator who renamed the volume
+        // would mount the wrong one (or nothing at all if the default
+        // name had no volume on the host).
+        let mount =
+            build_ssh_keys_mount("my-custom-keys", &["some-key".to_string()])
+                .expect("non-empty deploy_keys must produce a mount");
+        assert_eq!(mount.source.as_deref(), Some("my-custom-keys"));
     }
 
     #[test]
