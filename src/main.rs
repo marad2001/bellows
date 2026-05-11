@@ -914,6 +914,15 @@ async fn status_cmd() -> Result<()> {
 /// `[A-Za-z0-9._-]+`, which covers every realistic crate/repo handle
 /// without leaving room for `'`, `$`, `/`, `\n`, or other shell-special
 /// or path-traversal characters.
+///
+/// Additionally rejects the reserved metadata filenames `config` and
+/// `known_hosts` (the volume's SSH config and known-hosts files) and the
+/// path-resolution literals `.` and `..` — a name like `config` would
+/// pass the character-class check but pipe the operator's private key
+/// through `cat > /sshvol/config`, clobbering the volume's SSH config;
+/// `known_hosts` would do the same and then `chmod 644` the private key
+/// world-readable. `.` and `..` would resolve to `/sshvol` / the parent
+/// directory under `cat > /sshvol/<name>`.
 fn validate_deploy_key_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("deploy key name must not be empty"));
@@ -926,6 +935,13 @@ fn validate_deploy_key_name(name: &str) -> Result<()> {
             "deploy key name `{name}` contains characters outside `[A-Za-z0-9._-]`; \
              the name becomes a filename in the deploy-keys volume and a shell argument, \
              so only those characters are allowed",
+        ));
+    }
+    if matches!(name, "config" | "known_hosts" | "." | "..") {
+        return Err(anyhow!(
+            "deploy key name `{name}` is reserved (the deploy-keys volume uses \
+             `config` and `known_hosts` for its SSH metadata, and `.`/`..` resolve \
+             to directory paths); pick a different name like the crate or repo handle",
         ));
     }
     Ok(())
@@ -1548,6 +1564,21 @@ mod tests {
             assert!(
                 validate_deploy_key_name(name).is_err(),
                 "expected `{name}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_deploy_key_name_rejects_reserved_metadata_filenames() {
+        // `config` and `known_hosts` are the volume's SSH metadata files;
+        // accepting either as a deploy-key name would route the operator's
+        // private-key paste into the metadata file (overwriting config or
+        // leaving the key world-readable under chmod 644 of known_hosts).
+        // `.` and `..` resolve to directory paths under `cat > /sshvol/<name>`.
+        for name in ["config", "known_hosts", ".", ".."] {
+            assert!(
+                validate_deploy_key_name(name).is_err(),
+                "expected reserved name `{name}` to be rejected",
             );
         }
     }
