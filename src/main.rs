@@ -735,7 +735,7 @@ async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
             .context("find containers for issue")?;
     if container_ids.is_empty() {
         println!(
-            "bellows: no live sandbox container found for {}/#{} (orchestrator likely between phases)",
+            "bellows: no live sandbox container found for {}#{} (orchestrator likely between phases)",
             resolved.repo_label, issue,
         );
     } else {
@@ -749,7 +749,7 @@ async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
                 .await
                 .with_context(|| format!("force-remove sandbox container {id}"))?;
             println!(
-                "bellows: removed container {} for {}/#{}",
+                "bellows: removed container {} for {}#{}",
                 &id[..id.len().min(12)],
                 resolved.repo_label,
                 issue,
@@ -757,7 +757,7 @@ async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
         }
         if container_ids.len() > 1 {
             println!(
-                "bellows: removed {} containers in total for {}/#{} (a prior phase's lifecycle-end force-remove likely failed; both the corpse and the live container shared the label)",
+                "bellows: removed {} containers in total for {}#{} (a prior phase's lifecycle-end force-remove likely failed; both the corpse and the live container shared the label)",
                 container_ids.len(),
                 resolved.repo_label,
                 issue,
@@ -791,7 +791,7 @@ async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
     .context("transition issue label to agent-cancelled")?;
 
     println!(
-        "bellows: kill signal sent; agent-cancelled label applied to {}/#{}",
+        "bellows: kill signal sent; agent-cancelled label applied to {}#{}",
         resolved.repo_label, issue,
     );
     Ok(())
