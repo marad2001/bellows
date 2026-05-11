@@ -338,9 +338,11 @@ pub struct CargoChecksRun {
 
 /// Spawn a fresh container from the policy image and run the cargo
 /// checks gate: `cargo clippy --all-targets --all-features -- -D
-/// warnings` followed by `cargo test`. Both run inside the same
-/// container (entrypoint overridden to `run-cargo-checks`) so clippy's
-/// compilation artifacts are reused by test.
+/// warnings` followed by `cargo test --all-targets --all-features`.
+/// Both run inside the same container (entrypoint overridden to
+/// `run-cargo-checks`) so clippy's compilation artifacts are reused
+/// by test. The flag set matches the GitHub Actions CI workflow so
+/// the two verdicts agree by construction.
 ///
 /// Returns a `CargoChecksRun` carrying each check's exit code + captured
 /// output (in `gate`) plus a `killed_by_deadline` flag. `cargo_test` in

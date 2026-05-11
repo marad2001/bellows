@@ -1,5 +1,7 @@
 # Bellows
 
+[![CI](https://github.com/marad2001/bellows/actions/workflows/ci.yml/badge.svg)](https://github.com/marad2001/bellows/actions/workflows/ci.yml)
+
 > AFK Claude Code orchestrator for Rust repos. Bellows watches a GitHub
 > issue tracker, picks up issues that you've triaged to `ready-for-agent`,
 > and runs a sandboxed Claude Code agent inside a Docker container against
@@ -178,6 +180,49 @@ for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug
   gh label create "$label" --force
 done
 ```
+
+### 5. Branch protection setup
+
+Bellows runs its own `cargo clippy` + `cargo test` gate inside the
+sandbox on every agent commit, but that gate doesn't run on commits a
+human pushes directly to a feature branch (review fix-ups, drive-by
+edits, etc.). The GitHub Actions workflow at
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) re-runs the
+exact same checks on every pull request and on every push to `master`,
+so the merge button is gated by the same verdict bellows uses
+internally. Wire it into branch protection on `master` so the gate is
+mechanically required, not relied on by memory.
+
+Open **Settings → Branches → Add branch protection rule** for the
+`master` branch and apply these settings:
+
+| Setting | Value |
+| --- | --- |
+| Branch name pattern | `master` |
+| Require a pull request before merging | enabled |
+| Require status checks to pass before merging | enabled |
+| Required status check | `ci` |
+| Require linear history | enabled (squash-on-merge friendly) |
+| Block force pushes | enabled |
+| Block deletions | enabled |
+| Allow administrators to bypass | enabled (operator emergency lever) |
+
+**GitHub-UI ordering quirk.** The required-status-check picker only
+lists checks GitHub has already *seen* fire on the branch. On a
+freshly added workflow, the `ci` check is **not** selectable in the
+protection rule until the workflow has run at least once on `master`.
+The post-merge ordering is therefore:
+
+1. Merge this PR (or a later one) to `master`.
+2. The push-to-master event fires `ci.yml`; the workflow run shows
+   up in the Actions tab.
+3. Reopen **Settings → Branches** and edit the `master` protection
+   rule. The `ci` check is now visible in the required-checks picker;
+   tick it and save.
+
+After that, every subsequent PR (human- or agent-authored) has to
+show `ci` green before the merge button enables, and no path to
+`master` bypasses the gate except the explicit admin override above.
 
 ## Daily use
 
@@ -418,6 +463,11 @@ chip away at them.
 - headless Claude Code agent (`claude -p ...`) inside a Docker
   sandbox built from a baked policy image;
 - `cargo clippy` + `cargo test` gate after the agent reports done;
+- a GitHub Actions CI gate (`.github/workflows/ci.yml`) re-running
+  the same `cargo test --all-targets --all-features` and
+  `cargo clippy --all-targets --all-features -- -D warnings` checks
+  on every PR + every push to `master`, so human-authored commits get
+  the same verdict bellows applies to agent commits;
 - automated code review + fix loop after the gate passes
   (clippy / test failures land before review even runs);
 - always-open-a-PR contract — regular PR on success, draft PR on
@@ -434,6 +484,9 @@ chip away at them.
 - `sccache` or other build caches beyond what the agent's own
   `target/` directory provides
   (per-repo cache volumes are tracked in issue #6);
+- Windows or macOS CI runners (the workflow is Linux-only in v1);
+- `cargo fmt --check`, code coverage reporting, or release-packaging
+  steps in CI (all future additions to the workflow);
 - web dashboard / TUI / status UI beyond the `bellows status`
   one-liner;
 - push notifications (Discord, Pushover, etc.);

@@ -355,6 +355,81 @@ fn readme_lists_prerequisites_for_running_bellows() {
 }
 
 #[test]
+fn readme_shows_ci_status_badge_pointing_at_the_workflow() {
+    let body = read_readme();
+    // Issue #36: a CI status badge near the top of the README is the
+    // quickest way for a visitor to see master's gate status. The
+    // badge.svg + workflow link pattern is the GitHub-standard shape;
+    // assert the workflow path appears (so a future rename of the
+    // workflow file would also need to update the badge target).
+    assert_contains_all(
+        &body,
+        &[
+            "actions/workflows/ci.yml/badge.svg",
+            "actions/workflows/ci.yml",
+        ],
+        "ci-badge",
+    );
+}
+
+#[test]
+fn readme_documents_branch_protection_setup_with_ui_quirk_note() {
+    let body = read_readme();
+    // Issue #36 acceptance criteria:
+    //  - a `## Branch protection setup` (or matching) subsection under
+    //    one-time setup,
+    //  - covering: require PR, require status check `ci`, require
+    //    linear history, block force-push, block deletions, admin
+    //    bypass allowed,
+    //  - explicitly naming the GitHub-UI quirk: the `ci` status check
+    //    only becomes selectable in the protection rule AFTER the
+    //    workflow has run at least once on master (so the post-merge
+    //    ordering is: merge → workflow fires → reopen settings →
+    //    tick the now-visible `ci` check).
+    assert_contains_all(
+        &body,
+        &[
+            "Branch protection",
+            "linear history",
+            "force push",
+            "deletion",
+            "admin",
+            "`ci`",
+            // The UI-quirk note: the status check only appears after
+            // the first workflow run on master. We check for the
+            // load-bearing fragments rather than a verbatim sentence
+            // so prose can flex.
+            "first",
+            "after",
+            "master",
+        ],
+        "branch-protection-setup",
+    );
+}
+
+#[test]
+fn readme_v1_scope_lists_ci_gate_as_in_scope() {
+    let body = read_readme();
+    // Issue #36: the v1 in-scope list gains the GitHub Actions CI
+    // gate. The brief calls this out as a required README change so
+    // the scope-list stays the canonical "what does v1 do" answer.
+    // We check for a near-verbatim phrase rather than just "CI"
+    // (which is too generic) to make this assertion actually pin
+    // the change.
+    let candidates = [
+        "GitHub Actions CI",
+        "GitHub Actions",
+    ];
+    let has_any = candidates.iter().any(|c| body.contains(c));
+    assert!(
+        has_any,
+        "README v1 scope must mention the new GitHub Actions CI gate \
+         (issue #36). Looked for any of: {:?}",
+        candidates,
+    );
+}
+
+#[test]
 fn readme_opens_with_overview_explaining_what_bellows_is() {
     let body = read_readme();
     // The README must answer "what is this thing?" before anything
