@@ -1,10 +1,11 @@
 use bellows::policy::{
     build_violation_callout, classify_exit, compute_coverage_violations, has_new_tests,
     is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections, parse_findings,
-    per_finding_kickoff, render_kickoff, synthesize_no_new_tests_entry,
-    synthesize_unaddressed_entries, AgentNoteSection, CheckResult, ExitReason, FindingCoverage,
-    GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome, Severity,
-    BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    per_finding_kickoff, render_kickoff, synthesize_implement_crash_entry,
+    synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection, CheckResult,
+    ExitReason, FindingCoverage, GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes,
+    ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE,
+    REVIEW_FIX_PROMPT, REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -68,6 +69,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         }),
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -90,6 +92,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     }
 }
 
@@ -152,6 +155,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         end_pipeline_gate: None,
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::WallClockExceeded);
 }
@@ -238,6 +242,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::RateLimited);
 }
@@ -263,6 +268,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
 }
@@ -283,6 +289,7 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
         end_pipeline_gate: None,
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(
         classify_exit(true, &outcomes),
@@ -305,6 +312,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -328,6 +336,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         }),
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::FinalTestsRed);
 }
@@ -1307,4 +1316,182 @@ fn weak_test_guard_and_parser_as_backstop_entries_coexist_in_a_single_agent_note
         "parser-as-backstop section #2 must survive coexistence: {titles:?}"
     );
     assert_eq!(sections.len(), 3, "exactly three sections expected: {sections:?}");
+}
+
+// ---- Issue #49: implement-crash recovery, synth + classification ----
+
+#[test]
+fn synthesize_implement_crash_entry_includes_exit_code_and_stderr_tail_prefix() {
+    // Acceptance criterion (brief): "exactly one commit on `agent/<N>-...`
+    // containing a synthesised `agent-notes.md` that includes the
+    // implement-phase exit code and a bounded prefix of its captured
+    // stderr/stdout tail." The synth helper is the textual half of that —
+    // it must surface the exit code AND embed (bounded) stderr content so
+    // an operator reading agent-notes.md can diagnose without having to
+    // fetch container logs.
+    let stderr_tail = "Error: container exited 1: /workspace/entrypoint-user: bad interpreter\n";
+    let entry = synthesize_implement_crash_entry(137, stderr_tail);
+    assert!(
+        entry.contains("137"),
+        "synthesised entry must surface the implement-phase exit code: {entry}"
+    );
+    assert!(
+        entry.contains("bad interpreter"),
+        "synthesised entry must embed (a prefix of) the captured stderr tail: {entry}"
+    );
+}
+
+#[test]
+fn synthesize_implement_crash_entry_identifies_bellows_as_the_author() {
+    // Sibling contract to the existing synth helpers: a human reading
+    // agent-notes.md must be able to tell that the entry was synthesised
+    // by bellows rather than written by claude. Otherwise the operator
+    // could mistake a crash-recovery synth for an agent-initiated
+    // handoff.
+    let entry = synthesize_implement_crash_entry(1, "boom");
+    let lower = entry.to_lowercase();
+    assert!(
+        lower.contains("bellows") && (lower.contains("synthes") || lower.contains("crash")),
+        "synthesised crash entry must identify bellows as the author: {entry}"
+    );
+}
+
+#[test]
+fn synthesize_implement_crash_entry_does_not_produce_an_unaddressed_finding_section() {
+    // The synth must NOT collide with the slice-9.6 / slice-8 helpers
+    // that produce `## Unaddressed finding:` sections. Those are read by
+    // `parse_agent_notes_sections` to drive the address-or-explain
+    // coverage check. The implement-crash synth is a separate concern
+    // (different routing: Crash, not AgentSelfReportedFailure) and must
+    // not pollute the coverage parser's view.
+    let entry = synthesize_implement_crash_entry(1, "boom");
+    let sections = parse_agent_notes_sections(&entry);
+    assert!(
+        sections.is_empty(),
+        "implement-crash synth must NOT produce an `## Unaddressed finding:` \
+         section (would collide with the address-or-explain coverage parser): {sections:?}"
+    );
+}
+
+#[test]
+fn synthesize_implement_crash_entry_bounds_a_very_long_stderr_tail() {
+    // The brief explicitly calls out "a bounded prefix" — the sandbox
+    // already caps `stderr_tail` at 64KB, but for the synth note (which
+    // ships in the PR diff), a smaller bound is appropriate so the
+    // agent-notes.md entry stays human-readable. The exact bound is an
+    // implementation detail; the contract is that an unbounded blob is
+    // not embedded verbatim.
+    let long_tail = "A".repeat(64 * 1024);
+    let entry = synthesize_implement_crash_entry(1, &long_tail);
+    assert!(
+        entry.len() < long_tail.len(),
+        "synthesised entry must apply a tighter bound than the raw 64KB stderr tail: \
+         entry was {} bytes, tail was {} bytes",
+        entry.len(),
+        long_tail.len(),
+    );
+}
+
+#[test]
+fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_agent_notes_present() {
+    // Issue #49 core acceptance criterion: when the implement phase
+    // exits non-zero with no commits, bellows synthesises an agent-notes
+    // entry to ensure SOMETHING ships in the resulting PR's diff. The
+    // synth makes `has_agent_notes` true (the file exists on disk),
+    // which would normally route the run to AgentSelfReportedFailure
+    // via the existing precedence. That is the wrong routing: the agent
+    // did not self-report — bellows synthesised the entry to recover
+    // from a crash. The run must classify as `Crash`.
+    //
+    // The PhaseOutcomes carries an `implement_crash_synthesised` flag
+    // (set true by the runner only when bellows wrote the synth). When
+    // that flag is true, `classify_exit` must bypass the
+    // has_agent_notes-wins precedence and fall through to the normal
+    // implement-exit-non-zero → Crash routing.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 1,
+            stderr_tail: "boom".to_string(),
+        },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: true,
+    };
+    assert_eq!(
+        classify_exit(true, &outcomes),
+        ExitReason::Crash,
+        "implement-crash synth must classify as Crash, not AgentSelfReportedFailure, \
+         even when has_agent_notes is true (the notes are bellows-synthesised, not \
+         agent-authored)",
+    );
+}
+
+#[test]
+fn classify_exit_implement_crash_synth_preserves_agent_self_reported_failure_when_implement_exited_zero() {
+    // Defensive guard: the synth flag is only set by the runner when
+    // `implement_agent_run.exit_code != 0 && no commits`. The brief
+    // calls out the inverse case explicitly: "A run where implement
+    // exits zero with no commits is still classified as
+    // AgentSelfReportedFailure via the existing agent-notes.md
+    // precedence — not double-handled by this new path." This test
+    // pins that even if (hypothetically, defensively) the synth flag
+    // were set with a clean implement exit, the has_agent_notes
+    // precedence would still win — Crash is gated on a non-zero exit.
+    //
+    // In practice the runner never sets the synth flag without a
+    // non-zero exit, but defining the classification table at this
+    // junction makes the precedence ordering unambiguous: synth-flag
+    // suppresses notes-precedence ONLY when there is a crash to
+    // classify as.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 0,
+            stderr_tail: String::new(),
+        },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: true,
+    };
+    assert_eq!(
+        classify_exit(true, &outcomes),
+        ExitReason::AgentSelfReportedFailure,
+        "with a clean implement exit, agent-notes precedence still wins regardless of \
+         the synth flag — the new path only activates on a non-zero implement exit",
+    );
+}
+
+#[test]
+fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_failure_path() {
+    // Regression guard: a run where the agent voluntarily wrote
+    // agent-notes.md AND implement exited zero (the canonical
+    // AgentSelfReportedFailure path) must continue to route to
+    // AgentSelfReportedFailure when the synth flag is false. The
+    // synth flag is the ONLY signal that distinguishes bellows-
+    // authored notes from agent-authored notes; with the flag at
+    // false, the existing precedence is unchanged.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 0,
+            stderr_tail: String::new(),
+        },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+    };
+    assert_eq!(
+        classify_exit(true, &outcomes),
+        ExitReason::AgentSelfReportedFailure,
+    );
 }

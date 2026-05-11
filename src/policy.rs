@@ -107,6 +107,18 @@ pub struct PhaseOutcomes {
     /// includes the `### Address-or-explain contract violated`
     /// callout that names each offending finding.
     pub backstop_violations: Vec<ParsedFinding>,
+    /// Issue #49: true when the runner synthesised an
+    /// `agent-notes.md` entry to recover from an implement-phase
+    /// crash that left the workspace with no commits. The synth's
+    /// only purpose is to give the run something to commit so the
+    /// branch can be pushed and a draft PR opened (otherwise the
+    /// pipeline silently stalls at `agent-in-progress`). The note
+    /// content is bellows-authored, NOT agent-authored — so the
+    /// usual `has_agent_notes → AgentSelfReportedFailure` precedence
+    /// in `classify_exit` is suppressed when this flag is set and
+    /// implement actually exited non-zero, letting the run classify
+    /// as `Crash` instead.
+    pub implement_crash_synthesised: bool,
 }
 
 /// Decide how a finished agent run should be classified.
@@ -117,7 +129,19 @@ pub struct PhaseOutcomes {
 /// gate (clippy or test, post-implement or end-pipeline) is
 /// `FinalTestsRed`. Otherwise `Success`.
 pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitReason {
-    if has_agent_notes {
+    // Issue #49: when the runner synthesised an agent-notes entry to
+    // recover from an implement-phase crash with no commits, the file
+    // exists on disk (and ships in the PR diff) but is bellows-authored,
+    // not agent-authored. The agent did not self-report; bellows wrote
+    // the note to give the run something to commit. Suppress the usual
+    // `has_agent_notes` precedence so the run classifies on its actual
+    // failure mode (Crash) rather than spuriously routing to
+    // AgentSelfReportedFailure. The synth flag only suppresses when the
+    // implement phase ACTUALLY crashed — a clean-exit run with the flag
+    // somehow set (defensive corner) still respects notes-precedence.
+    let synth_suppresses_notes =
+        outcomes.implement_crash_synthesised && outcomes.implement.exit_code != 0;
+    if has_agent_notes && !synth_suppresses_notes {
         return ExitReason::AgentSelfReportedFailure;
     }
     if outcomes.wall_clock_exceeded {
@@ -830,6 +854,88 @@ pub fn synthesize_no_new_tests_entry() -> String {
          tests. The weak-test guard synthesised this entry so the run routes to \
          agent-self-reported-failure for a human reviewer.\n",
         title = NO_NEW_TESTS_FINDING_TITLE,
+    )
+}
+
+/// Maximum bytes of captured stderr/stdout tail that the implement-crash
+/// synth embeds in `agent-notes.md`. The sandbox already caps the raw
+/// `stderr_tail` at 64KB; for the synth note (which ships in the PR diff
+/// AND the agent-notes commit body) a tighter bound keeps the entry
+/// human-readable while still leaving plenty of room to fingerprint the
+/// underlying failure. The trim is char-boundary-aware (`char_indices`)
+/// so a multibyte glyph at the boundary cannot slice through UTF-8.
+const IMPLEMENT_CRASH_TAIL_CAP_BYTES: usize = 4 * 1024;
+
+/// Build the markdown bellows appends to `agent-notes.md` when the
+/// implement phase exits non-zero AND produced no commits — typical of
+/// an early-exit crash (sandbox setup failure, container start failure,
+/// immediate Anthropic error, etc.) where the agent never wrote
+/// anything to the workspace.
+///
+/// Without this synth, `workspace::commit_all` would return
+/// `NoChangesToCommit` and the legacy commit/push path produced no
+/// branch on origin — `open_pr` then either fails or opens a
+/// no-content PR, leaving the source issue stuck at `agent-in-progress`
+/// with no PR, no `agent-failed` label, and no log comment.
+///
+/// The synth gives the run a single, bellows-authored commit on the
+/// `agent/<N>-...` branch so the rest of the pipeline (the existing
+/// `halt_after_post_implement` → `classify_exit` → `finalise` path)
+/// runs through to completion: draft PR opens against the default
+/// branch, the issue's label transitions from `agent-in-progress` to
+/// `agent-failed`, and the standard `<details>` log comment posts on
+/// the PR.
+///
+/// The synth note uses an `## Implement phase crashed` heading
+/// (deliberately NOT an `## Unaddressed finding:` heading) so it does
+/// not collide with the slice-9.6 / slice-8 helpers — those produce
+/// `## Unaddressed finding:` sections which `parse_agent_notes_sections`
+/// keys on to drive the address-or-explain coverage check. The
+/// implement-crash synth is a separate concern (different routing:
+/// `Crash`, not `AgentSelfReportedFailure`) and must not pollute that
+/// parser's view of the file.
+///
+/// The body identifies bellows as the author so a human reviewing
+/// agent-notes.md later isn't confused about provenance, surfaces the
+/// implement-phase exit code, and embeds a bounded prefix of the
+/// captured stderr/stdout tail so the operator can diagnose the
+/// underlying failure (CRLF shebang, missing image, OAuth expiry, ...)
+/// without having to fetch container logs.
+pub fn synthesize_implement_crash_entry(exit_code: i64, stderr_tail: &str) -> String {
+    let truncated = if stderr_tail.len() <= IMPLEMENT_CRASH_TAIL_CAP_BYTES {
+        stderr_tail.to_string()
+    } else {
+        let mut cut = IMPLEMENT_CRASH_TAIL_CAP_BYTES;
+        while cut > 0 && !stderr_tail.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!(
+            "{}\n... (truncated; full tail in the bellows.log)",
+            &stderr_tail[..cut],
+        )
+    };
+    let tail_block = if truncated.trim().is_empty() {
+        "_(No agent output was captured before termination.)_".to_string()
+    } else {
+        format!("```\n{}\n```", truncated)
+    };
+    format!(
+        "\n\n<!-- bellows implement-crash recovery appended this entry because the \
+         implement-phase agent exited non-zero AND produced no commits in the workspace. \
+         Without this entry the workspace would have no changes to commit, the agent \
+         branch would never be pushed, and the source issue would silently stay at \
+         agent-in-progress. The presence of this entry lets the rest of the pipeline \
+         run through to a draft PR + agent-failed label. -->\n\
+         \n\
+         ## Implement phase crashed\n\
+         \n\
+         Bellows-synthesised entry. The implement-phase agent exited with code \
+         `{exit_code}` and produced no commits in the workspace; no agent-authored \
+         changes survived. A captured prefix of the agent's stderr/stdout tail \
+         follows so the operator can diagnose the failure without fetching the \
+         container's logs.\n\
+         \n\
+         {tail_block}\n",
     )
 }
 
