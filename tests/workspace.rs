@@ -194,12 +194,12 @@ async fn diff_between_returns_false_when_only_code_files_changed_across_two_comm
 
 #[tokio::test]
 async fn diff_between_returns_false_when_mixed_code_and_agent_notes_commits_exist() {
-    // Cycle 4: code commit dominates. The existing
-    // last_commit_touched_only_agent_notes helper CANNOT represent this
-    // case because it only inspects HEAD~1..HEAD; here the agent-notes-only
-    // commit happens to be the most-recent one, but a real code fix sat
-    // before it. The general-case helper must scan the full base..head
-    // diff and report false — commit_landed=true at the call site.
+    // Cycle 4: code commit dominates. A HEAD~1..HEAD inspection (as the
+    // PR #37 helper did) CANNOT represent this case; here the
+    // agent-notes-only commit happens to be the most-recent one, but a
+    // real code fix sat before it. The general-case helper must scan the
+    // full base..head diff and report false — commit_landed=true at the
+    // call site.
     let remote_dir = TempDir::new().unwrap();
     init_remote_repo(remote_dir.path());
     let remote_url = remote_dir.path().to_string_lossy().to_string();

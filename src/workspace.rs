@@ -177,10 +177,10 @@ pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
 /// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
 /// per-finding loop after PR #38: with the agent free to self-commit
 /// its code fix under its own commit message, looking only at the most
-/// recent commit (cf. [`last_commit_touched_only_agent_notes`]) is not
-/// enough — the runner must consider the entire diff between the
-/// pre-invocation `HEAD` and the post-invocation `HEAD`, which may
-/// span multiple commits authored by either the agent or bellows.
+/// recent commit (as the PR #37 helper did) is not enough — the runner
+/// must consider the entire diff between the pre-invocation `HEAD` and
+/// the post-invocation `HEAD`, which may span multiple commits authored
+/// by either the agent or bellows.
 ///
 /// Returns `Ok(false)` when `base == head` (the empty diff is not
 /// exactly `["agent-notes.md"]`). The runner short-circuits before
@@ -210,37 +210,6 @@ pub async fn diff_between_touches_only_agent_notes(
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    Ok(files.len() == 1 && files[0] == "agent-notes.md")
-}
-
-/// Whether the most recent commit on the agent branch touched ONLY
-/// `agent-notes.md` (and nothing else). Used by the runner's slice-9.6
-/// per-finding loop to distinguish "agent committed code as a fix" from
-/// "agent ONLY appended to agent-notes.md as an explanation" — only the
-/// former counts as `commit_landed=true` in `FindingCoverage`. Without
-/// this distinction, the verbatim-title check in
-/// `policy::compute_coverage_violations` is unreachable (any commit_all
-/// success — including agent-notes-only — short-circuits the filter).
-///
-/// PR #37 review finding #1 fix.
-pub async fn last_commit_touched_only_agent_notes(
-    workspace: &Workspace,
-) -> Result<bool, WorkspaceError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace.path())
-        .args(["diff", "--name-only", "HEAD~1", "HEAD"])
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(WorkspaceError::GitFailed {
-            args: vec!["diff".into(), "--name-only".into(), "HEAD~1".into(), "HEAD".into()],
-            status: output.status,
-        });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    // Exactly one file changed AND it's agent-notes.md → section-only commit.
     Ok(files.len() == 1 && files[0] == "agent-notes.md")
 }
 
