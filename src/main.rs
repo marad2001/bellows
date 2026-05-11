@@ -642,13 +642,19 @@ fn resolve_kill_target(
 
     if let Some(qualifier) = qualifier {
         // `<owner>/<name>/<issue>` shape — match against configured repos.
+        // Skip entries whose URL fails to parse so a single malformed
+        // `[[repo]]` does not pre-empt the match for unrelated entries.
+        // Matches the shape of the `configured` list built in the
+        // not-found branch below, which already tolerates parse failures
+        // via `filter_map`.
         let mut found: Option<(String, String)> = None;
         for r in repos {
-            let (owner, repo) = parse_owner_repo(&r.url)?;
-            let slug = format!("{}/{}", owner, repo);
-            if slug == qualifier {
-                found = Some((slug, r.url.clone()));
-                break;
+            if let Ok((owner, repo)) = parse_owner_repo(&r.url) {
+                let slug = format!("{}/{}", owner, repo);
+                if slug == qualifier {
+                    found = Some((slug, r.url.clone()));
+                    break;
+                }
             }
         }
         let (repo_label, repo_url) = found.ok_or_else(|| {
@@ -1599,6 +1605,28 @@ mod tests {
         ]);
         let resolved =
             resolve_kill_target("marad2001/repo-b/42", &repos).expect("explicit form must resolve");
+        assert_eq!(resolved.issue, 42);
+        assert_eq!(resolved.repo_label, "marad2001/repo-b");
+        assert_eq!(
+            resolved.repo_url,
+            "https://github.com/marad2001/repo-b",
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_tolerates_unrelated_malformed_repo_url_in_config() {
+        // A malformed URL in an unrelated `[[repo]]` entry must not
+        // pre-empt the explicit-form match for a different entry. The
+        // configured-list error path on the not-found branch already
+        // tolerates parse failures via `filter_map`; the match loop
+        // should match that shape rather than aborting on the first
+        // bad URL.
+        let repos = multi_repo(&[
+            "not-a-url",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let resolved = resolve_kill_target("marad2001/repo-b/42", &repos)
+            .expect("explicit form must still resolve when an unrelated entry has a bad URL");
         assert_eq!(resolved.issue, 42);
         assert_eq!(resolved.repo_label, "marad2001/repo-b");
         assert_eq!(
