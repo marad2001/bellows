@@ -907,6 +907,52 @@ async fn status_cmd() -> Result<()> {
     }
 }
 
+/// Validate a deploy-key `name` at CLI-parse time. The name becomes a
+/// filename in the deploy-keys volume and is interpolated into shell
+/// scripts (single-quoted in `docker run -c "..."`), so reject anything
+/// that could break out of either context. The allowed set is
+/// `[A-Za-z0-9._-]+`, which covers every realistic crate/repo handle
+/// without leaving room for `'`, `$`, `/`, `\n`, or other shell-special
+/// or path-traversal characters.
+fn validate_deploy_key_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("deploy key name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(anyhow!(
+            "deploy key name `{name}` contains characters outside `[A-Za-z0-9._-]`; \
+             the name becomes a filename in the deploy-keys volume and a shell argument, \
+             so only those characters are allowed",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an `ssh-host` value at CLI-parse time. The host is
+/// interpolated into shell scripts (Host stanza, `ssh-keyscan`,
+/// `ssh-keygen -F`), so reject anything outside a conservative
+/// hostname character class. `[A-Za-z0-9.-]+` covers `github.com`,
+/// `git.example.com`, and any reasonable GHE host; nothing else is
+/// needed.
+fn validate_ssh_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(anyhow!("ssh-host must not be empty"));
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return Err(anyhow!(
+            "ssh-host `{host}` contains characters outside `[A-Za-z0-9.-]`; \
+             use a plain hostname like `github.com` or `git.example.com`",
+        ));
+    }
+    Ok(())
+}
+
 /// Shell script the `add` arm runs inside a one-shot container with
 /// the deploy-keys volume mounted at `/sshvol` (issue #69 / ADR-0002).
 /// stdin is piped through to the container, so `cat > /sshvol/<name>`
@@ -1018,6 +1064,8 @@ async fn setup_deploy_keys_cmd(
 
     match action {
         SetupDeployKeysAction::Add { name, ssh_host } => {
+            validate_deploy_key_name(&name)?;
+            validate_ssh_host(&ssh_host)?;
             println!(
                 "bellows: importing deploy key `{name}` into volume `{volume}` (host: {ssh_host})."
             );
@@ -1070,6 +1118,7 @@ async fn setup_deploy_keys_cmd(
             }
         }
         SetupDeployKeysAction::Remove { name } => {
+            validate_deploy_key_name(&name)?;
             let script = build_deploy_keys_remove_script(&name);
             let status = tokio::process::Command::new("docker")
                 .args([
@@ -1463,6 +1512,58 @@ mod tests {
             help.contains("setup-deploy-keys"),
             "top-level --help must list setup-deploy-keys: {help}"
         );
+    }
+
+    #[test]
+    fn validate_deploy_key_name_accepts_realistic_handles() {
+        for name in ["workboard-core", "my_key", "v2.0", "abc123", "a"] {
+            assert!(
+                validate_deploy_key_name(name).is_ok(),
+                "expected `{name}` to validate",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_deploy_key_name_rejects_shell_special_and_path_chars() {
+        // Each of these would break the shell scripts that interpolate
+        // the name into single-quoted `docker run -c "..."` text, or
+        // would escape the /sshvol/ prefix.
+        for name in [
+            "",
+            "foo'bar",
+            "foo$IFS",
+            "foo/bar",
+            "../etc/passwd",
+            "foo bar",
+            "foo\nbar",
+            "foo;rm",
+        ] {
+            assert!(
+                validate_deploy_key_name(name).is_err(),
+                "expected `{name}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_accepts_realistic_hosts() {
+        for host in ["github.com", "git.example.com", "ghe.internal", "host-1.io"] {
+            assert!(
+                validate_ssh_host(host).is_ok(),
+                "expected `{host}` to validate",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_shell_special_chars() {
+        for host in ["", "foo'bar", "foo$x", "foo bar", "foo;rm", "foo/bar", "foo_bar"] {
+            assert!(
+                validate_ssh_host(host).is_err(),
+                "expected `{host}` to be rejected",
+            );
+        }
     }
 
     #[test]
