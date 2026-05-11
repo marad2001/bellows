@@ -29,6 +29,15 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct RepoConfig {
     pub url: String,
+    /// Names of deploy keys (issue #69 / ADR-0002) the agent and
+    /// cargo-checks containers spawned for THIS repo should be able to
+    /// see. Each name must correspond to a regular file in the
+    /// `[auth].ssh_keys_volume` Docker volume. Empty / unset means no
+    /// SSH credentials are mounted — preserving the "no creds in
+    /// sandbox by default" posture across every repo that doesn't
+    /// explicitly opt in.
+    #[serde(default)]
+    pub deploy_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +140,15 @@ pub struct AuthConfig {
     pub method: AuthMethod,
     #[serde(default = "default_credentials_volume")]
     pub credentials_volume: String,
+    /// Name of the Docker volume holding per-repo SSH deploy keys
+    /// (issue #69 / ADR-0002). Populated via
+    /// `bellows setup-deploy-keys add` and mounted read-only at
+    /// `/home/bellows/.ssh/` into agent and cargo-checks containers
+    /// spawned for `[[repo]]` blocks whose `deploy_keys` list is
+    /// non-empty. Parallel to but distinct from `credentials_volume`
+    /// — separate lifecycle, separate setup command, separate purpose.
+    #[serde(default = "default_ssh_keys_volume")]
+    pub ssh_keys_volume: String,
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq, Eq)]
@@ -145,12 +163,17 @@ impl Default for AuthConfig {
         Self {
             method: AuthMethod::default(),
             credentials_volume: default_credentials_volume(),
+            ssh_keys_volume: default_ssh_keys_volume(),
         }
     }
 }
 
 fn default_credentials_volume() -> String {
     "bellows-claude-credentials".to_string()
+}
+
+fn default_ssh_keys_volume() -> String {
+    "bellows-deploy-keys".to_string()
 }
 
 /// Per-issue agent budget. Currently just the wall-clock cap; later
