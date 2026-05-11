@@ -123,17 +123,22 @@ fn extract_permissions_block(body: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn auto_merge_workflow_permissions_block_is_exactly_pull_requests_and_contents_write() {
+fn auto_merge_workflow_permissions_block_is_exactly_pull_requests_contents_and_issues_write() {
     let body = read_workflow();
-    // Brief acceptance criterion: the workflow's `permissions:` block
-    // must request ONLY `pull-requests: write` and `contents: write`
-    // — no other scopes. Using the default `GITHUB_TOKEN` means
-    // whatever the workflow asks for is the blast radius of a
-    // compromise; over-scoping (e.g. `actions: write`, `issues:
+    // Brief acceptance criterion (issue #59): the workflow's
+    // `permissions:` block must request EXACTLY
+    // `pull-requests: write`, `contents: write`, and `issues: write`
+    // — no other scopes. `issues: write` is the load-bearing addition
+    // for issue #59: it lets the default GITHUB_TOKEN explicitly close
+    // each linked source issue after a successful auto-merge, working
+    // around the fact that GitHub's `Closes #N` auto-close hook does
+    // NOT fire when the merger is `app/github-actions`.
+    //
+    // Over-scoping (e.g. `actions: write`, `repository-projects:
     // write`) would let a future bug do more damage than the slice
     // needs. The test asserts on the *set* of declared scopes, not
-    // just substrings, so adding an extra scope flips this test red
-    // even if the original two are still present.
+    // just substrings, so adding an unexpected scope flips this test
+    // red even if the three required ones are still present.
     let perms = extract_permissions_block(&body);
     assert!(
         !perms.is_empty(),
@@ -149,14 +154,15 @@ fn auto_merge_workflow_permissions_block_is_exactly_pull_requests_and_contents_w
     scopes.sort();
     let expected: Vec<(String, String)> = vec![
         ("contents".to_string(), "write".to_string()),
+        ("issues".to_string(), "write".to_string()),
         ("pull-requests".to_string(), "write".to_string()),
     ];
     assert_eq!(
         scopes, expected,
         "auto-merge workflow's `permissions:` block must be EXACTLY \
-         `pull-requests: write` and `contents: write` — no extra \
-         scopes (over-scoping widens the blast radius of the default \
-         GITHUB_TOKEN). Got: {:?}",
+         `pull-requests: write`, `contents: write`, and `issues: \
+         write` — no extra scopes (over-scoping widens the blast \
+         radius of the default GITHUB_TOKEN). Got: {:?}",
         scopes,
     );
 }
@@ -273,6 +279,201 @@ fn auto_merge_workflow_pins_merge_call_to_ci_tested_head_sha() {
         &body,
         &["sha: headSha", "merge_method", "squash"],
         "merge / sha-pinned squash call",
+    );
+}
+
+#[test]
+fn auto_merge_workflow_close_step_runs_only_after_successful_merge() {
+    let body = read_workflow();
+    // Brief acceptance criterion (issue #59): the close step MUST run
+    // only after `pulls.merge` returns success. If the merge fails
+    // (conflict, head-moved 409, anything), the workflow's existing
+    // catch block already logs via `core.warning` and the PR sits
+    // open for manual resolution — closing the linked issue at that
+    // point would orphan it under a still-open PR.
+    //
+    // Textually the load-bearing fact is that the `issues.update`
+    // call appears inside the merge's `try { ... }` block, between
+    // the `pulls.merge` call and the merge's `catch (err)` handler.
+    // Assert byte-offset ordering: pulls.merge < issues.update <
+    // catch (err). A future drive-by edit that moves the close
+    // outside the try (so a merge failure no longer guards the
+    // close) flips this test red.
+    let merge_idx = body
+        .find("pulls.merge")
+        .expect("workflow must call pulls.merge");
+    let close_idx = body
+        .find("issues.update")
+        .expect("workflow must call issues.update for explicit close");
+    let merge_catch_idx = body
+        .find("catch (err)")
+        .expect("merge call must remain wrapped in try/catch (err)");
+    assert!(
+        merge_idx < close_idx,
+        "auto-merge workflow MUST call `issues.update` (close step) \
+         AFTER `pulls.merge` — closing the linked issue before the \
+         merge would orphan it if the merge then failed. Got \
+         merge_idx={}, close_idx={}.",
+        merge_idx,
+        close_idx,
+    );
+    assert!(
+        close_idx < merge_catch_idx,
+        "auto-merge workflow MUST place the close step INSIDE the \
+         merge's `try {{ ... }}` block (before `catch (err)`), so a \
+         merge failure short-circuits past the close step rather \
+         than orphaning a closed issue under a still-open PR. Got \
+         close_idx={}, merge_catch_idx={}.",
+        close_idx,
+        merge_catch_idx,
+    );
+}
+
+#[test]
+fn auto_merge_workflow_close_errors_are_caught_and_warned_per_issue() {
+    let body = read_workflow();
+    // Brief acceptance criterion (issue #59): an error closing one
+    // linked issue (network blip, permission denial, race with another
+    // close, anything) MUST NOT abort the PR loop or block other PRs /
+    // other linked issues in the same workflow run from being
+    // processed. The error must be logged via `core.warning`.
+    //
+    // The brief says "wrap the `issues.update` call in try/catch so
+    // an error closing one issue does not abort the merge loop. Log
+    // via `core.warning`." That implies a try/catch around the
+    // per-issue close inside the per-PR loop — not just the outer
+    // merge try/catch, which already exists.
+    //
+    // Count `try {` blocks and `core.warning(` calls: the workflow
+    // needs at least TWO of each — one pair for the existing merge
+    // call (pre-existing in this slice) and a second pair for the
+    // close step added by this slice. A future drive-by edit that
+    // collapses them down to one pair flips this test red.
+    let try_count = body.matches("try {").count();
+    let warning_count = body.matches("core.warning(").count();
+    assert!(
+        try_count >= 2,
+        "auto-merge workflow MUST wrap the per-issue close call in \
+         its own `try {{ ... }}` block (in addition to the existing \
+         merge try/catch) so an error closing one issue does not \
+         abort the PR loop. Found only {} `try {{` block(s). \
+         Got:\n{}",
+        try_count,
+        body,
+    );
+    assert!(
+        warning_count >= 2,
+        "auto-merge workflow MUST log close failures via \
+         `core.warning(...)` (in addition to the existing merge \
+         failure warning) so operators see why an issue stayed open. \
+         Found only {} `core.warning(` call(s). Got:\n{}",
+        warning_count,
+        body,
+    );
+}
+
+#[test]
+fn auto_merge_workflow_close_step_is_idempotent_for_already_closed_issues() {
+    let body = read_workflow();
+    // Brief acceptance criterion (issue #59): an issue that is already
+    // `closed` at the time the workflow runs must be left untouched —
+    // no error, no state churn, no superfluous comment. This matters
+    // because the workflow can be re-run (rerunning `workflow_run` is
+    // a single click in the GitHub UI) and because a human may have
+    // closed the issue manually in the gap between merge and the
+    // workflow firing.
+    //
+    // The workflow must therefore check the issue's current state
+    // before calling `issues.update`. Pin the load-bearing literals:
+    // `issues.get` is the REST call that returns the issue's current
+    // state, and `'closed'` is the state value the workflow needs to
+    // detect to early-out. The test does not pin the exact `if`
+    // structure (that's implementation), only that the workflow reads
+    // the issue's state before deciding to close it.
+    assert_contains_all(
+        &body,
+        &["issues.get", "state"],
+        "close / idempotency state-check",
+    );
+}
+
+#[test]
+fn auto_merge_workflow_parses_pr_body_for_close_keywords_case_insensitively() {
+    let body = read_workflow();
+    // Brief acceptance criterion (issue #59): the workflow must close
+    // every issue referenced via the GitHub auto-close keyword set
+    // (`close` / `closes` / `closed`, `fix` / `fixes` / `fixed`,
+    // `resolve` / `resolves` / `resolved`) in the PR body —
+    // case-insensitive, with optional trailing punctuation.
+    //
+    // The brief offers two viable implementations (GraphQL
+    // `closingIssuesReferences` or a direct regex over `pr.body`);
+    // this test pins whichever path is used to reading `pr.body` as
+    // the source of issue numbers AND using a case-insensitive match
+    // that covers all three root keywords (`close`, `fix`, `resolve`).
+    //
+    // Pin the three keyword roots, the `pr.body` source, and the
+    // case-insensitive regex flag — so a future drive-by edit that
+    // drops one of the keywords (e.g. only matches `Closes`) flips
+    // this test red.
+    let lower = body.to_lowercase();
+    for keyword in &["close", "fix", "resolve"] {
+        assert!(
+            lower.contains(keyword),
+            "auto-merge workflow MUST match the GitHub auto-close \
+             keyword `{}` (root form covers `{}`/`{}s`/`{}d`) when \
+             parsing the PR body for issues to close. Got:\n{}",
+            keyword,
+            keyword,
+            keyword,
+            keyword,
+            body,
+        );
+    }
+    assert_contains_all(
+        &body,
+        &["pr.body"],
+        "close / pr.body is the source for linked issues",
+    );
+    // The case-insensitive flag (`i`) on the keyword regex is the
+    // load-bearing piece for matching `closes`, `CLOSES`, `Closes`
+    // alike. JS regex literals carry their flags after the closing
+    // slash (`/pattern/flags`), and the only common combinations for
+    // a global, case-insensitive matcher are `/gi` or `/ig`. Pin one
+    // of those flag suffixes so a future drive-by edit that drops
+    // the `i` flag (which would silently miss `closes` / `CLOSES` in
+    // PR bodies) flips this test red.
+    assert!(
+        body.contains("/gi") || body.contains("/ig"),
+        "auto-merge workflow MUST use a case-insensitive regex flag \
+         (`/.../gi` or `/.../ig`) on the auto-close keyword matcher, \
+         since GitHub treats `Closes` / `closes` / `CLOSES` \
+         identically. Got:\n{}",
+        body,
+    );
+}
+
+#[test]
+fn auto_merge_workflow_closes_linked_issues_after_successful_merge() {
+    let body = read_workflow();
+    // Brief acceptance criterion (issue #59): after a successful
+    // squash-merge, the workflow MUST explicitly close every issue
+    // referenced by a `Closes #N` / `Fixes #N` / `Resolves #N` keyword
+    // in the PR body. GitHub's auto-close hook does NOT fire when the
+    // merger is `app/github-actions`, so the bellows AFK contract
+    // (issue → PR → merge → issue closed, no operator intervention)
+    // breaks unless the workflow does the close itself.
+    //
+    // Pin the load-bearing literals: the `issues.update` REST call
+    // (`PUT /repos/{owner}/{repo}/issues/{issue_number}`) is what
+    // github-script exposes as `github.rest.issues.update(...)`,
+    // and the close transition is `state: 'closed'`. A future
+    // drive-by edit that drops the close step entirely flips this
+    // test red.
+    assert_contains_all(
+        &body,
+        &["issues.update", "state: 'closed'", "issue_number"],
+        "close / issues.update state closed",
     );
 }
 

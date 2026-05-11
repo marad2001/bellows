@@ -23,6 +23,12 @@ on:
 permissions:
   pull-requests: write
   contents: write
+  # issues: write lets the workflow explicitly close each linked
+  # source issue after a successful auto-merge. GitHub's `Closes #N`
+  # auto-close hook does NOT fire when the merger is
+  # `app/github-actions`, so the workflow has to do the close itself
+  # to honour the bellows AFK contract (issue #59).
+  issues: write
 
 jobs:
   auto-merge:
@@ -133,6 +139,59 @@ jobs:
                   merge_method: 'squash',
                 });
                 core.info(`Squash-merged PR #${pr.number}.`);
+
+                // Issue #59: GitHub's auto-close hook does NOT fire
+                // when the merger is `app/github-actions`, so we
+                // explicitly close each linked source issue here by
+                // parsing the PR body for GitHub's auto-close
+                // keywords (close / closes / closed, fix / fixes /
+                // fixed, resolve / resolves / resolved) — the
+                // case-insensitive `i` flag mirrors GitHub's own
+                // matcher; the optional trailing `s`/`d` covers the
+                // tense variants the brief calls out.
+                const keywordRegex =
+                  /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi;
+                const linkedIssues = new Set();
+                let match;
+                while ((match = keywordRegex.exec(pr.body || '')) !== null) {
+                  linkedIssues.add(Number(match[1]));
+                }
+                for (const issue_number of linkedIssues) {
+                  // Per-issue try/catch: a network blip, permission
+                  // denial, or race with another close on ONE linked
+                  // issue must not abort the PR loop or block other
+                  // linked issues / other PRs in the same workflow
+                  // run from being processed. The error is logged via
+                  // `core.warning` so operators see why an issue
+                  // stayed open without the whole run going red.
+                  try {
+                    // Idempotency: skip issues that are already
+                    // closed. The workflow can be re-run (a single
+                    // click in the GitHub UI), and a human may have
+                    // closed the issue manually between the merge and
+                    // this step firing. `issues.get` returns the
+                    // current state cheaply.
+                    const { data: issue } = await github.rest.issues.get({
+                      owner, repo, issue_number,
+                    });
+                    if (issue.state === 'closed') {
+                      core.info(`Issue #${issue_number} is already ` +
+                        `closed; skipping.`);
+                      continue;
+                    }
+                    await github.rest.issues.update({
+                      owner, repo, issue_number, state: 'closed',
+                    });
+                    core.info(`Closed issue #${issue_number} ` +
+                      `(linked from PR #${pr.number}).`);
+                  } catch (closeErr) {
+                    core.warning(`Failed to close linked issue ` +
+                      `#${issue_number} (from PR #${pr.number}): ` +
+                      `${closeErr.message}. The issue remains open ` +
+                      `for manual handling; other linked issues and ` +
+                      `PRs in this run are unaffected.`);
+                  }
+                }
               } catch (err) {
                 // A merge conflict, head-moved 409, or any other
                 // GitHub API error is logged but does not fail the
