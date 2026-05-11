@@ -1,37 +1,35 @@
 #!/bin/sh
-# Bellows policy-image entrypoint.
+# Bellows policy-image root-mode prep.
 #
-# Runs once per container start. Copies the baked skills + CLAUDE.md from
-# /opt/bellows-policy/ into /home/bellows/.claude/ (where the credentials
-# volume mounts) so they layer with the persisted OAuth tokens, then
-# exec's run-agent.
+# Runs as root on container start (the Dockerfile does NOT set
+# `USER bellows`; that drop happens here instead). Two responsibilities:
 #
-# Idempotent: subsequent runs overwrite any older copies in the volume,
-# which is what we want — the policy image is the source of truth for
-# skills + CLAUDE.md, the volume is the source of truth for credentials.
+# 1. Chown the cache-volume mount points so the bellows user can write
+#    to them. Docker creates a fresh named volume's `_data` directory
+#    as `root:root` mode 0755 whenever the mount target does not exist
+#    in the image — which is the case for `/workspace/target` (shadowed
+#    by the workspace bind mount) and `/usr/local/cargo/registry`
+#    (cargo creates it lazily; the base image doesn't ship it). Without
+#    this chown, cargo's first write into either path fails with EACCES
+#    on a fresh repo / fresh host.
+#
+# 2. Drop to the bellows user via `runuser` and exec the user-mode
+#    continuation (either /usr/local/bin/entrypoint-user for the
+#    default agent run, or whatever override was passed — e.g.
+#    /usr/local/bin/run-cargo-checks for the cargo-checks gate).
+#    Claude Code refuses to honour `--dangerously-skip-permissions`
+#    when running as root, so the agent invocation MUST run as bellows.
 
 set -eu
 
-CLAUDE_HOME=/home/bellows/.claude
+# Top-level chown is sufficient: on first attach the volume's _data is
+# the empty mount-point directory itself, and cargo (running as bellows)
+# creates everything underneath as bellows. -R would needlessly walk a
+# warm target/ tree on every subsequent run.
+chown bellows:bellows /workspace/target /usr/local/cargo/registry
 
-mkdir -p "$CLAUDE_HOME/skills"
-
-# Use cp -r with a trailing /. so we copy CONTENTS, not the directory
-# itself, regardless of whether the destination already exists.
-cp -r /opt/bellows-policy/skills/. "$CLAUDE_HOME/skills/"
-cp /opt/bellows-policy/CLAUDE.md "$CLAUDE_HOME/CLAUDE.md"
-
-# Workaround for Claude Code v2.1: setup-auth created
-# /home/bellows/.claude.json (sibling file), but the credentials volume
-# only mounts /home/bellows/.claude/ (the directory). .claude.json is
-# NOT in the volume, so it's lost on container exit. Claude Code itself
-# stashes a backup inside /home/bellows/.claude/backups/ (which IS in
-# the volume); restore it on each start so Claude Code finds its config.
-if [ ! -f /home/bellows/.claude.json ]; then
-    LATEST_BACKUP=$(ls -t "$CLAUDE_HOME/backups/.claude.json.backup."* 2>/dev/null | head -n 1 || true)
-    if [ -n "$LATEST_BACKUP" ]; then
-        cp "$LATEST_BACKUP" /home/bellows/.claude.json
-    fi
+if [ "$#" -eq 0 ]; then
+    set -- /usr/local/bin/entrypoint-user
 fi
 
-exec /usr/local/bin/run-agent "$@"
+exec runuser -u bellows -- "$@"
