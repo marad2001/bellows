@@ -187,6 +187,52 @@ pub async fn commit_all_and_push_if_advanced(
     Ok(head_after)
 }
 
+/// Commit a set of files directly to `branch` on the workspace's
+/// remote, bypassing the agent/* PR flow. Used by the `bellows
+/// triage <N>` wontfix-enhancement path, which must land an
+/// `.out-of-scope/<filename>.md` precedent on master so subsequent
+/// triage runs see the new precedent in the workspace at clone time.
+///
+/// The helper fetches `branch` from origin, force-checks-out a local
+/// branch tracking it (so a stale local copy from a prior op cannot
+/// produce a wrong-base commit), writes each `(relative_path,
+/// content)` pair (mkdir-ing parent directories as needed), stages
+/// the paths, commits with `message`, and pushes. Multiple files
+/// land in a single commit so the post-condition is a single new
+/// commit on the branch.
+///
+/// The caller's workspace is left checked out on `branch` afterwards;
+/// the workspace is discarded by `bellows triage` after this call so
+/// the post-state of the local working copy is immaterial.
+pub async fn commit_to_branch(
+    workspace: &Workspace,
+    branch: &str,
+    message: &str,
+    files: &[(String, String)],
+) -> Result<(), WorkspaceError> {
+    let path = workspace.path();
+
+    // Bring `branch` up to date from origin and force-recreate the
+    // local copy off it, so the commit's parent is the remote's
+    // current tip rather than whatever the workspace had locally.
+    git(path, &["fetch", "origin", branch]).await?;
+    let origin_ref = format!("origin/{branch}");
+    git(path, &["checkout", "-B", branch, &origin_ref]).await?;
+
+    for (rel, content) in files {
+        let abs = path.join(rel);
+        if let Some(parent) = abs.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&abs, content).await?;
+        git(path, &["add", rel]).await?;
+    }
+
+    git(path, &["commit", "-m", message]).await?;
+    git(path, &["push", "origin", branch]).await?;
+    Ok(())
+}
+
 pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
     git(
         workspace.path(),

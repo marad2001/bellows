@@ -1,11 +1,13 @@
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path, query_param};
+use wiremock::matchers::{body_json, body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
-    claim, fetch_agent_brief, finalise, find_next_issue, list_needs_triage_issues,
-    list_open_agent_prs, post_pr_comment, transition_to_cancelled, ClaimError, FinaliseRequest,
+    apply_verdict, claim, fetch_agent_brief, fetch_issue_with_comments, finalise, find_next_issue,
+    list_needs_triage_issues, list_open_agent_prs, post_pr_comment, transition_to_cancelled,
+    ClaimError, FinaliseRequest,
 };
+use bellows::triage::TriageVerdict;
 use wiremock::matchers::body_string_contains;
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
@@ -631,6 +633,410 @@ async fn list_needs_triage_issues_surfaces_github_errors() {
     let client = octocrab_pointed_at(mock.uri());
     let result = list_needs_triage_issues(&client, "marad2001", "test-repo", "needs-triage").await;
     assert!(result.is_err(), "expected Err, got {:?}", result.map(|_| "Ok"));
+}
+
+// ----------------------------------------------------------------------
+// Slice T1 (#21): fetch_issue_with_comments + apply_verdict. The
+// `bellows triage <N>` command depends on a typed IssueBundle that
+// carries the issue body, current labels, and full comment history
+// into the sandbox-side input file, and on an apply_verdict that
+// posts comments, transitions labels, and (for wontfix) closes the
+// issue. Workspace-side .out-of-scope handling lives in
+// `workspace::commit_to_branch`, not here.
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_issue_with_comments_bundles_body_labels_and_ordered_comment_history() {
+    // Operator contract: the agent sees the issue body, the current
+    // label set, and the full ordered comment history. Comment order
+    // matters — a prior triage note may include questions the
+    // reporter then answered in a later comment, and the agent must
+    // see the answer-after-the-question sequence to make the right
+    // verdict.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 77,
+            "title": "Foo crashes on empty input",
+            "body": "Repro: pass `\"\"` to `foo()` and it panics.",
+            "labels": [
+                { "name": "needs-info" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "body": "What version were you on?" },
+            { "body": "0.4.2." }
+        ])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let bundle = fetch_issue_with_comments(&client, "marad2001", "test-repo", 77)
+        .await
+        .expect("fetch_issue_with_comments should succeed");
+
+    assert_eq!(bundle.number, 77);
+    assert_eq!(bundle.title, "Foo crashes on empty input");
+    assert!(bundle.body.as_deref().unwrap().contains("Repro"));
+    assert_eq!(
+        bundle
+            .labels
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["needs-info", "bug"],
+    );
+    assert_eq!(bundle.comments.len(), 2);
+    assert!(bundle.comments[0].contains("What version"));
+    assert!(bundle.comments[1].contains("0.4.2"));
+}
+
+#[tokio::test]
+async fn fetch_issue_with_comments_returns_an_empty_comment_list_when_no_comments_yet() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Fresh issue",
+            "body": null,
+            "labels": [{ "name": "needs-triage" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let bundle = fetch_issue_with_comments(&client, "marad2001", "test-repo", 42)
+        .await
+        .expect("fetch_issue_with_comments should succeed");
+    assert!(bundle.body.is_none());
+    assert!(bundle.comments.is_empty());
+    assert_eq!(
+        bundle
+            .labels
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["needs-triage"],
+    );
+}
+
+#[tokio::test]
+async fn apply_verdict_for_ready_for_agent_posts_comment_brief_and_swaps_labels() {
+    // ready-for-agent flow: post the disclaimer-prefixed comment, post
+    // the `## Agent Brief` as a SEPARATE comment so the downstream
+    // bellows-run pipeline's `tracker::fetch_agent_brief` (which scans
+    // for the literal `## Agent Brief` header) picks it up, then swap
+    // any current triage state label for `ready-for-agent`.
+    let mock = MockServer::start().await;
+
+    // GET current state — currently `needs-triage`.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 77,
+            "title": "Foo",
+            "labels": [
+                { "name": "needs-triage" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // POST the verdict's main comment_body (with AI disclaimer prefix).
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .and(body_string_contains("generated by AI during triage"))
+        .and(body_string_contains("Moving to ready-for-agent."))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // POST a separate `## Agent Brief` comment so fetch_agent_brief picks it up.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .and(body_string_contains("## Agent Brief"))
+        .and(body_string_contains("Fix the foo bug"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 2 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // PATCH labels: drop needs-triage, add ready-for-agent, preserve `bug`.
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/77"))
+        .and(body_json(json!({ "labels": ["bug", "ready-for-agent"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 77,
+            "title": "Foo",
+            "labels": [
+                { "name": "bug" },
+                { "name": "ready-for-agent" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    let verdict = TriageVerdict::parse(
+        "{
+            \"category\": \"bug\",
+            \"state\": \"ready-for-agent\",
+            \"reasoning\": \"clear repro\",
+            \"comment_body\": \"Moving to ready-for-agent.\",
+            \"agent_brief\": \"## Agent Brief\\n\\nFix the foo bug.\"
+        }",
+    )
+    .expect("valid verdict");
+
+    let client = octocrab_pointed_at(mock.uri());
+    apply_verdict(&client, "marad2001", "test-repo", 77, &verdict)
+        .await
+        .expect("apply_verdict should succeed");
+}
+
+#[tokio::test]
+async fn apply_verdict_for_needs_info_posts_only_the_comment_and_swaps_labels() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/88"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 88,
+            "title": "Vague",
+            "labels": [{ "name": "needs-triage" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    // Only one comment expected — the AI-disclaimer-prefixed body. No
+    // separate brief; the agent_brief / human_brief paths must not fire.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/88/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/88"))
+        .and(body_json(json!({ "labels": ["needs-info"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 88,
+            "title": "Vague",
+            "labels": [{ "name": "needs-info" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let verdict = TriageVerdict::parse(
+        "{
+            \"category\": \"bug\",
+            \"state\": \"needs-info\",
+            \"reasoning\": \"no repro\",
+            \"comment_body\": \"Need repro steps please.\"
+        }",
+    )
+    .expect("valid verdict");
+
+    let client = octocrab_pointed_at(mock.uri());
+    apply_verdict(&client, "marad2001", "test-repo", 88, &verdict)
+        .await
+        .expect("apply_verdict should succeed");
+}
+
+#[tokio::test]
+async fn apply_verdict_for_ready_for_human_posts_main_comment_and_human_brief() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 99,
+            "title": "Big design call",
+            "labels": [{ "name": "needs-triage" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .and(body_string_contains("Routing this to a human"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .and(body_string_contains("## Human Brief"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 2 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/99"))
+        .and(body_json(json!({ "labels": ["ready-for-human"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 99,
+            "title": "Big design call",
+            "labels": [{ "name": "ready-for-human" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let verdict = TriageVerdict::parse(
+        "{
+            \"category\": \"enhancement\",
+            \"state\": \"ready-for-human\",
+            \"reasoning\": \"needs human judgement\",
+            \"comment_body\": \"Routing this to a human.\",
+            \"human_brief\": \"## Human Brief\\n\\nDecide on the schema migration.\"
+        }",
+    )
+    .expect("valid verdict");
+
+    let client = octocrab_pointed_at(mock.uri());
+    apply_verdict(&client, "marad2001", "test-repo", 99, &verdict)
+        .await
+        .expect("apply_verdict should succeed");
+}
+
+#[tokio::test]
+async fn apply_verdict_for_wontfix_bug_posts_comment_swaps_labels_and_closes_issue() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 123,
+            "title": "Stale",
+            "labels": [
+                { "name": "needs-info" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/123/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // Label transition AND the close happen via PATCH on the issue —
+    // bellows merges them into a single PATCH to keep the issue's
+    // observed state coherent (no half-applied verdict on transient
+    // network failures between the two PATCHes).
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/123"))
+        .and(body_partial_json(json!({ "state": "closed" })))
+        .and(body_partial_json(json!({ "labels": ["bug", "wontfix"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 123,
+            "title": "Stale",
+            "state": "closed",
+            "labels": [
+                { "name": "bug" },
+                { "name": "wontfix" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    let verdict = TriageVerdict::parse(
+        "{
+            \"category\": \"bug\",
+            \"state\": \"wontfix\",
+            \"reasoning\": \"not reproducible\",
+            \"comment_body\": \"Closing as wontfix.\",
+            \"close_issue\": true
+        }",
+    )
+    .expect("valid verdict");
+
+    let client = octocrab_pointed_at(mock.uri());
+    apply_verdict(&client, "marad2001", "test-repo", 123, &verdict)
+        .await
+        .expect("apply_verdict should succeed");
+}
+
+#[tokio::test]
+async fn apply_verdict_strips_all_canonical_triage_labels_before_adding_the_new_state_label() {
+    // Re-triage path (e.g. `bellows triage <N>` against an issue that
+    // was previously needs-info and now has a reporter response). The
+    // current triage state label MUST be replaced, not duplicated —
+    // if `needs-info` and `ready-for-agent` both stay on the issue,
+    // the downstream runner's label-state machine breaks.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Re-triage",
+            "labels": [
+                { "name": "needs-info" },
+                { "name": "enhancement" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/55/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/55"))
+        .and(body_json(json!({ "labels": ["enhancement", "ready-for-agent"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 55,
+            "title": "Re-triage",
+            "labels": [
+                { "name": "enhancement" },
+                { "name": "ready-for-agent" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    let verdict = TriageVerdict::parse(
+        "{
+            \"category\": \"enhancement\",
+            \"state\": \"ready-for-agent\",
+            \"reasoning\": \"reporter answered the questions\",
+            \"comment_body\": \"Re-triaged.\",
+            \"agent_brief\": \"## Agent Brief\\n\\nProceed.\"
+        }",
+    )
+    .expect("valid verdict");
+
+    let client = octocrab_pointed_at(mock.uri());
+    apply_verdict(&client, "marad2001", "test-repo", 55, &verdict)
+        .await
+        .expect("apply_verdict should succeed");
 }
 
 #[tokio::test]
