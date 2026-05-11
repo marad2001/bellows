@@ -2,8 +2,11 @@
 # Bellows post-run cargo checks gate (slice X1).
 #
 # Runs `cargo clippy --all-targets --all-features -- -D warnings` then,
-# if clippy passed, `cargo test` — both inside the same container so
-# clippy's compilation artifacts are reused by test.
+# if clippy passed, `cargo test --all-targets --all-features` — both
+# inside the same container so clippy's compilation artifacts are
+# reused by test. The flag set on both invocations is identical to
+# the GitHub Actions CI workflow so the two verdicts agree by
+# construction (see `.github/workflows/ci.yml`).
 #
 # Each check's stdout+stderr is captured to its own file in the
 # workspace bind mount so the runner can attribute failures to the
@@ -34,7 +37,7 @@ cargo clippy --all-targets --all-features -- -D warnings >"$CLIPPY_OUTPUT" 2>&1
 CLIPPY_EXIT=$?
 
 if [ $CLIPPY_EXIT -eq 0 ]; then
-    cargo test >"$TEST_OUTPUT" 2>&1
+    cargo test --all-targets --all-features >"$TEST_OUTPUT" 2>&1
     TEST_EXIT=$?
     TEST_RECORDED=$TEST_EXIT
 else
