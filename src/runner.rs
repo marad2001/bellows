@@ -391,6 +391,11 @@ pub async fn run_once(
                 );
                 tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff)
                     .await?;
+                // Capture HEAD BEFORE the agent runs so we can detect
+                // whether the agent self-committed during the
+                // invocation. See the four-corners comment below the
+                // run for the full contract.
+                let head_before = workspace::head_sha(&workspace).await?;
                 let per_finding_run = sandbox::run_agent(
                     &workspace,
                     &auth,
@@ -404,29 +409,54 @@ pub async fn run_once(
                     review_fix_exit = per_finding_run.exit_code;
                 }
 
-                // Did a CODE commit land for this finding? `.bellows-*`
-                // files are excluded from `git add -A` so the diff
-                // file / findings file / kickoff don't taint the
-                // signal. But agent-notes.md IS in the diff (the agent's
-                // self-report channel needs to ship), so a commit_all
-                // success doesn't on its own mean "code fix landed" —
-                // it could be agent-notes-only.
+                // Did a CODE commit land for this finding? The four
+                // corners we must classify:
                 //
-                // PR #37 review finding #1 fix: distinguish "agent
-                // committed code" (commit_landed=true → coverage filter
-                // short-circuits) from "agent only edited agent-notes.md"
-                // (commit_landed=false → the verbatim-title check
-                // in compute_coverage_violations actually runs).
-                let commit_landed = match workspace::commit_all(&workspace).await {
-                    Ok(()) => {
-                        workspace::push_branch(&workspace).await?;
-                        // If the only file touched was agent-notes.md,
-                        // treat as section-only (NOT a code fix).
-                        !workspace::last_commit_touched_only_agent_notes(&workspace).await?
-                    }
-                    Err(WorkspaceError::NoChangesToCommit) => false,
+                //   1. Agent self-commits the fix (PR #38 case). HEAD
+                //      advances during the invocation under whatever
+                //      commit message the agent chose; bellows's
+                //      subsequent commit_all sees nothing to stage and
+                //      returns NoChangesToCommit. commit_landed=true
+                //      iff the diff between head_before..head_after
+                //      touched any file other than agent-notes.md.
+                //   2. Bellows commits on the agent's behalf (existing
+                //      case). Agent left uncommitted edits; commit_all
+                //      produces the boilerplate "Bellows agent run"
+                //      commit and HEAD advances. Same diff-based check
+                //      as case 1 — agent-notes-only commits still mean
+                //      commit_landed=false.
+                //   3. Notes-only edit (any author). The agent only
+                //      wrote an Unaddressed-finding section; HEAD may
+                //      advance via bellows's commit but the diff is
+                //      exactly [agent-notes.md]. commit_landed=false
+                //      so the verbatim-title fallback in
+                //      compute_coverage_violations runs.
+                //   4. No commit at all. HEAD did not advance (agent
+                //      did nothing and left no uncommitted edits).
+                //      commit_landed=false.
+                //
+                // Both Ok(()) and NoChangesToCommit are normal
+                // post-invocation outcomes after PR #38; the
+                // commit_all return value is no longer load-bearing
+                // for commit_landed. The agent self-commit case
+                // produces NoChangesToCommit but HEAD has still
+                // advanced, so push is gated on head movement rather
+                // than on which branch of the match we took.
+                match workspace::commit_all(&workspace).await {
+                    Ok(()) | Err(WorkspaceError::NoChangesToCommit) => {}
                     Err(e) => return Err(e.into()),
-                };
+                }
+                let head_after = workspace::head_sha(&workspace).await?;
+                if head_after != head_before {
+                    workspace::push_branch(&workspace).await?;
+                }
+                let commit_landed = head_after != head_before
+                    && !workspace::diff_between_touches_only_agent_notes(
+                        &workspace,
+                        &head_before,
+                        &head_after,
+                    )
+                    .await?;
                 coverage.push(policy::FindingCoverage {
                     finding: finding.clone(),
                     commit_landed,

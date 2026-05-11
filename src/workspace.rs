@@ -149,6 +149,70 @@ pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
     .await
 }
 
+/// Capture the current `HEAD` SHA via `git rev-parse HEAD`. Used by
+/// the slice-9.6 per-finding loop to detect whether the agent's
+/// invocation advanced `HEAD` (an agent self-commit advances `HEAD`
+/// without bellows's subsequent `commit_all` seeing anything to stage).
+/// PR #38 review finding #1 fix: paired with
+/// [`diff_between_touches_only_agent_notes`] so the per-finding
+/// `commit_landed` signal handles all three commit-shape outcomes
+/// (agent self-commit, bellows commit on behalf, no advancement).
+pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec!["rev-parse".into(), "HEAD".into()],
+            status: output.status,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether the file list touched between `base` and `head` is exactly
+/// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
+/// per-finding loop after PR #38: with the agent free to self-commit
+/// its code fix under its own commit message, looking only at the most
+/// recent commit (cf. [`last_commit_touched_only_agent_notes`]) is not
+/// enough — the runner must consider the entire diff between the
+/// pre-invocation `HEAD` and the post-invocation `HEAD`, which may
+/// span multiple commits authored by either the agent or bellows.
+///
+/// Returns `Ok(false)` when `base == head` (the empty diff is not
+/// exactly `["agent-notes.md"]`). The runner short-circuits before
+/// reaching this helper on the no-advancement path anyway; the
+/// `Ok(false)` contract is defensive consistency.
+pub async fn diff_between_touches_only_agent_notes(
+    workspace: &Workspace,
+    base: &str,
+    head: &str,
+) -> Result<bool, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["diff", "--name-only", base, head])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec![
+                "diff".into(),
+                "--name-only".into(),
+                base.into(),
+                head.into(),
+            ],
+            status: output.status,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    Ok(files.len() == 1 && files[0] == "agent-notes.md")
+}
+
 /// Whether the most recent commit on the agent branch touched ONLY
 /// `agent-notes.md` (and nothing else). Used by the runner's slice-9.6
 /// per-finding loop to distinguish "agent committed code as a fix" from
