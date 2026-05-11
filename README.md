@@ -157,9 +157,10 @@ issue:
 - `bug` — the issue describes a defect in existing behavior.
 - `enhancement` — the issue describes new or changed behavior.
 
-**Runtime labels** (applied by bellows itself as a run progresses;
-override the strings via `[runtime_labels]` in `orchestrator.toml` if
-you need to):
+**Runtime labels** (applied by bellows to the **issue** as a run
+progresses — the PR opened by the run is itself unlabeled; override
+the strings via `[runtime_labels]` in `orchestrator.toml` if you need
+to):
 
 - `agent-in-progress` — bellows has claimed the issue; a container is
   running or about to run.
@@ -331,10 +332,11 @@ single issue moves like this:
    gates on `cargo clippy` and `cargo test`, runs an automated
    code-review phase, applies fixes from that review, then a final
    gate.
-5. **The PR opens.** Regular PR + `agent-done` label on success;
-   draft PR + `agent-failed` (or `agent-rate-limited` /
-   `agent-cancelled`) on failure, with the run's logs attached as a
-   collapsible `<details>` comment.
+5. **The PR opens.** Regular PR on success; draft PR on failure,
+   with the run's logs attached as a collapsible `<details>` comment.
+   The outcome label (`agent-done` / `agent-failed` /
+   `agent-rate-limited` / `agent-cancelled`) is applied to the
+   **issue**, not the PR — bellows-opened PRs are unlabeled.
 6. **A human reviews** the PR — bellows never merges. Squash-on-merge
    keeps the agent's intermediate commits out of `main`'s history.
 
