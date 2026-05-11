@@ -50,8 +50,34 @@ fn auth_section_defaults_apply_when_omitted() {
 #[test]
 fn agent_section_defaults_apply_when_omitted() {
     // Slice 6: the per-issue wall-clock budget defaults to 60 minutes
-    // when [agent].wall_clock_minutes is unspecified.
+    // when [agent].wall_clock_minutes is unspecified. Slice 8: the
+    // weak-test-guard skip label defaults to "refactor" when
+    // [agent].weak_test_guard_skip_label is unspecified.
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert_eq!(config.agent.wall_clock_minutes.get(), 60);
+    assert_eq!(config.agent.weak_test_guard_skip_label, "refactor");
+}
+
+#[test]
+fn agent_section_weak_test_guard_skip_label_can_be_overridden() {
+    // Slice 8 acceptance criterion: the runtime config exposes a
+    // configurable skip-label string under `[agent]`. An operator
+    // running e.g. a documentation-heavy fork can rename the label
+    // without code changes.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[agent]
+weak_test_guard_skip_label = "no-tests-needed"
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(config.agent.weak_test_guard_skip_label, "no-tests-needed");
+    // Wall-clock default still applies when only the skip-label was
+    // overridden — the two fields are independent.
     assert_eq!(config.agent.wall_clock_minutes.get(), 60);
 }
 

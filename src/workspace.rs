@@ -226,6 +226,27 @@ pub async fn generate_diff(
     workspace: &Workspace,
     dest_filename: &str,
 ) -> Result<(), WorkspaceError> {
+    let diff = compute_diff_against_base(workspace).await?;
+    tokio::fs::write(workspace.path().join(dest_filename), diff.as_bytes()).await?;
+    Ok(())
+}
+
+/// Capture `git diff <default_branch>...HEAD` and return it as a
+/// String. Sibling of `generate_diff` for callers that want to scan
+/// the diff directly (the slice-8 weak-test guard) rather than write
+/// it to a workspace file.
+///
+/// Uses three dots (`<base>...HEAD`) so the diff matches what the
+/// PR would show — commits unique to this branch since divergence.
+/// Returns an empty string when the branch is at parity with base.
+///
+/// `git diff` output is UTF-8 in practice (Rust source files are
+/// UTF-8); `from_utf8_lossy` defends against the rare binary-file
+/// case so a stray non-UTF-8 byte in a diff doesn't surface as an
+/// IO error.
+pub async fn compute_diff_against_base(
+    workspace: &Workspace,
+) -> Result<String, WorkspaceError> {
     let spec = format!("{}...HEAD", workspace.default_branch);
     let output = Command::new("git")
         .arg("-C")
@@ -239,8 +260,7 @@ pub async fn generate_diff(
             status: output.status,
         });
     }
-    tokio::fs::write(workspace.path().join(dest_filename), &output.stdout).await?;
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[derive(Debug, Deserialize)]

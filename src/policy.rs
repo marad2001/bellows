@@ -735,6 +735,104 @@ pub fn per_finding_kickoff(
         .replace("{agent_notes_path}", agent_notes_path)
 }
 
+/// Canonical title of the synthetic `## Unaddressed finding:` entry the
+/// slice-8 weak-test guard appends to `agent-notes.md` when an implement
+/// run produced changes but no new Rust test attributes. Verbatim per the
+/// brief; the agent-notes parser (and any future cross-reference) keys
+/// on this exact string.
+pub const NO_NEW_TESTS_FINDING_TITLE: &str = "no new tests added";
+
+/// Detect whether a unified diff adds at least one new Rust test
+/// attribute. Used by the slice-8 weak-test guard: an agent that ships
+/// implementation code with no new tests trips a green cargo gate but
+/// is otherwise indistinguishable from a real Success — the post-hoc
+/// diff scan is the only mechanical post-run check that catches it.
+///
+/// Recognises the common attribute shapes: `#[test]`, `#[tokio::test]`,
+/// `#[async_std::test]`, `#[wasm_bindgen_test]`, `#[rstest]`,
+/// `#[test_case(...)]`, `#[proptest]`. Each may optionally carry a
+/// `(...)` argument list (e.g. `#[tokio::test(flavor = "multi_thread")]`)
+/// so the patterns match prefixes rather than full bracketed forms.
+///
+/// Scan discipline (the heuristic that keeps this useful AND honest):
+///
+/// - Only lines starting with a single `+` are considered (added lines).
+///   `+++ b/path` file-header lines and ` ` context lines are skipped.
+/// - A `-` removed-only line is NOT a new test attribute even if it
+///   names one — a refactor that deletes a test must not pass the guard.
+/// - Lines whose first non-whitespace content is `//` are treated as
+///   line comments and skipped. `// #[test]` in a doc string or example
+///   is not a real test attribute; the brief explicitly calls this
+///   false-positive case out.
+///
+/// Limitations (deliberately out of scope for the guard's presence
+/// check — the triage gate + human review remain the primary defences
+/// against weak tests): block-comment-style `/* #[test] */` and string
+/// literals containing the substring are not filtered. Both are rare
+/// enough in real test suites that the cost of false-positives is
+/// preferable to the parser complexity needed to handle them.
+pub fn has_new_tests(diff: &str) -> bool {
+    const ATTR_PATTERNS: &[&str] = &[
+        "#[test]",
+        "#[tokio::test",
+        "#[async_std::test",
+        "#[wasm_bindgen_test",
+        "#[rstest",
+        "#[test_case",
+        "#[proptest",
+    ];
+    for line in diff.lines() {
+        // File-header marker (`+++ b/path`). Not an added content line.
+        if line.starts_with("+++") {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix('+') else {
+            continue;
+        };
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if ATTR_PATTERNS.iter().any(|p| trimmed.contains(p)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the markdown the slice-8 weak-test guard appends to
+/// `agent-notes.md` when the post-implement diff contains no new Rust
+/// test attributes (and the issue does not carry the skip-label). The
+/// section's title is the canonical `NO_NEW_TESTS_FINDING_TITLE`
+/// constant so a parser cross-reference matches verbatim; the body
+/// identifies bellows as the author so a human reviewing
+/// `agent-notes.md` later isn't confused about provenance.
+///
+/// Reuses the existing slice-9.6 mechanism rather than introducing a
+/// new pipeline phase: the presence of an `## Unaddressed finding:`
+/// section triggers `classify_exit`'s `has_agent_notes` precedence,
+/// routing the run to `AgentSelfReportedFailure` and producing a draft
+/// PR with the `agent-failed` label.
+pub fn synthesize_no_new_tests_entry() -> String {
+    format!(
+        "\n\n<!-- bellows weak-test guard appended this entry because the implement phase \
+         produced changes against the base branch with no new Rust test attributes \
+         (#[test], #[tokio::test], etc.) and the issue did not carry the configurable \
+         skip-label. The presence of this entry forces the run to agent-self-reported-failure \
+         (draft PR + agent-failed label) so a human reviewer sees the gap. -->\n\
+         \n\
+         ## Unaddressed finding: {title}\n\
+         \n\
+         Bellows-synthesised entry. The implement phase produced a diff against the base \
+         branch with no new Rust test attributes detected by the slice-8 weak-test guard. \
+         A green cargo-checks gate over an unchanged test suite is a poor signal of \
+         correctness; the brief's acceptance criteria typically require accompanying \
+         tests. The weak-test guard synthesised this entry so the run routes to \
+         agent-self-reported-failure for a human reviewer.\n",
+        title = NO_NEW_TESTS_FINDING_TITLE,
+    )
+}
+
 /// Render the kickoff prompt that gets fed into `claude -p` inside the
 /// sandbox. Pure function so it can be unit-tested without spinning up
 /// a container.
