@@ -404,15 +404,25 @@ pub async fn run_once(
                     review_fix_exit = per_finding_run.exit_code;
                 }
 
-                // Did a commit land for this finding? `.bellows-*`
+                // Did a CODE commit land for this finding? `.bellows-*`
                 // files are excluded from `git add -A` so the diff
                 // file / findings file / kickoff don't taint the
-                // signal; a commit_all success means the per-finding
-                // agent produced real workspace changes.
+                // signal. But agent-notes.md IS in the diff (the agent's
+                // self-report channel needs to ship), so a commit_all
+                // success doesn't on its own mean "code fix landed" —
+                // it could be agent-notes-only.
+                //
+                // PR #37 review finding #1 fix: distinguish "agent
+                // committed code" (commit_landed=true → coverage filter
+                // short-circuits) from "agent only edited agent-notes.md"
+                // (commit_landed=false → the verbatim-title check
+                // in compute_coverage_violations actually runs).
                 let commit_landed = match workspace::commit_all(&workspace).await {
                     Ok(()) => {
                         workspace::push_branch(&workspace).await?;
-                        true
+                        // If the only file touched was agent-notes.md,
+                        // treat as section-only (NOT a code fix).
+                        !workspace::last_commit_touched_only_agent_notes(&workspace).await?
                     }
                     Err(WorkspaceError::NoChangesToCommit) => false,
                     Err(e) => return Err(e.into()),

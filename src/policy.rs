@@ -475,11 +475,22 @@ pub fn parse_findings(text: &str) -> ParseFindingsResult {
 /// example findings in REVIEW_PROMPT are numbered; the parser accepts
 /// either form so a future tweak to the prompt's example doesn't break
 /// extraction.
+///
+/// PR #37 review finding #3 fix: anchor the strip to require a space
+/// after the period (`N. `, not `N.X`), so a title like
+/// `1.5 release notes — important` doesn't get silently rewritten to
+/// `5 release notes — important`. Decimal-prefixed titles aren't in
+/// the prompt example today but a future operator-authored brief
+/// might use them.
 fn strip_leading_numbering(s: &str) -> &str {
     let trimmed = s.trim_start();
     if let Some(rest) = trimmed
         .split_once('.')
-        .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .filter(|(n, rest)| {
+            !n.is_empty()
+                && n.chars().all(|c| c.is_ascii_digit())
+                && rest.starts_with(' ')
+        })
         .map(|(_, rest)| rest)
     {
         rest.trim_start()
@@ -702,11 +713,17 @@ pub fn per_finding_kickoff(
     let urgency = match finding.severity {
         Severity::Blocker => "This is a **blocker**: the change as written is wrong, unsafe, or breaks the brief's acceptance criteria. It MUST be fixed before merge — escalation via the unaddressed-finding section is reserved for genuinely impossible cases, not for cases that are merely hard.",
         Severity::Important => "This is an **important** finding: a real bug or design flaw that survives the test suite (logic gap, leaked resource, wrong invariant). It must be fixed or escalated via the unaddressed-finding section; it should not silently ship.",
-        // The per-finding path doesn't carry nits — they go through the
-        // batch nit prompt. Guard with permissive wording rather than
-        // panicking so a future caller passing a nit gets a sensible
-        // (if unintended) result.
-        Severity::Nit => "This is a nit: address it if cheap, otherwise skip.",
+        // PR #37 review finding #2 fix: nits flow through the batch
+        // nit prompt, NOT this per-finding path. A nit reaching here
+        // means the caller (the runner's per-finding loop) is buggy.
+        // Previous "address-it-or-skip" fallback contradicted the
+        // surrounding template's mandate ("silent skip is
+        // prompt-out-of-bounds"), producing an incoherent kickoff;
+        // unreachable! is the right reaction.
+        Severity::Nit => unreachable!(
+            "per_finding_kickoff received a Nit finding; nits must go through \
+             BATCH_NIT_PROMPT, not the per-finding path. This is a runner bug."
+        ),
     };
 
     REVIEW_FIX_PROMPT

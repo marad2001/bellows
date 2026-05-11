@@ -149,6 +149,37 @@ pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
     .await
 }
 
+/// Whether the most recent commit on the agent branch touched ONLY
+/// `agent-notes.md` (and nothing else). Used by the runner's slice-9.6
+/// per-finding loop to distinguish "agent committed code as a fix" from
+/// "agent ONLY appended to agent-notes.md as an explanation" — only the
+/// former counts as `commit_landed=true` in `FindingCoverage`. Without
+/// this distinction, the verbatim-title check in
+/// `policy::compute_coverage_violations` is unreachable (any commit_all
+/// success — including agent-notes-only — short-circuits the filter).
+///
+/// PR #37 review finding #1 fix.
+pub async fn last_commit_touched_only_agent_notes(
+    workspace: &Workspace,
+) -> Result<bool, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["diff", "--name-only", "HEAD~1", "HEAD"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec!["diff".into(), "--name-only".into(), "HEAD~1".into(), "HEAD".into()],
+            status: output.status,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    // Exactly one file changed AND it's agent-notes.md → section-only commit.
+    Ok(files.len() == 1 && files[0] == "agent-notes.md")
+}
+
 /// Capture `git diff <default_branch>...HEAD` and write it to
 /// `dest_filename` (a workspace-relative path). Used by the runner to
 /// feed the implement-phase diff into the review-phase claude run via
