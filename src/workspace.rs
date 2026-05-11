@@ -141,6 +141,52 @@ pub async fn commit_all(workspace: &Workspace) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
+/// The slice-9.6 four-corner commit/push pattern, packaged. Run this
+/// after any agent invocation that may have left the workspace in
+/// either of two shapes:
+///
+///   * Agent self-commit: `HEAD` advanced under the agent's own commit
+///     message inside the sandbox. `commit_all` finds nothing to stage
+///     and returns [`WorkspaceError::NoChangesToCommit`], but the
+///     branch genuinely moved and we must push the agent's commit.
+///   * Bellows-on-behalf: the agent left uncommitted edits in the
+///     workspace. `commit_all` produces the boilerplate "Bellows agent
+///     run" commit; `HEAD` advances here and we push that.
+///
+/// Both shapes (and a mixed shape where the agent commits *and* leaves
+/// further edits) are collapsed by tracking `HEAD` movement
+/// independently of `commit_all`'s return value. The push is gated on
+/// `head_after != head_before`, so a genuinely-no-op invocation (no
+/// commit, no edits) does NOT trigger a wasted no-op push.
+///
+/// Returns the post-commit `HEAD`. Callers that need to classify what
+/// the agent did (e.g. the per-finding loop's `commit_landed` signal)
+/// pair this with [`diff_between_touches_only_agent_notes`].
+///
+/// Issue #52 motivation: the nit-batch invocation used the legacy
+/// `match commit_all { Ok(()) => push, NoChangesToCommit => {} }`
+/// shape, which silently dropped agent-self-committed nit fixes — the
+/// commit lived on local HEAD but never reached origin, and the
+/// end-pipeline cargo-checks gate then ran against a workspace that
+/// had diverged from the pushed branch. False-positive `FinalTestsRed`
+/// classifications followed. Both the per-finding loop and the
+/// nit-batch invocation now share this helper so the gap cannot
+/// reappear at one site if the other is updated.
+pub async fn commit_all_and_push_if_advanced(
+    workspace: &Workspace,
+    head_before: &str,
+) -> Result<String, WorkspaceError> {
+    match commit_all(workspace).await {
+        Ok(()) | Err(WorkspaceError::NoChangesToCommit) => {}
+        Err(e) => return Err(e),
+    }
+    let head_after = head_sha(workspace).await?;
+    if head_after != head_before {
+        push_branch(workspace).await?;
+    }
+    Ok(head_after)
+}
+
 pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
     git(
         workspace.path(),

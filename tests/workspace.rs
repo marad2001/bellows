@@ -7,8 +7,8 @@ use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::workspace::{
-    commit_all, compute_diff_against_base, diff_between_touches_only_agent_notes, head_sha,
-    open_pr, prepare, push_branch, OpenPrRequest,
+    commit_all, commit_all_and_push_if_advanced, compute_diff_against_base,
+    diff_between_touches_only_agent_notes, head_sha, open_pr, prepare, push_branch, OpenPrRequest,
 };
 
 fn init_remote_repo(path: &Path) {
@@ -433,4 +433,176 @@ async fn open_pr_with_draft_true_posts_a_draft_pull_request() {
     .expect("open_pr should succeed");
 
     assert_eq!(pr.number, 42);
+}
+
+// ----------------------------------------------------------------------
+// Issue #52: commit_all_and_push_if_advanced — the slice-9.6 four-corner
+// commit/push pattern packaged as a reusable helper. The nit-batch
+// invocation in runner.rs needs the same shape the per-finding loop
+// already uses; rather than duplicate the dance, both call sites use
+// this helper. Tests pin the four post-agent-invocation outcomes:
+//   1. agent self-commit         → HEAD advanced; commit_all is a no-op;
+//                                  we push.
+//   2. bellows commit-on-behalf  → HEAD advances via commit_all; we push.
+//   3. mixed (agent commit + leftover edits) → both happen, single push.
+//   4. no advancement            → HEAD unchanged; we do NOT push.
+// ----------------------------------------------------------------------
+
+fn remote_has_branch(remote: &Path, branch: &str) -> bool {
+    let output = Command::new("git")
+        .args(["branch", "--list", branch])
+        .current_dir(remote)
+        .output()
+        .expect("git branch --list");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    stdout.lines().any(|l| l.contains(branch))
+}
+
+fn remote_branch_sha(remote: &Path, branch: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(remote)
+        .output()
+        .expect("git rev-parse on remote");
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).unwrap().trim().to_string())
+}
+
+#[tokio::test]
+async fn commit_all_and_push_if_advanced_pushes_when_agent_self_committed() {
+    // Slice for issue #52, corner 1: the agent self-committed its fix
+    // inside the sandbox (HEAD advanced under the agent's own commit
+    // message). Bellows's subsequent commit_all has nothing to stage and
+    // returns NoChangesToCommit — the legacy `Ok(()) => push` shape lost
+    // the commit. The helper detects HEAD advancement independently of
+    // commit_all's return and pushes the agent commit to origin.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/52-nit-batch-self-commit")
+        .await
+        .unwrap();
+
+    let head_before = head_sha(&workspace).await.unwrap();
+
+    // Simulate an in-container agent self-commit: write a file AND
+    // commit it ourselves, mimicking what `claude` would do when it
+    // decides to `git commit` its own fix.
+    std::fs::write(workspace.path().join("fixed.rs"), "fn fixed() {}\n").unwrap();
+    run_git(workspace.path(), &["add", "fixed.rs"]);
+    run_git(
+        workspace.path(),
+        &["commit", "-m", "agent: drop derive(Default) for new_without_default"],
+    );
+
+    let head_after = commit_all_and_push_if_advanced(&workspace, &head_before)
+        .await
+        .expect("helper should succeed on agent self-commit");
+
+    assert_ne!(
+        head_after, head_before,
+        "head_after must reflect the agent's self-commit, not the pre-invocation HEAD"
+    );
+    let local_head = head_sha(&workspace).await.unwrap();
+    assert_eq!(
+        head_after, local_head,
+        "helper must return the post-commit local HEAD verbatim"
+    );
+
+    let remote_sha = remote_branch_sha(remote_dir.path(), "agent/52-nit-batch-self-commit")
+        .expect("remote must hold the pushed branch");
+    assert_eq!(
+        remote_sha, head_after,
+        "remote branch must point at the agent's self-commit, not the pre-invocation HEAD"
+    );
+}
+
+#[tokio::test]
+async fn commit_all_and_push_if_advanced_pushes_when_bellows_commits_on_behalf() {
+    // Corner 2: agent left uncommitted edits in the workspace (the
+    // historical Ok(())-on-commit_all case). The helper produces the
+    // "Bellows agent run" commit, sees HEAD advance, and pushes —
+    // preserving the legacy nit-batch behaviour exactly.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/52-bellows-commits-on-behalf")
+        .await
+        .unwrap();
+
+    let head_before = head_sha(&workspace).await.unwrap();
+    std::fs::write(workspace.path().join("edits.rs"), "fn edits() {}\n").unwrap();
+
+    let head_after = commit_all_and_push_if_advanced(&workspace, &head_before)
+        .await
+        .expect("helper should succeed on bellows-on-behalf shape");
+
+    assert_ne!(head_after, head_before, "HEAD must advance after commit_all");
+    let remote_sha = remote_branch_sha(remote_dir.path(), "agent/52-bellows-commits-on-behalf")
+        .expect("remote must hold the pushed branch");
+    assert_eq!(remote_sha, head_after, "remote must absorb the bellows-on-behalf commit");
+}
+
+#[tokio::test]
+async fn commit_all_and_push_if_advanced_pushes_once_for_mixed_self_commit_plus_leftover_edits() {
+    // Corner 3: the agent self-committed *and* left further uncommitted
+    // edits behind (e.g. agent-notes scratch). The helper must absorb
+    // both into the post-invocation state and push once; the resulting
+    // remote SHA must be at-or-after the agent's self-commit.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/52-mixed")
+        .await
+        .unwrap();
+
+    let head_before = head_sha(&workspace).await.unwrap();
+
+    std::fs::write(workspace.path().join("fix.rs"), "fn fix() {}\n").unwrap();
+    run_git(workspace.path(), &["add", "fix.rs"]);
+    run_git(workspace.path(), &["commit", "-m", "agent: fix"]);
+    let after_self_commit = head_sha(&workspace).await.unwrap();
+
+    // Leftover uncommitted edits in the same invocation.
+    std::fs::write(workspace.path().join("agent-notes.md"), "trailing\n").unwrap();
+
+    let head_after = commit_all_and_push_if_advanced(&workspace, &head_before)
+        .await
+        .expect("helper should succeed on mixed shape");
+
+    assert_ne!(head_after, head_before);
+    assert_ne!(
+        head_after, after_self_commit,
+        "HEAD must advance past the agent's self-commit when bellows-on-behalf also fires"
+    );
+    let remote_sha = remote_branch_sha(remote_dir.path(), "agent/52-mixed")
+        .expect("remote must hold the pushed branch");
+    assert_eq!(remote_sha, head_after, "remote must reflect the final HEAD");
+}
+
+#[tokio::test]
+async fn commit_all_and_push_if_advanced_does_not_push_when_head_did_not_advance() {
+    // Corner 4: agent did nothing — no commit, no edits. commit_all
+    // returns NoChangesToCommit, HEAD did not advance, and the helper
+    // must NOT push (no commits exist to push, and a no-op push would
+    // still be wasted IO). The branch should not appear on the remote.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/52-no-op")
+        .await
+        .unwrap();
+
+    let head_before = head_sha(&workspace).await.unwrap();
+    let head_after = commit_all_and_push_if_advanced(&workspace, &head_before)
+        .await
+        .expect("helper should succeed on no-op");
+
+    assert_eq!(head_after, head_before, "HEAD must not advance on a no-op invocation");
+    assert!(
+        !remote_has_branch(remote_dir.path(), "agent/52-no-op"),
+        "remote must not receive a push when HEAD did not advance"
+    );
 }
