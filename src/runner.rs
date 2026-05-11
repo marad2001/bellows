@@ -53,6 +53,27 @@ pub enum RunOutcome {
         issue_number: u64,
         pr_number: u64,
     },
+    /// The pre-claim PR check (#42) found at least one open `agent/*`
+    /// PR — that PR may still gate master, so the tick refuses to
+    /// claim a new issue. `pr_numbers` is empty if the GitHub list-PRs
+    /// call failed (fail-closed: we don't know whether master is
+    /// gated, so we behave as if it is). The polling loop turns this
+    /// into a transition-only log line and a Blocked status-file
+    /// write; the next tick retries.
+    Blocked {
+        pr_numbers: Vec<u64>,
+    },
+}
+
+/// Outcome of `tracker::list_open_agent_prs` as the pre-claim check sees
+/// it. Three variants because the polling loop has to distinguish the
+/// API-failure case (we don't know which PRs are open) from the
+/// genuinely-blocked case (we have a list) — both fail-close to
+/// `RunOutcome::Blocked`, but the status file's rendering differs.
+enum PreClaim {
+    Clear,
+    Blocked(Vec<u64>),
+    BlockedUnknown,
 }
 
 pub async fn run_once(
@@ -62,6 +83,77 @@ pub async fn run_once(
     status_ctx: Option<&StatusContext>,
 ) -> Result<RunOutcome, RunError> {
     let (owner, repo) = parse_owner_repo(&config.repo.url)?;
+
+    // Issue #42: pre-claim PR check. Before any other API call, ask
+    // GitHub which open PRs exist on this repo and filter to bellows-
+    // authored `agent/*` branches. If any are open, the prior agent's
+    // PR may still gate master (CI running, in review, or stuck-draft)
+    // and claiming a new issue now would run the next agent against a
+    // master that hasn't absorbed the prior PR — the concrete race PR
+    // #41 was designed to fix and which #42 was filed for after PR #41
+    // hit it on itself.
+    //
+    // Fail-closed: any error talking to GitHub maps to Blocked with an
+    // empty pr_numbers list. We can't tell whether master is gated; the
+    // safe answer matches the answer we'd give if we knew it was. The
+    // next polling tick is the retry — no inner backoff, no retry loop.
+    let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
+        Ok(prs) if prs.is_empty() => PreClaim::Clear,
+        Ok(prs) => PreClaim::Blocked(prs),
+        Err(e) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: pre-claim PR check failed; failing closed (treating tick as blocked): {}",
+                e,
+            );
+            PreClaim::BlockedUnknown
+        }
+    };
+    match preclaim {
+        PreClaim::Blocked(pr_numbers) => {
+            if let Some(ctx) = status_ctx
+                && let Err(e) = ctx.write_blocked(&pr_numbers).await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not write blocked status (continuing): {}",
+                    e,
+                );
+            }
+            return Ok(RunOutcome::Blocked { pr_numbers });
+        }
+        PreClaim::BlockedUnknown => {
+            if let Some(ctx) = status_ctx
+                && let Err(e) = ctx.write_blocked(&[]).await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not write blocked status (continuing): {}",
+                    e,
+                );
+            }
+            return Ok(RunOutcome::Blocked {
+                pr_numbers: Vec::new(),
+            });
+        }
+        PreClaim::Clear => {
+            // The pre-claim check cleared. If a prior tick left the
+            // status file in a Blocked state, that state is stale —
+            // write idle so `bellows status` no longer lies. Also
+            // covers the first claim after a merge: the status was
+            // Blocked at the last tick, now we're idle until we
+            // either claim (write_busy) or short-circuit.
+            if let Some(ctx) = status_ctx
+                && let Err(e) = ctx.write_idle().await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not clear blocked status (continuing): {}",
+                    e,
+                );
+            }
+        }
+    }
 
     let issue = tracker::find_next_issue(
         client,

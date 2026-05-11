@@ -17,7 +17,18 @@ pub enum StatusError {
 pub struct Status {
     pub pid: u32,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
     pub current: Option<CurrentRun>,
+    /// Issue #42 pre-claim PR check: when the orchestrator is blocked
+    /// by one or more open `agent/*` PRs that may still gate master.
+    /// `current` and `blocked` are mutually exclusive — `write_busy`
+    /// and `write_blocked` both clear the other field.
+    ///
+    /// `pr_numbers` is empty in the fail-closed case (the GitHub
+    /// list-PRs call errored, so we don't know which PRs are open);
+    /// the summariser renders that differently from a known list.
+    #[serde(default)]
+    pub blocked: Option<BlockedState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +37,11 @@ pub struct CurrentRun {
     pub issue_title: String,
     pub repo: String,
     pub claimed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedState {
+    pub pr_numbers: Vec<u64>,
 }
 
 /// Resolve the platform-appropriate status-file path:
@@ -182,6 +198,7 @@ impl StatusContext {
                 pid: self.pid,
                 started_at: self.started_at,
                 current: None,
+                blocked: None,
             },
         )
         .await
@@ -194,10 +211,87 @@ impl StatusContext {
                 pid: self.pid,
                 started_at: self.started_at,
                 current: Some(current),
+                blocked: None,
             },
         )
         .await
     }
+
+    /// Persist the Blocked state — bellows refused to claim a new issue
+    /// because an open `agent/*` PR may still gate master. Called by
+    /// `run_once`'s pre-claim check (#42). An empty `pr_numbers` slice
+    /// means the GitHub list-PRs call failed (fail-closed); the
+    /// summariser renders that case distinctly.
+    pub async fn write_blocked(&self, pr_numbers: &[u64]) -> Result<(), StatusError> {
+        write(
+            &self.path,
+            &Status {
+                pid: self.pid,
+                started_at: self.started_at,
+                current: None,
+                blocked: Some(BlockedState {
+                    pr_numbers: pr_numbers.to_vec(),
+                }),
+            },
+        )
+        .await
+    }
+}
+
+/// Tracks whether the polling loop has already logged the current
+/// "blocked" state, so the operator's log doesn't flood with one
+/// "blocked by PR #N" line every 30 seconds during a 5-minute CI cycle.
+/// A fresh log line fires only on a transition — either the block set
+/// changes or bellows moves between blocked and unblocked.
+#[derive(Debug, Default)]
+pub struct BlockTransition {
+    last_block_set: Option<Vec<u64>>,
+}
+
+impl BlockTransition {
+    pub fn new() -> Self {
+        Self {
+            last_block_set: None,
+        }
+    }
+
+    /// Observe a tick that returned `RunOutcome::Blocked` with these
+    /// `pr_numbers`. Returns `Some(line)` if a log line should be emitted
+    /// (the block set differs from the previous tick) or `None` if the
+    /// tick is a same-state continuation that should stay silent.
+    pub fn observe_blocked(&mut self, pr_numbers: &[u64]) -> Option<String> {
+        if self.last_block_set.as_deref() == Some(pr_numbers) {
+            return None;
+        }
+        self.last_block_set = Some(pr_numbers.to_vec());
+        Some(format_blocked_line(pr_numbers))
+    }
+
+    /// Observe a tick that did NOT return `RunOutcome::Blocked`. Returns
+    /// `Some(line)` only if the prior state was blocked (i.e. we've
+    /// transitioned out of blocked and the operator wants to know that
+    /// normal claim behaviour has resumed); `None` for an idle-to-idle
+    /// tick.
+    pub fn observe_unblocked(&mut self) -> Option<String> {
+        if self.last_block_set.take().is_some() {
+            Some("bellows: no longer blocked by open agent PRs; resuming normal claim behaviour".to_string())
+        } else {
+            None
+        }
+    }
+}
+
+fn format_blocked_line(pr_numbers: &[u64]) -> String {
+    if pr_numbers.is_empty() {
+        return "bellows: blocked (could not list open agent PRs; failing closed and retrying next tick)"
+            .to_string();
+    }
+    let joined = pr_numbers
+        .iter()
+        .map(|n| format!("PR #{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("bellows: blocked by open agent {joined} (waiting for merge)")
 }
 
 /// Outcome of `check_status_for_kill` — whether `bellows kill <N>`
@@ -256,23 +350,55 @@ pub fn summarise(status: Option<&Status>, pid_alive: bool) -> String {
             "bellows is not running (stale status file from PID {} — may be a leftover from a crashed prior process).",
             s.pid,
         ),
-        Some(s) => match &s.current {
-            None => format!(
-                "bellows is running (PID {}, started at {}), currently idle.",
-                s.pid,
-                s.started_at.to_rfc3339(),
-            ),
-            Some(c) => format!(
-                "bellows is running (PID {}, started at {}), currently busy on issue #{} (\"{}\") in {}, claimed at {}.",
-                s.pid,
-                s.started_at.to_rfc3339(),
-                c.issue_number,
-                c.issue_title,
-                c.repo,
-                c.claimed_at.to_rfc3339(),
-            ),
-        },
+        Some(s) => {
+            // Blocked takes precedence over current. The two are
+            // mutually exclusive on the writer side, but a defensive
+            // priority here matches the brief: a Blocked status is
+            // the operator's headline when bellows is refusing to
+            // claim because of an open agent PR.
+            if let Some(b) = &s.blocked {
+                return format_blocked_summary(s, b);
+            }
+            match &s.current {
+                None => format!(
+                    "bellows is running (PID {}, started at {}), currently idle.",
+                    s.pid,
+                    s.started_at.to_rfc3339(),
+                ),
+                Some(c) => format!(
+                    "bellows is running (PID {}, started at {}), currently busy on issue #{} (\"{}\") in {}, claimed at {}.",
+                    s.pid,
+                    s.started_at.to_rfc3339(),
+                    c.issue_number,
+                    c.issue_title,
+                    c.repo,
+                    c.claimed_at.to_rfc3339(),
+                ),
+            }
+        }
     }
+}
+
+fn format_blocked_summary(s: &Status, b: &BlockedState) -> String {
+    if b.pr_numbers.is_empty() {
+        return format!(
+            "bellows is running (PID {}, started at {}), blocked (could not list open agent PRs; failing closed and retrying next tick).",
+            s.pid,
+            s.started_at.to_rfc3339(),
+        );
+    }
+    let joined = b
+        .pr_numbers
+        .iter()
+        .map(|n| format!("PR #{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "bellows is running (PID {}, started at {}), blocked by open agent {} (waiting for merge).",
+        s.pid,
+        s.started_at.to_rfc3339(),
+        joined,
+    )
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
@@ -300,6 +426,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc),
             }),
+            blocked: None,
         }
     }
 
@@ -325,6 +452,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             current: None,
+            blocked: None,
         };
 
         write(&path, &status).await.unwrap();
@@ -501,6 +629,230 @@ mod tests {
         assert!(s.contains("marad2001/bellows-test"), "{}", s);
         assert!(s.contains("2026-05-10T15:02:00"), "{}", s);
         assert!(!s.contains("currently idle"), "{}", s);
+    }
+
+    #[test]
+    fn summarise_blocked_status_names_each_pr_number_and_mentions_waiting_for_merge() {
+        // Issue #42: pre-claim PR check. When bellows is blocked by an
+        // open `agent/*` PR (CI running, in review, or stuck-draft), the
+        // status file's Blocked state is rendered with each PR number so
+        // an operator running `bellows status` knows exactly which PR is
+        // gating the next claim. The brief's exemplar string is
+        // "blocked by open agent PR #41 (waiting for merge)".
+        let st = Status {
+            pid: 12345,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            current: None,
+            blocked: Some(BlockedState {
+                pr_numbers: vec![41],
+            }),
+        };
+        let s = summarise(Some(&st), true);
+        assert!(s.contains("bellows is running"), "{}", s);
+        assert!(s.contains("PID 12345"), "{}", s);
+        assert!(
+            s.contains("blocked"),
+            "summary must surface the blocked state: {s}",
+        );
+        assert!(
+            s.contains("PR #41"),
+            "summary must name the blocking PR by number: {s}",
+        );
+        assert!(
+            s.to_lowercase().contains("waiting for merge"),
+            "summary must include the waiting-for-merge hint per the brief: {s}",
+        );
+        assert!(
+            !s.contains("currently idle"),
+            "blocked is not idle — must not render the idle wording: {s}",
+        );
+    }
+
+    #[test]
+    fn summarise_blocked_status_with_multiple_pr_numbers_lists_all_of_them() {
+        // Multiple open agent/* PRs (e.g. two consecutive runs both
+        // waiting on CI) — the status command must show all of them so
+        // an operator can see the full block set, not just one.
+        let st = Status {
+            pid: 12345,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            current: None,
+            blocked: Some(BlockedState {
+                pr_numbers: vec![41, 60],
+            }),
+        };
+        let s = summarise(Some(&st), true);
+        assert!(s.contains("PR #41"), "{}", s);
+        assert!(s.contains("PR #60"), "{}", s);
+    }
+
+    #[test]
+    fn summarise_blocked_with_empty_pr_list_renders_unknown_list_call_failed() {
+        // Fail-closed contract: when the list-PRs GitHub call fails, the
+        // tick is treated as blocked but bellows doesn't know which PRs
+        // are open. The status renderer must distinguish this case so
+        // the operator can read the orchestrator's actual state rather
+        // than seeing a misleading "blocked by PR #(none)" line.
+        let st = Status {
+            pid: 12345,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            current: None,
+            blocked: Some(BlockedState {
+                pr_numbers: Vec::new(),
+            }),
+        };
+        let s = summarise(Some(&st), true);
+        assert!(s.to_lowercase().contains("blocked"), "{}", s);
+        assert!(
+            s.to_lowercase().contains("could not list")
+                || s.to_lowercase().contains("unknown"),
+            "must explain that PR numbers couldn't be retrieved: {s}",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_blocked_persists_pr_numbers_in_documented_schema() {
+        // Pin the on-disk shape so a future serde rename can't silently
+        // break the status command or `bellows status`'s consumers.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("status.json");
+        let ctx = StatusContext {
+            path: path.clone(),
+            pid: 4242,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        ctx.write_blocked(&[41, 60]).await.unwrap();
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["pid"], 4242);
+        assert_eq!(v["started_at"], "2026-05-10T15:00:00Z");
+        assert!(v["current"].is_null());
+        assert_eq!(v["blocked"]["pr_numbers"][0], 41);
+        assert_eq!(v["blocked"]["pr_numbers"][1], 60);
+    }
+
+    #[tokio::test]
+    async fn write_idle_after_write_blocked_clears_the_blocked_state() {
+        // Brief: "Closing or merging the blocking PR causes the next
+        // polling tick to transition out of blocked and resume normal
+        // claim behaviour without operator intervention." The status
+        // file's Blocked state must clear when bellows transitions back
+        // to idle — otherwise `bellows status` would lie until the next
+        // claim landed.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("status.json");
+        let ctx = StatusContext {
+            path: path.clone(),
+            pid: 4242,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        ctx.write_blocked(&[41]).await.unwrap();
+        ctx.write_idle().await.unwrap();
+        let parsed = read(&path).await.unwrap().unwrap();
+        assert!(parsed.blocked.is_none(), "expected blocked cleared, got {:?}", parsed.blocked);
+        assert!(parsed.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_busy_clears_any_prior_blocked_state() {
+        // Defensive: a claim should never coexist with a Blocked state
+        // in the status file. write_busy must clear the blocked field
+        // so consumers don't have to handle both-set-at-once.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("status.json");
+        let ctx = StatusContext {
+            path: path.clone(),
+            pid: 4242,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        ctx.write_blocked(&[41]).await.unwrap();
+        ctx.write_busy(CurrentRun {
+            issue_number: 9,
+            issue_title: "Test".to_string(),
+            repo: "o/r".to_string(),
+            claimed_at: DateTime::parse_from_rfc3339("2026-05-10T15:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        })
+        .await
+        .unwrap();
+        let parsed = read(&path).await.unwrap().unwrap();
+        assert!(parsed.blocked.is_none());
+        assert!(parsed.current.is_some());
+    }
+
+    #[test]
+    fn block_transition_idle_to_blocked_emits_log_line() {
+        // Brief: "The polling loop's log emits a 'blocked by PR #...' line
+        // only on state transitions — not on every tick." On the
+        // first tick that sees an open agent/* PR, the line fires.
+        let mut tracker = BlockTransition::new();
+        let line = tracker.observe_blocked(&[41]);
+        let line = line.expect("expected a transition log line");
+        assert!(line.contains("blocked"), "{}", line);
+        assert!(line.contains("PR #41"), "{}", line);
+    }
+
+    #[test]
+    fn block_transition_same_block_set_twice_in_a_row_is_silent() {
+        // The whole point of transition-only logging: a 5-minute CI cycle
+        // would otherwise flood the log with ~10 identical "blocked"
+        // lines, drowning out everything else.
+        let mut tracker = BlockTransition::new();
+        let _ = tracker.observe_blocked(&[41]);
+        let line = tracker.observe_blocked(&[41]);
+        assert!(
+            line.is_none(),
+            "second identical observation must not emit a log line, got {:?}",
+            line,
+        );
+    }
+
+    #[test]
+    fn block_transition_block_set_changing_emits_a_fresh_log_line() {
+        // If a second agent/* PR opens (or the prior one merges and a new
+        // one opens), the block set changes and the operator wants a
+        // fresh line saying so.
+        let mut tracker = BlockTransition::new();
+        let _ = tracker.observe_blocked(&[41]);
+        let line = tracker.observe_blocked(&[60]);
+        let line = line.expect("set changed; expected a transition line");
+        assert!(line.contains("PR #60"), "{}", line);
+    }
+
+    #[test]
+    fn block_transition_blocked_to_unblocked_emits_a_resume_line() {
+        let mut tracker = BlockTransition::new();
+        let _ = tracker.observe_blocked(&[41]);
+        let line = tracker.observe_unblocked();
+        let line = line.expect("blocked->unblocked transition expected a line");
+        assert!(
+            line.to_lowercase().contains("no longer blocked")
+                || line.to_lowercase().contains("resuming"),
+            "expected resume/no-longer-blocked wording: {line}",
+        );
+    }
+
+    #[test]
+    fn block_transition_unblocked_to_unblocked_is_silent() {
+        // Idle→Idle ticks must not log — only transitions speak.
+        let mut tracker = BlockTransition::new();
+        assert!(tracker.observe_unblocked().is_none());
+        assert!(tracker.observe_unblocked().is_none());
     }
 
     #[test]

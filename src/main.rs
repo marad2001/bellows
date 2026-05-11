@@ -11,7 +11,7 @@ use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
 use bellows::config::Config;
 use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
-use bellows::status::{self, KillPrecheck, StatusContext};
+use bellows::status::{self, BlockTransition, KillPrecheck, StatusContext};
 use bellows::tracker;
 
 #[derive(Parser)]
@@ -353,38 +353,70 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         }
     };
 
+    // #42 pre-claim PR check transition tracker. Lives across ticks so
+    // that a 5-minute CI cycle on an open agent PR doesn't produce ~10
+    // identical "blocked by PR #N" log lines drowning out everything
+    // else; a fresh line fires only when the block set changes or when
+    // bellows moves between blocked and unblocked.
+    let mut block_transition = BlockTransition::new();
+
     loop {
         let outcome = runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref()).await;
         match outcome {
-            Ok(RunOutcome::Idle) => log(&mut log_file, "bellows: idle (no ready-for-agent issues)"),
+            Ok(RunOutcome::Blocked { pr_numbers }) => {
+                if let Some(line) = block_transition.observe_blocked(&pr_numbers) {
+                    log(&mut log_file, &line);
+                }
+            }
+            Ok(RunOutcome::Idle) => {
+                if let Some(line) = block_transition.observe_unblocked() {
+                    log(&mut log_file, &line);
+                }
+                log(&mut log_file, "bellows: idle (no ready-for-agent issues)");
+            }
             Ok(RunOutcome::Finalised {
                 issue_number,
                 pr_number,
                 reason,
-            }) => log(
-                &mut log_file,
-                &format!(
-                    "bellows: finalised issue #{} -> PR #{} ({:?})",
-                    issue_number, pr_number, reason
-                ),
-            ),
-            Ok(RunOutcome::Contended { issue_number }) => log(
-                &mut log_file,
-                &format!(
-                    "bellows: claim contended on issue #{}; will retry next tick",
-                    issue_number
-                ),
-            ),
+            }) => {
+                if let Some(line) = block_transition.observe_unblocked() {
+                    log(&mut log_file, &line);
+                }
+                log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: finalised issue #{} -> PR #{} ({:?})",
+                        issue_number, pr_number, reason
+                    ),
+                );
+            }
+            Ok(RunOutcome::Contended { issue_number }) => {
+                if let Some(line) = block_transition.observe_unblocked() {
+                    log(&mut log_file, &line);
+                }
+                log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: claim contended on issue #{}; will retry next tick",
+                        issue_number
+                    ),
+                );
+            }
             Ok(RunOutcome::Cancelled {
                 issue_number,
                 pr_number,
-            }) => log(
-                &mut log_file,
-                &format!(
-                    "bellows: cancelled by operator mid-run — issue #{} -> draft PR #{} (agent-cancelled label applied externally)",
-                    issue_number, pr_number,
-                ),
-            ),
+            }) => {
+                if let Some(line) = block_transition.observe_unblocked() {
+                    log(&mut log_file, &line);
+                }
+                log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: cancelled by operator mid-run — issue #{} -> draft PR #{} (agent-cancelled label applied externally)",
+                        issue_number, pr_number,
+                    ),
+                );
+            }
             Err(e) => {
                 log(
                     &mut log_file,
