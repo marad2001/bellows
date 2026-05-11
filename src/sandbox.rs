@@ -1217,6 +1217,54 @@ mod tests {
     }
 
     #[test]
+    fn build_ssh_keys_mount_returns_none_when_deploy_keys_empty() {
+        // Issue #69 (ADR-0002) acceptance: containers spawned for
+        // `[[repo]]` entries with empty or unset `deploy_keys` get no
+        // SSH mount — that's how the "no creds in sandbox by default"
+        // posture is preserved. The mount filter is the single
+        // chokepoint enforcing this; if it ever returned a mount for an
+        // empty list, every container (including bellows-on-bellows)
+        // would get the keys.
+        let mount = build_ssh_keys_mount("bellows-deploy-keys", &[]);
+        assert!(mount.is_none(), "empty deploy_keys must produce no mount: {:?}", mount);
+    }
+
+    #[test]
+    fn build_ssh_keys_mount_returns_read_only_mount_when_deploy_keys_non_empty() {
+        // Issue #69 (ADR-0002) acceptance: a `[[repo]]` block that
+        // declares at least one deploy key gets the configured
+        // ssh_keys_volume mounted READ-ONLY at /home/bellows/.ssh/ —
+        // read-only so an escaping agent cannot tamper with the keys
+        // (the brief calls this out explicitly as the security
+        // boundary).
+        let mount = build_ssh_keys_mount("bellows-deploy-keys", &["workboard-core".to_string()])
+            .expect("non-empty deploy_keys must produce a mount");
+        assert_eq!(mount.typ, Some(MountType::VOLUME));
+        assert_eq!(mount.source.as_deref(), Some("bellows-deploy-keys"));
+        assert_eq!(mount.target.as_deref(), Some("/home/bellows/.ssh"));
+        assert_eq!(
+            mount.read_only,
+            Some(true),
+            "the deploy-keys mount must be read-only (security boundary per ADR-0002): {:?}",
+            mount,
+        );
+    }
+
+    #[test]
+    fn build_ssh_keys_mount_honours_custom_volume_name() {
+        // Acceptance criterion implication: the volume name is
+        // configurable via `[auth].ssh_keys_volume`. The mount filter
+        // must pipe that name through verbatim — if it hard-coded
+        // "bellows-deploy-keys", an operator who renamed the volume
+        // would mount the wrong one (or nothing at all if the default
+        // name had no volume on the host).
+        let mount =
+            build_ssh_keys_mount("my-custom-keys", &["some-key".to_string()])
+                .expect("non-empty deploy_keys must produce a mount");
+        assert_eq!(mount.source.as_deref(), Some("my-custom-keys"));
+    }
+
+    #[test]
     fn build_cache_mounts_produces_target_and_registry_volumes() {
         // Slice 4 acceptance: every agent container is spawned with
         // two named-volume mounts, one per-repo (target/) and one
