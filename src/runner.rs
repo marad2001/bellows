@@ -341,8 +341,75 @@ pub async fn run_once(
     };
 
     announce(log_writer, "bellows: committing + pushing implement branch");
-    let _ =
+    let head_after_implement =
         workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
+
+    // Issue #49: implement-crash recovery. When the implement-phase
+    // agent exited non-zero AND produced no commits, the legacy path
+    // produced no branch on origin — `open_pr` later either fails or
+    // opens a no-content PR, and the source issue silently stays at
+    // `agent-in-progress` with no `agent-failed` label, no draft PR,
+    // and no log comment. Witnessed live on issue #42 (CRLF shebang
+    // in policy-image/entrypoint-user).
+    //
+    // The fix: synthesise a bellows-authored `agent-notes.md` entry
+    // capturing the implement-phase exit code + a bounded prefix of
+    // its stderr/stdout tail. That gives the run a single commit on
+    // the agent branch (so the push succeeds) AND something readable
+    // for the operator in the resulting draft PR's diff. The synth
+    // also flips `implement_crash_synthesised` in PhaseOutcomes so
+    // `classify_exit` knows the agent-notes content is bellows-
+    // authored (suppress the usual `has_agent_notes →
+    // AgentSelfReportedFailure` precedence — the run did not self-
+    // report, it crashed).
+    //
+    // Gated tightly:
+    //   - `implement_agent_run.exit_code != 0` — the new path only
+    //     activates on a true crash. A clean exit with no commits
+    //     (agent decided the brief was unnecessary or wrote
+    //     agent-notes.md instead of code) still routes through the
+    //     existing `agent-notes.md` precedence, per the brief.
+    //   - `head_after_implement == head_before_implement` — and the
+    //     workspace must genuinely be at base. If the agent self-
+    //     committed before crashing, HEAD has advanced; the existing
+    //     halt-with-partial-progress path handles that and must not
+    //     be regressed.
+    let implement_crash_synthesised = if implement_agent_run.exit_code != 0
+        && head_after_implement == head_before_implement
+    {
+        announce(
+            log_writer,
+            "bellows: implement crashed with no commits — synthesising agent-notes entry so the run produces a draft PR + agent-failed label rather than silently stalling at agent-in-progress",
+        );
+        let notes_path = workspace.path().join("agent-notes.md");
+        let existing = if notes_path.exists() {
+            tokio::fs::read_to_string(&notes_path).await?
+        } else {
+            String::new()
+        };
+        let mut new_notes = existing;
+        if !new_notes.is_empty() && !new_notes.ends_with('\n') {
+            new_notes.push('\n');
+        }
+        new_notes.push_str(&policy::synthesize_implement_crash_entry(
+            implement_agent_run.exit_code,
+            &implement_agent_run.stderr_tail,
+        ));
+        tokio::fs::write(&notes_path, new_notes).await?;
+        // Bellows-write-then-bellows-commit with no intervening agent
+        // invocation, so HEAD cannot have advanced under an agent
+        // commit message between the write and the commit. The legacy
+        // match-on-result shape (mirrors the weak-test guard and
+        // parser-as-backstop synth sites) is correct here.
+        match workspace::commit_all(&workspace).await {
+            Ok(()) => workspace::push_branch(&workspace).await?,
+            Err(WorkspaceError::NoChangesToCommit) => {}
+            Err(e) => return Err(e.into()),
+        }
+        true
+    } else {
+        false
+    };
 
     // ---- Phase 2: Post-implement cargo checks gate ----
     let post_implement_gate: GateOutcome = if !budget.exceeded
@@ -852,6 +919,7 @@ pub async fn run_once(
         end_pipeline_gate,
         wall_clock_exceeded: budget.exceeded,
         backstop_violations,
+        implement_crash_synthesised,
     };
     let pipeline_reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
 
@@ -1446,6 +1514,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         }
     }
 
@@ -1559,6 +1628,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -1590,6 +1660,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1624,6 +1695,7 @@ mod tests {
             }),
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -1655,6 +1727,7 @@ mod tests {
             }),
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -1683,6 +1756,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
@@ -1712,6 +1786,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -1748,6 +1823,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::RateLimited,
@@ -1786,6 +1862,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::Crash,
@@ -1832,6 +1909,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::Success,
@@ -1867,6 +1945,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -1919,6 +1998,7 @@ mod tests {
                     body: "body".to_string(),
                 },
             ],
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::AgentSelfReportedFailure,
@@ -1960,6 +2040,7 @@ mod tests {
             end_pipeline_gate: None,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -1982,6 +2063,70 @@ mod tests {
         let body = build_pr_body(&ExitReason::RateLimited, 42, None, None);
         assert!(body.to_lowercase().contains("rate limit"));
         assert!(body.contains("run-log comment"));
+    }
+
+    #[test]
+    fn implement_crash_synth_outcomes_classify_as_crash_and_render_crash_pr_and_log_bodies() {
+        // Issue #49 end-to-end shape: a PhaseOutcomes carrying the
+        // synth flag (set true by the runner when implement crashed
+        // with no commits) and a non-zero implement exit must route
+        // through `classify_exit` to `Crash` even with
+        // `has_agent_notes=true` (the synth wrote agent-notes.md
+        // and committed it). The resulting PR body must be the
+        // Crash body (`crashed`), NOT the AgentSelfReportedFailure
+        // body which would quote the bellows-synthesised note as if
+        // the agent had self-reported.
+        let synth_note = policy::synthesize_implement_crash_entry(
+            137,
+            "Error: /workspace/entrypoint-user: bad interpreter",
+        );
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 137,
+                stderr_tail: "Error: /workspace/entrypoint-user: bad interpreter".to_string(),
+            },
+            post_implement_gate: GateOutcome::default(),
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
+            implement_crash_synthesised: true,
+        };
+        let reason = policy::classify_exit(true, &outcomes);
+        assert_eq!(
+            reason,
+            ExitReason::Crash,
+            "synth + non-zero implement exit must classify as Crash, not \
+             AgentSelfReportedFailure — the synth note is bellows-authored, \
+             not an agent self-report",
+        );
+        // build_pr_body for Crash must NOT quote the synth note as
+        // "self-reported failure" content.
+        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()));
+        assert!(
+            pr_body.contains("crashed"),
+            "PR body for the synth-driven Crash must say `crashed`: {pr_body}"
+        );
+        assert!(
+            !pr_body.to_lowercase().contains("self-reported failure"),
+            "PR body must NOT frame the synth note as an agent self-report: {pr_body}"
+        );
+        // build_log_body for Crash surfaces the stderr tail directly
+        // (from outcomes.implement.stderr_tail) so the operator can
+        // see what the implement-phase agent printed before exiting,
+        // independent of whatever the synth note also embedded.
+        let started = fixed_timestamp();
+        let finished = started + chrono::Duration::seconds(5);
+        let log_body = build_log_body(&reason, 42, started, finished, "agent/42-x", &outcomes);
+        assert!(
+            log_body.contains("Crash"),
+            "log body must include the Crash classification header: {log_body}"
+        );
+        assert!(
+            log_body.contains("bad interpreter"),
+            "log body must surface the implement-phase stderr tail: {log_body}"
+        );
     }
 
     #[test]
