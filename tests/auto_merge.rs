@@ -254,6 +254,29 @@ fn auto_merge_workflow_calls_merge_api_with_squash_method() {
 }
 
 #[test]
+fn auto_merge_workflow_pins_merge_call_to_ci_tested_head_sha() {
+    let body = read_workflow();
+    // Important finding (review of issue #43): the `github.rest.pulls.merge`
+    // call MUST pass `sha: headSha` so the merge is bound to the SHA
+    // that `workflow_run` reported CI passed on. Without `sha`, the
+    // GitHub merge API takes whatever the PR's head is at merge time
+    // — so a push that lands between CI completing and this job firing
+    // would slip new untested commits in under CI's green light,
+    // breaking the "this workflow IS the CI gate" claim from ADR-0001.
+    //
+    // With `sha`, the API returns a 409 if the head has moved, which
+    // is the correct behaviour: the next CI run for the new head will
+    // re-fire this workflow. Pin the literal `sha:` argument in the
+    // merge call so a future drive-by edit that drops it flips this
+    // test red.
+    assert_contains_all(
+        &body,
+        &["sha: headSha", "merge_method", "squash"],
+        "merge / sha-pinned squash call",
+    );
+}
+
+#[test]
 fn auto_merge_workflow_falls_back_to_head_sha_lookup_for_empty_pull_requests() {
     let body = read_workflow();
     // Brief: the `workflow_run` event's `pull_requests` array can be

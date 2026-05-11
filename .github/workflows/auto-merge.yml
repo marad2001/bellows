@@ -112,19 +112,33 @@ jobs:
               }
 
               core.info(`Squash-merging PR #${pr.number} ` +
-                `(head.ref="${pr.head.ref}", base.ref="${pr.base.ref}").`);
+                `(head.ref="${pr.head.ref}", base.ref="${pr.base.ref}", ` +
+                `sha="${headSha}").`);
               try {
+                // Pin the merge to the SHA that workflow_run reported
+                // CI passed on. Without `sha`, the merge API takes
+                // whatever the PR's head is at merge time — so a push
+                // that lands between CI completing and this job firing
+                // would slip new commits in under CI's green light
+                // without being tested, breaking the "this workflow IS
+                // the CI gate" claim from ADR-0001. With `sha`, the API
+                // returns 409 if the head has moved, which is the
+                // correct behaviour: the next CI run for the new head
+                // will re-fire this workflow.
                 await github.rest.pulls.merge({
                   owner,
                   repo,
                   pull_number: pr.number,
+                  sha: headSha,
                   merge_method: 'squash',
                 });
                 core.info(`Squash-merged PR #${pr.number}.`);
               } catch (err) {
-                // A merge conflict (or any other GitHub API error)
-                // is logged but does not fail the workflow — the PR
-                // sits open for manual resolution, per the brief.
+                // A merge conflict, head-moved 409, or any other
+                // GitHub API error is logged but does not fail the
+                // workflow — the PR sits open for manual resolution
+                // (or for the next CI run on the new head to re-fire
+                // this workflow), per the brief.
                 core.warning(`Failed to squash-merge PR #${pr.number}: ` +
                   `${err.message}. The PR remains open for manual handling.`);
               }
