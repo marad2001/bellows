@@ -185,6 +185,37 @@ fn auto_merge_workflow_filters_to_agent_branches_only() {
 }
 
 #[test]
+fn auto_merge_workflow_filters_fork_prs_by_head_repo_equality() {
+    let body = read_workflow();
+    // Important finding (review of issue #43): the original filter set
+    // (head.ref prefix, draft, state, base.ref) did NOT include a
+    // head-repo equality check. An external contributor could fork the
+    // repo, push a branch named `agent/exploit`, open a PR targeting
+    // the default branch, get CI green on innocuous-looking code, and
+    // have this workflow squash-merge it with the base repo's
+    // GITHUB_TOKEN — bypassing review entirely. ADR-0001 rejects
+    // `pull_request_target` for supply-chain reasons, but the merge
+    // step here is the supply-chain risk regardless of how the
+    // workflow itself executes.
+    //
+    // Bellows only ever pushes to `origin` (`workspace::push_branch`),
+    // so legitimate bellows PRs are never from a fork; the fork gate
+    // is pure defence with no false-positive cost.
+    //
+    // Pin both `head.repo` (so the filter is read off the PR object,
+    // not some derived flag) and `full_name` (the unambiguous
+    // `owner/repo` identifier — comparing by id would also work but
+    // `full_name` is the existing GitHub-API convention and matches
+    // the suggestion in the review finding). A future drive-by edit
+    // that drops the fork gate flips this test red.
+    assert_contains_all(
+        &body,
+        &["head.repo", "full_name", "base.repo"],
+        "filter / fork PR head.repo equality",
+    );
+}
+
+#[test]
 fn auto_merge_workflow_filters_drafts_open_and_default_branch() {
     let body = read_workflow();
     // Brief acceptance criteria, three filters:

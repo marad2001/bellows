@@ -66,6 +66,25 @@ jobs:
                 owner, repo, pull_number: summary.number,
               });
 
+              // Filter: head.repo MUST equal base.repo. Bellows only
+              // ever pushes to `origin` (workspace::push_branch), so a
+              // legitimate bellows PR is never from a fork. A fork PR
+              // matching the `agent/` prefix would otherwise be merged
+              // to the base repo with base-repo authority, bypassing
+              // review — the supply-chain risk ADR-0001 calls out lives
+              // at the merge step regardless of how the workflow runs.
+              // `pr.head.repo` is `null` when the source repo has been
+              // deleted, which we also treat as a skip.
+              if (pr.head.repo == null ||
+                  pr.head.repo.full_name !== pr.base.repo.full_name) {
+                const headRepoName = pr.head.repo
+                  ? pr.head.repo.full_name
+                  : '<deleted>';
+                core.info(`Skipping PR #${pr.number}: head.repo ` +
+                  `"${headRepoName}" != base.repo ` +
+                  `"${pr.base.repo.full_name}" (fork PR).`);
+                continue;
+              }
               // Filter: head.ref MUST start with `agent/` (the bellows
               // branch convention; non-`agent/*` PRs are not auto-merged).
               if (!pr.head.ref.startsWith('agent/')) {
