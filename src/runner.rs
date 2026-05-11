@@ -363,6 +363,18 @@ pub async fn run_once(
             }
             new_notes.push_str(&policy::synthesize_no_new_tests_entry());
             tokio::fs::write(&notes_path, new_notes).await?;
+            // Issue #52 asymmetry audit: this site looks like the
+            // nit-batch shape but does NOT need
+            // `commit_all_and_push_if_advanced`. There is no agent
+            // invocation between the bellows-side `tokio::fs::write`
+            // above and this `commit_all` — bellows is the only writer
+            // and the only committer, so HEAD cannot have advanced
+            // under a different commit message. `commit_all` returns
+            // `Ok(())` whenever the synth write produced staged
+            // content (the bytes are bellows-authored and always
+            // non-empty), and `NoChangesToCommit` only when the synth
+            // bytes were already present byte-for-byte from a prior
+            // run — neither case loses a push.
             match workspace::commit_all(&workspace).await {
                 Ok(()) => workspace::push_branch(&workspace).await?,
                 Err(WorkspaceError::NoChangesToCommit) => {}
@@ -603,21 +615,14 @@ pub async fn run_once(
                 //      did nothing and left no uncommitted edits).
                 //      commit_landed=false.
                 //
-                // Both Ok(()) and NoChangesToCommit are normal
-                // post-invocation outcomes after PR #38; the
-                // commit_all return value is no longer load-bearing
-                // for commit_landed. The agent self-commit case
-                // produces NoChangesToCommit but HEAD has still
-                // advanced, so push is gated on head movement rather
-                // than on which branch of the match we took.
-                match workspace::commit_all(&workspace).await {
-                    Ok(()) | Err(WorkspaceError::NoChangesToCommit) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                let head_after = workspace::head_sha(&workspace).await?;
-                if head_after != head_before {
-                    workspace::push_branch(&workspace).await?;
-                }
+                // commit_all_and_push_if_advanced collapses corners 1
+                // and 2 into a single call: it treats NoChangesToCommit
+                // as a normal post-agent outcome and gates the push on
+                // HEAD movement rather than commit_all's return. Issue
+                // #52 introduced the helper so the nit-batch site
+                // shares the same shape.
+                let head_after =
+                    workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
                 let commit_landed = head_after != head_before
                     && !workspace::diff_between_touches_only_agent_notes(
                         &workspace,
@@ -634,6 +639,25 @@ pub async fn run_once(
             // Nit batch: single permissive invocation, silent skip
             // allowed. Skipped entirely when there are no nits or the
             // budget is spent.
+            //
+            // Issue #52: the nit-batch invocation is just as exposed
+            // to the agent-self-commit shape as the per-finding loop —
+            // if the agent self-commits a nit fix inside the sandbox,
+            // bellows's subsequent commit_all sees nothing to stage and
+            // returns NoChangesToCommit. The legacy
+            // `Ok(()) => push, NoChangesToCommit => {}` shape silently
+            // dropped that commit (HEAD on the local branch had
+            // advanced, but no push happened, so origin lagged). The
+            // end-pipeline cargo-checks gate would then run against a
+            // workspace whose HEAD had diverged from the pushed branch,
+            // producing false-positive FinalTestsRed classifications
+            // (witnessed live on PR #51). We capture head_before and
+            // use the shared `commit_all_and_push_if_advanced` helper
+            // so the per-finding and nit-batch sites are identically
+            // tolerant of either commit shape. Diff-based
+            // classification (commit_landed) is not needed here — the
+            // nit batch does not contribute to address-or-explain
+            // coverage — so we discard `head_after`.
             if !nit_findings.is_empty() && !budget.exceeded {
                 announce(
                     log_writer,
@@ -654,6 +678,7 @@ pub async fn run_once(
                 nit_kickoff.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
                 tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &nit_kickoff)
                     .await?;
+                let head_before = workspace::head_sha(&workspace).await?;
                 let nit_batch_run = sandbox::run_agent(
                     &workspace,
                     &auth,
@@ -667,11 +692,8 @@ pub async fn run_once(
                 if review_fix_exit == 0 && nit_batch_run.exit_code != 0 {
                     review_fix_exit = nit_batch_run.exit_code;
                 }
-                match workspace::commit_all(&workspace).await {
-                    Ok(()) => workspace::push_branch(&workspace).await?,
-                    Err(WorkspaceError::NoChangesToCommit) => {}
-                    Err(e) => return Err(e.into()),
-                }
+                let _ = workspace::commit_all_and_push_if_advanced(&workspace, &head_before)
+                    .await?;
             }
 
             review_fix_outcome = Some(FixOutcome {
@@ -709,6 +731,15 @@ pub async fn run_once(
                 }
                 new_notes.push_str(&synth);
                 tokio::fs::write(&notes_path, new_notes).await?;
+                // Issue #52 asymmetry audit: like the weak-test-guard
+                // synth above, this site is bellows-write-then-bellows-
+                // commit with no intervening agent invocation, so HEAD
+                // cannot move under an agent commit message between
+                // the write and `commit_all`. `commit_all_and_push_if_advanced`
+                // is not needed here — the legacy match-on-result
+                // shape is correct because the only way to reach this
+                // branch is via a bellows-side write that genuinely
+                // produced staged content.
                 match workspace::commit_all(&workspace).await {
                     Ok(()) => workspace::push_branch(&workspace).await?,
                     Err(WorkspaceError::NoChangesToCommit) => {}
