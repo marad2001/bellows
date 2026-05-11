@@ -5,7 +5,7 @@ use bellows::policy::{
     synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection, CheckResult,
     ExitReason, FindingCoverage, GateOutcome, ImplementOutcome, ParsedFinding, PhaseOutcomes,
     ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE,
-    REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    REVIEW_COMMIT_LOG_FILE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -1493,5 +1493,168 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
     assert_eq!(
         classify_exit(true, &outcomes),
         ExitReason::AgentSelfReportedFailure,
+    );
+}
+
+// ---- Issue #40: Tier-2 test-first backstop ----
+
+#[test]
+fn rendered_kickoff_includes_concrete_test_first_commit_shape_instructions() {
+    // Acceptance criterion (brief): "render_kickoff output contains
+    // concrete test-first commit-shape instructions (one failing-test
+    // commit then one make-it-pass commit, per acceptance criterion)."
+    // Concrete commit-shape language, not just "use TDD" — the prior
+    // prompt's high-level skill mention was ignorable. The kickoff must
+    // literally describe the two-commit shape per AC so the implement
+    // agent has no room to interpret "use TDD" as "write code and tests
+    // in one commit".
+    let prompt = render_kickoff(
+        "any brief",
+        "https://github.com/owner/repo",
+        "agent/40-test-first",
+    );
+    let lower = prompt.to_lowercase();
+    assert!(
+        lower.contains("failing-test commit") || lower.contains("failing test commit"),
+        "render_kickoff must explicitly name the failing-test commit: {prompt}"
+    );
+    assert!(
+        lower.contains("make-it-pass commit") || lower.contains("make it pass commit"),
+        "render_kickoff must explicitly name the make-it-pass commit: {prompt}"
+    );
+    assert!(
+        lower.contains("per acceptance criterion")
+            || lower.contains("per acceptance criteria")
+            || lower.contains("each acceptance criterion"),
+        "render_kickoff must scope the two-commit shape to each acceptance criterion: {prompt}"
+    );
+}
+
+#[test]
+fn review_prompt_describes_test_first_violations_tagged_important() {
+    // Acceptance criterion (brief): "REVIEW_PROMPT contains a check
+    // item describing test-first violations (mega-commit, source-before-
+    // test ordering) and tags them with `important`." Both violation
+    // shapes must be named so the reviewer-claude has explicit
+    // categories to flag against, and the severity tag must be the
+    // existing `important` so the per-finding enact loop carries the
+    // finding through with no new plumbing.
+    let lower = REVIEW_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("mega-commit") || lower.contains("mega commit"),
+        "REVIEW_PROMPT must name the mega-commit violation shape: {REVIEW_PROMPT}"
+    );
+    assert!(
+        lower.contains("source-before-test") || lower.contains("source before test"),
+        "REVIEW_PROMPT must name the source-before-test violation shape: {REVIEW_PROMPT}"
+    );
+    assert!(
+        lower.contains("test-first") || lower.contains("test first"),
+        "REVIEW_PROMPT must frame the violations as test-first violations: {REVIEW_PROMPT}"
+    );
+    assert!(
+        REVIEW_PROMPT.contains("important"),
+        "REVIEW_PROMPT must tag test-first violations with the `important` severity: {REVIEW_PROMPT}"
+    );
+}
+
+#[test]
+fn review_prompt_references_the_commit_log_artefact_path() {
+    // Acceptance criterion (brief): the check item must reference "the
+    // new commit-log artefact path." Otherwise the reviewer-claude has
+    // no concrete file to read to reason about commit ordering — it
+    // would have to fall back to guessing from the squashed diff, which
+    // is exactly the gap test-first violations exploit.
+    assert!(
+        REVIEW_PROMPT.contains(REVIEW_COMMIT_LOG_FILE),
+        "REVIEW_PROMPT must reference the commit-log artefact path \
+         `{REVIEW_COMMIT_LOG_FILE}` so the reviewer knows where to read \
+         commit ordering: {REVIEW_PROMPT}"
+    );
+}
+
+#[test]
+fn review_commit_log_file_const_is_a_bellows_internal_dotfile() {
+    // The handoff file must use the `.bellows-` prefix so the
+    // workspace's .git/info/exclude rule (managed by `workspace::prepare`)
+    // keeps it out of `git add -A`. Otherwise the runner would risk
+    // committing the artefact into the PR diff, which the existing
+    // cleanup step exists to prevent.
+    assert!(
+        REVIEW_COMMIT_LOG_FILE.starts_with(".bellows-"),
+        "REVIEW_COMMIT_LOG_FILE must use the `.bellows-` prefix so it \
+         is excluded from commits: {REVIEW_COMMIT_LOG_FILE}"
+    );
+}
+
+#[test]
+fn parse_findings_round_trips_an_important_severity_test_first_finding() {
+    // Acceptance criterion (brief): "parse_findings round-trips an
+    // `important`-severity test-first finding through to the per-finding
+    // enact path with no new plumbing — same parser, same severity
+    // vocabulary, same `## Unaddressed finding: <title>` contract."
+    //
+    // Test-first findings are not a new severity class — they ride on
+    // the existing slice 9.6 plumbing. Pin the round-trip here so a
+    // future "tidy up the severity vocabulary" PR cannot accidentally
+    // shift test-first findings to a custom tag.
+    let text = "\
+## Findings
+
+### 1. tests and implementation landed in a single mega-commit — important
+
+`git log <base>...HEAD` shows one commit `agent: implement and test the foo \
+flow` that touches both `src/foo.rs` and `tests/foo.rs` together. The brief's \
+kickoff requires one failing-test commit then one make-it-pass commit per \
+acceptance criterion; a single combined commit defeats the test-first ordering \
+the kickoff mandates.
+
+**Suggestion:** rewrite history to split the implementation commit from its \
+test commit, OR append an `## Unaddressed finding:` section to agent-notes.md.
+";
+    let result = parse_findings(text);
+    assert!(
+        result.malformed_titles.is_empty(),
+        "test-first finding must parse cleanly: {:?}",
+        result.malformed_titles
+    );
+    assert_eq!(result.findings.len(), 1, "exactly one finding: {:?}", result.findings);
+    let f = &result.findings[0];
+    assert_eq!(f.severity, Severity::Important);
+    assert_eq!(
+        f.title,
+        "tests and implementation landed in a single mega-commit"
+    );
+
+    // Verbatim title round-trip through the per-finding kickoff and
+    // back through the agent-notes parser — the same contract the
+    // existing slice 9.6 plumbing keys on.
+    let kickoff = per_finding_kickoff(f, ".bellows-review-diff.patch", "agent-notes.md");
+    assert!(
+        kickoff.contains(
+            "## Unaddressed finding: tests and implementation landed in a single mega-commit"
+        ),
+        "per-finding kickoff must include the verbatim `## Unaddressed finding:` \
+         header for the test-first finding: {kickoff}"
+    );
+    let notes = format!(
+        "## Unaddressed finding: {}\n\nDeferred to a follow-up PR.\n",
+        f.title
+    );
+    let sections = parse_agent_notes_sections(&notes);
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].title, f.title);
+
+    // Cross-reference through the parser-as-backstop: a finding with
+    // an explanation section in agent-notes.md is NOT a violation.
+    let coverage = vec![FindingCoverage {
+        finding: f.clone(),
+        commit_landed: false,
+    }];
+    let violations = compute_coverage_violations(&coverage, &sections);
+    assert!(
+        violations.is_empty(),
+        "verbatim-title section must close the address-or-explain loop for the \
+         test-first finding: {violations:?}"
     );
 }

@@ -532,6 +532,7 @@ pub async fn run_once(
             "bellows: phase 3/5 — review (claude reads diff, produces findings)",
         );
         workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+        workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
         tokio::fs::write(
             workspace.path().join(".bellows-kickoff.md"),
             policy::REVIEW_PROMPT,
@@ -1389,7 +1390,11 @@ impl WallClockBudget {
 async fn cleanup_phase_handoff_files(
     workspace: &workspace::Workspace,
 ) -> Result<(), std::io::Error> {
-    for name in [policy::REVIEW_DIFF_FILE, policy::REVIEW_FINDINGS_FILE] {
+    for name in [
+        policy::REVIEW_DIFF_FILE,
+        policy::REVIEW_FINDINGS_FILE,
+        policy::REVIEW_COMMIT_LOG_FILE,
+    ] {
         let path = workspace.path().join(name);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
@@ -2145,5 +2150,79 @@ mod tests {
         assert!(body.contains("### Agent output tail"));
         assert!(body.contains("stuck on something"));
         assert!(!body.contains("### `cargo test` output"));
+    }
+
+    // ---- Issue #40: cleanup of the test-first commit-log artefact ----
+
+    #[tokio::test]
+    async fn cleanup_phase_handoff_files_removes_review_commit_log_artefact() {
+        // Acceptance criterion (brief): "The runner writes the
+        // commit-log artefact alongside the diff artefact before the
+        // review phase and cleans it up before the final `commit_all`
+        // so it does not land in the PR diff."
+        //
+        // The existing `cleanup_phase_handoff_files` already removes
+        // REVIEW_DIFF_FILE and REVIEW_FINDINGS_FILE; this test pins
+        // that the new REVIEW_COMMIT_LOG_FILE is also swept by the
+        // same helper. Without this guarantee the file would survive
+        // through to `commit_all` and ship in the PR diff — exactly
+        // what the cleanup step exists to prevent (mirrors the
+        // existing contract for the other two handoff files).
+        let remote_dir = tempfile::TempDir::new().unwrap();
+        // Initialise a tiny git repo to act as the "remote" for prepare().
+        for args in &[
+            &["init"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(*args)
+                .current_dir(remote_dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(remote_dir.path().join("README.md"), "test\n").unwrap();
+        for args in &[&["add", "."][..], &["commit", "-m", "initial"][..]] {
+            let status = std::process::Command::new("git")
+                .args(*args)
+                .current_dir(remote_dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        let workspace = workspace::prepare(&remote_url, "agent/40-cleanup")
+            .await
+            .unwrap();
+
+        // Write all three handoff files; cleanup must remove every one.
+        for name in &[
+            policy::REVIEW_DIFF_FILE,
+            policy::REVIEW_FINDINGS_FILE,
+            policy::REVIEW_COMMIT_LOG_FILE,
+        ] {
+            tokio::fs::write(workspace.path().join(name), b"handoff\n")
+                .await
+                .unwrap();
+            assert!(
+                workspace.path().join(name).exists(),
+                "pre-cleanup: {name} must exist",
+            );
+        }
+
+        cleanup_phase_handoff_files(&workspace).await.unwrap();
+
+        for name in &[
+            policy::REVIEW_DIFF_FILE,
+            policy::REVIEW_FINDINGS_FILE,
+            policy::REVIEW_COMMIT_LOG_FILE,
+        ] {
+            assert!(
+                !workspace.path().join(name).exists(),
+                "post-cleanup: {name} must have been removed",
+            );
+        }
     }
 }
