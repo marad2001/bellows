@@ -133,7 +133,7 @@ async fn triage_one_cmd(
         Err(e) => Err(anyhow!(
             "bellows triage: issue #{} failed: {}",
             issue,
-            e,
+            e
         )),
     }
 }
