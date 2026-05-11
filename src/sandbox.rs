@@ -832,7 +832,7 @@ fn build_cache_mounts(repo_slug: &str) -> Vec<Mount> {
 ///
 /// The names inside `deploy_keys` are not consulted here; they're
 /// resolved against the volume's filesystem at startup
-/// (`validate_deploy_keys_exist`), where a missing key short-circuits
+/// (`validate_deploy_keys`), where a missing key short-circuits
 /// the run with a clear error. This function only decides "mount or
 /// no mount" based on whether the list is empty.
 fn build_ssh_keys_mount(ssh_keys_volume: &str, deploy_keys: &[String]) -> Option<Mount> {
