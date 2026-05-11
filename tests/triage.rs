@@ -29,6 +29,7 @@ fn issue(number: u64, title: &str) -> Issue {
         number,
         title: title.to_string(),
         labels: vec![],
+        created_at: None,
     }
 }
 

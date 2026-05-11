@@ -11,7 +11,7 @@ use std::io::Cursor;
 use std::str::FromStr;
 
 use bellows::config::Config;
-use bellows::runner::{run_once, RunOutcome};
+use bellows::runner::{run_once, RunError, RunOutcome};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -167,5 +167,184 @@ async fn run_once_returns_blocked_fail_closed_when_list_prs_call_fails() {
             "fail-closed Blocked has empty pr_numbers, got {pr_numbers:?}",
         ),
         other => panic!("expected Blocked (fail-closed), got {other:?}"),
+    }
+}
+
+// ---- Issue #35: multi-repo polling. Oldest-by-`created_at` across all
+//      configured repos is claimed first. ----
+
+#[tokio::test]
+async fn run_once_picks_oldest_issue_across_multiple_repos_by_created_at() {
+    // Issue #35 acceptance criterion: with two `[[repo]]` entries
+    // configured and one open `ready-for-agent` issue in each (different
+    // `created_at`), the OLDER issue is claimed first regardless of
+    // `[[repo]]` ordering. We assert this by stubbing the issues
+    // endpoint on each repo and observing which issue the runner
+    // attempts to fetch the agent brief for next — `MissingAgentBrief`
+    // surfaces the chosen issue number without driving the rest of the
+    // pipeline (no Docker, no clone, no claim PATCH).
+    //
+    // repo-a's issue was created EARLIER than repo-b's, so repo-a's
+    // issue #10 must be selected even though repo-b appears first in
+    // the config. Pinning the cross-repo tiebreak this way catches
+    // an implementation that defaulted to "first repo's first issue"
+    // instead of computing the global oldest.
+    let mock = MockServer::start().await;
+
+    // Both repos cleared on the pre-claim PR check.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // repo-a has the older issue (#10, 2026-01-01).
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 10,
+                "title": "older issue from repo-a",
+                "created_at": "2026-01-01T00:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // repo-b has the newer issue (#20, 2026-02-01). It must NOT be the
+    // chosen issue this tick — selection is global-oldest, not first
+    // repo wins.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 20,
+                "title": "newer issue from repo-b",
+                "created_at": "2026-02-01T00:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // Agent-brief comments endpoint returns empty for the chosen issue
+    // so the runner surfaces `MissingAgentBrief(N)` and short-circuits
+    // BEFORE touching the workspace, sandbox, or claim path. The N we
+    // see in the error proves which issue the runner picked.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/issues/10/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let toml = format!(
+        r#"
+[[repo]]
+url = "{base}/owner-x/repo-b"
+
+[[repo]]
+url = "{base}/owner-x/repo-a"
+
+[github]
+pat_env_var = "BELLOWS_TEST_PAT"
+"#,
+        base = mock.uri(),
+    );
+    let config = Config::from_str(&toml).expect("multi-repo config parses");
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None).await;
+
+    match outcome {
+        Err(RunError::MissingAgentBrief(n)) => assert_eq!(
+            n, 10,
+            "oldest issue across repos should be picked (#10 in repo-a, created 2026-01-01); got #{n}",
+        ),
+        other => panic!(
+            "expected MissingAgentBrief(10) — the oldest issue's brief is missing — got {other:?}",
+        ),
+    }
+}
+
+#[tokio::test]
+async fn run_once_only_blocks_when_every_configured_repo_is_blocked() {
+    // Issue #35 nuance: per-repo pre-claim check. Repo A being blocked
+    // by its own open `agent/*` PR must NOT block claims from repo B.
+    // The cross-repo invariant is concurrency=1, which the polling loop
+    // maintains by being serial. Verifying this avoids regressing into
+    // a "block everything if any repo is blocked" behaviour that would
+    // stall multi-repo deployments whenever any one repo's CI is slow.
+    let mock = MockServer::start().await;
+
+    // repo-a is blocked by its own open agent PR.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // repo-b is clear.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // repo-b has a ready-for-agent issue #50.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 50,
+                "title": "unblocked issue from repo-b",
+                "created_at": "2026-03-01T00:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // Brief missing on #50 -> short-circuit at MissingAgentBrief(50)
+    // proves repo-b's issue was picked despite repo-a being blocked.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues/50/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let toml = format!(
+        r#"
+[[repo]]
+url = "{base}/owner-x/repo-a"
+
+[[repo]]
+url = "{base}/owner-x/repo-b"
+
+[github]
+pat_env_var = "BELLOWS_TEST_PAT"
+"#,
+        base = mock.uri(),
+    );
+    let config = Config::from_str(&toml).expect("multi-repo config parses");
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None).await;
+
+    match outcome {
+        Err(RunError::MissingAgentBrief(n)) => assert_eq!(
+            n, 50,
+            "repo-b's unblocked issue should be selected even when repo-a is blocked",
+        ),
+        other => panic!(
+            "expected MissingAgentBrief(50) (repo-b's issue), got {other:?}",
+        ),
     }
 }

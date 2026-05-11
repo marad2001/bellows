@@ -305,6 +305,7 @@ pub async fn run_agent(
     workspace: &Workspace,
     auth: &Auth,
     issue_number: u64,
+    repo: &str,
     repo_slug: &str,
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
@@ -319,7 +320,7 @@ pub async fn run_agent(
     // bind-mount handler rejects, so we use the path as-is.
     let workspace_path = workspace.path().to_string_lossy().to_string();
 
-    let labels = build_managed_labels(&run_id, issue_number, None);
+    let labels = build_managed_labels(&run_id, issue_number, repo, None);
 
     let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
     env.extend(auth.extra_env());
@@ -405,6 +406,7 @@ pub struct CargoChecksRun {
 pub async fn run_cargo_checks(
     workspace: &Workspace,
     issue_number: u64,
+    repo: &str,
     repo_slug: &str,
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
@@ -416,7 +418,7 @@ pub async fn run_cargo_checks(
 
     let workspace_path = workspace.path().to_string_lossy().to_string();
 
-    let labels = build_managed_labels(&run_id, issue_number, Some("cargo-checks-gate"));
+    let labels = build_managed_labels(&run_id, issue_number, repo, Some("cargo-checks-gate"));
 
     let mut mounts = vec![Mount {
         target: Some("/workspace".to_string()),
@@ -660,15 +662,17 @@ fn labelled_volume_mount(target: &str, source: &str, labels: HashMap<String, Str
 /// out of the inline body in `run_agent` / `run_cargo_checks` so the
 /// label shape is unit-testable without spinning up Docker.
 ///
-/// Always sets `bellows-managed=true`, `bellows-run-id=<run_id>`, and
-/// `bellows-issue-number=<issue_number>`. Optionally sets
-/// `bellows-purpose=<purpose>` when `purpose` is `Some` (the
-/// cargo-checks-gate uses this to distinguish itself from the agent
-/// run; `bellows kill <N>` uses `bellows-issue-number` to find either
-/// kind via a server-side label filter).
+/// Always sets `bellows-managed=true`, `bellows-run-id=<run_id>`,
+/// `bellows-issue-number=<issue_number>`, and `bellows-repo=<owner>/<name>`.
+/// The `bellows-repo` label was added in issue #35 so the kill path can
+/// disambiguate cross-repo issue-number collisions (issue #42 in repo A
+/// vs issue #42 in repo B). Optionally sets `bellows-purpose=<purpose>`
+/// when `purpose` is `Some` (the cargo-checks-gate uses this to
+/// distinguish itself from the agent run).
 fn build_managed_labels(
     run_id: &str,
     issue_number: u64,
+    repo: &str,
     purpose: Option<&str>,
 ) -> HashMap<String, String> {
     let mut labels = HashMap::new();
@@ -678,6 +682,7 @@ fn build_managed_labels(
         "bellows-issue-number".to_string(),
         issue_number.to_string(),
     );
+    labels.insert("bellows-repo".to_string(), repo.to_string());
     if let Some(p) = purpose {
         labels.insert("bellows-purpose".to_string(), p.to_string());
     }
@@ -685,17 +690,24 @@ fn build_managed_labels(
 }
 
 /// Build the bollard list-containers label filter for finding the
-/// container associated with a specific issue. Used by
-/// `find_containers_for_issue` to locate the running agent or
-/// cargo-checks container so `bellows kill <N>` can force-remove it.
-/// Pulled out as a pure function so the filter shape is unit-testable
-/// without docker.
-fn build_issue_container_filter(issue_number: u64) -> HashMap<String, Vec<String>> {
+/// container associated with a specific issue in a specific repo. Used
+/// by `find_containers_for_issue` to locate the running agent or
+/// cargo-checks container so `bellows kill <repo>/<N>` can force-remove
+/// it. Pulled out as a pure function so the filter shape is
+/// unit-testable without docker.
+///
+/// Filters on both `bellows-repo=<owner>/<name>` AND
+/// `bellows-issue-number=<N>` so cross-repo issue-number collisions are
+/// disambiguated (the operator who targets repo B's `#42` does not
+/// accidentally remove repo A's `#42` container). The brief calls this
+/// out explicitly as an issue #35 acceptance criterion.
+fn build_issue_container_filter(repo: &str, issue_number: u64) -> HashMap<String, Vec<String>> {
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
     filters.insert(
         "label".to_string(),
         vec![
             "bellows-managed=true".to_string(),
+            format!("bellows-repo={}", repo),
             format!("bellows-issue-number={}", issue_number),
         ],
     );
@@ -721,9 +733,10 @@ fn build_issue_container_filter(issue_number: u64) -> HashMap<String, Vec<String
 /// mirroring the slice-7 orphan-cleanup pattern.
 pub async fn find_containers_for_issue(
     docker: &Docker,
+    repo: &str,
     issue_number: u64,
 ) -> Result<Vec<String>, SandboxError> {
-    let filters = build_issue_container_filter(issue_number);
+    let filters = build_issue_container_filter(repo, issue_number);
     let options = ListContainersOptionsBuilder::default()
         .all(true)
         .filters(&filters)
@@ -1144,7 +1157,7 @@ mod tests {
         // `bellows-issue-number=<N>` so `bellows kill <N>` can find it
         // via a server-side label filter. The agent run carries no
         // `bellows-purpose`; the cargo-checks-gate does.
-        let labels = build_managed_labels("run-uuid-here", 42, None);
+        let labels = build_managed_labels("run-uuid-here", 42, "marad2001/test-repo", None);
         assert_eq!(labels.get("bellows-managed").map(String::as_str), Some("true"));
         assert_eq!(
             labels.get("bellows-run-id").map(String::as_str),
@@ -1164,7 +1177,7 @@ mod tests {
     #[test]
     fn build_managed_labels_for_cargo_checks_includes_purpose() {
         let labels =
-            build_managed_labels("run-uuid", 42, Some("cargo-checks-gate"));
+            build_managed_labels("run-uuid", 42, "marad2001/test-repo", Some("cargo-checks-gate"));
         assert_eq!(
             labels.get("bellows-issue-number").map(String::as_str),
             Some("42"),
@@ -1172,6 +1185,34 @@ mod tests {
         assert_eq!(
             labels.get("bellows-purpose").map(String::as_str),
             Some("cargo-checks-gate"),
+        );
+    }
+
+    #[test]
+    fn build_managed_labels_includes_bellows_repo_label_for_cross_repo_disambiguation() {
+        // Issue #35 acceptance criterion: every spawned container must
+        // carry `bellows-repo=<owner>/<name>` so the kill path can tell
+        // repo A's issue #42 from repo B's issue #42. Pin both the agent
+        // and cargo-checks shapes — the label is in the SAME position on
+        // both kinds of container because the kill filter doesn't care
+        // which one it's looking at.
+        let agent = build_managed_labels("run-uuid", 42, "marad2001/repo-a", None);
+        assert_eq!(
+            agent.get("bellows-repo").map(String::as_str),
+            Some("marad2001/repo-a"),
+            "agent run container must carry bellows-repo=<owner>/<name>",
+        );
+
+        let gate = build_managed_labels(
+            "run-uuid",
+            42,
+            "marad2001/repo-b",
+            Some("cargo-checks-gate"),
+        );
+        assert_eq!(
+            gate.get("bellows-repo").map(String::as_str),
+            Some("marad2001/repo-b"),
+            "cargo-checks-gate container must carry bellows-repo=<owner>/<name>",
         );
     }
 
@@ -1381,11 +1422,13 @@ mod tests {
     }
 
     #[test]
-    fn build_issue_container_filter_uses_managed_and_issue_number() {
+    fn build_issue_container_filter_uses_managed_repo_and_issue_number() {
         // Used by find_containers_for_issue. The filter must restrict to
-        // bellows-managed containers AND scope to the requested issue
-        // number — otherwise a kill could hit the wrong run.
-        let filter = build_issue_container_filter(42);
+        // bellows-managed containers AND scope to BOTH the repo and the
+        // requested issue number — otherwise a kill in a multi-repo
+        // config could remove the wrong repo's container when issue
+        // numbers collide. Issue #35 acceptance criterion.
+        let filter = build_issue_container_filter("marad2001/test-repo", 42);
         let label_values = filter.get("label").expect("label key required");
         assert!(
             label_values.iter().any(|v| v == "bellows-managed=true"),
@@ -1393,9 +1436,31 @@ mod tests {
             label_values,
         );
         assert!(
+            label_values
+                .iter()
+                .any(|v| v == "bellows-repo=marad2001/test-repo"),
+            "filter must include bellows-repo=<owner>/<name>: {:?}",
+            label_values,
+        );
+        assert!(
             label_values.iter().any(|v| v == "bellows-issue-number=42"),
             "filter must include bellows-issue-number=N: {:?}",
             label_values,
         );
+    }
+
+    #[test]
+    fn build_issue_container_filter_distinguishes_same_issue_number_across_repos() {
+        // The cross-repo collision case the new filter is designed to
+        // prevent: issue #42 in repo A vs issue #42 in repo B. The filter
+        // values must differ on the bellows-repo predicate even when the
+        // issue number is identical.
+        let filter_a = build_issue_container_filter("marad2001/repo-a", 42);
+        let filter_b = build_issue_container_filter("marad2001/repo-b", 42);
+        let labels_a = filter_a.get("label").unwrap();
+        let labels_b = filter_b.get("label").unwrap();
+        assert!(labels_a.iter().any(|v| v == "bellows-repo=marad2001/repo-a"));
+        assert!(labels_b.iter().any(|v| v == "bellows-repo=marad2001/repo-b"));
+        assert_ne!(labels_a, labels_b);
     }
 }

@@ -137,21 +137,25 @@ fn readme_enumerates_all_canonical_labels() {
 #[test]
 fn readme_documents_v1_scope_in_and_out() {
     let body = read_readme();
-    // Brief 9: two short lists, in-v1 vs not-in-v1.
-    // In: single repo, single in-flight issue, subscription, headless
-    // Claude Code in docker, clippy + cargo test gate, automated code
-    // review + fix loop, draft-PR-on-failure, GitHub label state
-    // machine.
-    // Out: multi-repo, multi-host, parallelism, sccache / build
-    // caches, web dashboard, push notifications, auto-retry, GitHub
-    // App auth, per-repo policy, cost/token tracking, automated
-    // triage (#21/#22), security review (#20).
+    // Brief 9 + issue #35: two short lists, in-v1 vs not-in-v1.
+    // In: multi-repo polling (#35 moved this from Not-in-v1 to
+    // In-v1), single in-flight issue, subscription, headless Claude
+    // Code in docker, clippy + cargo test gate, automated code review
+    // + fix loop, draft-PR-on-failure, GitHub label state machine.
+    // Out: multi-host, parallelism, sccache / build caches, web
+    // dashboard, push notifications, auto-retry, GitHub App auth,
+    // per-repo policy, cost/token tracking, security review (#20).
+    //
+    // Note: `multi-repo` continues to be required as a README
+    // substring because the README now documents the multi-repo
+    // capability under In-v1 (and links to the kill-syntax change);
+    // we just no longer require it to live under Not-in-v1.
     assert_contains_all(
         &body,
         &[
             "## v1 scope",
             "### In v1",
-            "single repo",
+            "multi-repo",
             "single in-flight issue",
             "subscription",
             "headless",
@@ -159,7 +163,6 @@ fn readme_documents_v1_scope_in_and_out() {
             "draft PR",
             "label state machine",
             "### Not in v1",
-            "multi-repo",
             "parallel",
             "sccache",
             "web dashboard",

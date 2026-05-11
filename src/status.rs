@@ -459,12 +459,12 @@ pub fn summarise(status: Option<&Status>, pid_alive: bool) -> String {
                     s.started_at.to_rfc3339(),
                 ),
                 Some(c) => format!(
-                    "bellows is running (PID {}, started at {}), currently busy on issue #{} (\"{}\") in {}, claimed at {}.",
+                    "bellows is running (PID {}, started at {}), currently busy on {}#{} (\"{}\"), claimed at {}.",
                     s.pid,
                     s.started_at.to_rfc3339(),
+                    c.repo,
                     c.issue_number,
                     c.issue_title,
-                    c.repo,
                     c.claimed_at.to_rfc3339(),
                 ),
             }
@@ -717,11 +717,30 @@ mod tests {
         let s = summarise(Some(&st), true);
         assert!(s.contains("bellows is running"), "{}", s);
         assert!(s.contains("PID 12345"), "{}", s);
-        assert!(s.contains("issue #9"), "{}", s);
+        // Issue #35 multi-repo polling: the busy line surfaces the
+        // `<owner>/<name>#<issue>` form so an operator running
+        // `bellows status` can tell at a glance which repo bellows is
+        // currently working on. Plain `issue #9` would be ambiguous in
+        // a multi-repo config.
         assert!(s.contains("Smoke test: ..."), "{}", s);
         assert!(s.contains("marad2001/bellows-test"), "{}", s);
         assert!(s.contains("2026-05-10T15:02:00"), "{}", s);
         assert!(!s.contains("currently idle"), "{}", s);
+    }
+
+    #[test]
+    fn summarise_busy_line_uses_owner_repo_hash_issue_format() {
+        // Issue #35 acceptance criterion: bellows status busy-line
+        // includes `<owner>/<name>#<issue>` so the report is
+        // unambiguous in multi-repo configs. The brief specifically
+        // calls out this format; pin the substring so a reformat
+        // can't silently regress to the slice-9 wording.
+        let st = sample_status();
+        let s = summarise(Some(&st), true);
+        assert!(
+            s.contains("marad2001/bellows-test#9"),
+            "busy line must include <owner>/<name>#<issue>: {s}",
+        );
     }
 
     #[test]

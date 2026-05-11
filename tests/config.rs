@@ -13,7 +13,12 @@ pat_env_var = "GITHUB_TOKEN"
 #[test]
 fn parses_minimal_orchestrator_toml() {
     let config = Config::from_str(MINIMAL_CONFIG).expect("minimal config should parse");
-    assert_eq!(config.repo.url, "https://github.com/marad2001/bellows");
+    // Issue #35 multi-repo polling: the legacy `[repo].url` form is
+    // normalised into a one-element `repos` list. Both shapes feed
+    // into `config.repos` so downstream callers don't branch on the
+    // wire shape.
+    assert_eq!(config.repos.len(), 1);
+    assert_eq!(config.repos[0].url, "https://github.com/marad2001/bellows");
     assert_eq!(config.github.pat_env_var, "GITHUB_TOKEN");
 }
 
@@ -119,6 +124,80 @@ wall_clock_minutes = 0
     assert!(
         result.is_err(),
         "expected wall_clock_minutes = 0 to fail parsing, got {:?}",
+        result.as_ref().map(|_| "Ok"),
+    );
+}
+
+// ---- Issue #35: multi-repo polling config shape ----
+
+#[test]
+fn parses_multi_repo_array_of_tables_form() {
+    // Issue #35 acceptance criterion (a): a `[[repo]]` array-of-tables
+    // config parses into `config.repos` with one element per `[[repo]]`
+    // entry, in the order they appeared in the file. Order matters
+    // because backward-compat callers (e.g. `bellows triage`) default
+    // to the first configured repo.
+    let config_text = r#"
+[[repo]]
+url = "https://github.com/marad2001/repo-a"
+
+[[repo]]
+url = "https://github.com/marad2001/repo-b"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let config = Config::from_str(config_text).expect("multi-repo config should parse");
+    assert_eq!(
+        config.repos.len(),
+        2,
+        "expected exactly two configured repos, got {:?}",
+        config.repos.iter().map(|r| &r.url).collect::<Vec<_>>(),
+    );
+    assert_eq!(config.repos[0].url, "https://github.com/marad2001/repo-a");
+    assert_eq!(config.repos[1].url, "https://github.com/marad2001/repo-b");
+}
+
+#[test]
+fn existing_single_repo_table_form_continues_to_parse_as_one_element_list() {
+    // Issue #35 acceptance criterion (b): the legacy `[repo]\nurl = ...`
+    // form must continue to parse so existing operator
+    // `orchestrator.toml` files keep working after the multi-repo slice
+    // lands. The shape is normalised into a one-element `repos` list
+    // so downstream code can iterate uniformly.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows-test"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let config = Config::from_str(config_text).expect("legacy single-repo config must parse");
+    assert_eq!(config.repos.len(), 1);
+    assert_eq!(
+        config.repos[0].url,
+        "https://github.com/marad2001/bellows-test",
+    );
+}
+
+#[test]
+fn empty_repo_list_rejected_at_parse_time() {
+    // Issue #35 acceptance criterion (c): a config with no [[repo]]
+    // entry at all must be rejected at parse time. An empty repo list
+    // would silently produce an Idle polling loop forever, which is
+    // never what the operator meant — clearly an error.
+    //
+    // We exercise this by omitting the `[repo]` / `[[repo]]` table
+    // entirely; an empty array-of-tables (`[[repo]]` with no body) is
+    // not expressible in TOML, but a *missing* table is.
+    let config_text = r#"
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let result = Config::from_str(config_text);
+    assert!(
+        result.is_err(),
+        "config with no repos must be rejected at parse time, got {:?}",
         result.as_ref().map(|_| "Ok"),
     );
 }

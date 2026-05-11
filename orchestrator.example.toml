@@ -4,13 +4,37 @@
 # your environment. The real `orchestrator.toml` is gitignored so you can
 # keep deployment-specific values out of source control.
 
-[repo]
-# The GitHub repository Bellows will poll for `ready-for-agent` issues.
+# Repos to poll. Two shapes are accepted; pick whichever fits your setup.
+#
+# ── Shape A: single repo (legacy `[repo]` table form) ──────────────
+#
+# [repo]
+# url = "https://github.com/marad2001/bellows-test"
+#
+# ── Shape B: multiple repos (`[[repo]]` array-of-tables form, added
+#    by issue #35) ────────────────────────────────────────────────
+#
+# One `[[repo]]` block per repo. The polling loop walks every entry on
+# each tick and claims the OLDEST `ready-for-agent` issue across the
+# combined set (by GitHub `created_at`). Concurrency stays at 1
+# regardless of how many repos are configured — bellows still runs at
+# most one agent container at a time.
+#
+# The example below shows the array-of-tables shape; pick this one if
+# you intend to poll more than one repo. Drop down to the single
+# `[repo]` form above if you only have one.
+
+[[repo]]
 url = "https://github.com/marad2001/bellows-test"
+
+# [[repo]]
+# url = "https://github.com/marad2001/another-repo"
 
 [github]
 # Name of the environment variable holding your fine-grained PAT.
 # The PAT needs: Issues: write, Pull requests: write, Contents: write.
+# A single PAT is shared across every configured repo — per-repo
+# credentials are out of scope for issue #35.
 pat_env_var = "BELLOWS_GITHUB_TOKEN"
 
 # All sections below are optional; defaults shown are what you get if
@@ -40,6 +64,8 @@ path = "bellows.log"
 # review, review-fix, end-pipeline gate); when the budget is spent or
 # the deadline fires mid-container, the run halts and routes to a
 # draft PR with the `agent-failed` label. Default: 60 minutes.
+# Single global cap shared across every configured repo (per-repo
+# overrides are out of scope for issue #35).
 wall_clock_minutes = 60
 # Issue-label that short-circuits the slice-8 weak-test guard. The
 # guard scans `git diff <base>...HEAD` after the implement phase and

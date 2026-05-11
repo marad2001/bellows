@@ -14,7 +14,7 @@ So the work the agent does on my behalf needs a dedicated piece of plumbing that
 
 ## Solution
 
-Bellows is a Rust orchestrator that runs on my laptop while it's open, polling one configured GitHub repo every 30–60 seconds for `ready-for-agent` issues. When it finds one:
+Bellows is a Rust orchestrator that runs on my laptop while it's open, polling one or more configured GitHub repos every 30–60 seconds for `ready-for-agent` issues. On each tick it walks every configured repo and claims the oldest such issue across the combined set (issue #35 moved multi-repo into v1 scope; the legacy single-`[repo]` table form still parses). Concurrency stays hard-coded to 1 regardless of how many repos are configured. When it finds an issue:
 
 1. **Claim.** Atomic label-swap: remove `ready-for-agent`, add `agent-in-progress`. The poll query is `label = ready-for-agent AND label != agent-in-progress`, so the swap is re-entrant-safe.
 2. **Workspace.** Fresh `git clone` into a temp dir. New branch `agent/{issue-number}-{slug}` off the default branch.
@@ -84,7 +84,7 @@ I wake up to a list of PRs — passing ones ready to merge, failing ones with th
 49. As the developer reviewing the agent's PR, I want to see which acceptance criterion each new test maps to so that I can verify the brief was actually satisfied (delivered via the agent's PR description, written by Claude Code, not Bellows).
 50. As the developer reviewing the agent's PR, I want the PR description to summarise what the agent attempted, what worked, and what didn't so that I can decide quickly whether to merge, request changes, or close.
 51. As the developer reviewing the agent's PR, I want failure PRs to include the last 100 lines of stderr and the full final `cargo test` output in the log comment so that I have the same diagnostic surface I'd have if I'd run it myself.
-52. As the developer, I want Bellows to support exactly one repo in v1 (config field present for multiple, only the first is read) so that v1 stays small but the v2 path is obvious.
+52. As the developer, I want Bellows to support one or more configured repos in v1 (single `[repo]` table or `[[repo]]` array-of-tables; the polling loop picks the oldest `ready-for-agent` issue across the combined set) so that one bellows process can drive multiple repos from the same laptop. Concurrency stays at 1 across all repos.
 53. As the developer, I want VPS deployment, webhooks, concurrency > 1, API-key auth, `sccache`, auto-prune, dashboards, notifications, auto-retry, GitHub App auth, per-repo policy overrides, cost tracking, and observability beyond log files all explicitly out of scope for v1 so that scope creep doesn't kill the project.
 54. As the developer, I want the cold-cache cost of the first run on a new repo documented as a known limitation so that I don't mistake a 90-minute first run for a bug.
 55. As the developer, I want Bellows's TOS posture (concurrency=1, personal subscription use) documented so that I understand the fallback (API mode via the auth enum) if Anthropic tightens the rules.
@@ -187,7 +187,6 @@ I wake up to a list of PRs — passing ones ready to merge, failing ones with th
 
 The following are explicitly **not** in v1. Each is additive on the v1 architecture and will land in a later milestone:
 
-- **Multi-repo support.** Config field present, only the first repo read.
 - **VPS deployment / true 24/7 AFK.** v1 runs on the laptop with the lid open.
 - **Webhooks.** Polling only.
 - **Concurrency > 1.** Hard-coded to 1.

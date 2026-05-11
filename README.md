@@ -79,8 +79,15 @@ $EDITOR orchestrator.toml
 
 Sections of `orchestrator.toml`, all of which are read at startup:
 
-- **`[repo].url`** — the GitHub repository bellows polls. Single-repo
-  in v1; the field accepts one URL.
+- **`[repo].url`** or **`[[repo]]` array-of-tables** — the GitHub
+  repositories bellows polls. A single `[repo]` table with one `url`
+  configures one repo (the legacy single-repo shape, still accepted
+  unchanged). A `[[repo]]` array-of-tables block with one entry per
+  repo configures many — the polling loop walks every configured
+  repo on each tick and claims the oldest `ready-for-agent` issue
+  across the combined set. Concurrency stays at 1 across all repos
+  (one agent run at a time, regardless of how many repos are
+  configured).
 - **`[github].pat_env_var`** — the name of the environment variable
   bellows will read your PAT from. Defaults to `BELLOWS_GITHUB_TOKEN`.
   Renaming this is purely cosmetic; bellows never reads the token from
@@ -271,16 +278,11 @@ running orchestrator keeps fresh — no IPC needed. Useful from a
 second terminal when you don't want to grep `bellows.log` to figure
 out whether bellows is alive.
 
-### `bellows kill <issue>` — abort an in-flight run
-
-> ⚠️ **Planned — not yet shipped.** Tracked in
-> [issue #9 (slice 10)](https://github.com/marad2001/bellows/issues/9).
-> Until that lands, abort an in-flight run by Ctrl-C-ing `bellows run`;
-> slice 7's orphan cleanup catches the leftover container at the next
-> startup. You'll need to manually re-label the issue back to
-> `ready-for-agent` to retry.
+### `bellows kill <repo>/<issue>` — abort an in-flight run
 
 ```bash
+bellows kill marad2001/my-repo/42
+# or, with a single-repo orchestrator.toml:
 bellows kill 42
 ```
 
@@ -290,6 +292,14 @@ opens a draft PR with the logs as a `<details>` comment, and
 transitions the issue's label to `agent-cancelled`. Use it when you
 realise an issue brief was wrong, or when an agent has clearly stuck
 itself and burning the rest of the wall-clock budget won't help.
+
+The `<owner>/<name>/<issue>` form is the explicit shape (issue #35
+multi-repo polling). The bare `<issue>` form continues to work when
+exactly one `[[repo]]` is configured; with multiple repos it refuses
+with a clear error rather than guessing which repo you meant. The
+container lookup filters on `bellows-repo=<owner>/<name>` AND
+`bellows-issue-number=<N>`, so repo A's `#42` and repo B's `#42` are
+never confused.
 
 ### `bellows refresh-auth` — re-seed expired OAuth tokens
 
@@ -492,7 +502,11 @@ chip away at them.
 
 ### In v1
 
-- single repo (one URL in `[repo]`);
+- multi-repo polling (one `[repo]` table OR a `[[repo]]`
+  array-of-tables with one entry per repo) — every poll tick walks
+  all configured repos and claims the oldest `ready-for-agent` issue
+  across the combined set. Concurrency stays at 1 regardless of how
+  many repos are configured;
 - single in-flight issue at any moment (concurrency=1, hard-coded);
 - subscription auth via Anthropic personal subscription, OAuth in a
   Docker volume;
@@ -514,7 +528,6 @@ chip away at them.
 
 ### Not in v1
 
-- multi-repo (the config field exists, only the first repo is read);
 - multi-host orchestration / true 24/7 AFK from a VPS;
 - parallelism / concurrent issues (concurrency stays at 1);
 - `sccache` integration — bellows already mounts per-repo `target/`
