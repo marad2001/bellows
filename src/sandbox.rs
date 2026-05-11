@@ -261,10 +261,15 @@ pub async fn list_deploy_keys_in_volume(
             status: format!("{}", output.status),
         });
     }
+    // Filter the volume's own metadata files (`config`, `known_hosts`)
+    // out of the present-set so the validator and the operator-facing
+    // `setup-deploy-keys list` agree on what counts as a key. Without
+    // this, `[[repo]] deploy_keys = ["config"]` would validate falsely
+    // and then mount-shadow the config file at container startup.
     let present = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && l != "config" && l != "known_hosts")
         .collect();
     Ok(present)
 }
