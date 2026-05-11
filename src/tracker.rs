@@ -26,6 +26,15 @@ pub struct Issue {
     pub title: String,
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// GitHub's `created_at` timestamp for the issue. Used by the
+    /// multi-repo polling loop (issue #35) to break ties across repos
+    /// — the oldest-by-created_at issue across all configured repos is
+    /// claimed first. Optional in the deserializer so existing tests
+    /// and any future caller that only cares about
+    /// `number`/`title`/`labels` keep parsing minimal payloads; real
+    /// GitHub responses always include the field.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Read-only bundle of issue state the triage agent sees in

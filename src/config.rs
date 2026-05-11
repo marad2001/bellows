@@ -3,19 +3,26 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("toml: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("[[repo]] list must not be empty; configure at least one repo")]
+    EmptyRepoList,
+}
+
+#[derive(Debug)]
 pub struct Config {
-    pub repo: RepoConfig,
+    /// Configured repos to poll. May have one element (legacy `[repo]`
+    /// table form) or many (the slice `[[repo]]` array-of-tables form
+    /// added by issue #35). Always non-empty — `FromStr` rejects an
+    /// empty list at parse time.
+    pub repos: Vec<RepoConfig>,
     pub github: GithubConfig,
-    #[serde(default)]
     pub polling: PollingConfig,
-    #[serde(default)]
     pub runtime_labels: RuntimeLabelsConfig,
-    #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(default)]
     pub auth: AuthConfig,
-    #[serde(default)]
     pub agent: AgentConfig,
 }
 
@@ -182,10 +189,59 @@ fn default_weak_test_guard_skip_label() -> String {
     "refactor".to_string()
 }
 
+/// Wire-shape used only at deserialize time. The `repo` key accepts
+/// either a single `[repo]` table (legacy single-repo form) or a
+/// `[[repo]]` array-of-tables (multi-repo form added in issue #35).
+/// `FromStr` normalises both into `Config.repos: Vec<RepoConfig>`.
+#[derive(Debug, Deserialize)]
+struct RawConfig {
+    #[serde(rename = "repo")]
+    repo_field: RepoField,
+    github: GithubConfig,
+    #[serde(default)]
+    polling: PollingConfig,
+    #[serde(default)]
+    runtime_labels: RuntimeLabelsConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
+    #[serde(default)]
+    auth: AuthConfig,
+    #[serde(default)]
+    agent: AgentConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RepoField {
+    /// `[repo]\nurl = "..."` — the legacy single-repo shape. Continues
+    /// to parse for backward compatibility; normalised into a
+    /// one-element list at `FromStr` time.
+    Single(RepoConfig),
+    /// `[[repo]]\nurl = "..."` — array-of-tables form for the
+    /// multi-repo polling slice (#35).
+    Multiple(Vec<RepoConfig>),
+}
+
 impl FromStr for Config {
-    type Err = toml::de::Error;
+    type Err = ConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        toml::from_str(s)
+        let raw: RawConfig = toml::from_str(s)?;
+        let repos = match raw.repo_field {
+            RepoField::Single(r) => vec![r],
+            RepoField::Multiple(v) => v,
+        };
+        if repos.is_empty() {
+            return Err(ConfigError::EmptyRepoList);
+        }
+        Ok(Config {
+            repos,
+            github: raw.github,
+            polling: raw.polling,
+            runtime_labels: raw.runtime_labels,
+            logging: raw.logging,
+            auth: raw.auth,
+            agent: raw.agent,
+        })
     }
 }

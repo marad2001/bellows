@@ -50,9 +50,17 @@ enum Command {
     /// cancellation comment. The running orchestrator detects the missing
     /// label in finalise, opens whatever workspace state existed at kill
     /// time as a draft PR, and returns to polling.
+    ///
+    /// Target syntax (issue #35 multi-repo polling):
+    ///   `bellows kill <owner>/<name>/<issue>` — explicit form, required
+    ///   when multiple `[[repo]]` entries are configured.
+    ///   `bellows kill <issue>` — bare form, accepted only when exactly
+    ///   one `[[repo]]` is configured. Errors with a clear message
+    ///   otherwise.
     Kill {
-        /// GitHub issue number to cancel.
-        issue: u64,
+        /// Either `<owner>/<name>/<issue>` (explicit) or `<issue>`
+        /// (bare; single-repo configs only).
+        target: String,
     },
     /// Run the triage skill against one issue or walk the whole
     /// `needs-triage` backlog. With an issue number, triages just that
@@ -119,7 +127,7 @@ async fn main() -> Result<()> {
         // the credentials volume).
         Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
         Command::Status => status_cmd().await,
-        Command::Kill { issue } => kill_cmd(&config_path, issue).await,
+        Command::Kill { target } => kill_cmd(&config_path, &target).await,
         Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
         Command::Prune {
             all,
@@ -146,7 +154,25 @@ async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) ->
         .personal_token(pat)
         .build()
         .context("build octocrab client")?;
-    let (owner, repo) = parse_owner_repo(&config.repo.url)?;
+    // Issue #35 multi-repo polling deliberately keeps `bellows triage`
+    // scoped to a single repo per invocation — the triage skill
+    // dispatches against one issue at a time and does not yet have a
+    // `<repo>/<issue>` argument shape. The first configured repo is
+    // used; operators driving triage against a non-first repo should
+    // re-order `[[repo]]` entries or run with a single-repo
+    // `orchestrator.toml`. A multi-repo-aware triage CLI is a future
+    // enhancement (not in this slice's scope).
+    let primary_repo = config
+        .repos
+        .first()
+        .expect("config.repos non-empty by FromStr invariant");
+    let (owner, repo) = parse_owner_repo(&primary_repo.url)?;
+    if config.repos.len() > 1 {
+        eprintln!(
+            "bellows triage: multiple repos configured; triaging against {}/{} only (first [[repo]] entry)",
+            owner, repo,
+        );
+    }
 
     match issue {
         Some(n) => triage_one_cmd(&client, &owner, &repo, &config, n, dry_run).await,
@@ -280,7 +306,11 @@ async fn call_triage_one(
     // Per-invocation throwaway branch name so multiple triage runs
     // against the same repo don't collide on a shared local branch.
     let branch_name = format!("bellows-triage-tmp/{issue}");
-    let workspace = workspace::prepare(&config.repo.url, &branch_name)
+    let primary_repo = config
+        .repos
+        .first()
+        .expect("config.repos non-empty by FromStr invariant");
+    let workspace = workspace::prepare(&primary_repo.url, &branch_name)
         .await
         .map_err(|e| format!("prepare workspace: {e}"))?;
 
@@ -298,7 +328,8 @@ async fn call_triage_one(
             credentials_volume_name: config.auth.credentials_volume.clone(),
         },
     };
-    let repo_slug = bellows::repo_slug(&config.repo.url);
+    let repo_slug = bellows::repo_slug(&primary_repo.url);
+    let repo_label = format!("{}/{}", owner, repo);
     let deadline = Some(Duration::from_secs(config.agent.wall_clock_minutes.get() * 60));
 
     let mut log_writer = std::io::stderr();
@@ -306,6 +337,7 @@ async fn call_triage_one(
         &workspace,
         &auth,
         issue,
+        &repo_label,
         &repo_slug,
         &mut log_writer,
         deadline,
@@ -563,11 +595,112 @@ fn format_volume_table(volumes: &[sandbox::CacheVolume]) -> String {
     out
 }
 
-async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
+/// Resolved `bellows kill` target — both the repo slug ("owner/name")
+/// and the issue number, after the optional `<repo>/` prefix has been
+/// parsed and reconciled against `config.repos`.
+#[derive(Debug)]
+struct ResolvedKillTarget {
+    /// `owner/name`. Used both for the GitHub-side label transition AND
+    /// for the `bellows-repo` container-filter label so the kill never
+    /// matches a different repo's container with the same issue number.
+    repo_label: String,
+    /// The fully-qualified repo URL from the matching `[[repo]]` entry.
+    /// Needed for `parse_owner_repo` (which the runner shares with this
+    /// path) and matches whatever URL form the operator wrote.
+    repo_url: String,
+    /// The issue number to cancel.
+    issue: u64,
+}
+
+/// Parse the `bellows kill <target>` argument and resolve it against
+/// the configured repos. Pure function (no IO) so each branch is
+/// directly unit-testable.
+///
+/// Accepted shapes (issue #35):
+///   `<owner>/<name>/<issue>` — explicit form. The `<owner>/<name>`
+///     slug must match exactly one configured `[[repo]]` entry's URL
+///     (via `parse_owner_repo`); otherwise the kill refuses so a
+///     typo doesn't silently target nothing.
+///   `<issue>` — bare form. Accepted only when exactly one repo is
+///     configured; rejected with a clear message in multi-repo
+///     configs so the operator gets an explicit prompt rather than a
+///     silent default.
+fn resolve_kill_target(
+    target: &str,
+    repos: &[bellows::config::RepoConfig],
+) -> Result<ResolvedKillTarget> {
+    let (qualifier, issue_str) = match target.rsplit_once('/') {
+        Some((q, rest)) => (Some(q), rest),
+        None => (None, target),
+    };
+    let issue: u64 = issue_str.parse().map_err(|_| {
+        anyhow!(
+            "bellows kill: invalid issue number `{}` (expected `<owner>/<name>/<issue>` or bare `<issue>`)",
+            issue_str,
+        )
+    })?;
+
+    if let Some(qualifier) = qualifier {
+        // `<owner>/<name>/<issue>` shape — match against configured repos.
+        let mut found: Option<(String, String)> = None;
+        for r in repos {
+            let (owner, repo) = runner::parse_owner_repo(&r.url).map_err(|e| anyhow!("{e}"))?;
+            let slug = format!("{}/{}", owner, repo);
+            if slug == qualifier {
+                found = Some((slug, r.url.clone()));
+                break;
+            }
+        }
+        let (repo_label, repo_url) = found.ok_or_else(|| {
+            let configured: Vec<String> = repos
+                .iter()
+                .filter_map(|r| {
+                    runner::parse_owner_repo(&r.url)
+                        .ok()
+                        .map(|(o, n)| format!("{}/{}", o, n))
+                })
+                .collect();
+            anyhow!(
+                "bellows kill: `{}` does not match any configured [[repo]] entry. Configured: {:?}",
+                qualifier,
+                configured,
+            )
+        })?;
+        Ok(ResolvedKillTarget {
+            repo_label,
+            repo_url,
+            issue,
+        })
+    } else {
+        // Bare `<issue>` shape — accepted only when there's exactly one
+        // configured repo. With multiple repos the bare form is
+        // ambiguous so we refuse explicitly.
+        if repos.len() != 1 {
+            anyhow::bail!(
+                "bellows kill: bare `<issue>` form is only valid with a single configured [[repo]]; \
+                 {} are configured. Re-run as `bellows kill <owner>/<name>/{}`.",
+                repos.len(),
+                issue,
+            );
+        }
+        let r = &repos[0];
+        let (owner, repo) = runner::parse_owner_repo(&r.url).map_err(|e| anyhow!("{e}"))?;
+        Ok(ResolvedKillTarget {
+            repo_label: format!("{}/{}", owner, repo),
+            repo_url: r.url.clone(),
+            issue,
+        })
+    }
+}
+
+async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    let resolved = resolve_kill_target(target, &config.repos)?;
+    let issue = resolved.issue;
 
     // Step 1: confirm bellows is running and busy on the requested issue
     // by reading the slice-9 status file. Using is_pid_alive so a stale
@@ -587,19 +720,23 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
     }
 
     // Step 2: locate + force-remove the sandbox container via a
-    // server-side label filter. A `None` here means the orchestrator has
-    // status=busy but no container is currently up (transient gap between
-    // phases) — still proceed to the GitHub-side transition; the running
-    // orchestrator will detect the label flip in its next finalise pass.
+    // server-side label filter. The filter is scoped to BOTH the repo
+    // slug and the issue number (issue #35) so a kill against repo A's
+    // `#42` never accidentally takes out repo B's `#42`. A `None` here
+    // means the orchestrator has status=busy but no container is
+    // currently up (transient gap between phases) — still proceed to
+    // the GitHub-side transition; the running orchestrator will detect
+    // the label flip in its next finalise pass.
     let docker = bollard::Docker::connect_with_local_defaults()
         .context("connect to local docker daemon")?;
-    let container_ids = sandbox::find_containers_for_issue(&docker, issue)
-        .await
-        .context("find containers for issue")?;
+    let container_ids =
+        sandbox::find_containers_for_issue(&docker, &resolved.repo_label, issue)
+            .await
+            .context("find containers for issue")?;
     if container_ids.is_empty() {
         println!(
-            "bellows: no live sandbox container found for issue #{} (orchestrator likely between phases)",
-            issue,
+            "bellows: no live sandbox container found for {}/#{} (orchestrator likely between phases)",
+            resolved.repo_label, issue,
         );
     } else {
         // PR #33 review finding #1: a single `bellows-issue-number=<N>`
@@ -612,15 +749,17 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
                 .await
                 .with_context(|| format!("force-remove sandbox container {id}"))?;
             println!(
-                "bellows: removed container {} for issue #{}",
+                "bellows: removed container {} for {}/#{}",
                 &id[..id.len().min(12)],
+                resolved.repo_label,
                 issue,
             );
         }
         if container_ids.len() > 1 {
             println!(
-                "bellows: removed {} containers in total for issue #{} (a prior phase's lifecycle-end force-remove likely failed; both the corpse and the live container shared the label)",
+                "bellows: removed {} containers in total for {}/#{} (a prior phase's lifecycle-end force-remove likely failed; both the corpse and the live container shared the label)",
                 container_ids.len(),
+                resolved.repo_label,
                 issue,
             );
         }
@@ -639,7 +778,7 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
         .personal_token(pat)
         .build()
         .context("build octocrab client")?;
-    let (owner, repo) = parse_owner_repo(&config.repo.url)?;
+    let (owner, repo) = parse_owner_repo(&resolved.repo_url)?;
     tracker::transition_to_cancelled(
         &client,
         &owner,
@@ -652,8 +791,8 @@ async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {
     .context("transition issue label to agent-cancelled")?;
 
     println!(
-        "bellows: kill signal sent; agent-cancelled label applied to issue #{}",
-        issue,
+        "bellows: kill signal sent; agent-cancelled label applied to {}/#{}",
+        resolved.repo_label, issue,
     );
     Ok(())
 }
@@ -754,11 +893,18 @@ async fn run(config_path: &PathBuf) -> Result<()> {
         .open(&config.logging.path)
         .with_context(|| format!("open log file at {}", config.logging.path.display()))?;
 
+    let repo_urls = config
+        .repos
+        .iter()
+        .map(|r| r.url.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     log(
         &mut log_file,
         &format!(
-            "bellows: polling {} every {}s, log file: {}",
-            config.repo.url,
+            "bellows: polling {} repo(s) [{}] every {}s, log file: {}",
+            config.repos.len(),
+            repo_urls,
             interval.as_secs(),
             config.logging.path.display(),
         ),
@@ -1353,5 +1499,142 @@ mod tests {
             refresh_help.to_lowercase().contains("expired"),
             "refresh-auth help must mention the expired-token situation: {refresh_help}"
         );
+    }
+
+    // ---- Issue #35: multi-repo kill target parsing ----
+
+    fn single_repo(url: &str) -> Vec<bellows::config::RepoConfig> {
+        // We have no RepoConfig public constructor, so go through
+        // Config::from_str to build a normalised vec without
+        // duplicating the schema. Same path the real CLI uses.
+        let toml = format!(
+            "[repo]\nurl = \"{}\"\n[github]\npat_env_var = \"X\"\n",
+            url,
+        );
+        Config::from_str(&toml).unwrap().repos
+    }
+
+    fn multi_repo(urls: &[&str]) -> Vec<bellows::config::RepoConfig> {
+        let mut toml = String::new();
+        for u in urls {
+            toml.push_str(&format!("[[repo]]\nurl = \"{}\"\n", u));
+        }
+        toml.push_str("[github]\npat_env_var = \"X\"\n");
+        Config::from_str(&toml).unwrap().repos
+    }
+
+    #[test]
+    fn cli_parses_kill_with_repo_slash_issue_explicit_form() {
+        // Issue #35 acceptance: the explicit `bellows kill
+        // <owner>/<name>/<issue>` form must parse through clap. We
+        // pin the target string is forwarded verbatim — the
+        // host/issue split happens later in resolve_kill_target.
+        let cli = Cli::try_parse_from(["bellows", "kill", "marad2001/bellows/42"])
+            .expect("bellows kill <owner>/<name>/<issue> must parse");
+        match cli.command {
+            Some(Command::Kill { target }) => assert_eq!(target, "marad2001/bellows/42"),
+            _ => panic!("expected Kill {{ ... }}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_kill_with_bare_issue_for_back_compat() {
+        // Issue #35 backward-compat: `bellows kill 42` must still
+        // parse. The runtime check that the bare form is valid only
+        // for single-repo configs lives in resolve_kill_target, not
+        // in clap.
+        let cli = Cli::try_parse_from(["bellows", "kill", "42"])
+            .expect("bellows kill <issue> bare form must parse");
+        match cli.command {
+            Some(Command::Kill { target }) => assert_eq!(target, "42"),
+            _ => panic!("expected Kill {{ ... }}"),
+        }
+    }
+
+    #[test]
+    fn resolve_kill_target_accepts_bare_issue_in_single_repo_config() {
+        // Back-compat path: `bellows kill 42` with one configured
+        // [[repo]] resolves cleanly to that repo's slug + the issue
+        // number. Equivalent to the slice-10 behaviour before
+        // multi-repo landed.
+        let repos = single_repo("https://github.com/marad2001/bellows-test");
+        let resolved = resolve_kill_target("42", &repos).unwrap();
+        assert_eq!(resolved.issue, 42);
+        assert_eq!(resolved.repo_label, "marad2001/bellows-test");
+        assert_eq!(
+            resolved.repo_url,
+            "https://github.com/marad2001/bellows-test",
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_rejects_bare_issue_with_multiple_repos_configured() {
+        // Acceptance: bare form is ambiguous when more than one repo
+        // is configured. The kill must refuse with a clear message
+        // naming the explicit form so the operator knows what to
+        // type instead.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err = resolve_kill_target("42", &repos).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("single configured")
+                || msg.contains("ambiguous")
+                || msg.contains("only valid"),
+            "error must explain that bare form is single-repo-only: {msg}",
+        );
+        assert!(
+            msg.contains("<owner>/<name>/42") || msg.contains("/42"),
+            "error must suggest the explicit form: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_accepts_explicit_repo_slash_issue_in_multi_repo_config() {
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let resolved =
+            resolve_kill_target("marad2001/repo-b/42", &repos).expect("explicit form must resolve");
+        assert_eq!(resolved.issue, 42);
+        assert_eq!(resolved.repo_label, "marad2001/repo-b");
+        assert_eq!(
+            resolved.repo_url,
+            "https://github.com/marad2001/repo-b",
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_rejects_explicit_form_when_repo_is_not_configured() {
+        // Defence against a typo: `bellows kill some/other/42` against
+        // a config that does not list `some/other` must refuse rather
+        // than silently doing nothing or guessing at the intended repo.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err =
+            resolve_kill_target("not-configured/repo-x/42", &repos).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not-configured/repo-x"),
+            "error must echo the rejected qualifier: {msg}",
+        );
+        assert!(
+            msg.contains("Configured"),
+            "error must list the configured repos: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_rejects_non_numeric_issue() {
+        let repos = single_repo("https://github.com/marad2001/bellows-test");
+        let err = resolve_kill_target("not-a-number", &repos).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not-a-number"), "{msg}");
+        assert!(msg.contains("invalid issue number"), "{msg}");
     }
 }

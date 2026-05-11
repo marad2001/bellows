@@ -109,97 +109,162 @@ enum PreClaim {
     BlockedUnknown,
 }
 
+/// Per-repo claim candidate the multi-repo polling tick (#35)
+/// collects across configured repos before picking the
+/// globally-oldest issue. Holds the parsed `(owner, repo)` tuple plus
+/// the original repo URL so the downstream pipeline can keep using
+/// `workspace::prepare(&repo_url, ...)` without re-parsing.
+struct RepoCandidate {
+    owner: String,
+    repo: String,
+    repo_url: String,
+    issue: tracker::Issue,
+}
+
 pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
     log_writer: &mut dyn Write,
     status_ctx: Option<&StatusContext>,
 ) -> Result<RunOutcome, RunError> {
-    let (owner, repo) = parse_owner_repo(&config.repo.url)?;
-
-    // Issue #42: pre-claim PR check. Before any other API call, ask
-    // GitHub which open PRs exist on this repo and filter to bellows-
-    // authored `agent/*` branches. If any are open, the prior agent's
-    // PR may still gate master (CI running, in review, or stuck-draft)
-    // and claiming a new issue now would run the next agent against a
-    // master that hasn't absorbed the prior PR — the concrete race PR
-    // #41 was designed to fix and which #42 was filed for after PR #41
-    // hit it on itself.
+    // Issue #35: multi-repo polling. For each configured repo, do the
+    // per-repo pre-claim PR check (#42), and on cleared repos collect
+    // the oldest open `ready-for-agent` issue. Across the combined set
+    // of cleared repos, claim the GLOBALLY-oldest issue by
+    // `created_at`.
     //
-    // Fail-closed: any error talking to GitHub maps to Blocked with an
-    // empty pr_numbers list. We can't tell whether master is gated; the
-    // safe answer matches the answer we'd give if we knew it was. The
-    // next polling tick is the retry — no inner backoff, no retry loop.
-    let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
-        Ok(prs) if prs.is_empty() => PreClaim::Clear,
-        Ok(prs) => PreClaim::Blocked(prs),
-        Err(e) => {
-            let _ = writeln!(
-                log_writer,
-                "bellows: pre-claim PR check failed; failing closed (treating tick as blocked): {}",
-                e,
-            );
-            PreClaim::BlockedUnknown
-        }
-    };
-    match preclaim {
-        PreClaim::Blocked(pr_numbers) => {
-            if let Some(ctx) = status_ctx
-                && let Err(e) = ctx.write_blocked(&pr_numbers).await
-            {
+    // Per-repo pre-claim isolation: repo A being blocked by its own
+    // open `agent/*` PR does NOT block claims from unblocked repo B —
+    // the gating rationale (prior agent's PR may still gate THIS
+    // repo's master) is per-repo, and the cross-repo invariant is just
+    // concurrency=1 which the loop maintains by virtue of being serial
+    // anyway. Only when EVERY repo is blocked does the tick return
+    // `RunOutcome::Blocked`.
+    let mut blocked_prs: Vec<u64> = Vec::new();
+    let mut any_blocked_unknown = false;
+    let mut blocked_any = false;
+    let mut candidates: Vec<RepoCandidate> = Vec::new();
+    let mut any_clear = false;
+
+    for repo_cfg in &config.repos {
+        let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
+        let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
+            Ok(prs) if prs.is_empty() => PreClaim::Clear,
+            Ok(prs) => PreClaim::Blocked(prs),
+            Err(e) => {
                 let _ = writeln!(
                     log_writer,
-                    "bellows: could not write blocked status (continuing): {}",
-                    e,
+                    "bellows: pre-claim PR check failed for {}/{}; failing closed (treating that repo as blocked this tick): {}",
+                    owner, repo, e,
                 );
+                PreClaim::BlockedUnknown
             }
-            return Ok(RunOutcome::Blocked { pr_numbers });
-        }
-        PreClaim::BlockedUnknown => {
-            if let Some(ctx) = status_ctx
-                && let Err(e) = ctx.write_blocked(&[]).await
-            {
-                let _ = writeln!(
-                    log_writer,
-                    "bellows: could not write blocked status (continuing): {}",
-                    e,
-                );
+        };
+        match preclaim {
+            PreClaim::Blocked(prs) => {
+                blocked_any = true;
+                blocked_prs.extend(prs);
             }
-            return Ok(RunOutcome::Blocked {
-                pr_numbers: Vec::new(),
-            });
-        }
-        PreClaim::Clear => {
-            // The pre-claim check cleared. If a prior tick left the
-            // status file in a Blocked state, that state is stale —
-            // write idle so `bellows status` no longer lies. Also
-            // covers the first claim after a merge: the status was
-            // Blocked at the last tick, now we're idle until we
-            // either claim (write_busy) or short-circuit.
-            if let Some(ctx) = status_ctx
-                && let Err(e) = ctx.write_idle().await
-            {
-                let _ = writeln!(
-                    log_writer,
-                    "bellows: could not clear blocked status (continuing): {}",
-                    e,
-                );
+            PreClaim::BlockedUnknown => {
+                blocked_any = true;
+                any_blocked_unknown = true;
+            }
+            PreClaim::Clear => {
+                any_clear = true;
+                let next = tracker::find_next_issue(
+                    client,
+                    &owner,
+                    &repo,
+                    &config.polling.pickup_label,
+                    &config.runtime_labels.agent_in_progress,
+                )
+                .await?;
+                if let Some(issue) = next {
+                    candidates.push(RepoCandidate {
+                        owner,
+                        repo,
+                        repo_url: repo_cfg.url.clone(),
+                        issue,
+                    });
+                }
             }
         }
     }
 
-    let issue = tracker::find_next_issue(
-        client,
-        &owner,
-        &repo,
-        &config.polling.pickup_label,
-        &config.runtime_labels.agent_in_progress,
-    )
-    .await?;
+    // No cleared repo produced a claimable issue. If at least one repo
+    // was blocked, this whole tick is "blocked" from the operator's
+    // perspective; otherwise it's idle.
+    if candidates.is_empty() {
+        if blocked_any && !any_clear {
+            // Every configured repo was blocked. Report the union of
+            // known blocking PR numbers (empty when every blocker was
+            // an unknown / list-PRs failure — same fail-closed contract
+            // as the single-repo path).
+            let prs = if any_blocked_unknown && blocked_prs.is_empty() {
+                Vec::new()
+            } else {
+                blocked_prs
+            };
+            if let Some(ctx) = status_ctx
+                && let Err(e) = ctx.write_blocked(&prs).await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not write blocked status (continuing): {}",
+                    e,
+                );
+            }
+            return Ok(RunOutcome::Blocked { pr_numbers: prs });
+        }
 
-    let Some(issue) = issue else {
+        // Some repos cleared but produced no candidates (or all repos
+        // were blocked but at least one cleared — but that branch
+        // can't happen here because candidates is empty). Either way,
+        // the steady-state log line is Idle.
+        if let Some(ctx) = status_ctx
+            && let Err(e) = ctx.write_idle().await
+        {
+            let _ = writeln!(
+                log_writer,
+                "bellows: could not clear status (continuing): {}",
+                e,
+            );
+        }
         return Ok(RunOutcome::Idle);
-    };
+    }
+
+    // At least one cleared repo produced a candidate. Status: clear
+    // any prior blocked state so `bellows status` doesn't lie until
+    // we either claim (write_busy) or short-circuit on a per-repo
+    // error.
+    if let Some(ctx) = status_ctx
+        && let Err(e) = ctx.write_idle().await
+    {
+        let _ = writeln!(
+            log_writer,
+            "bellows: could not clear blocked status (continuing): {}",
+            e,
+        );
+    }
+
+    // Pick the oldest candidate by GitHub `created_at`. The
+    // `Option<DateTime<Utc>>` shape means an issue whose payload didn't
+    // include the field defaults to `MIN_UTC` (treated as "older than
+    // anything else") — defensive, since real GitHub payloads always
+    // include the field and the only path to a missing value is a test
+    // fixture that didn't bother. The order matches the brief's
+    // contract: "oldest by GitHub `created_at`."
+    candidates.sort_by_key(|c| {
+        c.issue
+            .created_at
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    });
+    let RepoCandidate {
+        owner,
+        repo,
+        repo_url,
+        issue,
+    } = candidates.into_iter().next().expect("non-empty candidates");
 
     // Fetch the agent brief BEFORE claiming. If it's missing we return
     // an error without label-swapping the issue — the next polling tick
@@ -208,6 +273,7 @@ pub async fn run_once(
     let brief = tracker::fetch_agent_brief(client, &owner, &repo, issue.number)
         .await?
         .ok_or(RunError::MissingAgentBrief(issue.number))?;
+    let repo_label = format!("{}/{}", owner, repo);
 
     let claimed = match tracker::claim(
         client,
@@ -254,7 +320,7 @@ pub async fn run_once(
         let current = CurrentRun {
             issue_number: claimed.number,
             issue_title: claimed.title.clone(),
-            repo: format!("{}/{}", owner, repo),
+            repo: repo_label.clone(),
             claimed_at: started,
         };
         if let Err(e) = ctx.write_busy(current).await {
@@ -266,11 +332,11 @@ pub async fn run_once(
         }
     }
 
-    let workspace = workspace::prepare(&config.repo.url, &branch_name).await?;
+    let workspace = workspace::prepare(&repo_url, &branch_name).await?;
 
-    let repo_slug = crate::repo_slug(&config.repo.url);
+    let repo_slug = crate::repo_slug(&repo_url);
 
-    let kickoff = policy::render_kickoff(&brief, &config.repo.url, &branch_name);
+    let kickoff = policy::render_kickoff(&brief, &repo_url, &branch_name);
     tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
 
     let auth = match config.auth.method {
@@ -310,6 +376,7 @@ pub async fn run_once(
         &workspace,
         &auth,
         claimed.number,
+        &repo_label,
         &repo_slug,
         log_writer,
         budget.deadline_or_halt(),
@@ -422,6 +489,7 @@ pub async fn run_once(
         let run = sandbox::run_cargo_checks(
             &workspace,
             claimed.number,
+            &repo_label,
             &repo_slug,
             log_writer,
             budget.deadline_or_halt(),
@@ -542,6 +610,7 @@ pub async fn run_once(
             &workspace,
             &auth,
             claimed.number,
+            &repo_label,
             &repo_slug,
             log_writer,
             budget.deadline_or_halt(),
@@ -695,6 +764,7 @@ pub async fn run_once(
                     &workspace,
                     &auth,
                     claimed.number,
+                    &repo_label,
                     &repo_slug,
                     log_writer,
                     budget.deadline_or_halt(),
@@ -799,6 +869,7 @@ pub async fn run_once(
                     &workspace,
                     &auth,
                     claimed.number,
+                    &repo_label,
                     &repo_slug,
                     log_writer,
                     budget.deadline_or_halt(),
@@ -878,6 +949,7 @@ pub async fn run_once(
             let run = sandbox::run_cargo_checks(
                 &workspace,
                 claimed.number,
+                &repo_label,
                 &repo_slug,
                 log_writer,
                 budget.deadline_or_halt(),
