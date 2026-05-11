@@ -465,6 +465,50 @@ fn readme_documents_auto_merge_workflow_in_operational_flow() {
 }
 
 #[test]
+fn readme_documents_setup_deploy_keys_one_time_setup_subsection() {
+    let body = read_readme();
+    // Issue #69 (ADR-0002) acceptance: README gains a one-time-setup
+    // subsection covering the `setup-deploy-keys add` workflow, the
+    // GitHub deploy-key registration step, and how to reference the
+    // key from a consuming repo's `[[repo]] deploy_keys = [...]` block.
+    // Pin the load-bearing nouns; let the prose around them flex.
+    assert_contains_all(
+        &body,
+        &[
+            "setup-deploy-keys",
+            "deploy_keys",
+            "Deploy keys",
+            "private",
+            "ssh://git@github.com",
+            "bellows-deploy-keys",
+        ],
+        "one-time-setup / deploy-keys",
+    );
+}
+
+#[test]
+fn orchestrator_example_documents_ssh_keys_volume_and_deploy_keys() {
+    // Acceptance criterion: orchestrator.example.toml documents
+    // [auth].ssh_keys_volume and the per-repo deploy_keys field
+    // (issue #69 / ADR-0002), mirroring the existing
+    // credentials_volume / [[repo]] documentation pattern.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("orchestrator.example.toml");
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("orchestrator.example.toml must exist: {}", e));
+    for needle in [
+        "ssh_keys_volume",
+        "deploy_keys",
+        "bellows-deploy-keys",
+        "setup-deploy-keys",
+    ] {
+        assert!(
+            body.contains(needle),
+            "orchestrator.example.toml must mention `{needle}` for issue #69: {body}"
+        );
+    }
+}
+
+#[test]
 fn readme_opens_with_overview_explaining_what_bellows_is() {
     let body = read_readme();
     // The README must answer "what is this thing?" before anything
