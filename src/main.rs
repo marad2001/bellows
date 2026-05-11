@@ -83,7 +83,7 @@ enum Command {
         /// Remove every Bellows-managed cache volume (per-repo target
         /// volumes + the shared cargo registry). Prompts for
         /// confirmation unless `--yes` is also passed.
-        #[arg(long, conflicts_with = "target")]
+        #[arg(long, conflicts_with_all = ["target", "registry"])]
         all: bool,
         /// With `--all`, skip the confirmation prompt. Useful for
         /// scripts / CI. Ignored without `--all`.
@@ -95,8 +95,9 @@ enum Command {
         #[arg(long, value_name = "SLUG", conflicts_with_all = ["all", "registry"])]
         target: Option<String>,
         /// Remove the shared cargo registry volume
-        /// (`bellows-cargo-registry`). No confirmation prompt.
-        #[arg(long, conflicts_with = "target")]
+        /// (`bellows-cargo-registry`). No confirmation prompt. Cannot be
+        /// combined with `--all` or `--target`.
+        #[arg(long, conflicts_with_all = ["target", "all"])]
         registry: bool,
     },
 }
@@ -382,8 +383,8 @@ async fn call_triage_one(
 ///   • --registry       — remove the shared cargo registry volume.
 ///
 /// Flag combinations that would be ambiguous (`--target` with `--all`
-/// or `--registry`) are rejected at the clap layer; this function only
-/// sees the four legal shapes above.
+/// or `--registry`, or `--all` with `--registry`) are rejected at the
+/// clap layer; this function only sees the four legal shapes above.
 async fn prune_cmd(
     all: bool,
     yes: bool,
@@ -1216,6 +1217,21 @@ mod tests {
         assert!(
             result.is_err(),
             "bellows prune --target <slug> --registry must be a clap usage error",
+        );
+    }
+
+    #[test]
+    fn cli_rejects_prune_with_all_and_registry_combined() {
+        // Mixing `--all` with `--registry` is a clap-level usage error so
+        // the wider scope cannot silently swallow the narrower one. The
+        // operator who types `bellows prune --all --registry` must get a
+        // usage error rather than have `--all` discarded and only the
+        // registry volume removed.
+        let result =
+            Cli::try_parse_from(["bellows", "prune", "--all", "--registry"]);
+        assert!(
+            result.is_err(),
+            "bellows prune --all --registry must be a clap usage error",
         );
     }
 
