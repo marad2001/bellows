@@ -7,13 +7,17 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use bellows::auth::CLAUDE_HOME_IN_CONTAINER;
-use bellows::config::Config;
+use bellows::auth::{Auth, CLAUDE_HOME_IN_CONTAINER};
+use bellows::config::{AuthMethod, Config};
 use bellows::runner::{self, RunOutcome};
 use bellows::sandbox;
 use bellows::status::{self, KillPrecheck, OutcomeTransition, StatusContext};
 use bellows::tracker;
-use bellows::triage::{self, Verdict};
+use bellows::triage::{
+    self, render_dry_run_report, render_triage_input, render_triage_kickoff, TriageVerdict, Verdict,
+    VerdictState, TRIAGE_INPUT_FILE, TRIAGE_VERDICT_FILE,
+};
+use bellows::workspace;
 
 #[derive(Parser)]
 #[command(name = "bellows", about = "AFK Claude Code orchestrator for Rust repos")]
@@ -108,8 +112,8 @@ async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) ->
     let (owner, repo) = parse_owner_repo(&config.repo.url)?;
 
     match issue {
-        Some(n) => triage_one_cmd(&client, &owner, &repo, n, dry_run).await,
-        None => triage_backlog_cmd(&client, &owner, &repo, dry_run).await,
+        Some(n) => triage_one_cmd(&client, &owner, &repo, &config, n, dry_run).await,
+        None => triage_backlog_cmd(&client, &owner, &repo, &config, dry_run).await,
     }
 }
 
@@ -117,15 +121,15 @@ async fn triage_one_cmd(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
+    config: &Config,
     issue: u64,
     dry_run: bool,
 ) -> Result<()> {
-    // Targeted form (slice T1 / issue #21). When T1 lands on master,
-    // its per-issue triage path will live here; until then, `bellows
-    // triage <N>` returns the explicit T1-not-on-master diagnostic
-    // rather than running silently in an unimplemented state.
-    eprintln!("{}", TRIAGE_ONE_STUB_WARNING);
-    match call_triage_one(client, owner, repo, issue, dry_run).await {
+    // Targeted form (slice T1 / issue #21). Dispatches the triage
+    // skill against a single issue. The backlog-drain form (T2)
+    // shares this entry point so the per-issue isolation + verdict-
+    // tally contract is the same in both modes.
+    match call_triage_one(client, owner, repo, config, issue, dry_run).await {
         Ok(v) => {
             println!("bellows triage: issue #{} -> {}", issue, v);
             Ok(())
@@ -142,6 +146,7 @@ async fn triage_backlog_cmd(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
+    config: &Config,
     dry_run: bool,
 ) -> Result<()> {
     // Backlog drain (slice T2 / issue #22). Lists every open
@@ -161,12 +166,6 @@ async fn triage_backlog_cmd(
         return Ok(());
     }
 
-    // Surface the stub status BEFORE the drain begins so an operator
-    // does not read the inevitable "N failed" summary and file a fresh
-    // bug about "all my issues failed". When T1 lands and replaces
-    // call_triage_one, `TRIAGE_ONE_STUB_WARNING` is deleted; the
-    // unresolved references here flag the call sites for cleanup.
-    eprintln!("{}", TRIAGE_ONE_STUB_WARNING);
     println!(
         "bellows triage: draining {} open `{}` issue(s){}",
         issues.len(),
@@ -176,7 +175,7 @@ async fn triage_backlog_cmd(
 
     let summary = triage::drain_backlog(issues, dry_run, |n, dr| async move {
         println!("bellows triage: processing issue #{}", n);
-        match call_triage_one(client, owner, repo, n, dr).await {
+        match call_triage_one(client, owner, repo, config, n, dr).await {
             Ok(v) => {
                 println!("bellows triage: issue #{} -> {}", n, v);
                 Ok(v)
@@ -195,48 +194,146 @@ async fn triage_backlog_cmd(
     Ok(())
 }
 
-/// Operator-facing banner printed before any code path that engages
-/// the `call_triage_one` stub. Without this banner the targeted form
-/// looks like a per-issue error and the backlog form looks like every
-/// issue genuinely failed — both misleading enough to invite a bug
-/// report. When slice T1 (#21) lands and the stub is replaced, delete
-/// this constant; the unresolved references at the call sites flag
-/// the now-stale `eprintln!` lines for cleanup at the same time.
-const TRIAGE_ONE_STUB_WARNING: &str =
-    "bellows triage: warning: per-issue triage path is stubbed \
-     (slice T1 / issue #21 not yet on master); every invocation will \
-     fail with the T1-not-on-master diagnostic until T1 merges";
+/// Map a TriageVerdict's state onto the backlog-drain summary bucket
+/// (`triage::Verdict`). The full verdict is applied internally by
+/// `call_triage_one`; the drain just needs to tally outcomes by role
+/// for the end-of-run summary.
+fn verdict_to_summary_bucket(v: &TriageVerdict) -> Verdict {
+    match v.state {
+        VerdictState::NeedsInfo => Verdict::NeedsInfo,
+        VerdictState::ReadyForAgent => Verdict::ReadyForAgent,
+        VerdictState::ReadyForHuman => Verdict::ReadyForHuman,
+        VerdictState::Wontfix => Verdict::Wontfix,
+    }
+}
 
-/// Per-issue triage entry point. Slice T1 (issue #21) will replace
-/// this stub with the real implementation: dispatch the triage skill
-/// against the issue in a sandbox container, parse the verdict from
-/// the agent's structured output, and optionally apply it (label
-/// swap / `.out-of-scope/` write / etc.) unless `dry_run`.
+/// Per-issue triage entry point. Slice T1 (#21):
+///   1. Fetch the issue body + comments + labels via octocrab on the host.
+///   2. Clone the repo into a temp workspace; write the bundle into
+///      `.bellows-triage-input.md` and the kickoff into
+///      `.bellows-kickoff.md`.
+///   3. Launch a sandbox container that runs claude against the kickoff
+///      — same image as the implement / review / nit phases; container
+///      has NO GitHub credentials and so cannot post or label directly.
+///   4. Read + validate `.bellows-triage-verdict.json` produced by the
+///      agent. A missing or malformed verdict halts here with the
+///      issue untouched (no partial label swap).
+///   5. In `--dry-run`: print the verdict, no mutations. Otherwise:
+///      for `wontfix-enhancement`, commit the `.out-of-scope/<filename>`
+///      precedent directly to master; then call `apply_verdict` to
+///      post comments, transition labels, and (for wontfix) close the
+///      issue.
 ///
-/// Until T1 lands on master, this returns the explicit
-/// "T1 not yet implemented" diagnostic so that:
-///   - `bellows triage <N>` exits with a clear error rather than a
-///     silent-pass or panic;
-///   - `bellows triage` (backlog mode) still demonstrates the slice-T2
-///     iteration / isolation / summary contract end-to-end against
-///     real `needs-triage` issues — every issue tallies as `failed`
-///     with a uniform diagnostic, which is informative and harmless;
-///   - the T1 PR is a one-function swap, with the T2 wiring already
-///     in place (signature carries the full dependency footprint T1
-///     will need: client, owner, repo, issue, dry_run).
+/// Halt-on-failure: any of fetch / workspace / container / parse /
+/// apply error returns `Err(_)`. The backlog drain (T2) records the
+/// failure in its `failed` tally and continues with the next issue;
+/// the targeted form returns the error to the operator.
 async fn call_triage_one(
-    _client: &octocrab::Octocrab,
-    _owner: &str,
-    _repo: &str,
-    _issue: u64,
-    _dry_run: bool,
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    config: &Config,
+    issue: u64,
+    dry_run: bool,
 ) -> Result<Verdict, String> {
-    Err(
-        "slice T1 (issue #21) per-issue triage path is not yet on master; \
-         the T2 backlog-drain wiring is in place but cannot dispatch the \
-         triage skill until T1 merges"
-            .to_string(),
+    let bundle = tracker::fetch_issue_with_comments(client, owner, repo, issue)
+        .await
+        .map_err(|e| format!("fetch issue #{issue}: {e}"))?;
+
+    // Per-invocation throwaway branch name so multiple triage runs
+    // against the same repo don't collide on a shared local branch.
+    let branch_name = format!("bellows-triage-tmp/{issue}");
+    let workspace = workspace::prepare(&config.repo.url, &branch_name)
+        .await
+        .map_err(|e| format!("prepare workspace: {e}"))?;
+
+    let input_path = workspace.path().join(TRIAGE_INPUT_FILE);
+    tokio::fs::write(&input_path, render_triage_input(&bundle))
+        .await
+        .map_err(|e| format!("write triage input file: {e}"))?;
+    let kickoff_path = workspace.path().join(".bellows-kickoff.md");
+    tokio::fs::write(&kickoff_path, render_triage_kickoff())
+        .await
+        .map_err(|e| format!("write triage kickoff: {e}"))?;
+
+    let auth = match config.auth.method {
+        AuthMethod::Subscription => Auth::Subscription {
+            credentials_volume_name: config.auth.credentials_volume.clone(),
+        },
+    };
+    let repo_slug = bellows::repo_slug(&config.repo.url);
+    let deadline = Some(Duration::from_secs(config.agent.wall_clock_minutes.get() * 60));
+
+    let mut log_writer = std::io::stderr();
+    let agent_run = sandbox::run_agent(
+        &workspace,
+        &auth,
+        issue,
+        &repo_slug,
+        &mut log_writer,
+        deadline,
     )
+    .await
+    .map_err(|e| format!("sandbox::run_agent: {e}"))?;
+    if agent_run.exit_code != 0 {
+        return Err(format!(
+            "triage agent exited non-zero (exit {}); stderr tail:\n{}",
+            agent_run.exit_code, agent_run.stderr_tail,
+        ));
+    }
+
+    let verdict_path = workspace.path().join(TRIAGE_VERDICT_FILE);
+    let verdict_text = tokio::fs::read_to_string(&verdict_path).await.map_err(|e| {
+        format!(
+            "read verdict file at {}: {e} (the agent must produce this file)",
+            verdict_path.display(),
+        )
+    })?;
+    let verdict = TriageVerdict::parse(&verdict_text)
+        .map_err(|e| format!("validate verdict JSON: {e}"))?;
+
+    if dry_run {
+        println!("{}", render_dry_run_report(&verdict));
+        return Ok(verdict_to_summary_bucket(&verdict));
+    }
+
+    // wontfix-enhancement workspace-side mutation: commit the precedent
+    // file directly to master BEFORE the closing comment lands, so the
+    // comment can reference a file that actually exists on master.
+    if verdict.is_wontfix_enhancement() {
+        let filename = verdict
+            .out_of_scope_filename
+            .as_deref()
+            .ok_or_else(|| {
+                "wontfix-enhancement verdict missing out_of_scope_filename (validator bug)"
+                    .to_string()
+            })?;
+        let content = verdict
+            .out_of_scope_content
+            .as_deref()
+            .ok_or_else(|| {
+                "wontfix-enhancement verdict missing out_of_scope_content (validator bug)"
+                    .to_string()
+            })?;
+        let rel_path = format!(".out-of-scope/{filename}");
+        let commit_msg = format!(
+            "bellows triage: record `{filename}` as out-of-scope (issue #{issue})"
+        );
+        workspace::commit_to_branch(
+            &workspace,
+            workspace.default_branch(),
+            &commit_msg,
+            &[(rel_path, content.to_string())],
+        )
+        .await
+        .map_err(|e| format!("commit_to_branch: {e}"))?;
+    }
+
+    tracker::apply_verdict(client, owner, repo, issue, &verdict)
+        .await
+        .map_err(|e| format!("apply_verdict: {e}"))?;
+
+    Ok(verdict_to_summary_bucket(&verdict))
 }
 
 async fn kill_cmd(config_path: &PathBuf, issue: u64) -> Result<()> {

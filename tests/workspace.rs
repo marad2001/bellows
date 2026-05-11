@@ -7,7 +7,7 @@ use wiremock::matchers::{body_partial_json, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::workspace::{
-    commit_all, commit_all_and_push_if_advanced, compute_diff_against_base,
+    commit_all, commit_all_and_push_if_advanced, commit_to_branch, compute_diff_against_base,
     diff_between_touches_only_agent_notes, head_sha, open_pr, prepare, push_branch, OpenPrRequest,
 };
 
@@ -580,6 +580,182 @@ async fn commit_all_and_push_if_advanced_pushes_once_for_mixed_self_commit_plus_
     let remote_sha = remote_branch_sha(remote_dir.path(), "agent/52-mixed")
         .expect("remote must hold the pushed branch");
     assert_eq!(remote_sha, head_after, "remote must reflect the final HEAD");
+}
+
+// ----------------------------------------------------------------------
+// Slice T1 (#21): commit_to_branch — direct-to-master commit helper
+// used by `bellows triage <N>` when the verdict is wontfix-enhancement
+// and the workspace must persist an .out-of-scope/<slug>.md precedent
+// directly on master (no agent/* branch, no PR). The helper switches
+// the workspace to the target branch, writes each (path, content) pair,
+// stages it, commits with the supplied message, and pushes.
+// ----------------------------------------------------------------------
+
+fn init_remote_repo_accepting_master_push(path: &Path) {
+    init_remote_repo(path);
+    // Non-bare remote refuses pushes to its currently-checked-out
+    // branch by default. updateInstead is the standard "treat the
+    // remote like a deployment target" knob and is the right
+    // semantics for these tests — bellows pushes wontfix-enhancement
+    // commits directly to master.
+    run_git(path, &["config", "receive.denyCurrentBranch", "updateInstead"]);
+}
+
+#[tokio::test]
+async fn commit_to_branch_writes_files_and_pushes_directly_to_master() {
+    // Slice T1 happy path: wontfix-enhancement workflow. The agent
+    // produced an out_of_scope_filename + out_of_scope_content payload;
+    // bellows writes it under `.out-of-scope/<filename>` on master and
+    // pushes the precedent. A later operator can see the file on master
+    // and a future triage agent can read it to align with prior
+    // precedents.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo_accepting_master_push(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/triage-tmp").await.unwrap();
+
+    let files = vec![(
+        ".out-of-scope/auto-rerun.md".to_string(),
+        "# Auto-rerun out of scope\n\nReason: ...\n".to_string(),
+    )];
+
+    commit_to_branch(
+        &workspace,
+        "master",
+        "bellows triage: record auto-rerun as out-of-scope",
+        &files,
+    )
+    .await
+    .expect("commit_to_branch should succeed");
+
+    let show = Command::new("git")
+        .args(["show", "master:.out-of-scope/auto-rerun.md"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    assert!(show.status.success(), "remote master must contain the new file: {:?}", show);
+    let content = String::from_utf8(show.stdout).unwrap();
+    assert!(
+        content.contains("Auto-rerun out of scope"),
+        "remote master file content mismatch: {content:?}"
+    );
+
+    let log = Command::new("git")
+        .args(["log", "-1", "--format=%s", "master"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    let subject = String::from_utf8(log.stdout).unwrap();
+    assert!(
+        subject.contains("record auto-rerun as out-of-scope"),
+        "master's HEAD commit subject must reflect the supplied message: {subject:?}"
+    );
+}
+
+#[tokio::test]
+async fn commit_to_branch_creates_parent_directories_when_writing_nested_paths() {
+    // The `.out-of-scope/` directory does not exist in a brand-new
+    // repository. The helper must mkdir -p the parent so the write
+    // succeeds; otherwise wontfix-enhancement against a clean repo
+    // would crash on the file write.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo_accepting_master_push(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/triage-tmp").await.unwrap();
+
+    let files = vec![(
+        ".out-of-scope/nested/dir/file.md".to_string(),
+        "body\n".to_string(),
+    )];
+
+    commit_to_branch(&workspace, "master", "create deeply-nested precedent", &files)
+        .await
+        .expect("commit_to_branch should succeed for deeply-nested paths");
+
+    let show = Command::new("git")
+        .args(["show", "master:.out-of-scope/nested/dir/file.md"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    assert!(show.status.success(), "deeply-nested file must exist on master");
+    assert_eq!(String::from_utf8(show.stdout).unwrap(), "body\n");
+}
+
+#[tokio::test]
+async fn commit_to_branch_writes_multiple_files_in_one_commit() {
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo_accepting_master_push(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/triage-tmp").await.unwrap();
+
+    let files = vec![
+        (".out-of-scope/a.md".to_string(), "a\n".to_string()),
+        (".out-of-scope/b.md".to_string(), "b\n".to_string()),
+    ];
+
+    commit_to_branch(&workspace, "master", "two precedents", &files)
+        .await
+        .unwrap();
+
+    let names = Command::new("git")
+        .args(["log", "-1", "--name-only", "--format=", "master"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(names.stdout).unwrap();
+    assert!(stdout.contains(".out-of-scope/a.md"), "log names: {stdout}");
+    assert!(stdout.contains(".out-of-scope/b.md"), "log names: {stdout}");
+
+    let oneline = Command::new("git")
+        .args(["log", "--oneline", "master"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    let line_count = String::from_utf8(oneline.stdout).unwrap().lines().count();
+    assert_eq!(
+        line_count, 2,
+        "master must have exactly initial + one new commit (both files in the same commit)"
+    );
+}
+
+#[tokio::test]
+async fn commit_to_branch_does_not_leave_workspace_on_the_target_branch_indefinitely() {
+    // Defensive: the workspace was prepared on an agent/* branch. The
+    // helper switches to the target (master) to commit, but the
+    // workspace is short-lived and the test merely pins that the
+    // helper succeeds without panicking. We don't promise to restore
+    // the prior branch — the caller (bellows triage) discards the
+    // workspace afterwards.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo_accepting_master_push(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/triage-tmp").await.unwrap();
+
+    commit_to_branch(
+        &workspace,
+        "master",
+        "test",
+        &[(".out-of-scope/foo.md".to_string(), "x".to_string())],
+    )
+    .await
+    .expect("commit_to_branch should succeed");
+
+    // The workspace's local HEAD now points at the new master commit.
+    let local_master = Command::new("git")
+        .args(["rev-parse", "master"])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    let remote_master = Command::new("git")
+        .args(["rev-parse", "master"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(local_master.stdout).unwrap().trim(),
+        String::from_utf8(remote_master.stdout).unwrap().trim(),
+        "workspace's master SHA must match remote master after push"
+    );
 }
 
 #[tokio::test]
