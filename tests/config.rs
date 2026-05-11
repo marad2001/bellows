@@ -50,6 +50,76 @@ fn auth_section_defaults_apply_when_omitted() {
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
     assert!(matches!(config.auth.method, AuthMethod::Subscription));
     assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
+    // Issue #69 (ADR-0002) acceptance: `[auth].ssh_keys_volume` is a
+    // new sibling field to `credentials_volume`, defaulting to
+    // `"bellows-deploy-keys"`. A minimal config that omits the
+    // section entirely must still produce the default so existing
+    // operator orchestrator.toml files keep parsing.
+    assert_eq!(config.auth.ssh_keys_volume, "bellows-deploy-keys");
+}
+
+#[test]
+fn auth_section_ssh_keys_volume_can_be_overridden() {
+    // Issue #69 (ADR-0002) acceptance: operators can rename the
+    // deploy-keys volume in case the default collides with another
+    // volume on their host, mirroring the existing
+    // `credentials_volume` override hook.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[auth]
+ssh_keys_volume = "my-custom-keys"
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(config.auth.ssh_keys_volume, "my-custom-keys");
+    // The credentials volume default must still apply when only the
+    // ssh-keys volume was overridden — the two fields are independent.
+    assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
+}
+
+#[test]
+fn repo_deploy_keys_defaults_to_empty_vec_when_omitted() {
+    // Issue #69 (ADR-0002) acceptance: per-repo `deploy_keys` is the
+    // explicit opt-in for the SSH-deploy-keys mount. Omitting it (or
+    // leaving the `[[repo]]` block in its existing shape) must continue
+    // to parse and produce an empty Vec — preserving the "no creds in
+    // sandbox by default" posture.
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert_eq!(config.repos[0].deploy_keys, Vec::<String>::new());
+}
+
+#[test]
+fn repo_deploy_keys_parses_non_empty_list_for_array_of_tables_form() {
+    // Issue #69 (ADR-0002) acceptance: a `[[repo]]` block can declare
+    // one or more deploy-key names that the mount filter will then
+    // mount into the agent and cargo-checks containers spawned for
+    // that repo. The list is preserved verbatim — the names are
+    // resolved against the volume's filesystem at startup, not here.
+    let config_text = r#"
+[[repo]]
+url = "https://github.com/marad2001/workboard-financial-advice"
+deploy_keys = ["workboard-core", "workboard-shared"]
+
+[[repo]]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(config.repos.len(), 2);
+    assert_eq!(
+        config.repos[0].deploy_keys,
+        vec!["workboard-core".to_string(), "workboard-shared".to_string()],
+    );
+    assert!(
+        config.repos[1].deploy_keys.is_empty(),
+        "second repo must default to empty deploy_keys when omitted",
+    );
 }
 
 #[test]
