@@ -233,3 +233,40 @@ fn dockerfile_installs_openssh_client_for_setup_deploy_keys() {
         dockerfile,
     );
 }
+
+#[test]
+fn dockerfile_enables_cargo_net_git_fetch_with_cli() {
+    // Issue #77: cargo's default git client is libgit2+libssh2, which
+    // does NOT honour the `IdentityFile` directive in the per-host SSH
+    // config bellows seeds at `/home/bellows/.ssh/config`. libgit2 only
+    // tries ssh-agent (not running in the container) and aborts. So a
+    // `cargo fetch` against a private ssh:// dep fails inside the
+    // sandbox even when the deploy key, ssh config, and known_hosts are
+    // all correct — observed live on 2026-05-12 against
+    // `marad2001/workboard-financial-advice` issue #16. The cargo error
+    // itself names the fix: "if the git CLI succeeds then
+    // `net.git-fetch-with-cli` may help here".
+    //
+    // The fix is a system-wide cargo config at
+    // `/usr/local/cargo/config.toml` (CARGO_HOME for the rust:1.95-slim
+    // base image) containing `git-fetch-with-cli = true` under `[net]`,
+    // which makes cargo shell out to `/usr/bin/git` (installed by the
+    // existing openssh-client/git apt line) for git fetches — and the
+    // system git binary DOES honour the SSH config.
+    //
+    // Pin the literal `git-fetch-with-cli = true` in the Dockerfile so
+    // a future edit can't silently drop the setting and re-break the
+    // cargo-checks gate on every private-SSH-dep workspace. Match the
+    // string only (not a specific filename / heredoc shape) so the
+    // assertion stays robust to formatting choices.
+    //
+    // See: https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+    let dockerfile = read_policy_image_file("Dockerfile");
+    assert!(
+        dockerfile.contains("git-fetch-with-cli = true"),
+        "policy-image/Dockerfile must enable `net.git-fetch-with-cli = true` in a system-wide \
+         cargo config so cargo shells out to the system git binary (which honours the SSH \
+         config) for private ssh:// deps. See issue #77. Current Dockerfile:\n{}",
+        dockerfile,
+    );
+}
