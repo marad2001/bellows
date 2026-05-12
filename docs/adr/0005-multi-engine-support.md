@@ -152,6 +152,41 @@ both engines before they could use either, which defeats the
 "start with one engine, add the other later" rollout the design
 supports.
 
+## Policy image
+
+A **single** policy image carries both CLIs **baked** and **pinned**
+to specific versions — `claude-code` at the version bellows v1
+already pins, and `codex` at `rust-v0.130.0` (the version covered
+by the #79 spike findings). The image stays a single docker tag so
+operators do not have to coordinate two image lifecycles, and
+pinning both CLIs together keeps a known-good combination — bumping
+either CLI is a deliberate image rebuild, not a runtime surprise.
+
+Per-phase engine choice is passed into the container via the
+`BELLOWS_ENGINE` env var, set at each container start by bellows.
+Each phase's `cli_chain` walk produces an engine name (`claude` or
+`codex`); bellows passes that name through to docker as
+`-e BELLOWS_ENGINE=<name>` on the spawned container. The variable
+is set per-phase, not once at run start: the implement phase may
+launch with `BELLOWS_ENGINE=claude` and the review phase with
+`BELLOWS_ENGINE=codex` in the same pipeline. Inside the container
+the agent never sees the chain — only the single resolved engine
+choice for this phase.
+
+The image's entrypoint scripts — today's `run-agent` (the
+implement-phase wrapper) plus the analogous wrappers for the
+review and security-review phases — each branch on
+`BELLOWS_ENGINE` to invoke the right CLI with the right
+flags. The codex branch passes
+`codex exec --dangerously-bypass-approvals-and-sandbox
+--skip-git-repo-check` with explicit stdin closure (the #79 spike
+confirmed `</dev/null` is load-bearing — without it codex hangs on
+EOF). The claude branch keeps today's `claude -p
+--dangerously-skip-permissions` invocation unchanged. A missing or
+unrecognised `BELLOWS_ENGINE` is a hard error from the entrypoint
+— the bellows-side dispatcher always sets it, so an unset value
+indicates a regression rather than a degraded mode worth running.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
