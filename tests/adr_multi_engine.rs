@@ -347,3 +347,42 @@ fn adr_0005_documents_operator_ux() {
         "operator-ux",
     );
 }
+
+/// AC#10 — Incorporates the empirical findings from #79: Codex
+/// stderr signatures, headless invocation flags, volume-mount
+/// behaviour. The ADR has to NAME the load-bearing findings
+/// explicitly so a later implementer (slice #81/#82) does not need
+/// to re-read the spike comment.
+#[test]
+fn adr_0005_incorporates_spike_79_empirical_findings() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // Sourcing — the ADR must point readers at the spike.
+            "#79",
+            // The codex headless-invocation flag set surfaced by
+            // the spike.
+            "codex exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            // The load-bearing stdin-closure finding (without it
+            // codex hangs forever).
+            "</dev/null",
+            // The pinned codex version covered by the spike.
+            "rust-v0.130.0",
+            // Rate-limit stderr substrings sourced from the spike's
+            // source-code reading.
+            "quota exceeded",
+            "rate limit:",
+            // Auth-error substring composite.
+            "401 Unauthorized",
+            "Missing bearer or basic authentication",
+            // Reset-timestamp absence → conservative 5-minute
+            // default (load-bearing for #82's state file).
+            "5-minute",
+            // Volume-mount behaviour confirmed by the spike.
+            "$CODEX_HOME",
+        ],
+        "spike-79-empirical-findings",
+    );
+}
