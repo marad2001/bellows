@@ -357,18 +357,164 @@ When a phase exits matching an auth-error stderr signature, the
 runner produces a run-log comment with a callout that names
 **which** engine returned the error — for example, "Codex's API
 returned 401 Unauthorized — refresh your subscription auth with
-`bellows refresh-auth --engine codex`." (The codex auth-error
-substring match — `401 Unauthorized` AND `Missing bearer or basic
-authentication` — comes from the #79 spike findings, so this
-callout fires reliably.) Naming the engine is load-bearing under
-the multi-engine design: a generic "auth error" callout in a
-two-engine config leaves the operator guessing which volume to
-re-seed.
+`bellows refresh-auth --engine codex`." The codex auth-error
+substring match — the composite of `401 Unauthorized` AND
+"Missing bearer or basic authentication" — comes from the #79
+spike findings, so this callout fires reliably. Naming the engine
+is load-bearing under the multi-engine design: a generic "auth
+error" callout in a two-engine config leaves the operator guessing
+which volume to re-seed.
+
+## Empirical findings from spike #79
+
+The decisions above lean on findings captured by the spike on
+issue #79 against codex-cli 0.130.0 (full transcript on the
+comment thread of #80). The load-bearing facts:
+
+- **Pinned version.** Codex is pinned at **`rust-v0.130.0`** in the
+  policy image (direct Linux binary
+  `codex-x86_64-unknown-linux-musl.tar.gz` from the release tag,
+  not the npm wrapper).
+- **Headless invocation.** `codex exec
+  --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check
+  "$PROMPT" </dev/null` is the equivalent of `claude -p
+  --dangerously-skip-permissions`. The `</dev/null` stdin closure
+  is **load-bearing**: without it codex hangs forever waiting for
+  stdin EOF.
+- **Auth state path.** Codex auth state lives in `$CODEX_HOME`
+  (default `~/.codex/`). Mounting it as a Docker named volume
+  preserves credentials across container starts identically to
+  today's `bellows-claude-credentials` volume — confirmed
+  empirically by running codex inside a fresh `$CODEX_HOME` seeded
+  from a host copy of `auth.json` + `cap_sid` + `config.toml`.
+- **Rate-limit stderr signatures** for `is_rate_limit_signature`:
+  `quota exceeded` (subscription users, primary path) and
+  `rate limit:` (Platform-API users, secondary path). Source-code
+  derived from `codex-rs/codex-api/src/error.rs` rather than from
+  a deliberate quota burn — substring matches still hold.
+- **Auth-error stderr signature** for `is_auth_error_signature`:
+  composite match of `401 Unauthorized` AND the verbatim string
+  "Missing bearer or basic authentication" (a bare `401
+  Unauthorized` could be a false positive from an unrelated HTTP
+  401 in the agent's web-fetched content).
+- **No parseable reset-at in stderr.** Codex's structured reset
+  timestamps come from HTTP response headers
+  (`x-codex-primary-reset-at`, `x-codex-secondary-reset-at`), not
+  from default-text stderr. The state-file write path therefore
+  falls back to a conservative **5-minute** default cooldown when
+  a codex rate-limit substring matches — the self-correcting
+  behaviour in the persisted-state section covers the case where
+  the actual reset window is longer.
+- **Line-oriented plain-text stderr** with no ANSI control
+  sequences — grep-friendly substring matching is sufficient (no
+  separate parser needed).
+
+These findings are summarised here rather than linked from the
+spike comment because they are load-bearing for slices #81/#82 and
+should be visible in the ADR body without requiring a round-trip
+to GitHub.
 
 ## Considered alternatives
 
-(Placeholder — populated by subsequent acceptance criteria.)
+- **Single engine, drain-on-rate-limit** (today's posture). Rejected:
+  rate-limited runs park the issue and waste the operator's
+  remaining wall-clock budget; the throughput win is unreachable
+  by definition. Slow drift back towards the brief's listed
+  problem.
+- **One engine for the whole run, picked at claim time.** Rejected:
+  collapses the diversity win (same engine implements AND reviews)
+  and limits the throughput win to "fail the whole run early"
+  rather than "swap the next phase." Per-phase selection is the
+  only shape that wins on both axes.
+- **Hard-diversity preference (refuse-to-run if implementer-CLI is
+  the only hot engine).** Rejected: a degraded review is strictly
+  better than no review at all, especially when the implement
+  phase already produced a useful diff. The visible-collapse
+  warning in the run-log preserves the operator's ability to
+  reproduce the win on a re-run while still extracting value
+  from the current run.
+- **In-place chain advancement for every phase.** Rejected: review-
+  fix and security-fix operate on a workspace that carries
+  implement-phase commits; dropping that workspace mid-phase
+  destroys the work and forces a clean implement-phase re-run.
+  Limiting in-place advancement to implement-at-base-SHA preserves
+  the "no work lost" property the in-place shape exists for.
+- **Walk the chain mid-phase as many times as needed.** Rejected:
+  the single-pass-per-phase invariant exists to prevent thrash. A
+  multi-pass walker that re-enters chain selection after every
+  rate-limit signature would loop forever on a config where every
+  engine is cooling but bellows didn't observe it yet.
+- **Two policy images, one per engine.** Rejected: doubles the
+  image-build lifecycle, doubles the operator's pull cost, and
+  introduces a class of "wrong image for this phase" dispatch
+  bugs. The single image with both CLIs baked is one moving part
+  fewer.
+- **Parallel `AGENTS.md` next to `CLAUDE.md` in every repo.**
+  Rejected: creates a permanent lockstep-maintenance tax for
+  operating-context edits (the exact failure mode ADR-0004
+  documents for the bellows-vs-CI spec). Inlining at kickoff time
+  is one source of truth.
+- **Per-engine rate-limit state in volatile memory.** Rejected:
+  loses the cooldown across runs, so each fresh claim re-probes
+  every engine and burns one phase invocation on the cool-down
+  rediscovery. The state file's only job is to skip that
+  rediscovery.
+- **Eager validation of every engine's credentials volume at
+  bellows startup.** Rejected: forces operators to seed both
+  engines before they can use either, which defeats the
+  "incremental rollout" path. Lazy validation at dispatch time
+  preserves the v1 → multi-engine upgrade story.
+- **Flag the engine via a per-issue config block in
+  `orchestrator.toml`.** Rejected: per-issue config is not
+  per-issue *labels*; it's a different artifact with a separate
+  lifecycle. The `engine:claude` / `engine:codex` label sits next
+  to the other per-issue labels already in the triage state
+  machine and reuses the existing pre-claim refusal shape
+  (parallel to `MissingAgentBrief`).
 
 ## Consequences
 
-(Placeholder — populated by subsequent acceptance criteria.)
+- **Diversity by default.** Two-engine operators see implementer ≠
+  reviewer on every run where both engines are hot. The win
+  degrades visibly (a run-log warning) when forced; silent
+  collapse is a regression.
+- **Throughput across every phase.** A rate-limit during review or
+  security-review is no longer a run-killer when the alternative
+  engine is hot. The state file makes the cooldown durable across
+  claims — the next reclaim picks up where this run left off
+  rather than re-probing.
+- **Operators with one engine see no change.** A
+  `cli_chain = ["claude"]` on every phase, `auth.credentials_volume`
+  unset to `auth.codex.credentials_volume`, and an empty codex
+  volume produces the v1 single-engine behaviour. The
+  backwards-compatibility rewrite + lazy-validation rule together
+  make multi-engine opt-in.
+- **The `agent/*` namespace gains an engine dimension that's
+  invisible at the branch level.** Slices #81/#82 can persist the
+  engine choice for each phase in the run-log comment for
+  post-hoc auditing, but the branch name itself does not encode
+  which engine produced the diff. Operators who need that signal
+  can read the run-log; the per-issue `engine:<name>` label
+  remains the explicit channel.
+- **The `bellows-state.json` file becomes operator-visible state.**
+  An operator inspecting it sees per-engine cooldowns. Manual
+  edits work — clearing the file or zeroing a `cooling_until` is
+  the supported way to force a re-probe of an engine bellows
+  believes is cooling. The file is JSON not TOML on purpose: it's
+  written by bellows, read by bellows, only occasionally
+  inspected by humans, and the JSON shape composes more cleanly
+  with future structured fields.
+- **The `engine:claude` / `engine:codex` labels join the runtime-
+  label vocabulary.** They are pre-claim-only (consulted at
+  claim time), unlike the runtime labels bellows applies during a
+  run. The README's label-vocabulary table gains two entries.
+- **A future third engine fits without a schema change.** The
+  `cli_chain` is an ordered array; `auth.<engine>.credentials_volume`
+  is a nested table keyed by engine name; the state file's
+  `engines` map is keyed by engine name. Adding a third entry is
+  data, not code shape.
+- **The single-pass-per-phase invariant gives an upper bound on
+  cost per phase invocation.** At most one engine probe (plus, for
+  the implement phase only, at most one in-place chain
+  advancement) per phase invocation. Operators can reason about
+  worst-case wall-clock without consulting the chain depth.
