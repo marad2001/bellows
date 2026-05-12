@@ -663,3 +663,103 @@ fn forced_single_engine_synthesises_entry_when_chain_lacks_it() {
     assert_eq!(picked.entry.model, None);
     assert_eq!(picked.reason, PickReason::ForcedViaLabel);
 }
+
+// -----------------------------------------------------------------
+// AC: Run-log line at each phase-start carries phase name, engine,
+// model, and **reason** (one of five). Operator can reconstruct the
+// trail from the run-log alone.
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::format_phase_engine_log;
+
+#[test]
+fn pick_reason_as_run_log_phrase_covers_every_variant() {
+    // The runner uses `as_run_log_phrase` as the stable suffix on
+    // every phase-start log line so log-scraping tooling has a
+    // fixed string to match. The five phrases align with the brief's
+    // enumeration "chain first hot entry / diversity-preferred entry
+    // / second-pass after collapse / forced via label / in-place
+    // advancement after rate-limit".
+    assert_eq!(
+        PickReason::ChainFirstHotEntry.as_run_log_phrase(),
+        "chain first hot entry",
+    );
+    assert_eq!(
+        PickReason::DiversityPreferred.as_run_log_phrase(),
+        "diversity-preferred entry",
+    );
+    assert_eq!(
+        PickReason::SecondPassAfterCollapse.as_run_log_phrase(),
+        "second-pass after collapse",
+    );
+    assert_eq!(
+        PickReason::ForcedViaLabel.as_run_log_phrase(),
+        "forced via label",
+    );
+    assert_eq!(
+        PickReason::InPlaceAdvancementAfterRateLimit.as_run_log_phrase(),
+        "in-place advancement after rate-limit",
+    );
+}
+
+#[test]
+fn format_phase_engine_log_line_carries_phase_engine_model_and_reason() {
+    // Brief: "Run-log line at each phase-start states phase, engine,
+    // model, and reason (one of the five listed in Key interfaces)."
+    let chain_entry = ChainEntry {
+        engine: Engine::Claude,
+        model: Some("opus-4-7".to_string()),
+    };
+    let line = format_phase_engine_log(
+        "implement",
+        &chain_entry,
+        PickReason::ChainFirstHotEntry,
+    );
+    assert!(line.contains("phase `implement`"), "phase name: {line:?}");
+    assert!(line.contains("engine=claude"), "engine: {line:?}");
+    assert!(line.contains("model=opus-4-7"), "model: {line:?}");
+    assert!(
+        line.contains("reason=chain first hot entry"),
+        "reason: {line:?}",
+    );
+}
+
+#[test]
+fn format_phase_engine_log_line_renders_cli_default_when_no_model_pin() {
+    let chain_entry = ChainEntry {
+        engine: Engine::Codex,
+        model: None,
+    };
+    let line = format_phase_engine_log(
+        "review",
+        &chain_entry,
+        PickReason::DiversityPreferred,
+    );
+    assert!(line.contains("engine=codex"));
+    assert!(
+        line.contains("model=<CLI default>"),
+        "no model pin = `<CLI default>`: {line:?}",
+    );
+    assert!(line.contains("reason=diversity-preferred entry"));
+}
+
+#[test]
+fn format_phase_engine_log_line_renders_every_pick_reason() {
+    let entry = ChainEntry {
+        engine: Engine::Claude,
+        model: None,
+    };
+    for reason in [
+        PickReason::ChainFirstHotEntry,
+        PickReason::DiversityPreferred,
+        PickReason::SecondPassAfterCollapse,
+        PickReason::ForcedViaLabel,
+        PickReason::InPlaceAdvancementAfterRateLimit,
+    ] {
+        let line = format_phase_engine_log("implement", &entry, reason);
+        assert!(
+            line.contains(&format!("reason={}", reason.as_run_log_phrase())),
+            "reason {reason:?} must appear in the line as `reason=<phrase>`: {line:?}",
+        );
+    }
+}
