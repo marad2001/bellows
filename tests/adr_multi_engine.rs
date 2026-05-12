@@ -202,3 +202,32 @@ fn adr_0005_documents_auth_model() {
         "auth-model",
     );
 }
+
+/// AC#5 — Documents the policy-image strategy.
+///   - Single image with both CLIs baked and pinned.
+///   - Engine choice passed in via `BELLOWS_ENGINE` env var set
+///     per-phase at each container start.
+///   - `run-agent` and the review/security-review scripts branch on
+///     the env var.
+#[test]
+fn adr_0005_documents_policy_image_strategy() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // Single image, both CLIs baked + pinned.
+            "single",
+            "policy image",
+            "baked",
+            "pinned",
+            // Env-var dispatch — named verbatim.
+            "BELLOWS_ENGINE",
+            "per-phase",
+            // Scripts that branch on the env var.
+            "run-agent",
+            "review",
+            "security-review",
+        ],
+        "policy-image-strategy",
+    );
+}
