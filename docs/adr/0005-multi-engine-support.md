@@ -107,6 +107,51 @@ selection" verdict rather than silently picking one). The
 forced-single-engine override is meaningful only when it names one
 engine; two labels is operator error and bellows says so.
 
+## Auth model
+
+Codex authenticates against the ChatGPT subscription via an
+interactive OAuth flow on the host, parallel to today's claude
+`bellows setup-auth` interactive volume-seeding flow. The persisted
+login state lives in `$CODEX_HOME` on disk (default `~/.codex/`),
+and the spike on issue #79 confirmed empirically that mounting the
+codex auth directory as a Docker named volume preserves credentials
+across container restarts identically to today's
+`bellows-claude-credentials` volume — same pattern, different
+volume.
+
+Bellows therefore keeps **per-engine credentials volumes**, declared
+under a per-engine subtable in `orchestrator.toml`:
+
+```toml
+[auth.claude]
+credentials_volume = "bellows-claude-credentials"
+
+[auth.codex]
+credentials_volume = "bellows-codex-credentials"
+```
+
+The keys are `auth.claude.credentials_volume` and
+`auth.codex.credentials_volume`. The previous flat key
+`auth.credentials_volume` continues to work — bellows rewrites it
+to `auth.claude.credentials_volume` at config-load time for
+backwards compatibility with the v1 single-engine
+orchestrator.toml shape. An operator who never touches codex sees
+no change.
+
+**Lazy validation.** Only the engine about to be dispatched to has
+its credentials volume validated. An operator who has configured
+`cli_chain = ["claude", "codex"]` for `phases.implement` but has
+not yet completed `bellows setup-auth --engine codex` is not
+blocked from claiming an issue — bellows uses claude (the hot
+chain entry) and only fails over to codex if claude rate-limits.
+At that fallback point, if `auth.codex.credentials_volume` is
+missing or empty, the run terminates with an auth-error that names
+codex specifically (see operator UX, below). The alternative —
+eager validation at startup — would force the operator to seed
+both engines before they could use either, which defeats the
+"start with one engine, add the other later" rollout the design
+supports.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
