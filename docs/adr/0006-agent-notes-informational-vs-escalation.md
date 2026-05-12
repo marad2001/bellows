@@ -22,18 +22,30 @@ agent-authored note contains that heading, or Bellows deliberately synthesises
 that heading for an address-or-explain violation, the run continues to route as
 `AgentSelfReportedFailure`: draft PR plus `agent-failed`.
 
-Before applying that heading rule, the classifier recognises Bellows-authored
-synth material by the existing `<!-- bellows ... -->` HTML-comment marker each
-synth function emits. Those markers are provenance, not agent prose. The
-classifier strips marked Bellows synth blocks from the agent-authored prose
-stream before checking heading shape; that strip is not a downgrade to
-informational. The remaining structured classification still carries the
-synth's intended cause. A run whose only note is the issue #49 implement-crash
-synth has no agent-authored escalation heading and routes on its actual crash
-signal, subsuming the bespoke "has notes but ignore them" shim. A run whose
-only note is a weak-test or parser-as-backstop synth still routes to failure
-because those synths deliberately emit `## Unaddressed finding:` escalation as
-their cause.
+Before applying that heading rule, the classifier separates Bellows-authored
+synth material from agent-authored prose using structured pipeline state
+recorded at the synth write site. The synth helper that appends markdown to
+`agent-notes.md` must also return or persist an out-of-band provenance record
+with the synth cause and the exact byte boundaries of the appended entry.
+Those records travel through the runner state that later captures
+`agent-notes.md`; they are not reconstructed by parsing the workspace file.
+HTML comments are human-readable provenance only: the existing
+`<!-- bellows ... -->` comments help an operator understand the posted note,
+but they are not trusted for routing and cannot make later text
+Bellows-authored on their own.
+
+If the classifier still strips Bellows synth text from the agent-authored
+prose stream before checking heading shape, it only strips spans whose
+Bellows provenance is known outside the file text. The block boundaries are
+the exact appended-entry byte ranges from the structured provenance records,
+not a search for comment markers or headings. A copied `<!-- bellows ... -->`
+comment in an agent note remains ordinary agent-authored text unless it
+matches a recorded Bellows synth span. A run whose only note is the issue #49
+implement-crash synth has no agent-authored escalation heading and routes on
+its actual crash signal, subsuming the bespoke "has notes but ignore them"
+shim. A run whose only note is a weak-test or parser-as-backstop synth still
+routes to failure because the structured synth cause deliberately emits
+`## Unaddressed finding:` escalation.
 
 This ADR does not change the issue #85 lifecycle: `agent-notes.md` remains
 ephemeral. Bellows captures it for classification and for the PR comment, then
@@ -72,6 +84,11 @@ immediate auto-merge.
   own their merge policy under ADR-0001. Bellows should detect a missing
   `agent-noted` filter and fail closed with a draft fallback, not mutate every
   target repository's workflow on the operator's behalf.
+- **HTML comment marker as provenance.** Rejected because `agent-notes.md` is
+  workspace content an agent can write or append to. A copied or forged
+  `<!-- bellows ... -->` comment must not affect routing-sensitive
+  classification; Bellows-authored synth provenance has to come from the
+  Bellows write path and pipeline state instead.
 
 ## Consequences
 
@@ -80,7 +97,11 @@ immediate auto-merge.
 - `classify_exit` stops accepting a bare `has_agent_notes: bool` and instead
   consumes a structured note classification that can distinguish no notes,
   informational notes, structured escalation, and Bellows-authored synth
-  provenance.
+  provenance known outside the file text.
+- Bellows synth write sites return or store structured provenance alongside
+  the markdown they append to `agent-notes.md`. Any text stripping uses those
+  provenance records' exact byte boundaries, while HTML comments remain
+  human-readable provenance only.
 - `render_kickoff` teaches agents the two channels: freeform notes for
   informational context, and `## Unaddressed finding:` only for true
   escalation.
@@ -92,8 +113,7 @@ immediate auto-merge.
   filter, `SuccessWithNotes` falls back to draft so a human must merge
   manually.
 - The issue #49 `implement_crash_synthesised` special case is subsumed by
-  provenance-aware stripping of `<!-- bellows ... -->` synth blocks before
-  agent-authored heading classification.
+  out-of-band synth provenance before agent-authored heading classification.
 - The issue #85 ephemeral-file contract stays unchanged: `agent-notes.md` is
   captured, posted as a PR comment when present, removed from the workspace,
   and committed-deleted before the final push.
