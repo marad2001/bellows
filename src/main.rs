@@ -1313,6 +1313,105 @@ async fn setup_deploy_keys_cmd(
     Ok(())
 }
 
+/// Docker argv for the engine-specific interactive login flow driven
+/// by `setup_auth` (issue #100). Pure helper so the inline tests can
+/// pin the argv shape per engine.
+///
+/// Claude path is unchanged from before issue #100: docker runs the
+/// claude entrypoint with no positional args. The operator types
+/// `/login` inside the interactive claude TUI to start the OAuth
+/// flow — that slash command is Claude Code's idiom for triggering
+/// the browser-OAuth handoff.
+///
+/// Codex path runs `codex login --device-auth` directly. Codex has no
+/// `/login` slash command (the binary only ships `/org-setup`), so
+/// dropping into the interactive TUI gave the operator no way to
+/// drive OAuth — the original bug. The `login --device-auth`
+/// subcommand makes codex print a device-authorisation URL + short
+/// code, wait, and write `auth.json` into the mounted credentials
+/// volume once the operator approves the device. Treated as the
+/// container command by docker since the args appear after the image
+/// tag.
+fn setup_auth_docker_args(
+    engine: bellows::config::Engine,
+    volume: &str,
+    home_in_container: &str,
+    image_tag: &str,
+) -> Vec<String> {
+    // `--entrypoint <engine>` bypasses the bellows entrypoint script
+    // that normally `chown`s the cache mount points and `runuser`s to
+    // the bellows user. Without `--user` + an explicit `HOME` the
+    // container runs as root with `HOME=/root`, so:
+    //   - codex writes `auth.json` to `/root/.codex` (ephemeral; lost
+    //     on container exit — the original #100 symptom);
+    //   - if claude ever has to write fresh credentials it would land
+    //     in `/root/.claude` for the same reason (currently masked by
+    //     Claude Code v2.1's auto-detect logic, but latent).
+    // Pin both flags so login files land in the mounted volume AND
+    // are owned by `bellows:bellows` (uid 1000 — baked by the
+    // Dockerfile's `useradd --uid 1000 bellows`). That ownership is
+    // what subsequent agent containers — which also run as bellows
+    // uid via runuser — need in order to READ the credentials.
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-it".to_string(),
+        "--rm".to_string(),
+        "--user".to_string(),
+        "1000:1000".to_string(),
+        "-e".to_string(),
+        "HOME=/home/bellows".to_string(),
+        "--volume".to_string(),
+        format!("{volume}:{home_in_container}"),
+        "--entrypoint".to_string(),
+        engine.as_name().to_string(),
+        image_tag.to_string(),
+    ];
+    match engine {
+        bellows::config::Engine::Claude => {}
+        bellows::config::Engine::Codex => {
+            args.push("login".to_string());
+            args.push("--device-auth".to_string());
+        }
+    }
+    args
+}
+
+/// Pre-flight text printed before `docker run` so the operator knows
+/// how to drive the engine's OAuth flow (issue #100). Engine-specific
+/// because the two CLIs use different idioms — claude has a `/login`
+/// slash command inside its TUI, codex has no slash commands and
+/// drives OAuth via the `login --device-auth` subcommand the
+/// container is now launched with.
+fn setup_auth_preflight_instructions(
+    engine: bellows::config::Engine,
+    volume: &str,
+) -> String {
+    let engine_name = engine.as_name();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "bellows: launching interactive {engine_name} in a container to seed `{volume}` with OAuth credentials.\n"
+    ));
+    match engine {
+        bellows::config::Engine::Claude => {
+            out.push_str(
+                "bellows: inside the container, type `/login` to start the OAuth flow.\n",
+            );
+            out.push_str(&format!(
+                "bellows: when login completes, type `/exit` to close {engine_name}. The container will exit and the volume retains the credentials.\n"
+            ));
+        }
+        bellows::config::Engine::Codex => {
+            out.push_str(
+                "bellows: codex will print a device-authorisation URL and a short code. Open the URL in any browser where you're signed in to your codex account, paste the code, and approve the device.\n",
+            );
+            out.push_str(
+                "bellows: codex writes auth.json into the credentials volume once the device is approved, then exits on its own — the container exits and the volume retains the credentials.\n",
+            );
+        }
+    }
+    out
+}
+
 async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
@@ -1344,26 +1443,14 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
         bellows::config::Engine::Claude => CLAUDE_HOME_IN_CONTAINER,
         bellows::config::Engine::Codex => bellows::auth::CODEX_HOME_IN_CONTAINER,
     };
-    println!(
-        "bellows: launching interactive {engine_name} in a container to seed `{}` with OAuth credentials.",
-        volume,
-    );
-    println!("bellows: inside the container, type `/login` to start the OAuth flow.");
-    println!(
-        "bellows: when login completes, type `/exit` to close {engine_name}. The container will exit and the volume retains the credentials.",
-    );
 
+    // Engine-specific pre-flight text + docker argv (issue #100). The
+    // helpers are pure so the inline tests can pin the per-engine
+    // shape; the runtime path just prints + spawns docker.
+    print!("{}", setup_auth_preflight_instructions(engine, volume));
+    let docker_args = setup_auth_docker_args(engine, volume, home_in_container, &image_tag);
     let status = tokio::process::Command::new("docker")
-        .args([
-            "run",
-            "-it",
-            "--rm",
-            "--volume",
-            &format!("{volume}:{home_in_container}"),
-            "--entrypoint",
-            engine_name,
-            &image_tag,
-        ])
+        .args(&docker_args)
         .status()
         .await
         .context("spawn `docker run -it`")?;
@@ -2456,6 +2543,194 @@ mod tests {
             Some(Command::SetupAuth { engine: None }) => {}
             _ => panic!("expected SetupAuth with engine=None"),
         }
+    }
+
+    // ---- Issue #100: codex setup-auth drives `codex login --device-auth`,
+    //                  claude path is unchanged ----
+    //
+    // The bug fixed here: `bellows setup-auth --engine codex` previously
+    // dropped into the codex interactive TUI with no args and printed
+    // "type `/login` to start the OAuth flow". Codex has no `/login`
+    // slash command (the binary only ships `/org-setup`), so no OAuth
+    // ever completed and `auth.json` never landed in the credentials
+    // volume — every codex-engine pipeline run then 401'd inside the
+    // container. The fix branches the docker argv and pre-flight
+    // instructions on engine: claude keeps the interactive-TUI + `/login`
+    // flow; codex invokes `codex login --device-auth` directly so codex
+    // prints a device URL + code and writes `auth.json` back through the
+    // mount when the operator approves the device in their host browser.
+    //
+    // Both subcommands share the same impl (Command::SetupAuth and
+    // Command::RefreshAuth both call setup_auth), so one fix covers
+    // setup-auth and refresh-auth in lock-step.
+
+    #[test]
+    fn setup_auth_docker_args_for_claude_have_no_positional_args_after_image_tag() {
+        // Claude path is unchanged: docker runs the interactive claude
+        // TUI with no positional args, then the operator types `/login`
+        // inside the TUI. Pin the argv shape so a future regression
+        // would flip the test.
+        let args = setup_auth_docker_args(
+            bellows::config::Engine::Claude,
+            "bellows-claude-credentials",
+            "/home/bellows/.claude",
+            "bellows-policy:abc123",
+        );
+        // The image tag is the LAST positional arg for claude — no
+        // `login` / `--device-auth` etc. after it.
+        assert_eq!(
+            args.last().map(|s| s.as_str()),
+            Some("bellows-policy:abc123"),
+            "claude args must end at the image tag with no positional args after it: {args:?}",
+        );
+        // The engine name must follow `--entrypoint`.
+        let entrypoint_idx = args.iter().position(|a| a == "--entrypoint")
+            .expect("claude args must include --entrypoint");
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(|s| s.as_str()),
+            Some("claude"),
+            "claude --entrypoint value must be `claude`: {args:?}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_docker_args_for_codex_invoke_login_with_device_auth_after_image_tag() {
+        // Codex path: docker runs `codex login --device-auth` (i.e. the
+        // `login` subcommand with the `--device-auth` flag) as the
+        // container's command, so codex completes a device-auth OAuth
+        // flow inside the running container and writes `auth.json` back
+        // through the mounted credentials volume.
+        let args = setup_auth_docker_args(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+            "/home/bellows/.codex",
+            "bellows-policy:abc123",
+        );
+        // The engine name must follow `--entrypoint` (so codex is the
+        // entrypoint; docker treats remaining args as the container
+        // command).
+        let entrypoint_idx = args.iter().position(|a| a == "--entrypoint")
+            .expect("codex args must include --entrypoint");
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(|s| s.as_str()),
+            Some("codex"),
+            "codex --entrypoint value must be `codex`: {args:?}",
+        );
+        // `login` and `--device-auth` must both follow the image tag
+        // as positional args (docker treats them as args to the codex
+        // entrypoint). Order matters — codex's CLI shape is
+        // `codex login --device-auth`.
+        let image_tag_idx = args.iter().position(|a| a == "bellows-policy:abc123")
+            .expect("codex args must include the image tag");
+        assert_eq!(
+            args.get(image_tag_idx + 1).map(|s| s.as_str()),
+            Some("login"),
+            "codex args must place `login` immediately after the image tag: {args:?}",
+        );
+        assert_eq!(
+            args.get(image_tag_idx + 2).map(|s| s.as_str()),
+            Some("--device-auth"),
+            "codex args must place `--device-auth` immediately after `login`: {args:?}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_docker_args_run_as_bellows_uid_with_home_env_for_both_engines() {
+        // Issue #100 follow-up: `--entrypoint <engine>` bypasses the
+        // bellows entrypoint script that normally `runuser`s to the
+        // bellows user. Without `--user 1000:1000 -e HOME=/home/bellows`
+        // the container runs as root with HOME=/root, so the engine
+        // writes its credentials file to /root/.<engine> — ephemeral,
+        // lost on container exit. Pin both flags for both engines so
+        // login files land in the mounted volume AND are owned by
+        // `bellows:bellows` (uid 1000 — readable by subsequent agent
+        // containers, which also run as bellows uid 1000).
+        for engine in [bellows::config::Engine::Claude, bellows::config::Engine::Codex] {
+            let args = setup_auth_docker_args(engine, "v", "/h", "img:tag");
+            assert!(
+                args.windows(2).any(|w| w[0] == "--user" && w[1] == "1000:1000"),
+                "{engine:?} args must include `--user 1000:1000` so credentials are bellows-owned: {args:?}",
+            );
+            assert!(
+                args.windows(2).any(|w| w[0] == "-e" && w[1] == "HOME=/home/bellows"),
+                "{engine:?} args must include `-e HOME=/home/bellows` so the engine writes to the mounted volume, not /root/.<engine>: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_auth_docker_args_mount_credentials_volume_at_engine_home() {
+        // Both engines mount their credentials volume at the engine's
+        // in-container home. Pin the `--volume <name>:<target>` shape
+        // for both engines so the host that ends up with `auth.json`
+        // is the host the engine actually reads from.
+        for (engine, volume, home) in [
+            (bellows::config::Engine::Claude, "v-c", "/home/bellows/.claude"),
+            (bellows::config::Engine::Codex,  "v-x", "/home/bellows/.codex"),
+        ] {
+            let args = setup_auth_docker_args(engine, volume, home, "img:tag");
+            assert!(
+                args.iter().any(|a| a == &format!("{volume}:{home}")),
+                "{engine:?} args must mount `{volume}:{home}`: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_claude_mention_login_slash_command() {
+        // Claude path's pre-flight text instructs the operator to type
+        // `/login` inside the interactive TUI — that's the Claude Code
+        // OAuth idiom. Keep it pinned so the codex-side fix doesn't
+        // regress the claude-side messaging.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Claude,
+            "bellows-claude-credentials",
+        );
+        assert!(
+            text.contains("/login"),
+            "claude pre-flight instructions must mention `/login`: {text}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_codex_do_not_mention_login_slash_command() {
+        // Codex has no `/login` slash command. The pre-flight text MUST
+        // NOT tell the operator to type `/login` — that's the exact
+        // bug this issue fixes. A future regression that copy-pastes
+        // the claude phrasing back into the codex branch flips the
+        // test red.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+        );
+        assert!(
+            !text.contains("/login"),
+            "codex pre-flight instructions must NOT mention `/login` (codex has no /login slash command): {text}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_codex_mention_the_device_auth_flow() {
+        // Codex's pre-flight text guides the operator through the
+        // device-auth OAuth flow — codex prints a URL + a short code
+        // that the operator opens in their host browser and pastes.
+        // Pin enough of the wording that an operator scanning the
+        // output knows what to do, and that a future regression that
+        // strips the guidance fails the test.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+        );
+        let lowered = text.to_lowercase();
+        assert!(
+            lowered.contains("device") && (lowered.contains("url") || lowered.contains("browser")),
+            "codex pre-flight instructions must guide the operator through the device-auth flow \
+             (mention `device` and a URL / browser step): {text}",
+        );
+        assert!(
+            lowered.contains("code"),
+            "codex pre-flight instructions must mention the short code the operator pastes: {text}",
+        );
     }
 
     #[test]
