@@ -1217,6 +1217,109 @@ jobs:
 }
 
 #[tokio::test]
+async fn gate_commands_announcement_lines_attribute_parsed_commands_to_workflow_path() {
+    // ADR-0004 acceptance: the run-log line at each gate-phase start
+    // must state the actual command being run AND its provenance, so
+    // an operator reading the log can tell whether bellows mirrored
+    // the target's CI or fell back to config. When both commands
+    // parsed from `.github/workflows/ci.yml`, both lines tag the
+    // workflow path.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_with_ci_workflow(
+        remote_dir.path(),
+        r#"
+name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --all-targets -- -D clippy::correctness
+      - run: cargo test --features in-memory
+"#,
+    );
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare_with_gates(
+        &remote_url,
+        "agent/90-announce-parsed",
+        &GatesConfig::default(),
+    )
+    .await
+    .unwrap();
+    let lines = workspace.gate_commands().announcement_lines();
+    assert_eq!(lines.len(), 2, "expected one line per check: {lines:?}");
+    assert!(lines[0].contains("clippy:"), "first line must label clippy: {:?}", lines[0]);
+    assert!(
+        lines[0].contains("cargo clippy --all-targets -- -D clippy::correctness"),
+        "clippy line must contain the actual command: {:?}",
+        lines[0],
+    );
+    assert!(
+        lines[0].contains("parsed from"),
+        "clippy line must tag parsed provenance: {:?}",
+        lines[0],
+    );
+    assert!(
+        lines[0].contains(".github/workflows/ci.yml"),
+        "clippy line must name the workflow path: {:?}",
+        lines[0],
+    );
+    assert!(lines[1].contains("test:"), "second line must label test: {:?}", lines[1]);
+    assert!(
+        lines[1].contains("cargo test --features in-memory"),
+        "test line must contain the actual command: {:?}",
+        lines[1],
+    );
+    assert!(
+        lines[1].contains("parsed from"),
+        "test line must tag parsed provenance: {:?}",
+        lines[1],
+    );
+}
+
+#[tokio::test]
+async fn gate_commands_announcement_lines_attribute_fallback_commands_to_config() {
+    // ADR-0004 acceptance: when bellows fell back to the
+    // operator-declared `[gates].*_flags`, the run-log line must say
+    // so explicitly. An operator reading the log can immediately tell
+    // bellows did NOT mirror CI — usually a cue to either fix the
+    // workflow shape so bellows can parse it, or update the config
+    // fallback to match CI's intended posture.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare_with_gates(
+        &remote_url,
+        "agent/90-announce-fallback",
+        &GatesConfig::default(),
+    )
+    .await
+    .unwrap();
+    let lines = workspace.gate_commands().announcement_lines();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].contains("fallback"),
+        "clippy fallback line must mention 'fallback': {:?}",
+        lines[0],
+    );
+    assert!(
+        lines[0].contains("[gates].clippy_flags"),
+        "clippy fallback line must name the config knob: {:?}",
+        lines[0],
+    );
+    assert!(
+        lines[1].contains("fallback"),
+        "test fallback line must mention 'fallback': {:?}",
+        lines[1],
+    );
+    assert!(
+        lines[1].contains("[gates].test_flags"),
+        "test fallback line must name the config knob: {:?}",
+        lines[1],
+    );
+}
+
+#[tokio::test]
 async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_config() {
     // Back-compat acceptance: the legacy two-arg `prepare(url, branch)`
     // shape is still supported and resolves to the strict-default
