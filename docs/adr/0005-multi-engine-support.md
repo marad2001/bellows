@@ -30,6 +30,83 @@ collapse defeats the win); the chain-walk + state file is
 load-bearing for throughput (a one-shot probe per phase, without
 state, would thrash on every retry).
 
+## Engine selection model
+
+Engine selection is **per-phase**, not per-run. Each agent-invoking
+phase declares its own ordered `cli_chain` in `orchestrator.toml`:
+
+```toml
+[phases.implement]
+cli_chain = ["claude", "codex"]
+
+[phases.review]
+cli_chain = ["codex", "claude"]
+
+[phases.review_fix]
+cli_chain = ["claude", "codex"]
+
+[phases.security_review]
+cli_chain = ["codex", "claude"]
+
+[phases.security_fix]
+cli_chain = ["claude", "codex"]
+```
+
+The chain is consulted **at the start of each phase**, not once at
+claim time. A run that picks `claude` for implement and then hits
+rate-limit before review starts will independently re-walk the
+review-phase chain from scratch — there is no run-wide engine
+binding to carry forward.
+
+**Soft-diversity picker.** Inside a phase, bellows walks the chain in
+a two-pass selection:
+
+1. **First pass** — pick the first chain entry that is both (a) hot
+   (i.e. its persisted `cooling_until` is in the past or unset) and
+   (b) ≠ the implementer-CLI for this run. This is the diversity-
+   preferring pass: the reviewer is not the implementer when both
+   are hot.
+2. **Second pass** — if the first pass produces nothing (the only
+   hot chain entries match the implementer-CLI), pick the first
+   chain entry that is just (a) hot, and emit an operator-visible
+   warning to the run-log comment that diversity has collapsed for
+   this phase. The phase still runs; the win is degraded but the
+   throughput contract holds.
+3. **Empty chain** — if neither the first pass nor the second pass
+   finds a hot entry (every chain member is cooling), terminate the
+   run as `RateLimited`. The
+   persisted state file (see below) and the next claim's chain-walk
+   together make this self-correcting rather than fatal: when any
+   engine's `cooling_until` elapses, the next reclaim picks it up.
+
+The diversity-pass-first-then-throughput-pass order encodes "prefer
+diversity, but degrade visibly rather than block." Swapping the
+passes would silently sacrifice diversity even when an alternative
+hot engine was available.
+
+**Per-issue forced-engine label.** Operators can override the chain
+on a single issue with one of two labels — `engine:claude` or
+`engine:codex` — that act as a **forced-single-engine override** for
+that run:
+
+- No chain walk, no fallback, no diversity logic — the named engine
+  is the one used in every phase.
+- Rate-limit on the named engine terminates the run as `RateLimited`
+  (there is no alternative to fall through to, by design).
+- This is the escape hatch for "I want claude on this issue
+  specifically" — common shapes include reproducing a claude-only
+  bug, A/B comparing two engines on the same brief, or pinning a
+  workboard issue to a known-stable engine while bellows is still
+  hardening codex.
+
+**Both engine labels present → refuse-to-claim.** When both
+`engine:claude` and `engine:codex` appear on the same issue, bellows
+refuses to claim it (parallel to the existing `MissingAgentBrief`
+shape: the pre-claim check surfaces a clear "ambiguous engine
+selection" verdict rather than silently picking one). The
+forced-single-engine override is meaningful only when it names one
+engine; two labels is operator error and bellows says so.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
