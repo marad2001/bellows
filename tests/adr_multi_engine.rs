@@ -231,3 +231,29 @@ fn adr_0005_documents_policy_image_strategy() {
         "policy-image-strategy",
     );
 }
+
+/// AC#6 — Documents the operating-context strategy. Engine-aware
+/// `policy::render_kickoff`; Codex path inlines the operating-
+/// context body + all baked skill bodies into the kickoff prompt
+/// itself (no parallel `AGENTS.md` maintained in lockstep).
+#[test]
+fn adr_0005_documents_operating_context_strategy() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // The engine-aware renderer is named in code today.
+            "policy::render_kickoff",
+            "engine-aware",
+            // Codex path inlines bodies.
+            "Codex",
+            "inline",
+            "kickoff",
+            "skill",
+            // The thing we're NOT doing — the rationale for inlining.
+            "AGENTS.md",
+            "lockstep",
+        ],
+        "operating-context-strategy",
+    );
+}
