@@ -111,12 +111,14 @@ fn adr_0005_documents_diversity_and_throughput_wins() {
             "reviewer",
             "homework",
             // The throughput rationale — per-phase fallback across
-            // all agent-invoking phases, not just implement.
-            "implement",
-            "review",
-            "review-fix",
-            "security-review",
-            "security-fix",
+            // every agent-invoking phase, not just implement. The
+            // comma-separated co-occurrence pins the list shape as
+            // a single needle so the prose has to name all five
+            // phases together; the bare phase names independently
+            // would pass on unrelated uses elsewhere in the ADR
+            // (the config snippet, the rate-limit-split section,
+            // the operator-UX section all mention them).
+            "implement, review, review-fix, security-review, security-fix",
             // Soft preference + visible collapse phrasing pinned so
             // the prose names the load-bearing trade-off.
             "soft",
@@ -149,13 +151,19 @@ fn adr_0005_documents_engine_selection_model() {
             "cli_chain",
             "phases.implement",
             "phases.review",
-            // Phase-start picker, not claim-time picker.
-            "phase",
-            "claim",
-            // Soft-diversity two-pass shape.
+            // Phase-start picker, not claim-time picker — both
+            // halves of the contrast pinned, so a regression that
+            // drops one side fails the test. Bare "phase" / "claim"
+            // appear independently many times in the ADR.
+            "at the start of each phase",
+            "claim time",
+            // Soft-diversity two-pass shape. "Hot" is defined in
+            // the picker as `cooling_until` being in the past or
+            // unset; pinning that definition is stronger than the
+            // bare adjective, which appears in unrelated prose.
             "first pass",
             "second pass",
-            "hot",
+            "in the past or unset",
             "implementer-CLI",
             "RateLimited",
             // Forced-engine label override.
@@ -215,18 +223,24 @@ fn adr_0005_documents_policy_image_strategy() {
     assert_contains_all(
         &body,
         &[
-            // Single image, both CLIs baked + pinned.
-            "single",
-            "policy image",
-            "baked",
-            "pinned",
+            // Single image, both CLIs baked + pinned. Pin the
+            // load-bearing emphasis phrasing rather than the bare
+            // adjectives, which appear in unrelated ADR prose.
+            "**single** policy image",
+            "both CLIs **baked** and **pinned**",
             // Env-var dispatch — named verbatim.
             "BELLOWS_ENGINE",
             "per-phase",
-            // Scripts that branch on the env var.
+            // The image's entrypoint scripts branch on the env
+            // var. "analogous wrappers" pins the claim that the
+            // review/security-review phases each get a wrapper;
+            // "branch on" + "to invoke the right CLI" pin the
+            // dispatch shape so the prose has to keep the
+            // wrappers-branch-on-`BELLOWS_ENGINE` rationale.
             "run-agent",
-            "review",
-            "security-review",
+            "analogous wrappers",
+            "branch on",
+            "to invoke the right CLI",
         ],
         "policy-image-strategy",
     );
