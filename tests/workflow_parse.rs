@@ -47,7 +47,7 @@ jobs:
 "#,
     );
 
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy.as_deref(),
         Some(
@@ -98,7 +98,7 @@ jobs:
 "#,
     );
 
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy.as_deref(),
         Some("cargo clippy --all-targets -- -D warnings"),
@@ -134,7 +134,7 @@ jobs:
 "#,
     );
 
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(extracted.clippy.as_deref(), Some("cargo clippy --no-linux"));
     assert_eq!(extracted.test.as_deref(), Some("cargo test --no-linux"));
 }
@@ -145,7 +145,7 @@ fn no_workflow_file_returns_none_for_both_commands() {
     // parser returns ExtractedCommands { clippy: None, test: None,
     // source: FallbackFromConfig } so the caller falls back to config.
     let tmp = TempDir::new().unwrap();
-    let extracted = parse_ci_workflow(tmp.path()).expect("should not error on missing workflow");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(extracted.clippy, None);
     assert_eq!(extracted.test, None);
     assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
@@ -171,7 +171,7 @@ jobs:
       - run: echo nope
 "#,
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("should not error on missing CI workflow");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(extracted.clippy, None);
     assert_eq!(extracted.test, None);
     assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
@@ -191,7 +191,7 @@ fn malformed_yaml_returns_none_for_both_commands() {
         // Unbalanced bracket → YAML parse error.
         "name: CI\njobs: {\n  ci: [unbalanced\n",
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("must downgrade malformed yaml to None");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(extracted.clippy, None);
     assert_eq!(extracted.test, None);
     assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
@@ -219,7 +219,7 @@ jobs:
       - run: cargo test --all-targets --all-features
 "#,
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy, None,
         "clippy wrapped in a shell script the parser can't introspect must return None",
@@ -258,7 +258,7 @@ jobs:
       - run: cargo test --tests
 "#,
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy.as_deref(),
         Some("cargo clippy --all-targets -- -D warnings"),
@@ -305,7 +305,7 @@ jobs:
             --all-features
 "#,
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy.as_deref(),
         Some(
@@ -349,7 +349,7 @@ jobs:
       - run: cargo test --all-targets
 "#,
     );
-    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    let extracted = parse_ci_workflow(tmp.path());
     assert_eq!(
         extracted.clippy.as_deref(),
         Some("cargo clippy --all-targets -- -D warnings"),

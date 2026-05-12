@@ -161,7 +161,7 @@ pub async fn prepare_with_gates(
     // Workspace. Both the post-implement and end-pipeline gates read
     // from this snapshot, so a mid-pipeline edit to
     // `.github/workflows/ci.yml` cannot shift the in-flight verdict.
-    let extracted = parse_ci_workflow(path).unwrap_or_default();
+    let extracted = parse_ci_workflow(path);
     let gate_commands = materialise_gate_commands(extracted, gates);
 
     Ok(Workspace {

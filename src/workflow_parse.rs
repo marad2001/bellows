@@ -61,17 +61,18 @@ pub enum Provenance {
 /// workflow exists, when the YAML cannot be parsed, or when no literal
 /// `cargo clippy` / `cargo test` step is found.
 ///
-/// Never errors — every failure mode is downgraded to `None` for the
-/// affected command so the cargo-checks gate falls back to the
-/// operator-declared `[gates].*_flags` default.
-pub fn parse_ci_workflow(repo_root: &Path) -> std::io::Result<ExtractedCommands> {
+/// Never errors — every failure mode (missing directory, EACCES on
+/// `.github/`, unreadable yaml file, malformed yaml, no Linux job,
+/// no cargo clippy / test line) is downgraded to
+/// `ExtractedCommands::default()` so the cargo-checks gate falls back
+/// to the operator-declared `[gates].*_flags` default. The return
+/// type reflects the contract: a Result here would imply a failure
+/// mode the caller must handle, but there is none — fallback IS the
+/// failure mode.
+pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
     let dir = repo_root.join(".github").join("workflows");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExtractedCommands::default());
-        }
-        Err(e) => return Err(e),
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return ExtractedCommands::default();
     };
 
     // Collect workflow file paths in a deterministic order so the
@@ -104,19 +105,19 @@ pub fn parse_ci_workflow(repo_root: &Path) -> std::io::Result<ExtractedCommands>
         }
         let (clippy, test) = extract_from_workflow(doc);
         if clippy.is_some() || test.is_some() {
-            return Ok(ExtractedCommands {
+            return ExtractedCommands {
                 clippy,
                 test,
                 source: Provenance::ParsedFromWorkflow(path.clone()),
-            });
+            };
         }
         // Workflow named CI but no literal cargo clippy / test line —
         // treat identically to "no workflow" so both commands fall
         // back to config.
-        return Ok(ExtractedCommands::default());
+        return ExtractedCommands::default();
     }
 
-    Ok(ExtractedCommands::default())
+    ExtractedCommands::default()
 }
 
 /// Walk a parsed workflow's `jobs.*` map, pick the preferred job (a
