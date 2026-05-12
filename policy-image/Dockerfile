@@ -39,6 +39,25 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # stays in lock-step with the toolchain.
 RUN rustup component add clippy
 
+# Issue #77: tell cargo to use the system `git` binary for git fetches
+# instead of its bundled libgit2 + libssh2. libgit2 only tries
+# ssh-agent for ssh:// URLs and does NOT honour the `IdentityFile`
+# directive in the per-host SSH config bellows seeds at
+# `/home/bellows/.ssh/config` for private cross-repo Rust deps (see
+# ADR-0002 and issues #69 / #71 / #73). The system `git` (installed
+# alongside `openssh-client` above) uses `/usr/bin/ssh`, which DOES
+# honour the config — so `cargo fetch` against a private ssh:// dep
+# succeeds in the sandbox once `net.git-fetch-with-cli = true` is set
+# system-wide. /usr/local/cargo is CARGO_HOME on rust:1.95-slim, so a
+# `config.toml` there applies to every cargo invocation in every
+# container spawned from this image (agent + cargo-checks gate).
+#
+# No-op for repos with no private SSH deps: cargo's HTTPS registry
+# fetches continue to use libgit2 as before.
+#
+# Docs: https://doc.rust-lang.org/cargo/reference/config.html#netgit-fetch-with-cli
+RUN printf '[net]\ngit-fetch-with-cli = true\n' > /usr/local/cargo/config.toml
+
 # Non-root user for the agent run. Claude Code refuses to honour
 # --dangerously-skip-permissions when running as root (and we need that
 # flag for headless runs); USER bellows below switches to a constrained
