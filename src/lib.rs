@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod chain_walker;
 pub mod config;
 pub mod policy;
 pub mod runner;

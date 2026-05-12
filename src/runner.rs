@@ -2,7 +2,11 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::auth::Auth;
-use crate::config::{AuthMethod, ChainEntry, Config, EngineLabelOverride};
+use crate::chain_walker::{
+    self, format_phase_engine_log, handle_implement_rate_limit, handle_non_implement_rate_limit,
+    pick_engine_for_phase, PickError, PickReason, PickedEntry, RateLimitDisposition, StateFile,
+};
+use crate::config::{AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride};
 use crate::policy::{
     self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
     PhaseOutcomes, ReviewOutcome,
@@ -471,18 +475,22 @@ pub async fn run_once(
         .unwrap_or_default();
     let ssh_keys_volume = config.auth.ssh_keys_volume.clone();
 
-    let phase_chain_entry = |phase: &crate::config::PhaseChain| -> ChainEntry {
-        // Issue #81 / ADR-0005: forced-single-engine label override
-        // takes precedence over the chain. Labels don't carry model
-        // pins, so the engine matches but `model: None` always.
-        // Otherwise this slice picks the first chain entry (chain
-        // walking ships in slice #82).
-        if let Some(engine) = engine_label_override {
-            ChainEntry { engine, model: None }
-        } else {
-            phase.first_entry().clone()
-        }
-    };
+    // Issue #82 / ADR-0005: persisted per-engine rate-limit state.
+    // Lives alongside the bellows.log file; absent on first claim →
+    // empty state (every engine hot).
+    let state_path = state_file_path_alongside_log(&config.logging.path);
+    let mut state = StateFile::load(&state_path)?;
+    if let Some(parent) = state_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Implementer-CLI for this run. `None` until implement-phase end;
+    // set to whichever engine actually committed (accounting for any
+    // in-place advancement). Subsequent phases consult it for the
+    // diversity preference.
+    let mut implementer_cli: Option<Engine> = None;
 
     let auth_for = |entry: &ChainEntry| -> Auth {
         match config.auth.method {
@@ -498,22 +506,6 @@ pub async fn run_once(
         }
     };
 
-    // Engine for the implement phase. The kickoff prompt rendering
-    // depends on the engine; subsequent phases re-resolve via
-    // `phase_chain_entry` because the brief permits each phase to
-    // dispatch to a different engine.
-    let implement_chain_entry = phase_chain_entry(&config.phases.implement);
-
-    let kickoff = policy::render_kickoff_for_engine(
-        implement_chain_entry.engine,
-        &brief,
-        &repo_url,
-        &branch_name,
-    );
-    tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
-
-    let auth = auth_for(&implement_chain_entry);
-
     // Per-issue wall-clock budget. Threaded through every container call
     // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
     // reports the deadline fired.
@@ -521,67 +513,205 @@ pub async fn run_once(
         config.agent.wall_clock_minutes.get() * 60,
     ));
 
-    // ---- Phase 1: Implement ----
+    // Pre-implement chain walk (issue #82). Picks the engine for the
+    // implement phase from `config.phases.implement.cli_chain` under
+    // the freshly-loaded state file, then runs the implement phase in
+    // a bounded two-iteration loop so a rate-limit at base SHA can
+    // in-place-advance once before terminating.
     announce(
         log_writer,
         "bellows: phase 1/7 — implement (running agent in sandbox container, this is the long one)",
     );
-    announce_phase_engine(log_writer, "implement", &implement_chain_entry);
-    // Issue #52 asymmetry audit: capture HEAD before the implement
-    // agent invocation for the same reason the per-finding and nit-batch
-    // sites do. The agent brief discourages self-committing inside the
-    // sandbox but does not prevent it; if the implement agent self-
-    // commits and leaves nothing else staged, `commit_all` returns
-    // `NoChangesToCommit` and the legacy
-    // `commit_all().await?; push_branch().await?;` shape aborts the run
-    // outright — strictly worse than the silent-drop case, because the
-    // self-committed work lives on local HEAD but never reaches origin
-    // and the pipeline dies before producing a PR. The shared
-    // `commit_all_and_push_if_advanced` helper collapses the four-corner
-    // pattern (agent self-commit / bellows-on-behalf / mixed / no-op)
-    // so this site is tolerant of every commit shape the implement
-    // agent can leave behind.
     let head_before_implement = workspace::head_sha(&workspace).await?;
-    let implement_agent_run = sandbox::run_agent(
-        &workspace,
-        &auth,
-        claimed.number,
-        &repo_label,
-        &repo_slug,
-        &ssh_keys_volume,
-        &deploy_keys,
-        log_writer,
-        budget.deadline_or_halt(),
-    )
-    .await?;
-    budget.mark_killed_if(implement_agent_run.killed_by_deadline);
-    announce(
-        log_writer,
-        &format!(
-            "bellows: implement done (exit {}{})",
-            implement_agent_run.exit_code,
-            if implement_agent_run.killed_by_deadline {
-                ", killed by wall-clock"
-            } else {
-                ""
-            },
-        ),
-    );
+    let mut implement_advances_used: u8 = 0;
+    let mut rate_limited_phase: Option<&'static str> = None;
+    let (_implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
+        let now = chrono::Utc::now();
+        let pick_result = pick_engine_for_phase(
+            &config.phases.implement.cli_chain,
+            &state,
+            None,
+            engine_label_override,
+            now,
+        );
+        let mut picked = match pick_result {
+            Ok(p) => p,
+            Err(PickError::AllCooling) => {
+                // Every chain entry is cooling per the state file →
+                // terminate as RateLimited without invoking any agent.
+                rate_limited_phase = Some("implement");
+                announce(
+                    log_writer,
+                    "bellows: every implement chain entry is cooling per bellows-state.json; terminating as RateLimited",
+                );
+                let _ = state.save(&state_path);
+                break (
+                    ChainEntry {
+                        engine: Engine::Claude,
+                        model: None,
+                    },
+                    sandbox::AgentRun {
+                        exit_code: 0,
+                        stderr_tail: "(implement skipped: all chain entries cooling)".to_string(),
+                        killed_by_deadline: false,
+                    },
+                    head_before_implement.clone(),
+                    None,
+                );
+            }
+        };
+        // After the first in-place advance, override the picker's
+        // reason so the run-log line tells the operator the second
+        // invocation happened because of a rate-limit, not because
+        // chain[0] was cooling.
+        if implement_advances_used > 0 {
+            picked = PickedEntry {
+                entry: picked.entry,
+                reason: PickReason::InPlaceAdvancementAfterRateLimit,
+            };
+        }
+        if engine_label_override.is_some() {
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: engine forced via engine:{} label; chain walking skipped",
+                    picked.entry.engine.as_name(),
+                ),
+            );
+        }
+        announce(
+            log_writer,
+            &format_phase_engine_log("implement", &picked.entry, picked.reason),
+        );
 
-    // If the agent wrote a PR description file, capture + remove it
-    // before committing so it does NOT appear in the diff.
-    let pr_description_path = workspace.path().join(".bellows-pr-description.md");
-    let claude_pr_body = if pr_description_path.exists() {
-        let body = tokio::fs::read_to_string(&pr_description_path).await?;
-        tokio::fs::remove_file(&pr_description_path).await?;
-        Some(body.trim().to_string())
-    } else {
-        None
+        // Render kickoff for this engine. Each iteration re-renders so
+        // an in-place advance to a different engine sees the
+        // engine-specific kickoff body.
+        let kickoff = policy::render_kickoff_for_engine(
+            picked.entry.engine,
+            &brief,
+            &repo_url,
+            &branch_name,
+        );
+        tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
+
+        let auth = auth_for(&picked.entry);
+
+        let agent_run = sandbox::run_agent(
+            &workspace,
+            &auth,
+            claimed.number,
+            &repo_label,
+            &repo_slug,
+            &ssh_keys_volume,
+            &deploy_keys,
+            log_writer,
+            budget.deadline_or_halt(),
+        )
+        .await?;
+        budget.mark_killed_if(agent_run.killed_by_deadline);
+        announce(
+            log_writer,
+            &format!(
+                "bellows: implement done (exit {}{})",
+                agent_run.exit_code,
+                if agent_run.killed_by_deadline {
+                    ", killed by wall-clock"
+                } else {
+                    ""
+                },
+            ),
+        );
+
+        // If the agent wrote a PR description file, capture + remove
+        // it before committing so it does NOT appear in the diff.
+        let pr_description_path = workspace.path().join(".bellows-pr-description.md");
+        let pr_body = if pr_description_path.exists() {
+            let body = tokio::fs::read_to_string(&pr_description_path).await?;
+            tokio::fs::remove_file(&pr_description_path).await?;
+            Some(body.trim().to_string())
+        } else {
+            None
+        };
+
+        announce(log_writer, "bellows: committing + pushing implement branch");
+        let head_after =
+            workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
+
+        // Rate-limit handling (issue #82). Forced engine bypasses
+        // chain walking: any rate-limit terminates without an
+        // in-place advance.
+        if agent_run.exit_code != 0
+            && policy::is_rate_limit_signature(&agent_run.stderr_tail)
+            && !budget.exceeded
+        {
+            let at_base_sha = head_after == head_before_implement;
+            let now = chrono::Utc::now();
+            if engine_label_override.is_some() {
+                let parsed = chain_walker::parse_cooling_until(
+                    picked.entry.engine,
+                    &agent_run.stderr_tail,
+                    now,
+                );
+                state.record_rate_limit(picked.entry.engine, parsed.cooling_until);
+                if parsed.used_fallback {
+                    announce(
+                        log_writer,
+                        "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
+                    );
+                }
+                let _ = state.save(&state_path);
+                rate_limited_phase = Some("implement");
+                break (picked.entry, agent_run, head_after, pr_body);
+            }
+            // Record fallback flag for log visibility before
+            // delegating to the composed handler.
+            let parsed = chain_walker::parse_cooling_until(
+                picked.entry.engine,
+                &agent_run.stderr_tail,
+                now,
+            );
+            if parsed.used_fallback {
+                announce(
+                    log_writer,
+                    "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
+                );
+            }
+            let disposition = handle_implement_rate_limit(
+                &mut state,
+                picked.entry.engine,
+                &agent_run.stderr_tail,
+                now,
+                at_base_sha,
+                implement_advances_used,
+            );
+            let _ = state.save(&state_path);
+            match disposition {
+                RateLimitDisposition::InPlaceAdvance => {
+                    implement_advances_used += 1;
+                    announce(
+                        log_writer,
+                        &format!(
+                            "bellows: implement rate-limited at base SHA with engine={}; in-place-advancing to next hot chain entry (max 1 per phase invocation)",
+                            picked.entry.engine.as_name(),
+                        ),
+                    );
+                    continue;
+                }
+                RateLimitDisposition::Terminate => {
+                    rate_limited_phase = Some("implement");
+                    break (picked.entry, agent_run, head_after, pr_body);
+                }
+            }
+        }
+
+        // Implement phase produced output (or crashed for a non-
+        // rate-limit reason). Record the engine that actually ran as
+        // the implementer-CLI so subsequent phases can apply the
+        // diversity preference.
+        implementer_cli = Some(picked.entry.engine);
+        break (picked.entry, agent_run, head_after, pr_body);
     };
-
-    announce(log_writer, "bellows: committing + pushing implement branch");
-    let head_after_implement =
-        workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
 
     // Issue #49: implement-crash recovery. When the implement-phase
     // agent exited non-zero AND produced no commits, the legacy path
@@ -775,39 +905,73 @@ pub async fn run_once(
     // a synthetic agent-notes entry.
     let mut backstop_violations: Vec<policy::ParsedFinding> = Vec::new();
 
-    if !halt_after_post_implement {
+    if !halt_after_post_implement && rate_limited_phase.is_none() {
         // ---- Phase 3: Review ----
-        let review_chain_entry = phase_chain_entry(&config.phases.review);
-        let review_auth = auth_for(&review_chain_entry);
         announce(
             log_writer,
             "bellows: phase 3/7 — review (reads diff, produces findings)",
         );
-        announce_phase_engine(log_writer, "review", &review_chain_entry);
-        workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-        workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
-        let review_kickoff = policy::wrap_phase_prompt_for_engine(
-            review_chain_entry.engine,
-            policy::REVIEW_PROMPT,
-        );
-        tokio::fs::write(
-            workspace.path().join(".bellows-kickoff.md"),
-            review_kickoff,
-        )
-        .await?;
-        let review_agent_run = sandbox::run_agent(
-            &workspace,
-            &review_auth,
-            claimed.number,
-            &repo_label,
-            &repo_slug,
-            &ssh_keys_volume,
-            &deploy_keys,
+        let review_picked_opt = pick_non_implement_engine(
+            &config.phases.review.cli_chain,
+            &state,
+            implementer_cli,
+            engine_label_override,
+            "review",
             log_writer,
-            budget.deadline_or_halt(),
-        )
-        .await?;
-        budget.mark_killed_if(review_agent_run.killed_by_deadline);
+        );
+        if review_picked_opt.is_none() {
+            rate_limited_phase = Some("review");
+        }
+        let review_picked = review_picked_opt.unwrap_or(PickedEntry {
+            entry: ChainEntry { engine: Engine::Claude, model: None },
+            reason: PickReason::ChainFirstHotEntry,
+        });
+        let review_chain_entry = review_picked.entry.clone();
+        let review_auth = auth_for(&review_chain_entry);
+        let review_agent_run = if rate_limited_phase.is_some() {
+            // Picker terminated; skip the agent invocation.
+            sandbox::AgentRun {
+                exit_code: 0,
+                stderr_tail: String::new(),
+                killed_by_deadline: false,
+            }
+        } else {
+            workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+            workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
+            let review_kickoff = policy::wrap_phase_prompt_for_engine(
+                review_chain_entry.engine,
+                policy::REVIEW_PROMPT,
+            );
+            tokio::fs::write(
+                workspace.path().join(".bellows-kickoff.md"),
+                review_kickoff,
+            )
+            .await?;
+            let run = sandbox::run_agent(
+                &workspace,
+                &review_auth,
+                claimed.number,
+                &repo_label,
+                &repo_slug,
+                &ssh_keys_volume,
+                &deploy_keys,
+                log_writer,
+                budget.deadline_or_halt(),
+            )
+            .await?;
+            budget.mark_killed_if(run.killed_by_deadline);
+            if process_non_implement_rate_limit(
+                &mut state,
+                &state_path,
+                review_chain_entry.engine,
+                "review",
+                &run,
+                log_writer,
+            ) {
+                rate_limited_phase = Some("review");
+            }
+            run
+        };
 
         // Read the findings file. Don't remove it yet — review-fix may
         // need to read it. If review-fix runs successfully it removes
@@ -895,8 +1059,6 @@ pub async fn run_once(
             // review-fix phase has its own `[phases.review_fix]
             // cli_chain`; the per-finding loop and the nit-batch both
             // dispatch to the same engine for the phase.
-            let review_fix_chain_entry = phase_chain_entry(&config.phases.review_fix);
-            let review_fix_auth = auth_for(&review_fix_chain_entry);
             announce(
                 log_writer,
                 &format!(
@@ -905,7 +1067,23 @@ pub async fn run_once(
                     nit_findings.len(),
                 ),
             );
-            announce_phase_engine(log_writer, "review-fix", &review_fix_chain_entry);
+            let review_fix_picked_opt = pick_non_implement_engine(
+                &config.phases.review_fix.cli_chain,
+                &state,
+                implementer_cli,
+                engine_label_override,
+                "review-fix",
+                log_writer,
+            );
+            if review_fix_picked_opt.is_none() {
+                rate_limited_phase = Some("review-fix");
+            }
+            let review_fix_picked = review_fix_picked_opt.unwrap_or(PickedEntry {
+                entry: ChainEntry { engine: Engine::Claude, model: None },
+                reason: PickReason::ChainFirstHotEntry,
+            });
+            let review_fix_chain_entry = review_fix_picked.entry.clone();
+            let review_fix_auth = auth_for(&review_fix_chain_entry);
 
             // Per-finding loop: one container per blocker/important
             // finding. Each invocation respects the remaining wall-
@@ -914,6 +1092,15 @@ pub async fn run_once(
             let mut coverage: Vec<policy::FindingCoverage> = Vec::new();
             let mut review_fix_exit: i64 = 0;
             for (idx, finding) in urgent_findings.iter().enumerate() {
+                if rate_limited_phase.is_some() {
+                    // Earlier per-finding invocation rate-limited; skip
+                    // the rest so they don't burn additional API calls.
+                    coverage.push(policy::FindingCoverage {
+                        finding: finding.clone(),
+                        commit_landed: false,
+                    });
+                    continue;
+                }
                 if budget.exceeded {
                     announce(
                         log_writer,
@@ -974,6 +1161,16 @@ pub async fn run_once(
                 )
                 .await?;
                 budget.mark_killed_if(per_finding_run.killed_by_deadline);
+                if process_non_implement_rate_limit(
+                    &mut state,
+                    &state_path,
+                    review_fix_chain_entry.engine,
+                    "review-fix",
+                    &per_finding_run,
+                    log_writer,
+                ) {
+                    rate_limited_phase = Some("review-fix");
+                }
                 if review_fix_exit == 0 && per_finding_run.exit_code != 0 {
                     review_fix_exit = per_finding_run.exit_code;
                 }
@@ -1047,7 +1244,7 @@ pub async fn run_once(
             // classification (commit_landed) is not needed here — the
             // nit batch does not contribute to address-or-explain
             // coverage — so we discard `head_after`.
-            if !nit_findings.is_empty() && !budget.exceeded {
+            if !nit_findings.is_empty() && !budget.exceeded && rate_limited_phase.is_none() {
                 announce(
                     log_writer,
                     &format!(
@@ -1085,6 +1282,16 @@ pub async fn run_once(
                 )
                 .await?;
                 budget.mark_killed_if(nit_batch_run.killed_by_deadline);
+                if process_non_implement_rate_limit(
+                    &mut state,
+                    &state_path,
+                    review_fix_chain_entry.engine,
+                    "review-fix",
+                    &nit_batch_run,
+                    log_writer,
+                ) {
+                    rate_limited_phase = Some("review-fix");
+                }
                 if review_fix_exit == 0 && nit_batch_run.exit_code != 0 {
                     review_fix_exit = nit_batch_run.exit_code;
                 }
@@ -1164,42 +1371,71 @@ pub async fn run_once(
         // X1's review halt.
         let mut halt_after_security = false;
         let mut halt_after_security_fix = false;
-        if !halt_after_review && !halt_after_fix && !budget.exceeded {
-            let security_review_chain_entry =
-                phase_chain_entry(&config.phases.security_review);
-            let security_review_auth = auth_for(&security_review_chain_entry);
+        if !halt_after_review && !halt_after_fix && !budget.exceeded && rate_limited_phase.is_none()
+        {
             announce(
                 log_writer,
                 "bellows: phase 5/7 — security-review (reads diff for the five security focus categories, produces findings)",
             );
-            announce_phase_engine(
-                log_writer,
+            let security_review_picked_opt = pick_non_implement_engine(
+                &config.phases.security_review.cli_chain,
+                &state,
+                implementer_cli,
+                engine_label_override,
                 "security-review",
-                &security_review_chain_entry,
-            );
-            workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-            let security_kickoff = policy::wrap_phase_prompt_for_engine(
-                security_review_chain_entry.engine,
-                policy::SECURITY_REVIEW_PROMPT,
-            );
-            tokio::fs::write(
-                workspace.path().join(".bellows-kickoff.md"),
-                security_kickoff,
-            )
-            .await?;
-            let security_agent_run = sandbox::run_agent(
-                &workspace,
-                &security_review_auth,
-                claimed.number,
-                &repo_label,
-                &repo_slug,
-                &ssh_keys_volume,
-                &deploy_keys,
                 log_writer,
-                budget.deadline_or_halt(),
-            )
-            .await?;
-            budget.mark_killed_if(security_agent_run.killed_by_deadline);
+            );
+            if security_review_picked_opt.is_none() {
+                rate_limited_phase = Some("security-review");
+            }
+            let security_review_picked = security_review_picked_opt.unwrap_or(PickedEntry {
+                entry: ChainEntry { engine: Engine::Claude, model: None },
+                reason: PickReason::ChainFirstHotEntry,
+            });
+            let security_review_chain_entry = security_review_picked.entry.clone();
+            let security_review_auth = auth_for(&security_review_chain_entry);
+            let security_agent_run = if rate_limited_phase.is_some() {
+                sandbox::AgentRun {
+                    exit_code: 0,
+                    stderr_tail: String::new(),
+                    killed_by_deadline: false,
+                }
+            } else {
+                workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+                let security_kickoff = policy::wrap_phase_prompt_for_engine(
+                    security_review_chain_entry.engine,
+                    policy::SECURITY_REVIEW_PROMPT,
+                );
+                tokio::fs::write(
+                    workspace.path().join(".bellows-kickoff.md"),
+                    security_kickoff,
+                )
+                .await?;
+                let run = sandbox::run_agent(
+                    &workspace,
+                    &security_review_auth,
+                    claimed.number,
+                    &repo_label,
+                    &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
+                    log_writer,
+                    budget.deadline_or_halt(),
+                )
+                .await?;
+                budget.mark_killed_if(run.killed_by_deadline);
+                if process_non_implement_rate_limit(
+                    &mut state,
+                    &state_path,
+                    security_review_chain_entry.engine,
+                    "security-review",
+                    &run,
+                    log_writer,
+                ) {
+                    rate_limited_phase = Some("security-review");
+                }
+                run
+            };
 
             // Read the security findings file. Don't remove it yet —
             // security-fix may need to read it. The security-fix phase
@@ -1243,50 +1479,83 @@ pub async fn run_once(
             // findings file" shape — not the slice-9.6 per-finding loop;
             // security fixups are scoped tightly enough that the
             // per-finding overhead would dwarf the work).
-            if !halt_after_security && has_security_findings && !budget.exceeded {
-                let security_fix_chain_entry =
-                    phase_chain_entry(&config.phases.security_fix);
-                let security_fix_auth = auth_for(&security_fix_chain_entry);
+            if !halt_after_security
+                && has_security_findings
+                && !budget.exceeded
+                && rate_limited_phase.is_none()
+            {
                 announce(
                     log_writer,
                     "bellows: phase 6/7 — security-fix (reads findings and addresses each)",
                 );
-                announce_phase_engine(
-                    log_writer,
+                let security_fix_picked_opt = pick_non_implement_engine(
+                    &config.phases.security_fix.cli_chain,
+                    &state,
+                    implementer_cli,
+                    engine_label_override,
                     "security-fix",
-                    &security_fix_chain_entry,
-                );
-                let security_fix_kickoff = policy::wrap_phase_prompt_for_engine(
-                    security_fix_chain_entry.engine,
-                    policy::SECURITY_FIX_PROMPT,
-                );
-                tokio::fs::write(
-                    workspace.path().join(".bellows-kickoff.md"),
-                    security_fix_kickoff,
-                )
-                .await?;
-                let head_before = workspace::head_sha(&workspace).await?;
-                let security_fix_run = sandbox::run_agent(
-                    &workspace,
-                    &security_fix_auth,
-                    claimed.number,
-                    &repo_label,
-                    &repo_slug,
-                    &ssh_keys_volume,
-                    &deploy_keys,
                     log_writer,
-                    budget.deadline_or_halt(),
-                )
-                .await?;
-                budget.mark_killed_if(security_fix_run.killed_by_deadline);
+                );
+                if security_fix_picked_opt.is_none() {
+                    rate_limited_phase = Some("security-fix");
+                }
+                let security_fix_picked = security_fix_picked_opt.unwrap_or(PickedEntry {
+                    entry: ChainEntry { engine: Engine::Claude, model: None },
+                    reason: PickReason::ChainFirstHotEntry,
+                });
+                let security_fix_chain_entry = security_fix_picked.entry.clone();
+                let security_fix_auth = auth_for(&security_fix_chain_entry);
+                let security_fix_run = if rate_limited_phase.is_some() {
+                    sandbox::AgentRun {
+                        exit_code: 0,
+                        stderr_tail: String::new(),
+                        killed_by_deadline: false,
+                    }
+                } else {
+                    let security_fix_kickoff = policy::wrap_phase_prompt_for_engine(
+                        security_fix_chain_entry.engine,
+                        policy::SECURITY_FIX_PROMPT,
+                    );
+                    tokio::fs::write(
+                        workspace.path().join(".bellows-kickoff.md"),
+                        security_fix_kickoff,
+                    )
+                    .await?;
+                    let head_before = workspace::head_sha(&workspace).await?;
+                    let run = sandbox::run_agent(
+                        &workspace,
+                        &security_fix_auth,
+                        claimed.number,
+                        &repo_label,
+                        &repo_slug,
+                        &ssh_keys_volume,
+                        &deploy_keys,
+                        log_writer,
+                        budget.deadline_or_halt(),
+                    )
+                    .await?;
+                    budget.mark_killed_if(run.killed_by_deadline);
+                    if process_non_implement_rate_limit(
+                        &mut state,
+                        &state_path,
+                        security_fix_chain_entry.engine,
+                        "security-fix",
+                        &run,
+                        log_writer,
+                    ) {
+                        rate_limited_phase = Some("security-fix");
+                    }
+                    // Same agent-self-commit-tolerant push plumbing as
+                    // the per-finding/nit-batch sites. If the agent
+                    // self-committed each fix, bellows's commit_all
+                    // sees nothing to stage (NoChangesToCommit) but
+                    // HEAD has advanced — commit_all_and_push_if_advanced
+                    // pushes either shape.
+                    let _ =
+                        workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
+                    run
+                };
                 let security_fix_exit = security_fix_run.exit_code;
-                // Same agent-self-commit-tolerant push plumbing as the
-                // per-finding/nit-batch sites. If the agent self-
-                // committed each fix, bellows's commit_all sees nothing
-                // to stage (NoChangesToCommit) but HEAD has advanced —
-                // commit_all_and_push_if_advanced pushes either shape.
-                let _ =
-                    workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
                 security_fix_outcome = Some(FixOutcome {
                     exit_code: security_fix_exit,
                 });
@@ -1413,8 +1682,17 @@ pub async fn run_once(
         }
     };
 
+    // Issue #82: a non-implement-phase rate-limit (or implement-phase
+    // rate-limit that terminates rather than in-place-advances) sets
+    // `rate_limited_phase`. The existing `classify_exit` already
+    // recognises implement-phase rate-limit signatures; the override
+    // catches non-implement phases (review / review-fix /
+    // security-review / security-fix) whose stderr_tail does not flow
+    // into `PhaseOutcomes::implement`.
     let reason = if externally_cancelled {
         ExitReason::Cancelled
+    } else if rate_limited_phase.is_some() {
+        ExitReason::RateLimited
     } else {
         pipeline_reason
     };
@@ -1875,25 +2153,121 @@ fn announce(log_writer: &mut dyn Write, line: &str) {
     let _ = writeln!(log_writer, "{}", line);
 }
 
-/// Issue #81 / ADR-0005 AC: at each phase-start, log the engine + the
-/// model being used. `<CLI default>` when the chain entry pinned no
-/// model. The reasoning (chain-order vs diversity-preference vs
-/// label-forced) ships with #82; for slice #81 the line is "engine +
-/// model" so the operator can audit per-phase dispatch from the
-/// polling log.
-fn announce_phase_engine(
+/// Issue #82: path to the per-engine rate-limit state file, written
+/// alongside `bellows.log` so the operator finds both in the same
+/// directory. ADR-0005: "written alongside `bellows.log` in the
+/// operator's bellows working directory; same parent path as the
+/// existing log; same lifecycle owner."
+pub fn state_file_path_alongside_log(log_path: &std::path::Path) -> std::path::PathBuf {
+    log_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("bellows-state.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("bellows-state.json"))
+}
+
+/// Pick the engine for a non-implement phase and emit the run-log
+/// line. Returns `Some(PickedEntry)` on success, `None` when every
+/// chain entry is cooling (caller short-circuits to RateLimited).
+/// Surfaces the diversity-collapse warning when pass-2 of the picker
+/// fired so the operator can see why the implementer-CLI ran review.
+fn pick_non_implement_engine(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    forced: Option<Engine>,
+    phase_name: &'static str,
     log_writer: &mut dyn Write,
-    phase_name: &str,
-    entry: &ChainEntry,
-) {
-    let model_field = entry.model.as_deref().unwrap_or("<CLI default>");
-    announce(
-        log_writer,
-        &format!(
-            "bellows: phase `{phase_name}` engine={engine} model={model_field}",
-            engine = entry.engine.as_name(),
-        ),
-    );
+) -> Option<PickedEntry> {
+    let now = chrono::Utc::now();
+    match pick_engine_for_phase(chain, state, implementer, forced, now) {
+        Ok(p) => {
+            if forced.is_some() {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: engine forced via engine:{} label; chain walking skipped",
+                        p.entry.engine.as_name(),
+                    ),
+                );
+            } else if p.reason == PickReason::SecondPassAfterCollapse {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: diversity preference collapsed for phase `{phase_name}` — every hot chain entry matches the implementer-CLI; proceeding with the same engine",
+                    ),
+                );
+            }
+            announce(
+                log_writer,
+                &format_phase_engine_log(phase_name, &p.entry, p.reason),
+            );
+            Some(p)
+        }
+        Err(PickError::AllCooling) => {
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: every `{phase_name}` chain entry is cooling per bellows-state.json; terminating as RateLimited",
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Record a non-implement-phase rate-limit signature in the state
+/// file. Returns `true` when the agent run matched a rate-limit
+/// signature (caller halts the rest of the pipeline). The composed
+/// helper from `chain_walker` does the state-update + decide; this
+/// runner-side wrapper adds the log lines.
+fn process_non_implement_rate_limit(
+    state: &mut StateFile,
+    state_path: &std::path::Path,
+    engine: Engine,
+    phase_name: &'static str,
+    agent_run: &sandbox::AgentRun,
+    log_writer: &mut dyn Write,
+) -> bool {
+    if agent_run.exit_code == 0 || !policy::is_rate_limit_signature(&agent_run.stderr_tail) {
+        return false;
+    }
+    let now = chrono::Utc::now();
+    let parsed = chain_walker::parse_cooling_until(engine, &agent_run.stderr_tail, now);
+    if parsed.used_fallback {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown for engine={}",
+                engine.as_name(),
+            ),
+        );
+    }
+    let disposition =
+        handle_non_implement_rate_limit(state, engine, phase_name, &agent_run.stderr_tail, now);
+    let _ = state.save(state_path);
+    match disposition {
+        RateLimitDisposition::Terminate => {
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: phase `{phase_name}` rate-limited on engine={}; terminating run as RateLimited",
+                    engine.as_name(),
+                ),
+            );
+        }
+        RateLimitDisposition::InPlaceAdvance => {
+            // Non-implement phases never in-place-advance; defensive.
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: phase `{phase_name}` rate-limited on engine={}; terminating run as RateLimited",
+                    engine.as_name(),
+                ),
+            );
+        }
+    }
+    true
 }
 
 /// Tracks the per-issue wall-clock budget across the slice-X1
