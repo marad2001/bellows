@@ -1339,17 +1339,10 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
 
     let engine_auth = config.auth.for_engine(engine);
     let volume = &engine_auth.credentials_volume;
-    let (engine_name, cli_binary, home_in_container) = match engine {
-        bellows::config::Engine::Claude => (
-            "claude",
-            "claude",
-            CLAUDE_HOME_IN_CONTAINER,
-        ),
-        bellows::config::Engine::Codex => (
-            "codex",
-            "codex",
-            bellows::auth::CODEX_HOME_IN_CONTAINER,
-        ),
+    let engine_name = engine.as_name();
+    let home_in_container = match engine {
+        bellows::config::Engine::Claude => CLAUDE_HOME_IN_CONTAINER,
+        bellows::config::Engine::Codex => bellows::auth::CODEX_HOME_IN_CONTAINER,
     };
     println!(
         "bellows: launching interactive {engine_name} in a container to seed `{}` with OAuth credentials.",
@@ -1368,7 +1361,7 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
             "--volume",
             &format!("{volume}:{home_in_container}"),
             "--entrypoint",
-            cli_binary,
+            engine_name,
             &image_tag,
         ])
         .status()
