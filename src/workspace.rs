@@ -46,6 +46,41 @@ pub struct GateCommands {
     pub test_source: Provenance,
 }
 
+impl GateCommands {
+    /// Format the two operator-visible run-log lines that announce
+    /// which cargo command is about to run and where it came from.
+    /// Emitted by the runner at the start of each cargo-checks gate
+    /// phase, so an operator tailing the log can tell whether bellows
+    /// is mirroring the target repo's CI or has fallen back to the
+    /// operator-declared `[gates].*_flags`.
+    ///
+    /// Each line is shaped:
+    ///   `  <check>: <command>  [<provenance>]`
+    /// where `<provenance>` is either `parsed from <path>` or
+    /// `fallback from [gates].<knob>` so the source is unambiguous.
+    pub fn announcement_lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "  clippy: {}  [{}]",
+                self.clippy,
+                format_provenance(&self.clippy_source, "[gates].clippy_flags"),
+            ),
+            format!(
+                "  test:   {}  [{}]",
+                self.test,
+                format_provenance(&self.test_source, "[gates].test_flags"),
+            ),
+        ]
+    }
+}
+
+fn format_provenance(provenance: &Provenance, config_knob: &str) -> String {
+    match provenance {
+        Provenance::ParsedFromWorkflow(path) => format!("parsed from {}", path.display()),
+        Provenance::FallbackFromConfig => format!("fallback from {}", config_knob),
+    }
+}
+
 impl Workspace {
     pub fn path(&self) -> &Path {
         self.temp_dir.path()
