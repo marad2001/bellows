@@ -444,6 +444,21 @@ with `agent/`, PRs targeting a non-default branch, and PRs whose CI
 failed are all skipped — so human-authored PRs and bellows failure
 PRs still need a human merge.
 
+The `agent/*` branch namespace is **bellows-owned by convention**.
+Bellows creates `agent/<N>-<slug>` on every claim, force-overwrites
+on retries, and — per [ADR-0003](docs/adr/0003-pre-claim-stale-agent-branch-deletion.md)
+— sweeps any stale `agent/<N>-*` ref on origin before claiming an
+issue, so a failed prior run's leftover branch can't crash the next
+reclaim. Practical consequence: **closing a bellows PR without
+`--delete-branch` is treated as "abandon — bellows will reclaim and
+overwrite the branch on the next claim."** Closing the PR through
+the GitHub UI or `gh pr close` leaves the `agent/*` branch on
+origin by default; on the next `ready-for-agent` flip, bellows will
+delete that branch and rebuild from scratch. If you want to preserve
+the work an agent produced on a closed PR, `git checkout` and rebase
+those commits onto a non-`agent/*` branch first — bellows does not
+look at non-`agent/*` branches.
+
 Bellows does **not** auto-retry. If a run lands at `agent-failed` and
 you want to try again, fix whatever needs fixing (the agent brief, the
 test environment, an upstream dep) and re-label the issue back to
