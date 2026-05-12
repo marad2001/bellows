@@ -125,3 +125,47 @@ fn adr_0005_documents_diversity_and_throughput_wins() {
         "wins / diversity + throughput",
     );
 }
+
+/// AC#3 — Documents the engine selection model. Five load-bearing
+/// shapes from the brief:
+///   1. Per-phase `cli_chain` in config (each agent-invoking phase
+///      declares an ordered list of engines).
+///   2. Engine choice happens at each phase's start, not once at
+///      claim time.
+///   3. Soft-diversity two-pass picker: first pass = (hot AND ≠
+///      implementer-CLI); second pass = (hot) with a visible
+///      collapse warning; empty → terminate run as `RateLimited`.
+///   4. Per-issue `engine:claude` / `engine:codex` label = forced
+///      single-engine override (no fallback, no diversity logic).
+///   5. Both labels present → refuse-to-claim (parallel to
+///      `MissingAgentBrief`).
+#[test]
+fn adr_0005_documents_engine_selection_model() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // Config shape.
+            "cli_chain",
+            "phases.implement",
+            "phases.review",
+            // Phase-start picker, not claim-time picker.
+            "phase",
+            "claim",
+            // Soft-diversity two-pass shape.
+            "first pass",
+            "second pass",
+            "hot",
+            "implementer-CLI",
+            "RateLimited",
+            // Forced-engine label override.
+            "engine:claude",
+            "engine:codex",
+            "forced-single-engine",
+            // Refuse-to-claim parallel to MissingAgentBrief.
+            "MissingAgentBrief",
+            "refuse-to-claim",
+        ],
+        "engine-selection-model",
+    );
+}
