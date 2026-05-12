@@ -3,9 +3,9 @@ use wiremock::matchers::{body_json, body_partial_json, method, path, query_param
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
-    apply_verdict, claim, fetch_agent_brief, fetch_issue_with_comments, finalise, find_next_issue,
-    list_needs_triage_issues, list_open_agent_prs, post_pr_comment, transition_to_cancelled,
-    ClaimError, FinaliseRequest,
+    apply_verdict, claim, delete_stale_agent_branches, fetch_agent_brief,
+    fetch_issue_with_comments, finalise, find_next_issue, list_needs_triage_issues,
+    list_open_agent_prs, post_pr_comment, transition_to_cancelled, ClaimError, FinaliseRequest,
 };
 use bellows::triage::TriageVerdict;
 use wiremock::matchers::body_string_contains;
@@ -1062,4 +1062,242 @@ async fn post_pr_comment_posts_body_to_the_pr_comments_endpoint() {
     )
     .await
     .expect("post_pr_comment should succeed");
+}
+
+// ---- Issue #76 / ADR-0003: pre-claim deletion of stale `agent/<N>-*`
+//      branches on origin. The function walks `git/matching-refs/heads/agent/{N}-`,
+//      DELETEs every match, and returns the list of successfully-deleted
+//      names. 404 on an individual DELETE is treated as success (the branch
+//      raced out from under us — same end state). Any other non-success
+//      propagates as Err so the runner can surface RunOutcome::Blocked. ----
+
+#[tokio::test]
+async fn delete_stale_agent_branches_deletes_a_single_matching_ref() {
+    // The brief's "stale branch from a prior failed run" case: one
+    // `agent/<N>-<slug>` ref exists on origin, the DELETE returns 204,
+    // the function returns a vec with that branch name.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-foo",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-foo",
+                "object": { "sha": "deadbeef", "type": "commit", "url": "http://example/commits/deadbeef" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-foo"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let deleted = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16)
+        .await
+        .expect("delete_stale_agent_branches should succeed");
+    assert_eq!(deleted, vec!["agent/16-foo".to_string()]);
+}
+
+#[tokio::test]
+async fn delete_stale_agent_branches_deletes_every_match_for_the_issue_number() {
+    // The title-edit case from the brief: the operator renamed the issue
+    // between failed runs, so two distinct `agent/16-*` slugs both exist
+    // on origin. Exact-slug matching would leak the orphan; the
+    // anchored-prefix sweep deletes BOTH branches.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-foo",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-foo",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            },
+            {
+                "ref": "refs/heads/agent/16-bar",
+                "node_id": "n2",
+                "url": "http://example/refs/heads/agent/16-bar",
+                "object": { "sha": "bbb", "type": "commit", "url": "http://example/commits/bbb" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-foo"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-bar"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let deleted = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16)
+        .await
+        .expect("delete_stale_agent_branches should succeed");
+    let mut names = deleted;
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["agent/16-bar".to_string(), "agent/16-foo".to_string()],
+    );
+}
+
+#[tokio::test]
+async fn delete_stale_agent_branches_treats_404_on_delete_as_success_and_continues() {
+    // Idempotency contract per ADR-0003: a 404 on an individual DELETE
+    // means the branch raced out from under us — same end state as
+    // having deleted it ourselves. The function must NOT propagate the
+    // 404 as Err, and must continue processing any remaining refs.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-gone",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-gone",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            },
+            {
+                "ref": "refs/heads/agent/16-still-here",
+                "node_id": "n2",
+                "url": "http://example/refs/heads/agent/16-still-here",
+                "object": { "sha": "bbb", "type": "commit", "url": "http://example/commits/bbb" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "Reference does not exist",
+            "documentation_url": "https://docs.github.com/..."
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-still-here"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let deleted = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16)
+        .await
+        .expect("404 on individual DELETE must be treated as success");
+    // The 404'd branch counts as successfully removed (idempotency), and
+    // the next ref is still processed.
+    let mut names = deleted;
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "agent/16-gone".to_string(),
+            "agent/16-still-here".to_string(),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn delete_stale_agent_branches_propagates_403_as_err_so_runner_can_block() {
+    // Branch protection or PAT scope: GitHub returns 403 on the DELETE.
+    // Per the brief, this must surface as Err so the runner returns
+    // RunOutcome::Blocked. The next tick will retry — the contract is
+    // idempotent across retries.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-protected",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-protected",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-protected"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "message": "Resource not accessible by integration",
+            "documentation_url": "https://docs.github.com/..."
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let result = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16).await;
+    assert!(
+        result.is_err(),
+        "403 on DELETE must propagate as Err so the runner can return Blocked, got Ok({:?})",
+        result.ok(),
+    );
+}
+
+#[tokio::test]
+async fn delete_stale_agent_branches_returns_empty_vec_when_no_refs_match() {
+    // Common case on a clean repo: no `agent/16-*` refs exist. The
+    // matching-refs endpoint returns an empty array; the function must
+    // NOT issue any DELETE calls and must return an empty vec so the
+    // runner sees "zero swept" and proceeds to claim.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // No DELETE mock mounted: if the function issues one, wiremock will
+    // 404 and the test will surface that as an Err. The Ok(empty) path
+    // is what proves no DELETE was attempted.
+
+    let client = octocrab_pointed_at(mock.uri());
+    let deleted = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16)
+        .await
+        .expect("no matching refs should be the happy path, not an error");
+    assert!(deleted.is_empty(), "expected empty, got {:?}", deleted);
+}
+
+#[tokio::test]
+async fn delete_stale_agent_branches_uses_anchored_prefix_with_trailing_dash() {
+    // ADR-0003 rationale: the dash separator in the anchored prefix
+    // prevents collision between `agent/16-*` and `agent/160-*`. Pin the
+    // matching-refs URL so a future implementation can't silently drop
+    // the dash and start eating cross-issue branches when an issue's
+    // number is a prefix of another's.
+    let mock = MockServer::start().await;
+
+    // ANY matching-refs path under `agent/16-` (with the dash) returns
+    // empty; a path WITHOUT the dash (or with the wrong number) would
+    // hit a wiremock-default 404 — which the function would propagate
+    // as Err, failing the test.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let deleted = delete_stale_agent_branches(&client, "marad2001", "test-repo", 16)
+        .await
+        .expect("function must query the anchored-with-dash prefix");
+    assert!(deleted.is_empty());
 }
