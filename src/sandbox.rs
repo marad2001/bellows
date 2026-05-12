@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::auth::Auth;
 use crate::policy::{CheckResult, GateOutcome};
-use crate::workspace::Workspace;
+use crate::workspace::{GateCommands, Workspace};
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
 
@@ -625,10 +625,16 @@ pub async fn run_cargo_checks(
     // re-introduce the EACCES-on-first-write regression that
     // `/workspace/target` and `/usr/local/cargo/registry` are exposed
     // to whenever Docker freshly creates one of those named volumes.
+    //
+    // ADR-0004: pass the snapshotted gate commands into the container
+    // via BELLOWS_CLIPPY_CMD / BELLOWS_TEST_CMD env vars. The script
+    // eval's each one verbatim so the gate mirrors target CI rather
+    // than running bellows's old hardcoded flag set.
     let config = ContainerCreateBody {
         image: Some(image_tag),
         entrypoint: Some(build_cargo_checks_entrypoint()),
         cmd: Some(vec![]),
+        env: Some(build_cargo_checks_env(workspace.gate_commands())),
         working_dir: Some("/workspace".to_string()),
         labels: Some(labels),
         host_config: Some(host_config),
@@ -855,6 +861,17 @@ fn build_cargo_checks_entrypoint() -> Vec<String> {
     vec![
         POLICY_PREP_ENTRYPOINT.to_string(),
         CARGO_CHECKS_USER_SCRIPT.to_string(),
+    ]
+}
+
+/// ADR-0004: build the env list bellows hands the cargo-checks
+/// container so `run-cargo-checks` evaluates the snapshotted clippy
+/// and test commands verbatim. Pulled out into a pure function so
+/// the env shape is unit-testable without spinning up Docker.
+fn build_cargo_checks_env(gate_commands: &GateCommands) -> Vec<String> {
+    vec![
+        format!("BELLOWS_CLIPPY_CMD={}", gate_commands.clippy),
+        format!("BELLOWS_TEST_CMD={}", gate_commands.test),
     ]
 }
 

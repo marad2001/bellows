@@ -1,12 +1,23 @@
 #!/bin/sh
-# Bellows post-run cargo checks gate (slice X1).
+# Bellows post-run cargo checks gate (slice X1, parameterised by
+# ADR-0004).
 #
-# Runs `cargo clippy --all-targets --all-features -- -D warnings` then,
-# if clippy passed, `cargo test --all-targets --all-features` — both
-# inside the same container so clippy's compilation artifacts are
-# reused by test. The flag set on both invocations is identical to
-# the GitHub Actions CI workflow so the two verdicts agree by
-# construction (see `.github/workflows/ci.yml`).
+# The clippy and test commands are NOT baked into this script. Bellows
+# snapshots the target repo's CI workflow (.github/workflows/*.yml)
+# at workspace::prepare time and passes the extracted commands here
+# via two env vars:
+#
+#   BELLOWS_CLIPPY_CMD  — complete `cargo clippy ...` invocation.
+#   BELLOWS_TEST_CMD    — complete `cargo test ...` invocation.
+#
+# When the workflow can't be parsed, bellows substitutes its
+# `[gates].*_flags` fallback before invoking us. Either way, the
+# commands arrive here as complete shell-evaluable strings and we
+# eval them verbatim, so the gate runs whatever CI runs.
+#
+# `BELLOWS_WORKSPACE` overrides the default `/workspace` cwd so the
+# same script can be exercised under tests without a Docker bind-
+# mount in place.
 #
 # Each check's stdout+stderr is captured to its own file in the
 # workspace bind mount so the runner can attribute failures to the
@@ -20,11 +31,12 @@
 
 set -u
 
-cd /workspace
+WORKSPACE_DIR="${BELLOWS_WORKSPACE:-/workspace}"
+cd "$WORKSPACE_DIR" || exit 64
 
-CLIPPY_OUTPUT=/workspace/.bellows-cargo-clippy-output
-TEST_OUTPUT=/workspace/.bellows-cargo-test-output
-RESULTS=/workspace/.bellows-cargo-checks-results
+CLIPPY_OUTPUT="$WORKSPACE_DIR/.bellows-cargo-clippy-output"
+TEST_OUTPUT="$WORKSPACE_DIR/.bellows-cargo-test-output"
+RESULTS="$WORKSPACE_DIR/.bellows-cargo-checks-results"
 
 # Truncate any leftovers from a prior run (defensive — Bellows removes
 # these on the host between runs, but a partial file should never block
@@ -33,11 +45,21 @@ RESULTS=/workspace/.bellows-cargo-checks-results
 : > "$TEST_OUTPUT"
 : > "$RESULTS"
 
-cargo clippy --all-targets --all-features -- -D warnings >"$CLIPPY_OUTPUT" 2>&1
+CLIPPY_CMD="${BELLOWS_CLIPPY_CMD:-cargo clippy --all-targets --all-features -- -D warnings}"
+TEST_CMD="${BELLOWS_TEST_CMD:-cargo test --all-targets --all-features}"
+
+# Echo the actual command before executing so an operator watching the
+# container output sees the verbatim posture being applied. Bellows
+# emits its own provenance line (parsed vs fallback) at gate-phase
+# start; this echo is the per-step confirmation that the script
+# received and is running what bellows handed it.
+echo "+ $CLIPPY_CMD"
+sh -c "$CLIPPY_CMD" >"$CLIPPY_OUTPUT" 2>&1
 CLIPPY_EXIT=$?
 
 if [ $CLIPPY_EXIT -eq 0 ]; then
-    cargo test --all-targets --all-features >"$TEST_OUTPUT" 2>&1
+    echo "+ $TEST_CMD"
+    sh -c "$TEST_CMD" >"$TEST_OUTPUT" 2>&1
     TEST_EXIT=$?
     TEST_RECORDED=$TEST_EXIT
 else
