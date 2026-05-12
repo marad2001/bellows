@@ -4,6 +4,9 @@ use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::process::Command;
 
+use crate::config::GatesConfig;
+use crate::workflow_parse::{parse_ci_workflow, ExtractedCommands, Provenance};
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("io: {0}")]
@@ -23,6 +26,24 @@ pub struct Workspace {
     temp_dir: TempDir,
     branch_name: String,
     default_branch: String,
+    gate_commands: GateCommands,
+}
+
+/// ADR-0004 cargo-checks gate command snapshot, captured at
+/// `prepare` time and read by both the post-implement and
+/// end-pipeline gate phases within the same run. Each command carries
+/// its own [`Provenance`] so the operator-visible run-log line can
+/// state unambiguously whether the command was mirrored from the
+/// target repo's `.github/workflows/ci.yml` or substituted from the
+/// operator-declared `[gates].*_flags` fallback in `orchestrator.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCommands {
+    /// Complete cargo clippy invocation, including the `cargo`
+    /// prefix. Bellows hands this to the sandbox container verbatim.
+    pub clippy: String,
+    pub clippy_source: Provenance,
+    pub test: String,
+    pub test_source: Provenance,
 }
 
 impl Workspace {
@@ -39,9 +60,32 @@ impl Workspace {
     pub fn default_branch(&self) -> &str {
         &self.default_branch
     }
+
+    /// The snapshotted cargo-checks gate commands (ADR-0004). Captured
+    /// at `prepare` time so subsequent gate phases within the same run
+    /// see a stable verdict even if the agent edits
+    /// `.github/workflows/ci.yml` mid-pipeline.
+    pub fn gate_commands(&self) -> &GateCommands {
+        &self.gate_commands
+    }
 }
 
 pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, WorkspaceError> {
+    prepare_with_gates(repo_url, branch_name, &GatesConfig::default()).await
+}
+
+/// `prepare` variant that accepts the operator-declared
+/// `[gates].*_flags` fallback. The runner uses this so the
+/// snapshotted gate commands on the returned `Workspace` reflect the
+/// runtime configuration; callers without access to the config (e.g.
+/// unit tests not exercising the cargo-checks gate) can keep using
+/// the legacy `prepare(url, branch)` shape, which delegates here with
+/// `GatesConfig::default()`.
+pub async fn prepare_with_gates(
+    repo_url: &str,
+    branch_name: &str,
+    gates: &GatesConfig,
+) -> Result<Workspace, WorkspaceError> {
     let temp_dir = TempDir::new()?;
     let path = temp_dir.path();
 
@@ -77,11 +121,48 @@ pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, Wor
 
     git(path, &["checkout", "-b", branch_name]).await?;
 
+    // ADR-0004 snapshot: parse the target repo's CI workflow ONCE here
+    // and store the resolved (parsed-or-fallback) gate commands on the
+    // Workspace. Both the post-implement and end-pipeline gates read
+    // from this snapshot, so a mid-pipeline edit to
+    // `.github/workflows/ci.yml` cannot shift the in-flight verdict.
+    let extracted = parse_ci_workflow(path).unwrap_or_default();
+    let gate_commands = materialise_gate_commands(extracted, gates);
+
     Ok(Workspace {
         temp_dir,
         branch_name: branch_name.to_string(),
         default_branch,
+        gate_commands,
     })
+}
+
+/// Merge the parser output with the operator-declared fallback flags.
+/// Per-command: a `Some(cmd)` from the parser wins; a `None` falls
+/// back to `cargo <subcommand> <flags>` from `gates`. The provenance
+/// is reported per command so the run-log line attributes each gate
+/// invocation to its actual source.
+fn materialise_gate_commands(extracted: ExtractedCommands, gates: &GatesConfig) -> GateCommands {
+    let (clippy, clippy_source) = match extracted.clippy {
+        Some(cmd) => (cmd, extracted.source.clone()),
+        None => (
+            format!("cargo clippy {}", gates.clippy_flags),
+            Provenance::FallbackFromConfig,
+        ),
+    };
+    let (test, test_source) = match extracted.test {
+        Some(cmd) => (cmd, extracted.source),
+        None => (
+            format!("cargo test {}", gates.test_flags),
+            Provenance::FallbackFromConfig,
+        ),
+    };
+    GateCommands {
+        clippy,
+        clippy_source,
+        test,
+        test_source,
+    }
 }
 
 async fn detect_default_branch(repo: &Path) -> Result<String, WorkspaceError> {
