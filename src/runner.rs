@@ -1225,21 +1225,26 @@ pub async fn run_once(
         cleanup_phase_handoff_files(&workspace).await?;
     }
 
-    // Read agent-notes.md ONCE at the very end. Any phase may have
-    // written/appended to it (implement, review, review-fix). Notes
-    // stay in the workspace and the diff so the human reviewer sees
-    // them — not removed.
-    let agent_notes_path = workspace.path().join("agent-notes.md");
-    let agent_notes = if agent_notes_path.exists() {
-        Some(
-            tokio::fs::read_to_string(&agent_notes_path)
-                .await?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    // Issue #85: capture `agent-notes.md` content ONCE at the very end,
+    // then remove the file + commit + push the deletion. Any phase may
+    // have written/appended to it (implement, weak-test guard, review-fix,
+    // security-fix, parser-as-backstop synth) and the per-phase commits
+    // would have already pushed the file onto the agent branch — we
+    // explicitly commit the deletion here so the agent branch's pushed
+    // end-state has no `agent-notes.md`. A subsequent squash-merge to
+    // `master` therefore cannot inherit stale notes into the next run's
+    // fresh clone. The captured content still drives
+    // `classify_exit`'s `has_agent_notes` precedence below (unchanged)
+    // and is surfaced to the operator via a separate PR comment posted
+    // after `open_pr` (replaces the pre-#85 affordance of the file
+    // sitting in the PR's diff).
+    let agent_notes = capture_and_remove_agent_notes(&workspace).await?;
+    let head_before_ephemeral_cleanup = workspace::head_sha(&workspace).await?;
+    let _ = workspace::commit_all_and_push_if_advanced(
+        &workspace,
+        &head_before_ephemeral_cleanup,
+    )
+    .await?;
 
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
@@ -1349,6 +1354,21 @@ pub async fn run_once(
         &format!("bellows: opened PR #{} — finalising labels + log comment", pr.number),
     );
 
+    // Issue #85: post the agent's self-flag content as a separate
+    // `## Agent notes` PR comment. Replaces the pre-#85 affordance of
+    // the operator seeing the file inline in the PR diff — the file is
+    // now ephemeral to the run, so we surface the content here so the
+    // operator can still see what the agent flagged. No-op when the
+    // agent didn't write any notes.
+    post_agent_notes_comment_if_present(
+        client,
+        &owner,
+        &repo,
+        pr.number,
+        agent_notes.as_deref(),
+    )
+    .await?;
+
     // Post the review findings as a separate `## Review findings` PR
     // comment if the review phase produced any. Posted regardless of
     // whether review-fix succeeded — readers always see what was
@@ -1454,7 +1474,7 @@ fn build_pr_body(
             }),
         ExitReason::AgentSelfReportedFailure => format!(
             "## Agent self-reported failure\n\n\
-             The agent wrote `agent-notes.md` rather than complete the brief. The notes are committed in this PR's diff; quoted below for convenience.\n\n\
+             The agent wrote `agent-notes.md` rather than complete the brief. The file itself is ephemeral to the run (issue #85) and does not appear in this PR's diff; its content is posted as a separate `## Agent notes` PR comment for visibility and quoted below for convenience.\n\n\
              ```\n{}\n```\n\n\
              See the run-log comment on this PR for the agent's output tail.",
             agent_notes.unwrap_or("(no notes content captured)")
@@ -1746,6 +1766,63 @@ impl WallClockBudget {
             self.exceeded = true;
         }
     }
+}
+
+/// Issue #85: read `agent-notes.md` from the workspace (if present)
+/// and remove the file from disk in a single step. Returns the trimmed
+/// content, or `None` if the file did not exist.
+///
+/// Pipeline phases (implement, weak-test guard, review-fix's per-finding
+/// invocations, security-fix, parser-as-backstop synth) write/append
+/// to `agent-notes.md` and commit it as part of their per-phase `git
+/// add -A`. Pre-#85 the file then rode along on the agent branch into
+/// `master` via squash-merge, and every subsequent fresh clone
+/// inherited the stale content — `classify_exit`'s `has_agent_notes`
+/// precedence then fired regardless of actual outcome.
+///
+/// The fix: capture the content for `classify_exit` + the operator-
+/// visible PR comment in one shot, then remove the file. The caller is
+/// expected to follow this with a commit + push (e.g.
+/// [`workspace::commit_all_and_push_if_advanced`]) so the deletion lands
+/// on the agent branch's pushed tip. The squash-merged commit on
+/// `master` then no longer carries the file forward.
+pub async fn capture_and_remove_agent_notes(
+    workspace: &workspace::Workspace,
+) -> Result<Option<String>, std::io::Error> {
+    let path = workspace.path().join("agent-notes.md");
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    tokio::fs::remove_file(&path).await?;
+    Ok(Some(raw.trim().to_string()))
+}
+
+/// Issue #85: post the agent's self-flag content as a separate
+/// `## Agent notes` PR comment. No-op when `agent_notes` is `None`.
+///
+/// Mirrors the `## Review findings` / `## Security findings` per-phase
+/// comment posts in [`run_once`]: a dedicated, clearly-titled comment
+/// the operator can find in the PR's conversation tab without having to
+/// scan the file diff. Pre-#85 the content sat in the PR's diff via
+/// `agent-notes.md` itself; now the file is ephemeral, and this comment
+/// is the operator-visible surface that replaces it.
+pub async fn post_agent_notes_comment_if_present(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    agent_notes: Option<&str>,
+) -> Result<(), octocrab::Error> {
+    let Some(notes) = agent_notes else {
+        return Ok(());
+    };
+    if notes.trim().is_empty() {
+        return Ok(());
+    }
+    let body = format!("## Agent notes\n\n```\n{notes}\n```");
+    tracker::post_pr_comment(client, owner, repo, pr_number, &body).await
 }
 
 /// Remove the slice-X1 + X2 phase handoff files from the workspace.
