@@ -313,6 +313,34 @@ pub fn pick_engine(
     Err(PickError::AllCooling)
 }
 
+/// Render the single phase-start log line carrying phase, engine,
+/// model, and **reason**. Issue #82 operator-visibility AC: operator
+/// can reconstruct the engine-selection trail from the run-log alone.
+///
+/// Line shape — stable so log-scraping tooling can match:
+///
+/// ```text
+/// bellows: phase `<phase>` engine=<name> model=<model> reason=<phrase>
+/// ```
+///
+/// `model=<CLI default>` when the chain entry pinned no model
+/// (preserves the slice-#81 phrasing); `reason=...` carries one of the
+/// five `PickReason::as_run_log_phrase()` values.
+pub fn format_phase_engine_log(
+    phase_name: &str,
+    entry: &ChainEntry,
+    reason: PickReason,
+) -> String {
+    let model_field = entry.model.as_deref().unwrap_or("<CLI default>");
+    format!(
+        "bellows: phase `{phase}` engine={engine} model={model} reason={reason}",
+        phase = phase_name,
+        engine = entry.engine.as_name(),
+        model = model_field,
+        reason = reason.as_run_log_phrase(),
+    )
+}
+
 /// Phase-start picker with the forced-single-engine label override
 /// applied. ADR-0005 §"Per-issue forced-engine label": when
 /// `forced_engine` is `Some(...)` the chain walk is bypassed entirely
