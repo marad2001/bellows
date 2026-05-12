@@ -102,3 +102,23 @@ wall_clock_minutes = 60
 # refactors, dependency bumps) should carry this label so the guard
 # skips them. Default: "refactor".
 weak_test_guard_skip_label = "refactor"
+
+[gates]
+# ADR-0004 fallback flags for the cargo-checks gate. By default
+# bellows parses the target repo's `.github/workflows/*.yml`, finds
+# the workflow named `CI`, and runs whatever `cargo clippy` and
+# `cargo test` invocations CI runs — verbatim. The invariant is
+# "bellows gate passes ⇒ CI gate passes" by construction.
+#
+# These flags are the FALLBACK applied when bellows cannot parse the
+# workflow: there is no `.github/workflows/` directory at all, the
+# YAML is malformed, the workflow named `CI` is missing, or the
+# clippy / test step is wrapped in a shell script bellows can't
+# follow. Each fallback is applied per command — i.e. bellows can
+# extract `cargo test` from the workflow but still fall back on
+# `cargo clippy` if the latter alone is unparseable.
+#
+# The defaults below preserve today's strict bar so an existing
+# operator who omits `[gates]` sees no change in behaviour.
+clippy_flags = "--all-targets --all-features -- -D warnings"
+test_flags   = "--all-targets --all-features"

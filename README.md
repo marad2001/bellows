@@ -265,7 +265,42 @@ for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug
 done
 ```
 
-### 6. Branch protection setup
+### 6. Cargo-checks gate mirrors target CI
+
+Per [ADR-0004](docs/adr/0004-bellows-gate-mirrors-target-ci.md),
+bellows's cargo-checks gate is target-CI-aware: at workspace-prepare
+time it reads the target repo's `.github/workflows/*.yml`, finds the
+workflow named `CI`, and snapshots the literal `cargo clippy ...` and
+`cargo test ...` invocations declared in that workflow's Linux-runner
+job. The gate then runs those snapshotted commands verbatim inside
+the sandbox — the same posture CI runs, by construction. This is
+**how bellows guarantees "gate passes ⇒ CI passes"** without making
+the operator maintain two specs in sync.
+
+When the workflow can't be parsed — no `.github/workflows/` directory
+at all, malformed YAML, no workflow named `CI`, or the clippy/test
+step wrapped in a shell script bellows can't follow — bellows falls
+back to operator-declared defaults in `orchestrator.toml`:
+
+```toml
+[gates]
+clippy_flags = "--all-targets --all-features -- -D warnings"
+test_flags   = "--all-targets --all-features"
+```
+
+The defaults preserve today's strict bar. Override either flag set
+when the workflow is unparseable but you still want to mirror a
+specific posture (e.g. `clippy_flags = "-- -D clippy::correctness -D
+clippy::suspicious"` for repos that deliberately narrow clippy so
+pre-existing latent debt doesn't block new work). The per-command
+fallback is independent — bellows can extract `cargo test` from the
+workflow while still falling back on `clippy_flags` if clippy alone
+is unparseable. At each gate-phase start, the run-log states the
+actual command and its provenance (`parsed from .github/workflows/...`
+vs `fallback from [gates].clippy_flags`) so an operator reading the
+log can always tell which path took effect.
+
+### 7. Branch protection setup
 
 Bellows runs its own `cargo clippy` + `cargo test` gate inside the
 sandbox on every agent commit, but that gate doesn't run on commits a
