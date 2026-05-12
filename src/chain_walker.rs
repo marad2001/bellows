@@ -24,7 +24,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Engine;
+use crate::config::{ChainEntry, Engine};
 
 /// Conservative cooldown when the rate-limit stderr does not carry a
 /// parseable reset-at timestamp. ADR-0005: "the codex match substrings
@@ -171,6 +171,146 @@ pub fn parse_cooling_until(
         cooling_until: now + Duration::minutes(COOLING_UNTIL_FALLBACK_MINUTES),
         used_fallback: true,
     }
+}
+
+/// Reason a chain entry was picked. Ships in the run-log line so an
+/// operator can reconstruct the engine-selection trail from the log
+/// alone. Each variant has a stable `as_run_log_phrase()` so log-
+/// scraping tooling can match on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickReason {
+    /// Pass-1 picked the first chain entry — it was hot, and either
+    /// the run has no implementer-CLI yet (implement phase) or
+    /// chain[0] already differs from the implementer-CLI.
+    ChainFirstHotEntry,
+    /// Pass-1 picked a non-first chain entry because earlier hot
+    /// entries matched the implementer-CLI. The diversity preference
+    /// kicked in.
+    DiversityPreferred,
+    /// Pass-2 ran because every hot chain entry matched the
+    /// implementer-CLI. The picker degraded visibly; the runner
+    /// surfaces a collapse warning to the operator.
+    SecondPassAfterCollapse,
+    /// The forced-single-engine `engine:<name>` label bypassed the
+    /// chain walk entirely (ADR-0005). State file consulted only for
+    /// the rate-limit termination decision, not for selection.
+    ForcedViaLabel,
+    /// The implement phase rate-limited at base SHA with no prior
+    /// in-place advance; the picker walked the chain afresh and
+    /// produced the next hot entry to re-run.
+    InPlaceAdvancementAfterRateLimit,
+}
+
+impl PickReason {
+    /// Stable human-readable phrase for the run-log line. ADR-0005
+    /// AC: each phase-start line carries phase, engine, model, and
+    /// **reason** (one of these five phrases) so an operator can
+    /// reconstruct the trail from the run-log alone.
+    pub fn as_run_log_phrase(&self) -> &'static str {
+        match self {
+            PickReason::ChainFirstHotEntry => "chain first hot entry",
+            PickReason::DiversityPreferred => "diversity-preferred entry",
+            PickReason::SecondPassAfterCollapse => "second-pass after collapse",
+            PickReason::ForcedViaLabel => "forced via label",
+            PickReason::InPlaceAdvancementAfterRateLimit => {
+                "in-place advancement after rate-limit"
+            }
+        }
+    }
+}
+
+/// A chain entry picked by the two-pass soft-diversity picker, plus
+/// the reason it was picked. The runner uses `reason` to render the
+/// per-phase run-log line + the collapse-warning callout when
+/// `SecondPassAfterCollapse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickedEntry {
+    pub entry: ChainEntry,
+    pub reason: PickReason,
+}
+
+/// Why `pick_engine` could not produce a chain entry. The runner
+/// translates this into `ExitReason::RateLimited` and terminates the
+/// run (deferred to the next claim, which will re-read the state
+/// file and walk the chain afresh).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PickError {
+    #[error("every chain entry is cooling per the state file; terminating as RateLimited")]
+    AllCooling,
+}
+
+/// Two-pass soft-diversity picker. ADR-0005 §"Soft-diversity picker":
+///
+///  1. **First pass** — pick the first chain entry that is both (a)
+///     hot AND (b) ≠ implementer-CLI. Diversity-preferring.
+///  2. **Second pass** — if the first pass produces nothing, pick the
+///     first chain entry that is just (a) hot. Operator-visible
+///     collapse warning fires (see `PickReason::SecondPassAfterCollapse`).
+///  3. **No hot entry** — terminate the run as `RateLimited` (the
+///     persisted state file + the next claim's chain-walk together
+///     make this self-correcting).
+///
+/// `implementer` is `None` for the implement phase itself (the
+/// implementer-CLI is set at implement-phase end and consumed by
+/// later phases). With `None`, the picker degrades to pure chain
+/// walking — the first hot entry wins, no diversity preference.
+pub fn pick_engine(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
+    // First hot entry overall — we'll need this in two places: the
+    // "no implementer" path's pick, and the pass-2 fallback. Compute
+    // once for clarity.
+    let first_hot_overall = chain.iter().position(|e| state.is_hot(e.engine, now));
+
+    let Some(implementer_engine) = implementer else {
+        // Implement phase or any phase where the run-state has no
+        // implementer-CLI yet. Pure chain walking: first hot entry
+        // wins.
+        return first_hot_overall
+            .map(|idx| PickedEntry {
+                entry: chain[idx].clone(),
+                reason: PickReason::ChainFirstHotEntry,
+            })
+            .ok_or(PickError::AllCooling);
+    };
+
+    // Pass 1: first chain entry that is hot AND ≠ implementer.
+    if let Some(idx) = chain
+        .iter()
+        .position(|e| state.is_hot(e.engine, now) && e.engine != implementer_engine)
+    {
+        // Reason: if no earlier hot entry was skipped because it
+        // matched the implementer, this is just "chain first hot
+        // entry"; otherwise the diversity preference kicked in and
+        // skipped at least one same-as-implementer entry.
+        let skipped_a_same_engine = chain[..idx]
+            .iter()
+            .any(|e| state.is_hot(e.engine, now) && e.engine == implementer_engine);
+        let reason = if skipped_a_same_engine {
+            PickReason::DiversityPreferred
+        } else {
+            PickReason::ChainFirstHotEntry
+        };
+        return Ok(PickedEntry {
+            entry: chain[idx].clone(),
+            reason,
+        });
+    }
+
+    // Pass 2: first hot entry overall (every hot entry is the
+    // implementer-CLI — diversity has collapsed). The runner emits
+    // an operator-visible warning on this reason.
+    if let Some(idx) = first_hot_overall {
+        return Ok(PickedEntry {
+            entry: chain[idx].clone(),
+            reason: PickReason::SecondPassAfterCollapse,
+        });
+    }
+
+    Err(PickError::AllCooling)
 }
 
 /// Look for `<preamble>|<unix-epoch-seconds>` in `text` and decode the
