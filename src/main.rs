@@ -1313,6 +1313,87 @@ async fn setup_deploy_keys_cmd(
     Ok(())
 }
 
+/// Docker argv for the engine-specific interactive login flow driven
+/// by `setup_auth` (issue #100). Pure helper so the inline tests can
+/// pin the argv shape per engine.
+///
+/// Claude path is unchanged from before issue #100: docker runs the
+/// claude entrypoint with no positional args. The operator types
+/// `/login` inside the interactive claude TUI to start the OAuth
+/// flow — that slash command is Claude Code's idiom for triggering
+/// the browser-OAuth handoff.
+///
+/// Codex path runs `codex login --device-auth` directly. Codex has no
+/// `/login` slash command (the binary only ships `/org-setup`), so
+/// dropping into the interactive TUI gave the operator no way to
+/// drive OAuth — the original bug. The `login --device-auth`
+/// subcommand makes codex print a device-authorisation URL + short
+/// code, wait, and write `auth.json` into the mounted credentials
+/// volume once the operator approves the device. Treated as the
+/// container command by docker since the args appear after the image
+/// tag.
+fn setup_auth_docker_args(
+    engine: bellows::config::Engine,
+    volume: &str,
+    home_in_container: &str,
+    image_tag: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "run".to_string(),
+        "-it".to_string(),
+        "--rm".to_string(),
+        "--volume".to_string(),
+        format!("{volume}:{home_in_container}"),
+        "--entrypoint".to_string(),
+        engine.as_name().to_string(),
+        image_tag.to_string(),
+    ];
+    match engine {
+        bellows::config::Engine::Claude => {}
+        bellows::config::Engine::Codex => {
+            args.push("login".to_string());
+            args.push("--device-auth".to_string());
+        }
+    }
+    args
+}
+
+/// Pre-flight text printed before `docker run` so the operator knows
+/// how to drive the engine's OAuth flow (issue #100). Engine-specific
+/// because the two CLIs use different idioms — claude has a `/login`
+/// slash command inside its TUI, codex has no slash commands and
+/// drives OAuth via the `login --device-auth` subcommand the
+/// container is now launched with.
+fn setup_auth_preflight_instructions(
+    engine: bellows::config::Engine,
+    volume: &str,
+) -> String {
+    let engine_name = engine.as_name();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "bellows: launching interactive {engine_name} in a container to seed `{volume}` with OAuth credentials.\n"
+    ));
+    match engine {
+        bellows::config::Engine::Claude => {
+            out.push_str(
+                "bellows: inside the container, type `/login` to start the OAuth flow.\n",
+            );
+            out.push_str(&format!(
+                "bellows: when login completes, type `/exit` to close {engine_name}. The container will exit and the volume retains the credentials.\n"
+            ));
+        }
+        bellows::config::Engine::Codex => {
+            out.push_str(
+                "bellows: codex will print a device-authorisation URL and a short code. Open the URL in any browser where you're signed in to your codex account, paste the code, and approve the device.\n",
+            );
+            out.push_str(
+                "bellows: codex writes auth.json into the credentials volume once the device is approved, then exits on its own — the container exits and the volume retains the credentials.\n",
+            );
+        }
+    }
+    out
+}
+
 async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
@@ -1344,26 +1425,14 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
         bellows::config::Engine::Claude => CLAUDE_HOME_IN_CONTAINER,
         bellows::config::Engine::Codex => bellows::auth::CODEX_HOME_IN_CONTAINER,
     };
-    println!(
-        "bellows: launching interactive {engine_name} in a container to seed `{}` with OAuth credentials.",
-        volume,
-    );
-    println!("bellows: inside the container, type `/login` to start the OAuth flow.");
-    println!(
-        "bellows: when login completes, type `/exit` to close {engine_name}. The container will exit and the volume retains the credentials.",
-    );
 
+    // Engine-specific pre-flight text + docker argv (issue #100). The
+    // helpers are pure so the inline tests can pin the per-engine
+    // shape; the runtime path just prints + spawns docker.
+    print!("{}", setup_auth_preflight_instructions(engine, volume));
+    let docker_args = setup_auth_docker_args(engine, volume, home_in_container, &image_tag);
     let status = tokio::process::Command::new("docker")
-        .args([
-            "run",
-            "-it",
-            "--rm",
-            "--volume",
-            &format!("{volume}:{home_in_container}"),
-            "--entrypoint",
-            engine_name,
-            &image_tag,
-        ])
+        .args(&docker_args)
         .status()
         .await
         .context("spawn `docker run -it`")?;
