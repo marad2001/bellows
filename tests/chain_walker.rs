@@ -418,3 +418,151 @@ fn non_implement_rate_limit_terminates_for_security_fix() {
         NonImplementRateLimitAction::Terminate,
     );
 }
+
+// -----------------------------------------------------------------
+// AC: Self-correcting + lying-CLI lifecycle (h, i-implement,
+// i-other). The composed flow at phase-exit on a rate-limit
+// signature: parse `cooling_until` → update state file → decide
+// next action. The picker is the source of truth at the NEXT
+// phase-start (h). Implement-phase composition produces
+// InPlaceAdvance at base SHA (i-implement); non-implement composition
+// terminates (i-other).
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::{
+    handle_implement_rate_limit, handle_non_implement_rate_limit, RateLimitDisposition,
+};
+
+#[test]
+fn handle_h_stale_cooldown_blocks_picker_until_elapsed() {
+    // AC (h): state file says cooling but CLI is actually hot →
+    // state file is the source of truth at phase-start; CLI not
+    // invoked. Once cooling_until elapses, the next phase
+    // invocation picks the engine and succeeds.
+    let phase_one_now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Claude, phase_one_now + Duration::minutes(5));
+
+    // Phase one: state says claude cools at +5min. The picker with
+    // no implementer picks codex (the first hot entry).
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine(&chain, &state, None, phase_one_now)
+        .expect("picker must skip cooling claude");
+    assert_eq!(
+        picked.entry.engine,
+        Engine::Codex,
+        "picker honors state file even when claude is actually hot",
+    );
+
+    // Once cooling_until elapses, the next phase invocation picks
+    // claude (the first chain entry, now hot).
+    let phase_two_now = phase_one_now + Duration::minutes(10);
+    let picked = pick_engine(&chain, &state, None, phase_two_now)
+        .expect("post-cooldown claude must be picked");
+    assert_eq!(picked.entry.engine, Engine::Claude);
+}
+
+#[test]
+fn handle_i_implement_lying_cli_at_base_sha_updates_state_and_advances() {
+    // AC (i-implement): state file says hot, CLI actually rate-limits
+    // on implement at base SHA → state updated, in-place chain
+    // advance to next hot entry. The composed helper returns
+    // disposition + the updated state-file-write reason for the
+    // run-log line.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    let stderr = "codex: error: quota exceeded\n";
+    let disposition = handle_implement_rate_limit(
+        &mut state,
+        Engine::Codex,
+        stderr,
+        now,
+        /* at_base_sha = */ true,
+        /* advances_used = */ 0,
+    );
+    assert_eq!(
+        disposition,
+        RateLimitDisposition::InPlaceAdvance,
+        "lying CLI on implement at base SHA → InPlaceAdvance",
+    );
+    // State was updated so the next phase-start picker skips codex.
+    assert!(
+        !state.is_hot(Engine::Codex, now),
+        "state file must carry the freshly-recorded cooldown for codex",
+    );
+}
+
+#[test]
+fn handle_i_other_lying_cli_on_non_implement_terminates_with_state_updated() {
+    // AC (i-other): state file says hot, CLI rate-limits on a non-
+    // implement phase, OR on implement past base SHA → state updated,
+    // run terminates as RateLimited.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    let stderr = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    let disposition = handle_non_implement_rate_limit(
+        &mut state,
+        Engine::Claude,
+        "review",
+        stderr,
+        now,
+    );
+    assert_eq!(disposition, RateLimitDisposition::Terminate);
+    assert!(
+        !state.is_hot(Engine::Claude, now),
+        "state file must carry the freshly-recorded cooldown for claude",
+    );
+}
+
+#[test]
+fn handle_i_implement_past_base_terminates_with_state_updated() {
+    // AC (i-other) covers "implement past base" too: even on the
+    // implement phase, a workspace ahead of base SHA must terminate
+    // (the invariant guard from AC (f)) — and the state file must
+    // still be updated so the next claim's chain walk consults it.
+    let now = Utc::now();
+    let mut state = StateFile::default();
+    let stderr = "codex: rate limit: 60 requests/minute exceeded\n";
+    let disposition = handle_implement_rate_limit(
+        &mut state,
+        Engine::Codex,
+        stderr,
+        now,
+        /* at_base_sha = */ false,
+        /* advances_used = */ 0,
+    );
+    assert_eq!(disposition, RateLimitDisposition::Terminate);
+    assert!(!state.is_hot(Engine::Codex, now));
+}
+
+#[test]
+fn handle_implement_records_fallback_flag_for_codex_without_timestamp() {
+    // The composed helper exposes the fallback flag from
+    // parse_cooling_until so the runner can note "5-minute default
+    // applied" in the run-log line.
+    let now = Utc::now();
+    let mut state = StateFile::default();
+    let stderr = "codex: error: quota exceeded\n";
+    let disposition = handle_implement_rate_limit(
+        &mut state,
+        Engine::Codex,
+        stderr,
+        now,
+        true,
+        0,
+    );
+    assert!(matches!(disposition, RateLimitDisposition::InPlaceAdvance));
+    // The recorded cooldown is the 5-minute fallback.
+    let recorded = state
+        .engines
+        .get("codex")
+        .and_then(|s| s.cooling_until)
+        .unwrap();
+    assert_eq!(recorded, now + Duration::minutes(5));
+}
