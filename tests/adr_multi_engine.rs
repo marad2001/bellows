@@ -257,3 +257,40 @@ fn adr_0005_documents_operating_context_strategy() {
         "operating-context-strategy",
     );
 }
+
+/// AC#7 — Documents the persisted rate-limit state.
+///   - State file `bellows-state.json` (or similar) alongside
+///     `bellows.log`, recording per-engine `cooling_until`
+///     timestamps.
+///   - Updated when a phase exits with a rate-limit signature;
+///     cooldown parsed from the CLI's stderr signature.
+///   - Read at every phase-start before chain walking.
+///   - Self-correcting: if cooldown is wrong (CLI lied about reset
+///     time), the next call hits a fresh rate-limit, state is
+///     updated, chain advances. Single pass per phase prevents
+///     thrashing.
+#[test]
+fn adr_0005_documents_persisted_rate_limit_state() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // The state file name, the per-engine field name, and
+            // the sibling-file relationship to bellows.log.
+            "bellows-state.json",
+            "cooling_until",
+            "bellows.log",
+            // When it's updated, when it's read, and how the cooldown
+            // is derived from stderr.
+            "rate-limit signature",
+            "stderr",
+            "phase-start",
+            "chain walk",
+            // Self-correcting + thrash-prevention.
+            "self-correcting",
+            "thrash",
+            "single pass",
+        ],
+        "persisted-rate-limit-state",
+    );
+}
