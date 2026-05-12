@@ -36,8 +36,20 @@ enum Command {
     Run,
     /// First-time auth setup — run once per new install to seed the
     /// credentials volume with an OAuth session via an interactive
-    /// `claude login` flow.
-    SetupAuth,
+    /// `claude login` (or `codex login`) flow.
+    ///
+    /// Issue #81 / ADR-0005: `--engine claude` / `--engine codex`
+    /// selects which engine's credentials volume the interactive flow
+    /// targets. When the flag is omitted the default is the engine of
+    /// the first entry of `phases.implement.cli_chain` (model is
+    /// ignored for setup-auth/refresh-auth — login is per-subscription,
+    /// not per-model).
+    SetupAuth {
+        /// Engine to seed credentials for. Defaults to the first
+        /// chain entry of `phases.implement.cli_chain`.
+        #[arg(long, value_name = "NAME")]
+        engine: Option<String>,
+    },
     /// Manage the per-repo SSH deploy-keys volume (issue #69 /
     /// ADR-0002). Operators populate the volume via `add`, inspect
     /// what's in it via `list`, and clean up via `remove`. Each arm
@@ -48,10 +60,16 @@ enum Command {
         #[command(subcommand)]
         action: SetupDeployKeysAction,
     },
-    /// Re-authenticate when your Claude Code refresh token has expired.
-    /// Same flow as `setup-auth` (interactive container, `claude login`,
-    /// credentials volume seeded); different name for the situation.
-    RefreshAuth,
+    /// Re-authenticate when your engine's refresh token has expired.
+    /// Same flow as `setup-auth` (interactive container, `claude
+    /// login` / `codex login`, credentials volume seeded); different
+    /// name for the situation.
+    RefreshAuth {
+        /// Engine to refresh credentials for. Defaults to the first
+        /// chain entry of `phases.implement.cli_chain`.
+        #[arg(long, value_name = "NAME")]
+        engine: Option<String>,
+    },
     /// Print a one-line summary of the running orchestrator's state.
     Status,
     /// Abort the in-flight bellows run for a specific issue. Force-removes
@@ -166,7 +184,8 @@ async fn main() -> Result<()> {
         // situations (first-time install vs token expired) but share
         // the same underlying flow (interactive `claude login` against
         // the credentials volume).
-        Command::SetupAuth | Command::RefreshAuth => setup_auth(&config_path).await,
+        Command::SetupAuth { engine } => setup_auth(&config_path, engine.as_deref()).await,
+        Command::RefreshAuth { engine } => setup_auth(&config_path, engine.as_deref()).await,
         Command::SetupDeployKeys { action } => setup_deploy_keys_cmd(&config_path, action).await,
         Command::Status => status_cmd().await,
         Command::Kill { target } => kill_cmd(&config_path, &target).await,
@@ -397,7 +416,9 @@ async fn call_triage_one(
 
     let auth = match config.auth.method {
         AuthMethod::Subscription => Auth::Subscription {
-            credentials_volume_name: config.auth.credentials_volume.clone(),
+            engine: bellows::config::Engine::Claude,
+            model: None,
+            credentials_volume_name: config.auth.claude.credentials_volume.clone(),
         },
     };
     let repo_slug = bellows::repo_slug(&primary_repo.url);
@@ -1292,23 +1313,52 @@ async fn setup_deploy_keys_cmd(
     Ok(())
 }
 
-async fn setup_auth(config_path: &PathBuf) -> Result<()> {
+async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
 
+    // Issue #81 / ADR-0005: `--engine claude` / `--engine codex`.
+    // Default = the engine of the first chain entry of
+    // `phases.implement.cli_chain`. Model pins on chain entries are
+    // ignored for setup-auth/refresh-auth (login is per-subscription,
+    // not per-model).
+    let engine = match engine_flag {
+        Some(name) => bellows::config::Engine::from_name(name).ok_or_else(|| {
+            anyhow!(
+                "unknown --engine `{name}` (expected `claude` or `codex`)",
+            )
+        })?,
+        None => config.phases.implement.first_entry().engine,
+    };
+
     let image_tag = sandbox::ensure_policy_image()
         .await
         .context("build/check policy image")?;
 
-    let volume = &config.auth.credentials_volume;
+    let engine_auth = config.auth.for_engine(engine);
+    let volume = &engine_auth.credentials_volume;
+    let (engine_name, cli_binary, home_in_container) = match engine {
+        bellows::config::Engine::Claude => (
+            "claude",
+            "claude",
+            CLAUDE_HOME_IN_CONTAINER,
+        ),
+        bellows::config::Engine::Codex => (
+            "codex",
+            "codex",
+            bellows::auth::CODEX_HOME_IN_CONTAINER,
+        ),
+    };
     println!(
-        "bellows: launching interactive Claude Code in a container to seed `{}` with OAuth credentials.",
-        volume
+        "bellows: launching interactive {engine_name} in a container to seed `{}` with OAuth credentials.",
+        volume,
     );
     println!("bellows: inside the container, type `/login` to start the OAuth flow.");
-    println!("bellows: when login completes, type `/exit` to close Claude Code. The container will exit and the volume retains the credentials.");
+    println!(
+        "bellows: when login completes, type `/exit` to close {engine_name}. The container will exit and the volume retains the credentials.",
+    );
 
     let status = tokio::process::Command::new("docker")
         .args([
@@ -1316,9 +1366,9 @@ async fn setup_auth(config_path: &PathBuf) -> Result<()> {
             "-it",
             "--rm",
             "--volume",
-            &format!("{volume}:{}", CLAUDE_HOME_IN_CONTAINER),
+            &format!("{volume}:{home_in_container}"),
             "--entrypoint",
-            "claude",
+            cli_binary,
             &image_tag,
         ])
         .status()
@@ -1329,7 +1379,10 @@ async fn setup_auth(config_path: &PathBuf) -> Result<()> {
         anyhow::bail!("docker run exited with {}", status);
     }
 
-    println!("bellows: setup-auth complete; credentials volume `{}` is seeded.", volume);
+    println!(
+        "bellows: setup-auth complete; {engine_name} credentials volume `{}` is seeded.",
+        volume,
+    );
     Ok(())
 }
 

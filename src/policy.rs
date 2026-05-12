@@ -199,37 +199,69 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
     ExitReason::Success
 }
 
-/// Whether the given text contains a known Anthropic API rate-limit
-/// signature. Used by `classify_exit` to distinguish a rate-limit
-/// failure from a generic crash so the operator gets the right
-/// follow-up signal ("wait for the rate-limit window to clear and
-/// re-run" vs "investigate").
+/// Whether the given text contains a known rate-limit signature. Used
+/// by `classify_exit` to distinguish a rate-limit failure from a
+/// generic crash so the operator gets the right follow-up signal
+/// ("wait for the rate-limit window to clear and re-run" vs
+/// "investigate").
 ///
-/// Matches case-insensitively against the underscore-style identifiers
-/// Anthropic uses in API error responses (`rate_limit_error`,
-/// `rate_limited`). Bare HTTP `429` is deliberately NOT matched — too
-/// false-positive-prone (port numbers, test fixtures, JSON byte
-/// counts, etc.).
+/// Matches case-insensitively. The signature set covers:
+///   - Anthropic / Claude Code: the underscore-style identifiers
+///     Anthropic uses in API error responses (`rate_limit_error`,
+///     `rate_limited`).
+///   - Codex (issue #79 spike findings, sourced from
+///     `codex-rs/codex-api/src/error.rs`): `quota exceeded`
+///     (subscription users, primary path) and `rate limit:`
+///     (Platform-API users, secondary path).
+///
+/// Bare HTTP `429` is deliberately NOT matched — too false-positive-
+/// prone (port numbers, test fixtures, JSON byte counts, etc.).
 pub fn is_rate_limit_signature(text: &str) -> bool {
-    const SIGNATURES: [&str; 2] = ["rate_limit_error", "rate_limited"];
+    const SIGNATURES: [&str; 4] = [
+        // Claude Code / Anthropic API signatures.
+        "rate_limit_error",
+        "rate_limited",
+        // Codex signatures (issue #79 / ADR-0005 spike findings).
+        "quota exceeded",
+        "rate limit:",
+    ];
     let lower = text.to_lowercase();
     SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
-/// Whether the given text contains a known Anthropic / Claude Code
-/// auth-error signature. Used by the log-body builder to surface a
-/// clear "run `bellows refresh-auth`" pointer when a non-zero phase
-/// exit was caused by an expired OAuth refresh token rather than a
-/// generic crash. Mirrors `is_rate_limit_signature` in shape.
+/// Whether the given text contains a known auth-error signature. Used
+/// by the log-body builder to surface a clear "run `bellows
+/// refresh-auth`" pointer when a non-zero phase exit was caused by an
+/// expired OAuth refresh token rather than a generic crash. Mirrors
+/// `is_rate_limit_signature` in shape.
 ///
-/// Matches case-insensitively. The signature set starts small and is
-/// extended over time as real-world failure modes surface — current
-/// entries cover the literal `"401 unauthorized"` HTTP status line,
-/// the underscore-style `"refresh_token_expired"` identifier
-/// Anthropic returns in API error payloads, and the human-readable
-/// `"authentication failed"` phrase that appears in Claude Code's
-/// stderr when its OAuth session is rejected.
+/// Matches case-insensitively. Current entries:
+///   - Claude Code / Anthropic API: the literal `"401 unauthorized"`
+///     HTTP status line, the underscore-style `"refresh_token_expired"`
+///     identifier Anthropic returns in API error payloads, and the
+///     human-readable `"authentication failed"` phrase that appears in
+///     Claude Code's stderr when its OAuth session is rejected.
+///   - Codex (issue #79 / ADR-0005 spike findings): composite match
+///     of `"401 unauthorized"` AND `"missing bearer or basic
+///     authentication"` (a bare `401 Unauthorized` could be a false
+///     positive from unrelated HTTP 401 in the agent's web-fetched
+///     content; the composite avoids that, see
+///     `is_codex_auth_error_signature` for the strict path).
+///
+/// Note: bellows uses the union of all engine signatures here for
+/// the existing "auth error happened in this run" callout. The
+/// engine-naming callout (issue #81 / ADR-0005 AC: "Auth-error callout
+/// in the run-log comment names the engine to refresh") uses the
+/// per-engine helpers below.
 pub fn is_auth_error_signature(text: &str) -> bool {
+    is_claude_auth_error_signature(text) || is_codex_auth_error_signature(text)
+}
+
+/// Claude-side auth-error signature subset. Returns true when the
+/// stderr looks like the Claude Code CLI / Anthropic API auth
+/// failure mode — used by the run-log builder to name the engine to
+/// refresh (`bellows refresh-auth --engine claude`).
+pub fn is_claude_auth_error_signature(text: &str) -> bool {
     const SIGNATURES: [&str; 3] = [
         "401 unauthorized",
         "refresh_token_expired",
@@ -237,6 +269,16 @@ pub fn is_auth_error_signature(text: &str) -> bool {
     ];
     let lower = text.to_lowercase();
     SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
+/// Codex-side auth-error signature subset. Composite match of `401
+/// Unauthorized` AND `Missing bearer or basic authentication` (issue
+/// #79 spike findings) so a bare `401 Unauthorized` in unrelated
+/// web-fetched content does not produce a false positive.
+pub fn is_codex_auth_error_signature(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("401 unauthorized")
+        && lower.contains("missing bearer or basic authentication")
 }
 
 /// Whether either of a gate's checks exited non-zero. Crate-public so the
@@ -1114,7 +1156,85 @@ pub fn synthesize_implement_crash_entry(exit_code: i64, stderr_tail: &str) -> St
 /// Render the kickoff prompt that gets fed into `claude -p` inside the
 /// sandbox. Pure function so it can be unit-tested without spinning up
 /// a container.
+///
+/// Engine-aware via `render_kickoff_for_engine` (issue #81 / ADR-0005):
+/// the Claude path is unchanged (operating context auto-loads from
+/// `CLAUDE.md` + on-demand skill reads); the Codex path inlines the
+/// operating-context body + baked skill bodies directly into the
+/// kickoff prompt itself, because codex does not have an equivalent
+/// on-demand discovery mechanism. This wrapper preserves the v1
+/// `render_kickoff(brief, repo, branch)` signature (one source of
+/// truth for the failing-test commit-shape language), and delegates
+/// to the engine-aware function with `Engine::Claude` so the existing
+/// tests and call sites stay green.
 pub fn render_kickoff(brief: &str, repo_url: &str, branch_name: &str) -> String {
+    render_kickoff_for_engine(crate::config::Engine::Claude, brief, repo_url, branch_name)
+}
+
+/// Engine-aware kickoff renderer (issue #81 / ADR-0005). For
+/// `Engine::Claude` produces the canonical body the v1 single-engine
+/// path always produced. For `Engine::Codex` prepends the operating-
+/// context body + the bodies of all baked skills (tdd, diagnose,
+/// triage) so codex sees the same operating instructions claude would
+/// auto-discover via `CLAUDE.md` + on-demand file reads.
+pub fn render_kickoff_for_engine(
+    engine: crate::config::Engine,
+    brief: &str,
+    repo_url: &str,
+    branch_name: &str,
+) -> String {
+    let body = base_kickoff_body(brief, repo_url, branch_name);
+    wrap_phase_prompt_for_engine(engine, &body)
+}
+
+/// Wrap a phase-specific prompt body in engine-aware operating context.
+/// For `Engine::Claude` this is the identity function — Claude reads
+/// `CLAUDE.md` + the skills directory from disk so the runner doesn't
+/// need to repeat them in every kickoff. For `Engine::Codex` this
+/// prepends the operating-context body + baked skill bodies inline,
+/// because codex does not have an equivalent on-demand discovery
+/// mechanism (per ADR-0005: "the codex path in `policy::render_kickoff`
+/// inlines the operating-context body plus the bodies of all baked
+/// skills directly into the kickoff prompt").
+///
+/// The same wrapper applies to all agent-invoking phases (implement,
+/// review, review-fix's per-finding + nit-batch invocations, security-
+/// review, security-fix) so codex sees the same operating instructions
+/// at every phase boundary — there is no per-phase divergence in what
+/// the operating context says.
+pub fn wrap_phase_prompt_for_engine(
+    engine: crate::config::Engine,
+    body: &str,
+) -> String {
+    match engine {
+        crate::config::Engine::Claude => body.to_string(),
+        crate::config::Engine::Codex => {
+            // Inline the operating-context body + baked skill bodies.
+            // Claude-specific phrasing in the operating context
+            // ("Claude Code running headless...") is neutralised below.
+            let mut out = String::new();
+            out.push_str("# Operating context\n\n");
+            out.push_str(CODEX_INLINED_OPERATING_CONTEXT);
+            out.push_str("\n\n# Baked skills\n\n");
+            out.push_str(
+                "The following skill bodies are inlined here because codex does \
+                 not auto-load them from a skills directory. Reach for them \
+                 whenever they apply.\n\n",
+            );
+            out.push_str("## Skill: tdd\n\n");
+            out.push_str(CODEX_INLINED_SKILL_TDD);
+            out.push_str("\n\n## Skill: diagnose\n\n");
+            out.push_str(CODEX_INLINED_SKILL_DIAGNOSE);
+            out.push_str("\n\n## Skill: triage\n\n");
+            out.push_str(CODEX_INLINED_SKILL_TRIAGE);
+            out.push_str("\n\n---\n\n");
+            out.push_str(body);
+            out
+        }
+    }
+}
+
+fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
     format!(
         "You are working on {repo_url} on branch `{branch_name}`.\n\
          \n\
@@ -1142,3 +1262,33 @@ pub fn render_kickoff(brief: &str, repo_url: &str, branch_name: &str) -> String 
          When you are done, write a PR description body to `/workspace/.bellows-pr-description.md` summarising what you built, mapping each new test to the brief's acceptance criteria.\n"
     )
 }
+
+/// Codex operating-context body. Bellows's policy image bakes the
+/// `CLAUDE.md` operating context for claude (auto-discovered from
+/// `/home/bellows/.claude/CLAUDE.md`); codex does not have an
+/// equivalent auto-discovery mechanism, so the body is inlined into
+/// every codex kickoff. Verbatim copy of the operating context with
+/// claude-specific phrasing neutralised (the brief: "Claude-specific
+/// phrasing neutralised").
+pub const CODEX_INLINED_OPERATING_CONTEXT: &str = include_str!(
+    "../policy-image/CLAUDE.md"
+);
+
+/// Inlined body of the `tdd` baked skill — per ADR-0005, codex's
+/// kickoff carries each baked skill's body verbatim because codex has
+/// no on-demand skill discovery (claude reads
+/// `~/.claude/skills/tdd/SKILL.md` lazily when the kickoff names it).
+pub const CODEX_INLINED_SKILL_TDD: &str = include_str!(
+    "../policy-image/skills/tdd/SKILL.md"
+);
+
+/// Inlined body of the `diagnose` baked skill. Same rationale as the
+/// `tdd` skill above.
+pub const CODEX_INLINED_SKILL_DIAGNOSE: &str = include_str!(
+    "../policy-image/skills/diagnose/SKILL.md"
+);
+
+/// Inlined body of the `triage` baked skill. Same rationale as above.
+pub const CODEX_INLINED_SKILL_TRIAGE: &str = include_str!(
+    "../policy-image/skills/triage/SKILL.md"
+);
