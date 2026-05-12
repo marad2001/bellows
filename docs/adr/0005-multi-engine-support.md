@@ -227,6 +227,67 @@ line (no per-prompt token cap below what we'd actually inline), and
 the cost of a longer kickoff is paid once per phase — well below
 the cost of drifting operating-context maintained in two places.
 
+## Persisted rate-limit state
+
+Engine selection at phase-start consults a persisted state file
+named `bellows-state.json`, written alongside `bellows.log` in the
+operator's bellows working directory (same parent path as the
+existing log; same lifecycle owner). The file records per-engine
+`cooling_until` timestamps and nothing else — the structure is
+small enough that the entire file is rewritten on each update, no
+schema migration story needed yet.
+
+```json
+{
+  "engines": {
+    "claude":  { "cooling_until": "2026-05-12T17:42:00Z" },
+    "codex":   { "cooling_until": null }
+  }
+}
+```
+
+**Write path.** When a phase exits non-zero and the captured stderr
+matches a known rate-limit signature for the engine that ran, the
+runner derives a `cooling_until` timestamp from the signature and
+writes it to the state file before terminating or advancing the
+chain. The cooldown is parsed from the CLI's stderr signature
+itself when the engine surfaces one — claude's existing rate-limit
+messages already include a parseable retry-after duration; codex's
+default-text stderr does not include a parseable reset-at
+timestamp (per the #79 spike findings — reset timestamps live in
+HTTP response headers, not in stderr), so the codex match
+substrings (`quota exceeded`, `rate limit:`) trigger a conservative
+5-minute default cooldown. A future enhancement can capture
+codex's `--json` event stream for accurate `RateLimitSnapshot`
+reset-at timestamps if the 5-minute default proves too coarse in
+practice.
+
+**Read path.** Every phase-start reads `bellows-state.json` before
+the chain walk. An engine whose `cooling_until` is in the future is
+treated as cold (skipped in pass 1 and pass 2 of the soft-diversity
+picker); an engine whose `cooling_until` is in the past or `null`
+is hot. The read is a single point-in-time snapshot at the start
+of the phase — bellows does not re-read mid-phase.
+
+**Self-correcting.** If a cooldown is wrong (the CLI under-promised
+the reset window, or the persisted state is stale for any reason),
+the next phase that picks that engine off the chain hits a fresh
+rate-limit. The fresh stderr signature updates the state file with
+the new cooldown, and the chain advances. The mistake costs one
+phase invocation; nothing about the design assumes the CLI's reset
+timestamp is correct.
+
+**Single pass per phase prevents thrashing.** A phase that picks an
+engine, hits rate-limit, updates state, and re-enters the chain
+walk could in principle pick the next engine, hit rate-limit
+again, and loop. Bellows enforces a single pass per phase as an
+invariant: within one phase invocation, the chain walk runs once
+and produces one engine choice. Subsequent rate-limit signatures
+within that phase invocation terminate the run (or, for the
+implement phase, trigger at most one in-place chain advancement —
+see below). The state file is the persisted memory that lets the
+*next* claim consult cooldowns without thrashing this one.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
