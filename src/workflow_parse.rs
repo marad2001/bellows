@@ -92,6 +92,20 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
     workflow_paths.sort();
 
     for path in &workflow_paths {
+        // Skip anything that isn't a regular file. A target repo can
+        // commit a symlink under `.github/workflows/` (git preserves
+        // mode 120000) pointing to an arbitrary host path —
+        // `/etc/passwd`, a deploy key, a FIFO — and `read_to_string`
+        // would follow the link on the bellows host. `symlink_metadata`
+        // does NOT follow the link, so any symlink (regardless of
+        // target), FIFO, socket, or directory entry is filtered out
+        // before any read.
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };

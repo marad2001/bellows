@@ -416,6 +416,76 @@ jobs:
 }
 
 #[test]
+fn symlinked_workflow_file_is_skipped() {
+    // Security: a target repo can commit a symlink under
+    // .github/workflows/ pointing to an arbitrary host path (e.g.
+    // /etc/passwd or a FIFO). std::fs::read_to_string follows symlinks
+    // by default, so a naive parser would dereference the link on the
+    // bellows host during workspace::prepare. The parser must skip any
+    // workflow entry that is not a regular file via symlink_metadata.
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new().unwrap();
+    let workflows_dir = tmp.path().join(".github").join("workflows");
+    std::fs::create_dir_all(&workflows_dir).unwrap();
+    // A non-workflow file outside the workflows dir. Even if it
+    // happened to parse as a valid `name: CI` workflow, the parser
+    // must not dereference the symlink to read it.
+    let outside_target = tmp.path().join("secret.txt");
+    std::fs::write(
+        &outside_target,
+        "name: CI\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo clippy --evil\n      - run: cargo test --evil\n",
+    )
+    .unwrap();
+    symlink(&outside_target, workflows_dir.join("ci.yml")).unwrap();
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(extracted.clippy, None);
+    assert_eq!(extracted.test, None);
+    assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
+}
+
+#[test]
+fn regular_workflow_alongside_symlink_still_extracts() {
+    // Companion to the symlink-skip test: a workflows directory that
+    // contains both a regular `ci.yml` and a symlinked sibling must
+    // still extract from the regular file. The symlink-skip filter
+    // must not also block ordinary workflows.
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new().unwrap();
+    let workflows_dir = tmp.path().join(".github").join("workflows");
+    std::fs::create_dir_all(&workflows_dir).unwrap();
+    // Real workflow with extractable commands.
+    std::fs::write(
+        workflows_dir.join("ci.yml"),
+        r#"
+name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+"#,
+    )
+    .unwrap();
+    // Sibling symlink to a host path the parser must not follow.
+    let outside_target = tmp.path().join("decoy.yml");
+    std::fs::write(&outside_target, "name: CI\n").unwrap();
+    symlink(&outside_target, workflows_dir.join("aaa-decoy.yml")).unwrap();
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(
+        extracted.clippy.as_deref(),
+        Some("cargo clippy --all-targets -- -D warnings"),
+    );
+    assert_eq!(
+        extracted.test.as_deref(),
+        Some("cargo test --all-targets"),
+    );
+}
+
+#[test]
 fn extracted_commands_default_carries_fallback_provenance() {
     // The struct's defaults are useful for the workspace snapshot path:
     // when no workflow parsed and no fallback applied yet, both
