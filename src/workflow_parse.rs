@@ -202,7 +202,10 @@ fn matrix_axis_has_ubuntu(job: &Yaml, key: &str) -> bool {
 /// `uses:` action invocations) are skipped. Multi-line `run:` bodies
 /// are scanned line-by-line so a step that prefixes with `set -e` or
 /// a `cargo build` doesn't suppress extraction of a later
-/// `cargo clippy` line in the same step.
+/// `cargo clippy` line in the same step. Shell backslash line
+/// continuations are reconstituted before matching so a cargo
+/// invocation split across physical lines is captured as the full
+/// logical command bellows runs under `sh -c`.
 fn extract_from_job(job: &Yaml) -> (Option<String>, Option<String>) {
     let Some(steps) = job["steps"].as_vec() else {
         return (None, None);
@@ -213,7 +216,7 @@ fn extract_from_job(job: &Yaml) -> (Option<String>, Option<String>) {
         let Some(run) = step["run"].as_str() else {
             continue;
         };
-        for line in run.lines() {
+        for line in collapse_backslash_continuations(run) {
             let trimmed = line.trim();
             if clippy.is_none()
                 && let Some(cmd) = match_cargo_command(trimmed, "clippy")
@@ -231,6 +234,51 @@ fn extract_from_job(job: &Yaml) -> (Option<String>, Option<String>) {
         }
     }
     (clippy, test)
+}
+
+/// Collapse shell-style backslash continuations within a multi-line
+/// `run:` block into logical lines. A physical line whose trimmed text
+/// ends with a single trailing `\` is joined to the next physical line
+/// with the `\` dropped and a single space separating the segments —
+/// the same transformation `sh` would apply when executing the
+/// captured command. Without this step a `run: |` block that splits
+/// `cargo clippy ...` across physical lines would be captured as
+/// `cargo clippy \` and the gate would silently run `cargo clippy`
+/// with no flags, breaking the "gate passes ⇒ CI passes" invariant
+/// the cargo-checks mirror is meant to guarantee.
+fn collapse_backslash_continuations(run: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut acc: Option<String> = None;
+    for line in run.lines() {
+        let trimmed_end = line.trim_end();
+        if let Some(prefix) = trimmed_end.strip_suffix('\\') {
+            let segment = prefix.trim_end();
+            match &mut acc {
+                Some(a) => {
+                    a.push(' ');
+                    a.push_str(segment.trim_start());
+                }
+                None => acc = Some(segment.to_string()),
+            }
+        } else {
+            match acc.take() {
+                Some(mut a) => {
+                    a.push(' ');
+                    a.push_str(trimmed_end.trim_start());
+                    out.push(a);
+                }
+                None => out.push(trimmed_end.to_string()),
+            }
+        }
+    }
+    if let Some(a) = acc {
+        // Dangling backslash at end of run block — keep the
+        // accumulated prefix so a malformed-but-recognisable invocation
+        // still surfaces as a non-empty captured command rather than
+        // being silently dropped.
+        out.push(a);
+    }
+    out
 }
 
 /// Match a trimmed line against `cargo <subcommand>` and return the

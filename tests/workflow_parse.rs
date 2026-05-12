@@ -272,6 +272,55 @@ jobs:
 }
 
 #[test]
+fn backslash_continued_run_block_reconstitutes_full_command() {
+    // Regression: a `run: |` block that splits a cargo invocation across
+    // physical lines with a trailing `\` is a very common CI shape once
+    // flag lists grow. Naively iterating `run.lines()` and capturing
+    // the first match returns `cargo clippy \`, which `sh -c` then runs
+    // as `cargo clippy` with no flags — far more permissive than what
+    // CI actually runs and a silent break of the "gate passes ⇒ CI
+    // passes" invariant the cargo-checks mirror is meant to establish.
+    // The parser must reconstitute the continuation so the captured
+    // command matches what CI would execute.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: clippy
+        run: |
+          cargo clippy \
+            --all-targets --all-features \
+            -- -D warnings -D clippy::correctness
+      - name: test
+        run: |
+          cargo test \
+            --all-targets \
+            --all-features
+"#,
+    );
+    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    assert_eq!(
+        extracted.clippy.as_deref(),
+        Some(
+            "cargo clippy --all-targets --all-features -- -D warnings -D clippy::correctness"
+        ),
+        "backslash-continued clippy must be joined into the full logical command",
+    );
+    assert_eq!(
+        extracted.test.as_deref(),
+        Some("cargo test --all-targets --all-features"),
+        "backslash-continued test must be joined into the full logical command",
+    );
+}
+
+#[test]
 fn extracted_commands_default_carries_fallback_provenance() {
     // The struct's defaults are useful for the workspace snapshot path:
     // when no workflow parsed and no fallback applied yet, both
