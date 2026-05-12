@@ -120,28 +120,49 @@ pub fn parse_ci_workflow(repo_root: &Path) -> std::io::Result<ExtractedCommands>
 }
 
 /// Walk a parsed workflow's `jobs.*` map, pick the preferred job (a
-/// job running on a Linux runner; falling back to the first declared
-/// job when none is Linux), then return the first `cargo clippy` and
-/// `cargo test` lines from that job's steps.
+/// job running on a Linux runner that yields at least one cargo
+/// command; falling back to the first declared job when no Linux job
+/// extracts), then return the first `cargo clippy` and `cargo test`
+/// lines from that job's steps.
+///
+/// Iterates *all* Linux jobs in declaration order rather than locking
+/// onto the first one, so a workflow that declares a non-cargo Linux
+/// job (e.g. `release:` running `cargo build`) before the real `ci:`
+/// job still extracts. Without this fallthrough the parser would
+/// report (None, None) for that shape even though a sibling Linux job
+/// carries clippy/test.
 fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
     let Some(jobs) = doc["jobs"].as_hash() else {
         return (None, None);
     };
-    let mut linux_job: Option<&Yaml> = None;
+    let mut linux_jobs: Vec<&Yaml> = Vec::new();
     let mut first_job: Option<&Yaml> = None;
     for (_name, body) in jobs {
         if first_job.is_none() {
             first_job = Some(body);
         }
-        if linux_job.is_none() && job_is_linux(body) {
-            linux_job = Some(body);
+        if job_is_linux(body) {
+            linux_jobs.push(body);
         }
     }
-    let chosen = linux_job.or(first_job);
-    let Some(job) = chosen else {
-        return (None, None);
-    };
-    extract_from_job(job)
+    for job in &linux_jobs {
+        let extracted = extract_from_job(job);
+        if extracted.0.is_some() || extracted.1.is_some() {
+            return extracted;
+        }
+    }
+    // No Linux job produced an extractable command. If at least one
+    // Linux job existed, return its (None, None) so the verdict is
+    // attributable to that job. Otherwise fall through to the first
+    // declared job — the matrix-without-ubuntu shape the brief calls
+    // out.
+    if let Some(job) = linux_jobs.first() {
+        return extract_from_job(job);
+    }
+    match first_job {
+        Some(job) => extract_from_job(job),
+        None => (None, None),
+    }
 }
 
 /// Whether a `jobs.<name>` body runs on a Linux runner. Accepts a

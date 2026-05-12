@@ -321,6 +321,47 @@ jobs:
 }
 
 #[test]
+fn multiple_linux_jobs_skip_past_one_with_no_cargo_commands() {
+    // Regression: a workflow that declares more than one Linux job
+    // must not lock onto the first one when it carries no cargo
+    // commands. For example a `release:` job that only runs
+    // `cargo build` followed by a `ci:` job that runs clippy and test
+    // — the parser must skip past `release` and extract from `ci`.
+    // Locking onto the first Linux job would produce (None, None) and
+    // silently fall back to config even though a sibling Linux job
+    // had the commands.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo build --release
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+"#,
+    );
+    let extracted = parse_ci_workflow(tmp.path()).expect("parse should succeed");
+    assert_eq!(
+        extracted.clippy.as_deref(),
+        Some("cargo clippy --all-targets -- -D warnings"),
+        "second Linux job must be picked when the first carries no cargo commands",
+    );
+    assert_eq!(
+        extracted.test.as_deref(),
+        Some("cargo test --all-targets"),
+    );
+}
+
+#[test]
 fn extracted_commands_default_carries_fallback_provenance() {
     // The struct's defaults are useful for the workspace snapshot path:
     // when no workflow parsed and no fallback applied yet, both
