@@ -1,12 +1,16 @@
 #!/bin/sh
-# Bellows agent entry (slice 3 - real Claude Code).
+# Bellows agent entry (issue #81 / ADR-0005 - multi-engine).
 #
-# Reads the kickoff prompt Bellows wrote into the workspace before
-# the container started, removes the prompt file so it doesn't leak
-# into the resulting commit, and exec's `claude -p` with the prompt.
+# Reads the kickoff prompt Bellows wrote into the workspace before the
+# container started, removes the prompt file so it doesn't leak into
+# the resulting commit, then dispatches to either claude or codex
+# based on the per-phase BELLOWS_ENGINE env var the bellows runner
+# sets on the spawned container.
 #
-# Slice 2's stub-marker behaviour is gone; the agent is responsible
-# for whatever changes end up in the workspace.
+# When the runner pinned a model on the chain entry (e.g.
+# `"claude:opus-4-7"`), BELLOWS_MODEL is set and we append
+# `-m "$BELLOWS_MODEL"` to the CLI invocation. When no pin, the flag
+# is omitted and the CLI uses its default model.
 
 set -eu
 
@@ -20,8 +24,46 @@ fi
 PROMPT="$(cat "$KICKOFF")"
 rm -f "$KICKOFF"
 
-# --dangerously-skip-permissions bypasses Claude Code's per-tool approval
-# prompts. The container is the sandbox boundary (Docker isolation,
-# /workspace-only mount), so the per-tool gate is redundant and would
-# otherwise hang headlessly waiting for a human to approve each Write.
-exec claude --dangerously-skip-permissions -p "$PROMPT"
+# Issue #81 / ADR-0005: BELLOWS_ENGINE is set per-phase by the bellows
+# runner before each container starts. A missing or unrecognised value
+# is a hard error — the bellows-side dispatcher always sets it, so an
+# unset value indicates a regression rather than a degraded mode worth
+# running.
+if [ -z "${BELLOWS_ENGINE:-}" ]; then
+    echo "bellows: BELLOWS_ENGINE is not set; the bellows runner must export it before invoking the container" >&2
+    exit 3
+fi
+
+case "$BELLOWS_ENGINE" in
+    claude)
+        # --dangerously-skip-permissions bypasses Claude Code's per-tool
+        # approval prompts. The container is the sandbox boundary
+        # (Docker isolation, /workspace-only mount), so the per-tool
+        # gate is redundant and would otherwise hang headlessly
+        # waiting for a human to approve each Write.
+        if [ -n "${BELLOWS_MODEL:-}" ]; then
+            exec claude --dangerously-skip-permissions -m "$BELLOWS_MODEL" -p "$PROMPT"
+        else
+            exec claude --dangerously-skip-permissions -p "$PROMPT"
+        fi
+        ;;
+    codex)
+        # Codex headless invocation (issue #79 spike findings):
+        #   codex exec --dangerously-bypass-approvals-and-sandbox
+        #              --skip-git-repo-check "$PROMPT" </dev/null
+        #
+        # The `</dev/null` stdin closure is LOAD-BEARING. Without it
+        # codex hangs forever waiting for EOF on stdin (confirmed
+        # empirically against codex-cli rust-v0.130.0). Do NOT remove
+        # the redirect even if a "cleanup" pass thinks it's redundant.
+        if [ -n "${BELLOWS_MODEL:-}" ]; then
+            exec codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -m "$BELLOWS_MODEL" "$PROMPT" </dev/null
+        else
+            exec codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$PROMPT" </dev/null
+        fi
+        ;;
+    *)
+        echo "bellows: unrecognised BELLOWS_ENGINE=$BELLOWS_ENGINE (expected 'claude' or 'codex')" >&2
+        exit 4
+        ;;
+esac
