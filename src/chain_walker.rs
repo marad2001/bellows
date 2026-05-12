@@ -349,6 +349,33 @@ pub fn decide_implement_rate_limit_action(
     }
 }
 
+/// Non-implement-phase response to a rate-limit signature. Only one
+/// shape today: terminate. Kept as an enum sibling of
+/// `ImplementRateLimitAction` so a future relaxation (e.g. retry on
+/// the non-fix phases) lands as a new variant rather than a
+/// boolean-flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonImplementRateLimitAction {
+    /// Terminate the run as RateLimited. State file is updated; the
+    /// next claim consults it and walks the chain afresh. ADR-0005:
+    /// review-fix and security-fix operate on a workspace already
+    /// carrying committed implement-phase work; dropping that
+    /// workspace would destroy the agent's output, so terminate-and-
+    /// defer is the only safe shape.
+    Terminate,
+}
+
+/// Decide how the runner should handle a rate-limit signature in a
+/// non-implement agent-invoking phase. The `_phase_name` parameter
+/// is unused today (all four non-implement phases terminate) but is
+/// kept on the signature so a future per-phase relaxation lands
+/// without re-arranging the call site.
+pub fn decide_non_implement_rate_limit_action(
+    _phase_name: &str,
+) -> NonImplementRateLimitAction {
+    NonImplementRateLimitAction::Terminate
+}
+
 /// Look for `<preamble>|<unix-epoch-seconds>` in `text` and decode the
 /// trailing digit run into a UTC timestamp. Picks the FIRST such pipe-
 /// delimited number — claude's marker is the only known shape the
