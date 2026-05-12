@@ -313,6 +313,42 @@ pub fn pick_engine(
     Err(PickError::AllCooling)
 }
 
+/// Implement-phase response to a rate-limit signature. Pure decision
+/// shape consumed by the runner's bounded two-iteration implement
+/// loop. ADR-0005 §"Rate-limit behaviour: implement phase vs the
+/// rest":
+///
+/// - At base SHA with no prior in-place advance in this phase
+///   invocation → `InPlaceAdvance` (drop workspace, swap to next hot
+///   chain entry, re-run from base).
+/// - Workspace ahead of base SHA, OR prior in-place advance already
+///   used in this phase invocation → `Terminate` as RateLimited. The
+///   ahead-of-base guard avoids dropping committed work; the max-1
+///   cap preserves the single-pass-per-phase invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImplementRateLimitAction {
+    /// Bounded retry: drop the workspace state (cheap — no commits to
+    /// lose), pick the next hot chain entry, re-run from base.
+    InPlaceAdvance,
+    /// Terminate the run as RateLimited. State file is updated; the
+    /// next claim consults it and walks the chain afresh.
+    Terminate,
+}
+
+/// Decide how the runner should handle a rate-limit signature in the
+/// implement phase. Pure function so the runner-level contract is
+/// testable without docker.
+pub fn decide_implement_rate_limit_action(
+    at_base_sha: bool,
+    advances_used: u8,
+) -> ImplementRateLimitAction {
+    if at_base_sha && advances_used == 0 {
+        ImplementRateLimitAction::InPlaceAdvance
+    } else {
+        ImplementRateLimitAction::Terminate
+    }
+}
+
 /// Look for `<preamble>|<unix-epoch-seconds>` in `text` and decode the
 /// trailing digit run into a UTC timestamp. Picks the FIRST such pipe-
 /// delimited number — claude's marker is the only known shape the
