@@ -139,6 +139,30 @@ fn run_agent_script_passes_dash_m_when_bellows_model_is_set() {
 }
 
 #[test]
+fn run_agent_script_passes_long_form_model_flag_to_claude_when_bellows_model_is_set() {
+    // Claude v2.1 accepts `--model <model>` but NOT `-m <model>`
+    // (`claude --help` documents only the long form). Codex v0.130
+    // accepts both. The original multi-engine ship (#81) used `-m`
+    // for both branches, so a `cli_chain` entry like
+    // `"claude:claude-opus-4-7"` made claude exit 1 with
+    // `error: unknown option '-m'` before ever reading the prompt
+    // — every claude-with-model-pin run silently routed to Crash.
+    //
+    // Pin the claude branch's long-form flag so a future drive-by
+    // edit that reverts to `-m` for claude flips the test red.
+    // (The codex branch's `-m` is still pinned by
+    // `run_agent_script_passes_dash_m_when_bellows_model_is_set`
+    // above — codex documents both flags so either is acceptable
+    // for that engine.)
+    let run_agent = read_policy_image_file("run-agent");
+    assert!(
+        run_agent.contains(r#"--model "$BELLOWS_MODEL""#),
+        "run-agent's claude branch must use `--model \"$BELLOWS_MODEL\"` \
+         (not `-m`) because claude v2.1 documents only the long form: {run_agent}",
+    );
+}
+
+#[test]
 fn run_agent_script_fails_on_unset_or_unrecognised_engine() {
     let run_agent = read_policy_image_file("run-agent");
     // ADR-0005: "A missing or unrecognised BELLOWS_ENGINE is a hard
