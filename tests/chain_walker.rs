@@ -376,3 +376,45 @@ fn implement_f_workspace_ahead_of_base_terminates_without_advance() {
     );
     assert_eq!(action_with_advance_used, ImplementRateLimitAction::Terminate);
 }
+
+// -----------------------------------------------------------------
+// AC (g): All other agent-invoking phases (review, review-fix,
+// security-review, security-fix) mid-execution rate-limit →
+// terminate as RateLimited.
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::{
+    decide_non_implement_rate_limit_action, NonImplementRateLimitAction,
+};
+
+#[test]
+fn non_implement_rate_limit_terminates_for_review_phase() {
+    assert_eq!(
+        decide_non_implement_rate_limit_action("review"),
+        NonImplementRateLimitAction::Terminate,
+    );
+}
+
+#[test]
+fn non_implement_rate_limit_terminates_for_review_fix() {
+    assert_eq!(
+        decide_non_implement_rate_limit_action("review-fix"),
+        NonImplementRateLimitAction::Terminate,
+    );
+}
+
+#[test]
+fn non_implement_rate_limit_terminates_for_security_review() {
+    assert_eq!(
+        decide_non_implement_rate_limit_action("security-review"),
+        NonImplementRateLimitAction::Terminate,
+    );
+}
+
+#[test]
+fn non_implement_rate_limit_terminates_for_security_fix() {
+    assert_eq!(
+        decide_non_implement_rate_limit_action("security-fix"),
+        NonImplementRateLimitAction::Terminate,
+    );
+}
