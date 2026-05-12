@@ -1017,6 +1017,19 @@ fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
     // substitutes a host key during the first `bellows setup-deploy-keys
     // add` invocation.
     let seeding = build_known_hosts_seeding_block(ssh_host);
+    // Final `chown -R 1000:1000 /sshvol`: the one-shot container that
+    // runs this script runs as `--user 0` (root) so it can write to a
+    // fresh-volume mount point that Docker created `root:root`. Without
+    // a follow-up chown, the produced files stay root-owned; when the
+    // agent / cargo-checks gate container later mounts this volume at
+    // `/home/bellows/.ssh/` read-only and runs as bellows (uid 1000),
+    // bellows cannot read the `root:root` mode-600 key — SSH silently
+    // fails with "Permission denied (publickey)" and cargo reports the
+    // dep as unfetchable. The chown is run at the end so it covers both
+    // the key file and the `config` / `known_hosts` files (regardless of
+    // which conditional branches the script took). Idempotent — `chown
+    // -R` on a directory that already has the correct ownership is a
+    // no-op. Issue #73.
     format!(
         "set -e\n\
          umask 077\n\
@@ -1031,7 +1044,8 @@ fn build_deploy_keys_add_script(name: &str, ssh_host: &str) -> String {
          chmod 644 /sshvol/known_hosts\n\
          if ! ssh-keygen -F {ssh_host} -f /sshvol/known_hosts >/dev/null 2>&1; then\n\
          {seeding}\
-         fi\n",
+         fi\n\
+         chown -R 1000:1000 /sshvol\n",
         name = name,
         identity = identity,
         ssh_host = ssh_host,
@@ -1167,6 +1181,7 @@ fn build_deploy_keys_remove_script(name: &str) -> String {
              ' /sshvol/config > /sshvol/config.new\n\
              mv /sshvol/config.new /sshvol/config\n\
              chmod 600 /sshvol/config\n\
+             chown 1000:1000 /sshvol/config\n\
          fi\n",
         name = name,
         identity = identity,
@@ -1876,6 +1891,28 @@ mod tests {
     }
 
     #[test]
+    fn build_deploy_keys_add_script_chowns_volume_to_bellows_uid() {
+        // Issue #73: the setup-deploy-keys add container runs as
+        // `--user 0` (root), so files it writes to /sshvol stay
+        // root-owned. When the volume is later mounted into an agent
+        // / cargo-checks gate container at /home/bellows/.ssh/
+        // read-only and that container drops to bellows (uid 1000),
+        // bellows cannot read the root:root mode-600 key — SSH fails
+        // with "Permission denied (publickey)" and cargo can't fetch
+        // the dep. The script must chown the volume to 1000:1000
+        // (bellows's uid, baked by the policy image's `useradd
+        // --uid 1000 bellows`) before exiting. Run at the end so it
+        // covers every file regardless of which conditional branches
+        // the script took.
+        let script = build_deploy_keys_add_script("workboard-core", "github.com");
+        assert!(
+            script.contains("chown -R 1000:1000 /sshvol"),
+            "add script must chown the volume to bellows uid 1000 so the agent container \
+             can read the keys (issue #73): {script}",
+        );
+    }
+
+    #[test]
     fn build_deploy_keys_remove_script_removes_key_and_host_stanza() {
         // Acceptance AC5: remove must delete /sshvol/<name> AND the
         // matching Host stanza from /sshvol/config. Idempotent on
@@ -1910,6 +1947,23 @@ mod tests {
             script.contains("in_block=1; block=\"\""),
             "remove script must clear `block` when entering in_block so the \
              END rule does not resurrect an orphan Host header: {script}",
+        );
+    }
+
+    #[test]
+    fn build_deploy_keys_remove_script_chowns_config_to_bellows_uid() {
+        // Issue #73: `mv config.new config` inside the awk-rewrite
+        // block recreates /sshvol/config as root:root (the script runs
+        // as root). Subsequent agent containers can't read it under
+        // bellows uid 1000. The script must chown the rewritten config
+        // back to 1000:1000 before exiting, matching the add script's
+        // post-write chown.
+        let script = build_deploy_keys_remove_script("workboard-core");
+        assert!(
+            script.contains("chown 1000:1000 /sshvol/config")
+                || script.contains("chown -R 1000:1000 /sshvol"),
+            "remove script must chown /sshvol/config back to bellows uid 1000 after \
+             the awk-rewrite recreates it as root:root (issue #73): {script}",
         );
     }
 
