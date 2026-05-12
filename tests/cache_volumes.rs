@@ -212,3 +212,24 @@ fn cargo_checks_user_mode_script_does_not_chown() {
         script,
     );
 }
+
+#[test]
+fn dockerfile_installs_openssh_client_for_setup_deploy_keys() {
+    // Issue #71: `bellows setup-deploy-keys add` runs a script in a
+    // one-shot policy-image container that calls `ssh-keyscan` (to
+    // seed `/sshvol/known_hosts`) and `ssh-keygen -F` (to check whether
+    // the host is already seeded). Both come from the `openssh-client`
+    // apt package; `rust:1.95-slim` does NOT ship them. Without the
+    // package the script fails with exit 127 ("command not found")
+    // inside the container — observed live on 2026-05-12, immediately
+    // after the issue-#69 SSH-deploy-keys feature shipped. Pin the
+    // install here so a future Dockerfile edit can't silently drop the
+    // package and re-break `setup-deploy-keys add` on a fresh image.
+    let dockerfile = read_policy_image_file("Dockerfile");
+    assert!(
+        dockerfile.contains("openssh-client"),
+        "policy-image/Dockerfile must install `openssh-client` for the `setup-deploy-keys add` \
+         script's `ssh-keyscan` / `ssh-keygen -F` calls. See issue #71. Current Dockerfile:\n{}",
+        dockerfile,
+    );
+}

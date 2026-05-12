@@ -24,6 +24,7 @@ RUN apt-get update \
         curl \
         gnupg \
         git \
+        openssh-client \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
