@@ -88,3 +88,40 @@ fn adr_0005_exists_and_follows_shape_of_other_adrs() {
         "ADR shape (sections that ADR-0001..0004 also carry)",
     );
 }
+
+/// AC#2 — Documents the two stated wins (diversity + throughput) and
+/// which design choices are load-bearing for each.
+///
+/// The brief names diversity and throughput as the wins the design
+/// chases; both must be named explicitly. The reviewer-not-grading-
+/// its-own-homework framing is the diversity rationale; the
+/// per-phase fallback (across implement/review/review-fix/security-
+/// review/security-fix) is the throughput rationale.
+#[test]
+fn adr_0005_documents_diversity_and_throughput_wins() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // The two named wins, verbatim.
+            "Diversity",
+            "Throughput",
+            // The diversity rationale — reviewer not grading its
+            // own homework.
+            "reviewer",
+            "homework",
+            // The throughput rationale — per-phase fallback across
+            // all agent-invoking phases, not just implement.
+            "implement",
+            "review",
+            "review-fix",
+            "security-review",
+            "security-fix",
+            // Soft preference + visible collapse phrasing pinned so
+            // the prose names the load-bearing trade-off.
+            "soft",
+            "collapse",
+        ],
+        "wins / diversity + throughput",
+    );
+}
