@@ -1649,7 +1649,10 @@ fn build_log_body(
     }
 
     body.push_str("\n</details>");
-    body
+    // Issue #87: bound the body below GitHub's 64 KiB comment limit
+    // (the helper passes short bodies through unchanged so the common
+    // path is unaffected).
+    tracker::truncate_for_github_comment(&body)
 }
 
 fn gate_summary_line(gate: &GateOutcome) -> String {
