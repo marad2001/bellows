@@ -8,9 +8,15 @@
 //! injected directly into the picker as a known input rather than wired
 //! through the full runner pipeline (which would need docker).
 
-use bellows::chain_walker::{EngineState, StateFile};
-use bellows::config::Engine;
+use bellows::chain_walker::{
+    pick_engine, EngineState, PickError, PickReason, StateFile,
+};
+use bellows::config::{ChainEntry, Engine};
 use chrono::{DateTime, Duration, Utc};
+
+fn entry(engine: Engine) -> ChainEntry {
+    ChainEntry { engine, model: None }
+}
 
 // -----------------------------------------------------------------
 // AC: `bellows-state.json` created on first rate-limit; updated on
@@ -202,4 +208,113 @@ fn parse_cooling_until_falls_back_when_claude_signature_has_no_timestamp() {
     let parsed = bellows::chain_walker::parse_cooling_until(Engine::Claude, stderr, now);
     assert_eq!(parsed.cooling_until, now + Duration::minutes(5));
     assert!(parsed.used_fallback);
+}
+
+// -----------------------------------------------------------------
+// AC: Two-pass soft-diversity picker. Pass-1 picks hot AND ≠
+// implementer-CLI; pass-2 picks hot with an operator-visible
+// collapse warning; no hot entry → `RateLimited`.
+//
+// Unit tests (a/b/c/d) from the brief; the implementer-CLI is
+// injected directly into the picker as a known input per the
+// "fixture note for tests (a)/(b)/(c)".
+// -----------------------------------------------------------------
+
+#[test]
+fn pick_engine_a_diversity_preference_picks_codex_when_implementer_was_claude() {
+    // AC (a): Implementer = claude; review chain = [codex, claude];
+    // both hot → diversity preference picks codex (the non-claude
+    // chain entry, which happens to be chain[0]).
+    let now = Utc::now();
+    let state = StateFile::default(); // both hot
+    let chain = vec![entry(Engine::Codex), entry(Engine::Claude)];
+    let picked = pick_engine(&chain, &state, Some(Engine::Claude), now)
+        .expect("pick must succeed");
+    assert_eq!(picked.entry.engine, Engine::Codex);
+}
+
+#[test]
+fn pick_engine_b_collapse_second_pass_when_diversity_alt_is_cooling() {
+    // AC (b): Implementer = claude; review chain = [codex, claude];
+    // codex cooling, claude hot → diversity collapses, second pass
+    // picks claude with operator-visible warning.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Codex, now + Duration::minutes(10));
+    let chain = vec![entry(Engine::Codex), entry(Engine::Claude)];
+    let picked = pick_engine(&chain, &state, Some(Engine::Claude), now)
+        .expect("second-pass pick must succeed");
+    assert_eq!(picked.entry.engine, Engine::Claude);
+    assert_eq!(
+        picked.reason,
+        PickReason::SecondPassAfterCollapse,
+        "second pass must be reported so the operator sees the collapse warning",
+    );
+}
+
+#[test]
+fn pick_engine_c_diversity_preference_picks_claude_when_implementer_was_codex() {
+    // AC (c): Implementer = codex; review chain = [codex, claude];
+    // both hot → diversity preference picks claude (skips codex
+    // because it matches the implementer-CLI).
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Codex), entry(Engine::Claude)];
+    let picked = pick_engine(&chain, &state, Some(Engine::Codex), now)
+        .expect("pick must succeed");
+    assert_eq!(picked.entry.engine, Engine::Claude);
+    assert_eq!(
+        picked.reason,
+        PickReason::DiversityPreferred,
+        "the pick must be reported as diversity-preferred so the operator can audit",
+    );
+}
+
+#[test]
+fn pick_engine_d_terminates_when_every_chain_entry_is_cooling() {
+    // AC (d): Both engines cooling per state file at phase-start →
+    // terminate run as RateLimited.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Claude, now + Duration::minutes(10));
+    state.record_rate_limit(Engine::Codex, now + Duration::minutes(10));
+    let chain = vec![entry(Engine::Codex), entry(Engine::Claude)];
+    let result = pick_engine(&chain, &state, Some(Engine::Claude), now);
+    assert!(
+        matches!(result, Err(PickError::AllCooling)),
+        "all-cooling must terminate as RateLimited; got {result:?}",
+    );
+}
+
+#[test]
+fn pick_engine_no_implementer_uses_first_hot_entry() {
+    // Implement phase has no implementer-CLI yet (the implementer-CLI
+    // is set at implement-phase end). The picker falls through to
+    // "first hot entry" — chain-order driven, no diversity constraint.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine(&chain, &state, None, now).expect("pick must succeed");
+    assert_eq!(picked.entry.engine, Engine::Claude);
+    assert_eq!(picked.reason, PickReason::ChainFirstHotEntry);
+}
+
+#[test]
+fn pick_engine_no_implementer_skips_cooling_first_entry() {
+    // Implement phase with no implementer set yet, chain = [claude,
+    // codex], claude cooling: picker skips to codex (the first HOT
+    // entry — pure chain walking).
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Claude, now + Duration::minutes(10));
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine(&chain, &state, None, now).expect("pick must succeed");
+    assert_eq!(picked.entry.engine, Engine::Codex);
+    assert_eq!(picked.reason, PickReason::ChainFirstHotEntry);
 }
