@@ -344,6 +344,111 @@ async fn finalise_skips_label_patch_when_in_progress_label_already_removed_exter
 }
 
 #[tokio::test]
+async fn finalise_completes_label_transition_when_comment_post_fails_with_422() {
+    // Issue #87 AC #1 + AC #3. When the run-log comment POST fails (e.g.
+    // GitHub returns 422 because the body exceeds the 64 KiB hard limit
+    // on issue/PR comments), the label transition must still complete
+    // and `finalise` must return `Ok` so the surrounding pipeline reaches
+    // a terminal `RunOutcome` instead of leaving the source issue stuck
+    // at `agent-in-progress`. The comment-post failure is observability
+    // only — the caller surfaces it via `comment_post_failure` for the
+    // operator's log warning.
+    let mock = MockServer::start().await;
+
+    // GET issue: in_progress is still on the issue (no operator-side
+    // cancellation happened mid-run).
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big issue with huge run-log",
+            "labels": [
+                { "name": "agent-in-progress" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // PATCH issue: succeeds, transitions to agent-done. This MUST happen
+    // even though the comment POST below fails — AC #1's load-bearing
+    // assertion is the label state machine reaching its terminal state
+    // regardless of comment-post observability.
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .and(body_json(json!({ "labels": ["agent-done", "bug"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big issue with huge run-log",
+            "labels": [
+                { "name": "agent-done" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // POST run-log comment: 422 with the exact body-too-long error the
+    // live failure on workboard-financial-advice #15 produced.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "message": "Validation Failed",
+            "errors": [{
+                "resource": "IssueComment",
+                "code": "unprocessable",
+                "field": "data",
+                "message": "Body is too long (maximum is 65536 characters)"
+            }],
+            "documentation_url": "https://docs.github.com/rest"
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let outcome = finalise(
+        &client,
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 42,
+            pr_number: 99,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-done",
+            log_body: "Run completed; this body will be rejected by the mock",
+        },
+    )
+    .await
+    .expect(
+        "finalise must return Ok when only the comment POST fails — the label \
+         state machine is independent of comment observability (AC #3)",
+    );
+
+    // AC #1: label transition reached the terminal state.
+    assert!(!outcome.externally_cancelled);
+    let label_names: Vec<&str> = outcome.issue.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(
+        label_names.contains(&"agent-done"),
+        "expected agent-done in returned labels, got {:?}",
+        label_names,
+    );
+    assert!(!label_names.contains(&"agent-in-progress"));
+
+    // AC #3: the failure is surfaced to the caller so the polling loop /
+    // log writer can record an operator-visible warning. We don't pin
+    // the exact rendering — octocrab's Display may evolve — but the
+    // field must be Some, carrying a non-empty message.
+    let failure = outcome
+        .comment_post_failure
+        .as_ref()
+        .expect("expected comment_post_failure to be Some so the caller can log a warning");
+    assert!(
+        !failure.is_empty(),
+        "comment_post_failure must carry a non-empty diagnostic, got empty string",
+    );
+}
+
+#[tokio::test]
 async fn transition_to_cancelled_posts_short_comment_and_swaps_labels() {
     // The `bellows kill <N>` GitHub-side handler. Posts a short
     // AI-disclaimer-style comment so a human reading the issue knows what
