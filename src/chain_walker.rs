@@ -21,10 +21,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Engine;
+
+/// Conservative cooldown when the rate-limit stderr does not carry a
+/// parseable reset-at timestamp. ADR-0005: "the codex match substrings
+/// (`quota exceeded`, `rate limit:`) trigger a conservative 5-minute
+/// default cooldown" because codex stderr does not include a
+/// parseable reset-at (issue #79 spike findings). The same default
+/// applies to a claude rate-limit stderr whose phrasing changes and
+/// no longer matches the parseable shapes.
+const COOLING_UNTIL_FALLBACK_MINUTES: i64 = 5;
 
 /// Persisted per-engine rate-limit state. Written alongside
 /// `bellows.log` in the operator's bellows working directory; read at
@@ -109,4 +118,130 @@ impl StateFile {
             },
         );
     }
+}
+
+/// Result of parsing a `cooling_until` timestamp from a rate-limit
+/// stderr signature. `used_fallback` is `true` when the parser could
+/// not find a parseable timestamp and produced the conservative
+/// 5-minute default; the runner notes that in the run-log so an
+/// operator inspecting `bellows-state.json` can see why a cooldown is
+/// suspiciously short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedCooldown {
+    pub cooling_until: DateTime<Utc>,
+    pub used_fallback: bool,
+}
+
+/// Derive a `cooling_until` timestamp from a rate-limit stderr
+/// signature. The function tries the parseable shapes claude is known
+/// to emit, falling back to `now + 5 minutes` per ADR-0005 when no
+/// shape matches (codex's default-text stderr, or a future claude
+/// rephrasing).
+///
+/// Claude shapes tried, in order:
+///   1. `<some preamble>|<unix epoch>` — Claude Code's
+///      `Claude AI usage limit reached|<epoch>` marker.
+///   2. An RFC3339 timestamp embedded anywhere in the stderr —
+///      catches `resets at 2026-05-12T20:30:00Z` and any future
+///      rephrasing that retains a literal timestamp.
+///
+/// Codex always falls back (spike #79: reset times come from HTTP
+/// headers, not from default-text stderr). The fallback flag lets
+/// the runner surface "5-minute default applied" in the log.
+pub fn parse_cooling_until(
+    engine: Engine,
+    stderr: &str,
+    now: DateTime<Utc>,
+) -> ParsedCooldown {
+    if matches!(engine, Engine::Claude) {
+        if let Some(t) = extract_unix_epoch_after_pipe(stderr) {
+            return ParsedCooldown {
+                cooling_until: t,
+                used_fallback: false,
+            };
+        }
+        if let Some(t) = extract_rfc3339_in_text(stderr) {
+            return ParsedCooldown {
+                cooling_until: t,
+                used_fallback: false,
+            };
+        }
+    }
+    ParsedCooldown {
+        cooling_until: now + Duration::minutes(COOLING_UNTIL_FALLBACK_MINUTES),
+        used_fallback: true,
+    }
+}
+
+/// Look for `<preamble>|<unix-epoch-seconds>` in `text` and decode the
+/// trailing digit run into a UTC timestamp. Picks the FIRST such pipe-
+/// delimited number — claude's marker is the only known shape the
+/// stderr carries today, and matching the first one keeps the parser
+/// deterministic if a future error body interpolates additional
+/// numbers.
+fn extract_unix_epoch_after_pipe(text: &str) -> Option<DateTime<Utc>> {
+    for line in text.lines() {
+        if let Some(pipe_idx) = line.find('|') {
+            let tail = &line[pipe_idx + 1..];
+            // Take the leading run of ASCII digits.
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 9
+                && let Ok(epoch) = digits.parse::<i64>()
+                && let Some(t) = DateTime::<Utc>::from_timestamp(epoch, 0)
+            {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// Scan `text` for an embedded RFC3339 timestamp (`YYYY-MM-DDTHH:MM:SSZ`
+/// or with a timezone offset). Returns the FIRST one found. Loose
+/// detection — chrono's parser does the precise validation; we just
+/// hunt for a plausible-shaped substring to feed it.
+fn extract_rfc3339_in_text(text: &str) -> Option<DateTime<Utc>> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 20 <= bytes.len() {
+        // Loose shape probe: 4 digits, '-', 2 digits, '-', 2 digits, 'T'.
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4] == b'-'
+            && bytes[i + 7] == b'-'
+            && bytes[i + 10] == b'T'
+        {
+            // Find the end of the timestamp (Z or +/-HH:MM).
+            let mut end = i + 19; // YYYY-MM-DDTHH:MM:SS
+            if end < bytes.len() {
+                match bytes[end] {
+                    b'Z' => end += 1,
+                    b'+' | b'-' if end + 6 <= bytes.len() => end += 6,
+                    b'.' => {
+                        // Fractional seconds. Consume digits, then
+                        // the timezone designator.
+                        end += 1;
+                        while end < bytes.len() && bytes[end].is_ascii_digit() {
+                            end += 1;
+                        }
+                        if end < bytes.len() {
+                            match bytes[end] {
+                                b'Z' => end += 1,
+                                b'+' | b'-' if end + 6 <= bytes.len() => end += 6,
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Ok(t) = DateTime::parse_from_rfc3339(&text[i..end]) {
+                return Some(t.with_timezone(&Utc));
+            }
+        }
+        i += 1;
+    }
+    None
 }
