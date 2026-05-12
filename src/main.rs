@@ -2458,6 +2458,170 @@ mod tests {
         }
     }
 
+    // ---- Issue #100: codex setup-auth drives `codex login --device-auth`,
+    //                  claude path is unchanged ----
+    //
+    // The bug fixed here: `bellows setup-auth --engine codex` previously
+    // dropped into the codex interactive TUI with no args and printed
+    // "type `/login` to start the OAuth flow". Codex has no `/login`
+    // slash command (the binary only ships `/org-setup`), so no OAuth
+    // ever completed and `auth.json` never landed in the credentials
+    // volume — every codex-engine pipeline run then 401'd inside the
+    // container. The fix branches the docker argv and pre-flight
+    // instructions on engine: claude keeps the interactive-TUI + `/login`
+    // flow; codex invokes `codex login --device-auth` directly so codex
+    // prints a device URL + code and writes `auth.json` back through the
+    // mount when the operator approves the device in their host browser.
+    //
+    // Both subcommands share the same impl (Command::SetupAuth and
+    // Command::RefreshAuth both call setup_auth), so one fix covers
+    // setup-auth and refresh-auth in lock-step.
+
+    #[test]
+    fn setup_auth_docker_args_for_claude_have_no_positional_args_after_image_tag() {
+        // Claude path is unchanged: docker runs the interactive claude
+        // TUI with no positional args, then the operator types `/login`
+        // inside the TUI. Pin the argv shape so a future regression
+        // would flip the test.
+        let args = setup_auth_docker_args(
+            bellows::config::Engine::Claude,
+            "bellows-claude-credentials",
+            "/home/bellows/.claude",
+            "bellows-policy:abc123",
+        );
+        // The image tag is the LAST positional arg for claude — no
+        // `login` / `--device-auth` etc. after it.
+        assert_eq!(
+            args.last().map(|s| s.as_str()),
+            Some("bellows-policy:abc123"),
+            "claude args must end at the image tag with no positional args after it: {args:?}",
+        );
+        // The engine name must follow `--entrypoint`.
+        let entrypoint_idx = args.iter().position(|a| a == "--entrypoint")
+            .expect("claude args must include --entrypoint");
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(|s| s.as_str()),
+            Some("claude"),
+            "claude --entrypoint value must be `claude`: {args:?}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_docker_args_for_codex_invoke_login_with_device_auth_after_image_tag() {
+        // Codex path: docker runs `codex login --device-auth` (i.e. the
+        // `login` subcommand with the `--device-auth` flag) as the
+        // container's command, so codex completes a device-auth OAuth
+        // flow inside the running container and writes `auth.json` back
+        // through the mounted credentials volume.
+        let args = setup_auth_docker_args(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+            "/home/bellows/.codex",
+            "bellows-policy:abc123",
+        );
+        // The engine name must follow `--entrypoint` (so codex is the
+        // entrypoint; docker treats remaining args as the container
+        // command).
+        let entrypoint_idx = args.iter().position(|a| a == "--entrypoint")
+            .expect("codex args must include --entrypoint");
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(|s| s.as_str()),
+            Some("codex"),
+            "codex --entrypoint value must be `codex`: {args:?}",
+        );
+        // `login` and `--device-auth` must both follow the image tag
+        // as positional args (docker treats them as args to the codex
+        // entrypoint). Order matters — codex's CLI shape is
+        // `codex login --device-auth`.
+        let image_tag_idx = args.iter().position(|a| a == "bellows-policy:abc123")
+            .expect("codex args must include the image tag");
+        assert_eq!(
+            args.get(image_tag_idx + 1).map(|s| s.as_str()),
+            Some("login"),
+            "codex args must place `login` immediately after the image tag: {args:?}",
+        );
+        assert_eq!(
+            args.get(image_tag_idx + 2).map(|s| s.as_str()),
+            Some("--device-auth"),
+            "codex args must place `--device-auth` immediately after `login`: {args:?}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_docker_args_mount_credentials_volume_at_engine_home() {
+        // Both engines mount their credentials volume at the engine's
+        // in-container home. Pin the `--volume <name>:<target>` shape
+        // for both engines so the host that ends up with `auth.json`
+        // is the host the engine actually reads from.
+        for (engine, volume, home) in [
+            (bellows::config::Engine::Claude, "v-c", "/home/bellows/.claude"),
+            (bellows::config::Engine::Codex,  "v-x", "/home/bellows/.codex"),
+        ] {
+            let args = setup_auth_docker_args(engine, volume, home, "img:tag");
+            assert!(
+                args.iter().any(|a| a == &format!("{volume}:{home}")),
+                "{engine:?} args must mount `{volume}:{home}`: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_claude_mention_login_slash_command() {
+        // Claude path's pre-flight text instructs the operator to type
+        // `/login` inside the interactive TUI — that's the Claude Code
+        // OAuth idiom. Keep it pinned so the codex-side fix doesn't
+        // regress the claude-side messaging.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Claude,
+            "bellows-claude-credentials",
+        );
+        assert!(
+            text.contains("/login"),
+            "claude pre-flight instructions must mention `/login`: {text}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_codex_do_not_mention_login_slash_command() {
+        // Codex has no `/login` slash command. The pre-flight text MUST
+        // NOT tell the operator to type `/login` — that's the exact
+        // bug this issue fixes. A future regression that copy-pastes
+        // the claude phrasing back into the codex branch flips the
+        // test red.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+        );
+        assert!(
+            !text.contains("/login"),
+            "codex pre-flight instructions must NOT mention `/login` (codex has no /login slash command): {text}",
+        );
+    }
+
+    #[test]
+    fn setup_auth_preflight_instructions_for_codex_mention_the_device_auth_flow() {
+        // Codex's pre-flight text guides the operator through the
+        // device-auth OAuth flow — codex prints a URL + a short code
+        // that the operator opens in their host browser and pastes.
+        // Pin enough of the wording that an operator scanning the
+        // output knows what to do, and that a future regression that
+        // strips the guidance fails the test.
+        let text = setup_auth_preflight_instructions(
+            bellows::config::Engine::Codex,
+            "bellows-codex-credentials",
+        );
+        let lowered = text.to_lowercase();
+        assert!(
+            lowered.contains("device") && (lowered.contains("url") || lowered.contains("browser")),
+            "codex pre-flight instructions must guide the operator through the device-auth flow \
+             (mention `device` and a URL / browser step): {text}",
+        );
+        assert!(
+            lowered.contains("code"),
+            "codex pre-flight instructions must mention the short code the operator pastes: {text}",
+        );
+    }
+
     #[test]
     fn cli_help_differentiates_setup_auth_and_refresh_auth_situations() {
         // The two names exist BECAUSE they describe two different
