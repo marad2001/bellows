@@ -119,3 +119,87 @@ fn state_file_default_engine_state_is_hot_unset() {
     let s = EngineState::default();
     assert_eq!(s.cooling_until, None);
 }
+
+// -----------------------------------------------------------------
+// AC: `cooling_until` parsed from each engine's rate-limit stderr
+// when the signature carries a parseable timestamp; otherwise falls
+// back to a conservative 5-minute default and the fallback is noted
+// in the run-log.
+// -----------------------------------------------------------------
+
+#[test]
+fn parse_cooling_until_extracts_claude_unix_epoch_marker() {
+    // Claude Code stderr commonly carries a unix-epoch reset marker
+    // (`Claude AI usage limit reached|<epoch>`). The parser picks it
+    // up and returns the absolute timestamp.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    // Epoch 1778702400 = 2026-05-13T01:00:00Z (well past `now`).
+    let stderr = "Claude AI usage limit reached|1778702400\n";
+    let parsed = bellows::chain_walker::parse_cooling_until(Engine::Claude, stderr, now);
+    let expected = DateTime::<Utc>::from_timestamp(1778702400, 0).unwrap();
+    assert_eq!(
+        parsed.cooling_until, expected,
+        "claude unix-epoch marker must parse: {stderr:?}",
+    );
+    assert!(
+        !parsed.used_fallback,
+        "parsed timestamp must NOT be marked as fallback",
+    );
+}
+
+#[test]
+fn parse_cooling_until_extracts_claude_rfc3339_reset_at() {
+    // Alternative claude phrasing: a literal RFC3339 timestamp in the
+    // rate-limit message. The parser handles either shape so future
+    // claude-cli rephrasings don't silently drop into the fallback.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let stderr = "Error: rate_limit_error — resets at 2026-05-12T20:30:00Z\n";
+    let parsed = bellows::chain_walker::parse_cooling_until(Engine::Claude, stderr, now);
+    let expected = DateTime::parse_from_rfc3339("2026-05-12T20:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(parsed.cooling_until, expected);
+    assert!(!parsed.used_fallback);
+}
+
+#[test]
+fn parse_cooling_until_falls_back_to_5_minutes_for_codex_quota_exceeded() {
+    // Issue #79 spike findings: codex stderr does NOT include a
+    // parseable reset-at timestamp (reset times come from HTTP
+    // headers, not from default-text stderr). The parser falls back
+    // to a 5-minute default and marks the result as a fallback so
+    // the runner can note it in the run-log.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let stderr = "codex: error: quota exceeded for this billing window\n";
+    let parsed = bellows::chain_walker::parse_cooling_until(Engine::Codex, stderr, now);
+    assert_eq!(
+        parsed.cooling_until,
+        now + Duration::minutes(5),
+        "codex without a timestamp must fall back to now + 5 minutes",
+    );
+    assert!(
+        parsed.used_fallback,
+        "fallback must be flagged so the runner can note it in the log",
+    );
+}
+
+#[test]
+fn parse_cooling_until_falls_back_when_claude_signature_has_no_timestamp() {
+    // Defensive: a claude rate-limit stderr that does NOT include a
+    // parseable timestamp (older or rephrased message) falls back to
+    // the same 5-minute default. The fallback flag is set so the
+    // operator can see the conservative cooldown in the run-log.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let stderr = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+    let parsed = bellows::chain_walker::parse_cooling_until(Engine::Claude, stderr, now);
+    assert_eq!(parsed.cooling_until, now + Duration::minutes(5));
+    assert!(parsed.used_fallback);
+}
