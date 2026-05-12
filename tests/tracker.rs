@@ -449,6 +449,111 @@ async fn finalise_completes_label_transition_when_comment_post_fails_with_422() 
 }
 
 #[tokio::test]
+async fn finalise_truncates_oversized_log_body_before_posting() {
+    // Issue #87 AC #2. `finalise` is the GitHub API boundary — if a
+    // caller hands it a body that would exceed GitHub's 64 KiB comment
+    // limit, finalise must clip it (with a clear footer pointing the
+    // operator at bellows.log for the full output) so the POST itself
+    // succeeds. Defensive truncation here makes the contract hold
+    // regardless of whatever caller-side size-awareness exists.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big run",
+            "labels": [{ "name": "agent-in-progress" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big run",
+            "labels": [{ "name": "agent-done" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    // Generic POST mock — accepts any body so we can capture and inspect
+    // what finalise actually sent after truncation.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .mount(&mock)
+        .await;
+
+    // ~80 KiB log body — well past GitHub's 64 KiB hard limit.
+    let oversized = "a".repeat(80_000);
+
+    let client = octocrab_pointed_at(mock.uri());
+    let outcome = finalise(
+        &client,
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 42,
+            pr_number: 99,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-done",
+            log_body: &oversized,
+        },
+    )
+    .await
+    .expect("finalise must not return Err when handed an oversized body");
+
+    // Comment POST succeeded (truncation kept the body under the API
+    // limit), so no failure was recorded.
+    assert!(
+        outcome.comment_post_failure.is_none(),
+        "expected no comment_post_failure after defensive truncation, got: {:?}",
+        outcome.comment_post_failure,
+    );
+
+    // Inspect what was actually POSTed.
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock should expose received requests");
+    let post_body = requests
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/repos/marad2001/test-repo/issues/99/comments"
+        })
+        .expect("expected at least one POST to the comments endpoint")
+        .body
+        .clone();
+    let posted: serde_json::Value = serde_json::from_slice(&post_body)
+        .expect("POST body should be JSON");
+    let posted_text = posted
+        .get("body")
+        .and_then(|v| v.as_str())
+        .expect("posted JSON should have a `body` field");
+
+    // The actually-posted body stays well under GitHub's 64 KiB ceiling.
+    assert!(
+        posted_text.chars().count() <= 65000,
+        "posted body must be under GitHub's 64 KiB comment limit; got {} chars",
+        posted_text.chars().count(),
+    );
+    // Truncation footer is visible to the operator.
+    assert!(
+        posted_text.to_lowercase().contains("truncated"),
+        "posted body must contain a 'truncated' marker so the reader \
+         can tell content was clipped",
+    );
+    assert!(
+        posted_text.contains("bellows.log"),
+        "truncation footer must point the operator at bellows.log for \
+         the full output",
+    );
+}
+
+#[tokio::test]
 async fn transition_to_cancelled_posts_short_comment_and_swaps_labels() {
     // The `bellows kill <N>` GitHub-side handler. Posts a short
     // AI-disclaimer-style comment so a human reading the issue knows what
