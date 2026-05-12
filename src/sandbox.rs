@@ -1664,6 +1664,33 @@ mod tests {
     }
 
     #[test]
+    fn build_cargo_checks_env_carries_clippy_and_test_commands_from_gate_snapshot() {
+        // ADR-0004 acceptance: bellows passes the snapshotted clippy
+        // and test commands from the Workspace into the cargo-checks
+        // container via the `BELLOWS_CLIPPY_CMD` and `BELLOWS_TEST_CMD`
+        // env vars. The script reads these at the top and `eval`s
+        // each one so the commands run verbatim, not via bellows's
+        // hardcoded `--all-targets --all-features` defaults.
+        let gc = crate::workspace::GateCommands {
+            clippy: "cargo clippy --all-targets -- -D clippy::correctness".to_string(),
+            clippy_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+            test: "cargo test --features in-memory".to_string(),
+            test_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+        };
+        let env = build_cargo_checks_env(&gc);
+        assert!(
+            env.iter().any(|e| e
+                == "BELLOWS_CLIPPY_CMD=cargo clippy --all-targets -- -D clippy::correctness"),
+            "clippy command must be set on BELLOWS_CLIPPY_CMD: {env:?}",
+        );
+        assert!(
+            env.iter()
+                .any(|e| e == "BELLOWS_TEST_CMD=cargo test --features in-memory"),
+            "test command must be set on BELLOWS_TEST_CMD: {env:?}",
+        );
+    }
+
+    #[test]
     fn build_cargo_checks_entrypoint_runs_prep_then_user_script() {
         // The cargo-checks gate overrides the policy image's default
         // ENTRYPOINT, so without explicitly re-applying the root-mode
