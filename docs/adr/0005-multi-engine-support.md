@@ -485,7 +485,8 @@ to GitHub.
   rather than re-probing.
 - **Operators with one engine see no change.** A
   `cli_chain = ["claude"]` on every phase, `auth.credentials_volume`
-  unset to `auth.codex.credentials_volume`, and an empty codex
+  (rewritten to `auth.claude.credentials_volume` at config-load),
+  an unset `auth.codex.credentials_volume`, and an empty codex
   volume produces the v1 single-engine behaviour. The
   backwards-compatibility rewrite + lazy-validation rule together
   make multi-engine opt-in.
