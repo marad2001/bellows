@@ -313,6 +313,47 @@ pub fn pick_engine(
     Err(PickError::AllCooling)
 }
 
+/// Phase-start picker with the forced-single-engine label override
+/// applied. ADR-0005 §"Per-issue forced-engine label": when
+/// `forced_engine` is `Some(...)` the chain walk is bypassed entirely
+/// — the labeled engine is used for every phase regardless of the
+/// state file and chain order. Rate-limit on the forced engine
+/// terminates the run (caller's responsibility; `pick_engine_for_phase`
+/// itself never errors on a forced override).
+///
+/// When `forced_engine` is `None`, delegates to `pick_engine` so the
+/// runner has a single call site covering both the forced and the
+/// chain-walked cases.
+///
+/// Model pin: when the chain contains an entry for the forced engine
+/// (e.g. `codex:gpt-5.5`), the picker surfaces that entry verbatim so
+/// the operator's intended model survives the label override.
+/// Otherwise it synthesises a model-less `ChainEntry` so the runner
+/// can still dispatch — labels are engine-level, not model-pinning.
+pub fn pick_engine_for_phase(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    forced_engine: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
+    if let Some(engine) = forced_engine {
+        let entry = chain
+            .iter()
+            .find(|e| e.engine == engine)
+            .cloned()
+            .unwrap_or(ChainEntry {
+                engine,
+                model: None,
+            });
+        return Ok(PickedEntry {
+            entry,
+            reason: PickReason::ForcedViaLabel,
+        });
+    }
+    pick_engine(chain, state, implementer, now)
+}
+
 /// Implement-phase response to a rate-limit signature. Pure decision
 /// shape consumed by the runner's bounded two-iteration implement
 /// loop. ADR-0005 §"Rate-limit behaviour: implement phase vs the
