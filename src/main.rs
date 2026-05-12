@@ -1338,10 +1338,28 @@ fn setup_auth_docker_args(
     home_in_container: &str,
     image_tag: &str,
 ) -> Vec<String> {
+    // `--entrypoint <engine>` bypasses the bellows entrypoint script
+    // that normally `chown`s the cache mount points and `runuser`s to
+    // the bellows user. Without `--user` + an explicit `HOME` the
+    // container runs as root with `HOME=/root`, so:
+    //   - codex writes `auth.json` to `/root/.codex` (ephemeral; lost
+    //     on container exit — the original #100 symptom);
+    //   - if claude ever has to write fresh credentials it would land
+    //     in `/root/.claude` for the same reason (currently masked by
+    //     Claude Code v2.1's auto-detect logic, but latent).
+    // Pin both flags so login files land in the mounted volume AND
+    // are owned by `bellows:bellows` (uid 1000 — baked by the
+    // Dockerfile's `useradd --uid 1000 bellows`). That ownership is
+    // what subsequent agent containers — which also run as bellows
+    // uid via runuser — need in order to READ the credentials.
     let mut args: Vec<String> = vec![
         "run".to_string(),
         "-it".to_string(),
         "--rm".to_string(),
+        "--user".to_string(),
+        "1000:1000".to_string(),
+        "-e".to_string(),
+        "HOME=/home/bellows".to_string(),
         "--volume".to_string(),
         format!("{volume}:{home_in_container}"),
         "--entrypoint".to_string(),
@@ -2614,6 +2632,30 @@ mod tests {
             Some("--device-auth"),
             "codex args must place `--device-auth` immediately after `login`: {args:?}",
         );
+    }
+
+    #[test]
+    fn setup_auth_docker_args_run_as_bellows_uid_with_home_env_for_both_engines() {
+        // Issue #100 follow-up: `--entrypoint <engine>` bypasses the
+        // bellows entrypoint script that normally `runuser`s to the
+        // bellows user. Without `--user 1000:1000 -e HOME=/home/bellows`
+        // the container runs as root with HOME=/root, so the engine
+        // writes its credentials file to /root/.<engine> — ephemeral,
+        // lost on container exit. Pin both flags for both engines so
+        // login files land in the mounted volume AND are owned by
+        // `bellows:bellows` (uid 1000 — readable by subsequent agent
+        // containers, which also run as bellows uid 1000).
+        for engine in [bellows::config::Engine::Claude, bellows::config::Engine::Codex] {
+            let args = setup_auth_docker_args(engine, "v", "/h", "img:tag");
+            assert!(
+                args.windows(2).any(|w| w[0] == "--user" && w[1] == "1000:1000"),
+                "{engine:?} args must include `--user 1000:1000` so credentials are bellows-owned: {args:?}",
+            );
+            assert!(
+                args.windows(2).any(|w| w[0] == "-e" && w[1] == "HOME=/home/bellows"),
+                "{engine:?} args must include `-e HOME=/home/bellows` so the engine writes to the mounted volume, not /root/.<engine>: {args:?}",
+            );
+        }
     }
 
     #[test]
