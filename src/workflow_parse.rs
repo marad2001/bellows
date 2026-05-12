@@ -41,7 +41,7 @@ pub struct ExtractedCommands {
 /// Where a gate command came from. Surfaced in the run-log line so an
 /// operator reading the pipeline output can tell whether bellows
 /// mirrored CI verbatim or fell back to the operator-declared default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum Provenance {
     /// Bellows extracted the command from the named workflow file.
     /// The `PathBuf` carries the actual file (e.g.
@@ -50,13 +50,8 @@ pub enum Provenance {
     /// Bellows could not parse a literal command from any workflow
     /// file and the caller will substitute the operator-declared
     /// `[gates].*_flags` default.
+    #[default]
     FallbackFromConfig,
-}
-
-impl Default for Provenance {
-    fn default() -> Self {
-        Self::FallbackFromConfig
-    }
 }
 
 /// Walk `repo_root/.github/workflows/*.yml` and `.yaml`, find the
@@ -220,15 +215,15 @@ fn extract_from_job(job: &Yaml) -> (Option<String>, Option<String>) {
         };
         for line in run.lines() {
             let trimmed = line.trim();
-            if clippy.is_none() {
-                if let Some(cmd) = match_cargo_command(trimmed, "clippy") {
-                    clippy = Some(cmd);
-                }
+            if clippy.is_none()
+                && let Some(cmd) = match_cargo_command(trimmed, "clippy")
+            {
+                clippy = Some(cmd);
             }
-            if test.is_none() {
-                if let Some(cmd) = match_cargo_command(trimmed, "test") {
-                    test = Some(cmd);
-                }
+            if test.is_none()
+                && let Some(cmd) = match_cargo_command(trimmed, "test")
+            {
+                test = Some(cmd);
             }
             if clippy.is_some() && test.is_some() {
                 return (clippy, test);
