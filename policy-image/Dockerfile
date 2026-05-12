@@ -44,10 +44,29 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # recommendation. The release tarball is named
 # `codex-x86_64-unknown-linux-musl.tar.gz` and unpacks a single
 # `codex` binary; install it system-wide so any user can invoke it.
+#
+# The download is pinned by BOTH a version tag (CODEX_VERSION) and a
+# tarball SHA-256 (CODEX_SHA256). The version tag alone is not a trust
+# anchor — GitHub release assets can in principle be replaced by a
+# maintainer (or anyone who compromises a maintainer account / GitHub
+# release infrastructure), and the resulting binary would inherit the
+# agent's container privileges at every codex-engine phase: write
+# access to `/workspace`, read access to the credentials volume at
+# `/home/bellows/.codex`, and the container's egress. Pinning the
+# tarball hash means the image build fails closed on a mismatch
+# instead of silently installing a tampered binary.
+#
+# Bump workflow: when raising CODEX_VERSION, also recompute
+# CODEX_SHA256 from the upstream release's published asset digest
+# (`gh api repos/openai/codex/releases/tags/<tag>` exposes a
+# `digest: sha256:...` field per asset) or from a freshly downloaded
+# tarball; the two ARGs must move together.
 ARG CODEX_VERSION=rust-v0.130.0
+ARG CODEX_SHA256=16779e7b7857508a768a36d7d4e084eec336ec23946ed70a9b09489b8f861190
 RUN set -eux; \
     curl -fsSL -o /tmp/codex.tar.gz \
         "https://github.com/openai/codex/releases/download/${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz"; \
+    echo "${CODEX_SHA256}  /tmp/codex.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/codex.tar.gz -C /tmp; \
     install -m 0755 /tmp/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
         || install -m 0755 /tmp/codex /usr/local/bin/codex; \
