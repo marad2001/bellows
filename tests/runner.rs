@@ -740,6 +740,7 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .and(body_string_contains("## Agent notes"))
         .and(body_string_contains("stuck on the brief"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
         .expect(1)
