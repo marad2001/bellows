@@ -288,6 +288,53 @@ implement phase, trigger at most one in-place chain advancement —
 see below). The state file is the persisted memory that lets the
 *next* claim consult cooldowns without thrashing this one.
 
+## Rate-limit behaviour: implement phase vs the rest
+
+The throughput win operates across all agent-invoking phases, but
+the mid-execution rate-limit response splits in two:
+
+**Implement phase, workspace at base SHA** — when the implement
+phase rate-limits before the agent has made any commits beyond the
+base SHA (the cloned tip of `master` at claim time), bellows
+performs an **in-place chain advancement**: drop workspace, swap
+to the next hot chain entry, and re-run the implement phase from
+base. The work that was lost is zero (no commits), so an
+in-place retry is strictly cheaper than terminating and reclaiming.
+Bellows caps this at **max 1 in-place advancement per phase
+invocation** — if the second engine also rate-limits before
+committing anything, the run terminates as `RateLimited` rather
+than walking deeper into the chain in-place. The cap exists to
+preserve the single-pass-per-phase invariant from the persisted-
+state section above: bellows tolerates exactly one in-place retry
+for the "wasted nothing yet" case, then defers to the next-claim
+chain walk for further engine rotation.
+
+The in-place advancement is gated on the workspace being at base
+SHA specifically because once the agent commits, the cost of
+dropping the workspace is non-zero — that work has to be redone
+from scratch, possibly burning the wall-clock budget on the
+re-run. The clean restart from base is only free in the very
+narrow window before the agent has produced output.
+
+**All other agent-invoking phases** (review, review-fix,
+security-review, security-fix) — mid-execution rate-limit
+terminates the run as `RateLimited`. The state file is updated
+with the engine's `cooling_until`. The current run does not
+attempt an in-place engine swap for these phases: review-fix and
+security-fix in particular operate on a workspace that already
+carries committed implement-phase work, so a workspace drop would
+defeat the point. Terminate-and-defer is the safer shape: the
+operator's `agent-rate-limited` label appears on the issue.
+Next claim consults `bellows-state.json`, walks the chain
+**afresh** for each phase under the freshly-read cooldowns, and
+resumes from the implement-phase commit history that's already on
+the branch.
+
+The split is asymmetric on purpose: implement-phase in-place
+advancement is a cheap throughput win; review-phase in-place
+advancement is a workspace-throwing-out tax that the
+terminate-and-defer path avoids.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
