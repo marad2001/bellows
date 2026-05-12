@@ -294,3 +294,31 @@ fn adr_0005_documents_persisted_rate_limit_state() {
         "persisted-rate-limit-state",
     );
 }
+
+/// AC#8 — Documents the rate-limit behaviour split.
+///   - Implement phase, workspace at base SHA, mid-execution rate
+///     limit → in-place chain advancement (drop workspace, swap to
+///     next hot chain entry, re-run from base; max 1 in-place
+///     advancement per phase invocation).
+///   - All other agent-invoking phases mid-execution rate-limit →
+///     terminate run as `RateLimited`. State file updated. Next
+///     claim consults state and walks chain afresh.
+#[test]
+fn adr_0005_documents_rate_limit_behaviour_split() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // The implement-phase carve-out.
+            "in-place chain advancement",
+            "base SHA",
+            "drop workspace",
+            "max 1",
+            // All other phases terminate.
+            "terminate",
+            "Next claim",
+            "afresh",
+        ],
+        "rate-limit-behaviour-split",
+    );
+}
