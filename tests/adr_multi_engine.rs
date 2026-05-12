@@ -169,3 +169,36 @@ fn adr_0005_documents_engine_selection_model() {
         "engine-selection-model",
     );
 }
+
+/// AC#4 — Documents the auth model.
+///   - ChatGPT subscription login (parallel to claude
+///     `credentials_volume`).
+///   - Per-engine credentials volume config:
+///     `auth.claude.credentials_volume` AND
+///     `auth.codex.credentials_volume`.
+///   - Flat `auth.credentials_volume` rewrites to claude for
+///     backwards compatibility.
+///   - Lazy validation: only the engine about to be dispatched to
+///     is required to exist.
+#[test]
+fn adr_0005_documents_auth_model() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // ChatGPT subscription login, parallel to claude.
+            "ChatGPT",
+            "subscription",
+            // Per-engine credentials volume nesting.
+            "auth.claude.credentials_volume",
+            "auth.codex.credentials_volume",
+            // Flat backwards-compatibility rewrite.
+            "auth.credentials_volume",
+            "backwards compatib",
+            // Lazy validation, named verbatim.
+            "Lazy validation",
+            "dispatched",
+        ],
+        "auth-model",
+    );
+}
