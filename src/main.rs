@@ -2409,6 +2409,63 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_setup_auth_with_engine_claude_flag() {
+        // Issue #81 / ADR-0005: `bellows setup-auth --engine claude`
+        // selects which engine's credentials volume the interactive
+        // flow targets. The flag is optional; the omitted-flag
+        // default is the engine of the first chain entry of
+        // `phases.implement.cli_chain` (resolved in setup_auth).
+        let cli = Cli::try_parse_from(["bellows", "setup-auth", "--engine", "claude"])
+            .expect("bellows setup-auth --engine claude must parse");
+        match cli.command {
+            Some(Command::SetupAuth { engine: Some(e) }) => {
+                assert_eq!(e, "claude");
+            }
+            _ => panic!("expected SetupAuth with engine=Some(claude)"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_auth_with_engine_codex_flag() {
+        let cli = Cli::try_parse_from(["bellows", "setup-auth", "--engine", "codex"])
+            .expect("bellows setup-auth --engine codex must parse");
+        match cli.command {
+            Some(Command::SetupAuth { engine: Some(e) }) => {
+                assert_eq!(e, "codex");
+            }
+            _ => panic!("expected SetupAuth with engine=Some(codex)"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_refresh_auth_with_engine_codex_flag() {
+        // Same flag exists on refresh-auth (the brief: "bellows
+        // setup-auth --engine {claude,codex} and bellows refresh-auth
+        // --engine {claude,codex} flags").
+        let cli = Cli::try_parse_from(["bellows", "refresh-auth", "--engine", "codex"])
+            .expect("bellows refresh-auth --engine codex must parse");
+        match cli.command {
+            Some(Command::RefreshAuth { engine: Some(e) }) => {
+                assert_eq!(e, "codex");
+            }
+            _ => panic!("expected RefreshAuth with engine=Some(codex)"),
+        }
+    }
+
+    #[test]
+    fn cli_setup_auth_engine_flag_is_optional() {
+        // Default-from-first-implement-chain-entry-engine is resolved
+        // in setup_auth at config-load time; clap accepts the omitted
+        // flag.
+        let cli = Cli::try_parse_from(["bellows", "setup-auth"])
+            .expect("bellows setup-auth (no flag) must still parse");
+        match cli.command {
+            Some(Command::SetupAuth { engine: None }) => {}
+            _ => panic!("expected SetupAuth with engine=None"),
+        }
+    }
+
+    #[test]
     fn cli_help_differentiates_setup_auth_and_refresh_auth_situations() {
         // The two names exist BECAUSE they describe two different
         // operator situations. The help text for each must communicate

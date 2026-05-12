@@ -475,25 +475,13 @@ fn default_test_flags() -> String {
 /// defaults to `["claude"]` when the phase's `[phases.X]` table is
 /// omitted, so existing v1 single-engine operator configs see no
 /// behaviour change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PhasesConfig {
     pub implement: PhaseChain,
     pub review: PhaseChain,
     pub review_fix: PhaseChain,
     pub security_review: PhaseChain,
     pub security_fix: PhaseChain,
-}
-
-impl Default for PhasesConfig {
-    fn default() -> Self {
-        Self {
-            implement: PhaseChain::default(),
-            review: PhaseChain::default(),
-            review_fix: PhaseChain::default(),
-            security_review: PhaseChain::default(),
-            security_fix: PhaseChain::default(),
-        }
-    }
 }
 
 /// One phase's chain. The default chain is `[ClaimChainEntry::claude]`
