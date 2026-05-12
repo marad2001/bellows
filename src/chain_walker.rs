@@ -89,9 +89,8 @@ impl StateFile {
     /// body keeps the file human-readable when an operator manually
     /// inspects or zeros a `cooling_until`.
     pub fn save(&self, path: &Path) -> Result<(), std::io::Error> {
-        let serialized = serde_json::to_string_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("bellows-state.json: {e}"))
-        })?;
+        let serialized = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::other(format!("bellows-state.json: {e}")))?;
         std::fs::write(path, serialized)
     }
 
