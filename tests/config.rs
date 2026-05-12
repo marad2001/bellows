@@ -251,6 +251,69 @@ pat_env_var = "GITHUB_TOKEN"
 }
 
 #[test]
+fn gates_section_defaults_apply_when_omitted() {
+    // ADR-0004 acceptance: a config that omits the `[gates]` table
+    // entirely must still parse, and the fallback flag strings must
+    // preserve today's strict-default behaviour
+    // (`--all-targets --all-features -- -D warnings` for clippy,
+    // `--all-targets --all-features` for test). Existing operator
+    // `orchestrator.toml` files therefore keep parsing with no edits.
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert_eq!(
+        config.gates.clippy_flags,
+        "--all-targets --all-features -- -D warnings",
+    );
+    assert_eq!(config.gates.test_flags, "--all-targets --all-features");
+}
+
+#[test]
+fn gates_section_clippy_flags_can_be_overridden() {
+    // ADR-0004 acceptance: operators can declare a different fallback
+    // posture for the cargo-checks gate clippy invocation, used
+    // whenever bellows cannot parse the target repo's CI workflow.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[gates]
+clippy_flags = "--all-targets -- -D clippy::correctness -D clippy::suspicious"
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(
+        config.gates.clippy_flags,
+        "--all-targets -- -D clippy::correctness -D clippy::suspicious",
+    );
+    // test_flags default must still apply when only clippy_flags
+    // was overridden — the two fields are independent.
+    assert_eq!(config.gates.test_flags, "--all-targets --all-features");
+}
+
+#[test]
+fn gates_section_test_flags_can_be_overridden() {
+    // ADR-0004 acceptance: operators can pin a different test
+    // feature-flag posture for the cargo-checks gate fallback.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[gates]
+test_flags = "--features in-memory"
+"#;
+    let config = Config::from_str(config_text).unwrap();
+    assert_eq!(config.gates.test_flags, "--features in-memory");
+    assert_eq!(
+        config.gates.clippy_flags,
+        "--all-targets --all-features -- -D warnings",
+    );
+}
+
+#[test]
 fn empty_repo_list_rejected_at_parse_time() {
     // Issue #35 acceptance criterion (c): a config with no [[repo]]
     // entry at all must be rejected at parse time. An empty repo list
