@@ -41,8 +41,14 @@ case "$BELLOWS_ENGINE" in
         # (Docker isolation, /workspace-only mount), so the per-tool
         # gate is redundant and would otherwise hang headlessly
         # waiting for a human to approve each Write.
+        #
+        # Model pin uses the long-form `--model` flag — claude v2.1's
+        # `--help` documents only `--model <model>` (not `-m`). Passing
+        # `-m` makes claude exit 1 with `error: unknown option '-m'`
+        # before reading the prompt. Codex's branch below keeps `-m`;
+        # codex documents both forms so either is acceptable there.
         if [ -n "${BELLOWS_MODEL:-}" ]; then
-            exec claude --dangerously-skip-permissions -m "$BELLOWS_MODEL" -p "$PROMPT"
+            exec claude --dangerously-skip-permissions --model "$BELLOWS_MODEL" -p "$PROMPT"
         else
             exec claude --dangerously-skip-permissions -p "$PROMPT"
         fi
