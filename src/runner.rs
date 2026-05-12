@@ -1421,6 +1421,21 @@ pub async fn run_once(
     )
     .await?;
 
+    // Issue #87: the comment POST inside `finalise` is observability-
+    // only — the label transition has already completed by the time we
+    // get here regardless of whether the run-log comment landed. Surface
+    // a failure as an operator-visible warning on both `bellows.log` and
+    // the polling-loop's stdout, without collapsing the run.
+    if let Some(msg) = finalise_outcome.comment_post_failure.as_deref() {
+        let line = format!(
+            "bellows: posting the run-log comment on PR #{} failed (label \
+             transition completed; continuing): {}",
+            pr.number, msg,
+        );
+        println!("{line}");
+        let _ = writeln!(log_writer, "{line}");
+    }
+
     // Slice 9: announce we're back to idle. Best-effort —
     // halt paths still reach finalise above, so a single
     // write here covers all exit-reason variants.
@@ -1634,7 +1649,10 @@ fn build_log_body(
     }
 
     body.push_str("\n</details>");
-    body
+    // Issue #87: bound the body below GitHub's 64 KiB comment limit
+    // (the helper passes short bodies through unchanged so the common
+    // path is unaffected).
+    tracker::truncate_for_github_comment(&body)
 }
 
 fn gate_summary_line(gate: &GateOutcome) -> String {
@@ -2972,5 +2990,106 @@ mod tests {
             body.to_lowercase().contains("end-pipeline"),
             "end-pipeline cargo gate must still be summarised: {body}"
         );
+    }
+
+    #[test]
+    fn build_log_body_caps_oversized_bodies_below_the_github_comment_limit() {
+        // Issue #87 AC #2. GitHub rejects PR/issue comment bodies above
+        // 65536 characters with HTTP 422. Large agent runs (stderr tail
+        // + cargo output + per-phase callouts) routinely produce >64 KiB
+        // pre-cap. `build_log_body` must bound its output so the
+        // downstream POST in `finalise` succeeds.
+        let started = fixed_timestamp();
+        let finished = started;
+        // Stuff the stderr tail with ~80 KiB of content — well past the
+        // limit. End-pipeline gate output further pads it.
+        let huge_stderr = "stderr line that pads the tail; ".repeat(2500);
+        let huge_test_output = "cargo test failure detail; ".repeat(1500);
+        let outcomes = PhaseOutcomes {
+            implement: ImplementOutcome {
+                exit_code: 0,
+                stderr_tail: huge_stderr,
+            },
+            post_implement_gate: GateOutcome {
+                cargo_clippy: None,
+                cargo_test: Some(CheckResult {
+                    exit_code: 101,
+                    output: huge_test_output,
+                }),
+            },
+            review: None,
+            review_fix: None,
+            end_pipeline_gate: None,
+            wall_clock_exceeded: false,
+            backstop_violations: Vec::new(),
+            implement_crash_synthesised: false,
+            security: None,
+            security_fix: None,
+        };
+        let body = build_log_body(
+            &ExitReason::FinalTestsRed,
+            42,
+            started,
+            finished,
+            "agent/42-huge",
+            &outcomes,
+        );
+
+        // Cap leaves headroom for any subsequent encoding / wrapping —
+        // the exact constant is an implementation detail, but it must
+        // be well under GitHub's 65536 limit AND the body's character
+        // count (which is what the API actually counts) must stay below.
+        assert!(
+            body.chars().count() <= 65000,
+            "build_log_body must bound its output below GitHub's 64 KiB \
+             comment limit; got {} chars",
+            body.chars().count(),
+        );
+        // The truncated body must remain readable: the operator needs
+        // to know the content was clipped and where to find the rest.
+        assert!(
+            body.to_lowercase().contains("truncated"),
+            "expected an explicit truncation marker so the reader can \
+             tell the body was clipped; body did not contain 'truncated'",
+        );
+        assert!(
+            body.contains("bellows.log"),
+            "expected the truncation footer to point at bellows.log on \
+             the operator's host for the full output",
+        );
+        // The wrapping `<details>` element must still be closed so the
+        // PR comment renders cleanly even after a mid-section clip.
+        assert!(
+            body.trim_end().ends_with("</details>"),
+            "truncated body must still close the <details> wrapper; \
+             body ended with: {:?}",
+            &body[body.len().saturating_sub(80)..],
+        );
+    }
+
+    #[test]
+    fn build_log_body_for_short_runs_is_unchanged_by_the_truncation_path() {
+        // Issue #87 AC #4 baseline. Short bodies must not gain a
+        // truncation footer or any visible side-effect from the
+        // size-handling code — only oversized bodies trigger the clip.
+        let started = fixed_timestamp();
+        let finished = started;
+        let body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &slice5_log_outcomes(0, "small run", None),
+        );
+
+        assert!(
+            !body.to_lowercase().contains("truncated"),
+            "short bodies must not carry a truncation marker; got: {body}",
+        );
+        // Closing tag is the natural end of an un-truncated body.
+        assert!(body.trim_end().ends_with("</details>"));
+        // Should be obviously well under the cap.
+        assert!(body.chars().count() < 5_000);
     }
 }

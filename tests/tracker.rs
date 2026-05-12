@@ -344,6 +344,216 @@ async fn finalise_skips_label_patch_when_in_progress_label_already_removed_exter
 }
 
 #[tokio::test]
+async fn finalise_completes_label_transition_when_comment_post_fails_with_422() {
+    // Issue #87 AC #1 + AC #3. When the run-log comment POST fails (e.g.
+    // GitHub returns 422 because the body exceeds the 64 KiB hard limit
+    // on issue/PR comments), the label transition must still complete
+    // and `finalise` must return `Ok` so the surrounding pipeline reaches
+    // a terminal `RunOutcome` instead of leaving the source issue stuck
+    // at `agent-in-progress`. The comment-post failure is observability
+    // only — the caller surfaces it via `comment_post_failure` for the
+    // operator's log warning.
+    let mock = MockServer::start().await;
+
+    // GET issue: in_progress is still on the issue (no operator-side
+    // cancellation happened mid-run).
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big issue with huge run-log",
+            "labels": [
+                { "name": "agent-in-progress" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // PATCH issue: succeeds, transitions to agent-done. This MUST happen
+    // even though the comment POST below fails — AC #1's load-bearing
+    // assertion is the label state machine reaching its terminal state
+    // regardless of comment-post observability.
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .and(body_json(json!({ "labels": ["agent-done", "bug"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big issue with huge run-log",
+            "labels": [
+                { "name": "agent-done" },
+                { "name": "bug" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    // POST run-log comment: 422 with the exact body-too-long error the
+    // live failure on workboard-financial-advice #15 produced.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "message": "Validation Failed",
+            "errors": [{
+                "resource": "IssueComment",
+                "code": "unprocessable",
+                "field": "data",
+                "message": "Body is too long (maximum is 65536 characters)"
+            }],
+            "documentation_url": "https://docs.github.com/rest"
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let outcome = finalise(
+        &client,
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 42,
+            pr_number: 99,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-done",
+            log_body: "Run completed; this body will be rejected by the mock",
+        },
+    )
+    .await
+    .expect(
+        "finalise must return Ok when only the comment POST fails — the label \
+         state machine is independent of comment observability (AC #3)",
+    );
+
+    // AC #1: label transition reached the terminal state.
+    assert!(!outcome.externally_cancelled);
+    let label_names: Vec<&str> = outcome.issue.labels.iter().map(|l| l.name.as_str()).collect();
+    assert!(
+        label_names.contains(&"agent-done"),
+        "expected agent-done in returned labels, got {:?}",
+        label_names,
+    );
+    assert!(!label_names.contains(&"agent-in-progress"));
+
+    // AC #3: the failure is surfaced to the caller so the polling loop /
+    // log writer can record an operator-visible warning. We don't pin
+    // the exact rendering — octocrab's Display may evolve — but the
+    // field must be Some, carrying a non-empty message.
+    let failure = outcome
+        .comment_post_failure
+        .as_ref()
+        .expect("expected comment_post_failure to be Some so the caller can log a warning");
+    assert!(
+        !failure.is_empty(),
+        "comment_post_failure must carry a non-empty diagnostic, got empty string",
+    );
+}
+
+#[tokio::test]
+async fn finalise_truncates_oversized_log_body_before_posting() {
+    // Issue #87 AC #2. `finalise` is the GitHub API boundary — if a
+    // caller hands it a body that would exceed GitHub's 64 KiB comment
+    // limit, finalise must clip it (with a clear footer pointing the
+    // operator at bellows.log for the full output) so the POST itself
+    // succeeds. Defensive truncation here makes the contract hold
+    // regardless of whatever caller-side size-awareness exists.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big run",
+            "labels": [{ "name": "agent-in-progress" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Big run",
+            "labels": [{ "name": "agent-done" }]
+        })))
+        .mount(&mock)
+        .await;
+
+    // Generic POST mock — accepts any body so we can capture and inspect
+    // what finalise actually sent after truncation.
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .mount(&mock)
+        .await;
+
+    // ~80 KiB log body — well past GitHub's 64 KiB hard limit.
+    let oversized = "a".repeat(80_000);
+
+    let client = octocrab_pointed_at(mock.uri());
+    let outcome = finalise(
+        &client,
+        FinaliseRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            issue_number: 42,
+            pr_number: 99,
+            in_progress_label: "agent-in-progress",
+            outcome_label: "agent-done",
+            log_body: &oversized,
+        },
+    )
+    .await
+    .expect("finalise must not return Err when handed an oversized body");
+
+    // Comment POST succeeded (truncation kept the body under the API
+    // limit), so no failure was recorded.
+    assert!(
+        outcome.comment_post_failure.is_none(),
+        "expected no comment_post_failure after defensive truncation, got: {:?}",
+        outcome.comment_post_failure,
+    );
+
+    // Inspect what was actually POSTed.
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock should expose received requests");
+    let post_body = requests
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/repos/marad2001/test-repo/issues/99/comments"
+        })
+        .expect("expected at least one POST to the comments endpoint")
+        .body
+        .clone();
+    let posted: serde_json::Value = serde_json::from_slice(&post_body)
+        .expect("POST body should be JSON");
+    let posted_text = posted
+        .get("body")
+        .and_then(|v| v.as_str())
+        .expect("posted JSON should have a `body` field");
+
+    // The actually-posted body stays well under GitHub's 64 KiB ceiling.
+    assert!(
+        posted_text.chars().count() <= 65000,
+        "posted body must be under GitHub's 64 KiB comment limit; got {} chars",
+        posted_text.chars().count(),
+    );
+    // Truncation footer is visible to the operator.
+    assert!(
+        posted_text.to_lowercase().contains("truncated"),
+        "posted body must contain a 'truncated' marker so the reader \
+         can tell content was clipped",
+    );
+    assert!(
+        posted_text.contains("bellows.log"),
+        "truncation footer must point the operator at bellows.log for \
+         the full output",
+    );
+}
+
+#[tokio::test]
 async fn transition_to_cancelled_posts_short_comment_and_swaps_labels() {
     // The `bellows kill <N>` GitHub-side handler. Posts a short
     // AI-disclaimer-style comment so a human reading the issue knows what
