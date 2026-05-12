@@ -184,6 +184,33 @@ fn wrap_phase_prompt_for_engine_codex_prepends_operating_context() {
     assert!(wrapped.contains("# Baked skills"));
 }
 
+#[test]
+fn wrap_phase_prompt_for_engine_codex_neutralises_claude_specific_phrasing() {
+    // The codex kickoff inlines the operating-context body (whose
+    // canonical copy is `policy-image/CLAUDE.md`) so codex sees the
+    // same operating instructions claude does. But the canonical
+    // copy is written in claude's voice: it identifies the agent as
+    // "Claude Code" and tells it to read skills from "your skills
+    // directory". Neither is true for the codex container — it has
+    // no skills directory (skill bodies are inlined into the prompt
+    // by `wrap_phase_prompt_for_engine` itself), and calling the
+    // codex agent "Claude Code" is a misidentification that confuses
+    // the model's self-context. Pin the neutralisation here so the
+    // doc comment's "Claude-specific phrasing neutralised" promise
+    // matches reality.
+    let phase_body = "## Phase body\n\nirrelevant";
+    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, phase_body);
+    assert!(
+        !wrapped.contains("Claude Code"),
+        "codex kickoff must not call the agent \"Claude Code\": {wrapped}",
+    );
+    assert!(
+        !wrapped.contains("your skills directory"),
+        "codex kickoff must not point the agent at a non-existent skills \
+         directory: {wrapped}",
+    );
+}
+
 // -----------------------------------------------------------------
 // AC: per-phase BELLOWS_ENGINE / BELLOWS_MODEL dispatch via Auth.
 // -----------------------------------------------------------------

@@ -1210,24 +1210,33 @@ pub fn wrap_phase_prompt_for_engine(
         crate::config::Engine::Claude => body.to_string(),
         crate::config::Engine::Codex => {
             // Inline the operating-context body + baked skill bodies.
-            // Claude-specific phrasing in the operating context
-            // ("Claude Code running headless...") is neutralised below.
-            let mut out = String::new();
-            out.push_str("# Operating context\n\n");
-            out.push_str(CODEX_INLINED_OPERATING_CONTEXT);
-            out.push_str("\n\n# Baked skills\n\n");
-            out.push_str(
+            // Claude-specific phrasing in those bodies ("Claude Code
+            // running headless...", "your skills directory") is
+            // neutralised via `neutralise_claude_phrasing_for_codex`
+            // so the codex agent does not receive a kickoff that
+            // calls it "Claude Code" or points it at a skills
+            // directory it does not have. The phase-specific `body`
+            // is *not* neutralised — it is written by bellows for
+            // the agent currently in hand, so any "Claude Code"
+            // reference there is intentional.
+            let mut prepended = String::new();
+            prepended.push_str("# Operating context\n\n");
+            prepended.push_str(CODEX_INLINED_OPERATING_CONTEXT);
+            prepended.push_str("\n\n# Baked skills\n\n");
+            prepended.push_str(
                 "The following skill bodies are inlined here because codex does \
                  not auto-load them from a skills directory. Reach for them \
                  whenever they apply.\n\n",
             );
-            out.push_str("## Skill: tdd\n\n");
-            out.push_str(CODEX_INLINED_SKILL_TDD);
-            out.push_str("\n\n## Skill: diagnose\n\n");
-            out.push_str(CODEX_INLINED_SKILL_DIAGNOSE);
-            out.push_str("\n\n## Skill: triage\n\n");
-            out.push_str(CODEX_INLINED_SKILL_TRIAGE);
-            out.push_str("\n\n---\n\n");
+            prepended.push_str("## Skill: tdd\n\n");
+            prepended.push_str(CODEX_INLINED_SKILL_TDD);
+            prepended.push_str("\n\n## Skill: diagnose\n\n");
+            prepended.push_str(CODEX_INLINED_SKILL_DIAGNOSE);
+            prepended.push_str("\n\n## Skill: triage\n\n");
+            prepended.push_str(CODEX_INLINED_SKILL_TRIAGE);
+            prepended.push_str("\n\n---\n\n");
+
+            let mut out = neutralise_claude_phrasing_for_codex(&prepended);
             out.push_str(body);
             out
         }
@@ -1267,12 +1276,37 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
 /// `CLAUDE.md` operating context for claude (auto-discovered from
 /// `/home/bellows/.claude/CLAUDE.md`); codex does not have an
 /// equivalent auto-discovery mechanism, so the body is inlined into
-/// every codex kickoff. Verbatim copy of the operating context with
-/// claude-specific phrasing neutralised (the brief: "Claude-specific
-/// phrasing neutralised").
+/// every codex kickoff. This is the raw `CLAUDE.md` content;
+/// `wrap_phase_prompt_for_engine` runs it (together with the inlined
+/// skill bodies) through `neutralise_claude_phrasing_for_codex`
+/// before pushing it into the codex prompt, so claude-specific
+/// phrasing ("Claude Code", "your skills directory") does not leak
+/// through.
 pub const CODEX_INLINED_OPERATING_CONTEXT: &str = include_str!(
     "../policy-image/CLAUDE.md"
 );
+
+/// Strip claude-specific phrasing from policy-image content before
+/// inlining it into a codex kickoff. The codex container has no
+/// skills directory (skill bodies are inlined into the prompt
+/// instead, per ADR-0005), and the identity claim "Claude Code
+/// running headless" is wrong for a codex agent. Both must be
+/// rewritten so the codex agent gets a coherent kickoff. Applied to
+/// the operating-context body *and* the baked-skill bodies, since
+/// any of those may have been authored in claude's voice.
+fn neutralise_claude_phrasing_for_codex(claude_flavored: &str) -> String {
+    claude_flavored
+        .replace("Claude Code agent", "the agent")
+        .replace("Claude Code", "the agent")
+        .replace(
+            "that lives in your skills directory",
+            "(its body is inlined in the baked-skills section above)",
+        )
+        .replace(
+            "look for it under your skills directory",
+            "look for its body in the baked-skills section above",
+        )
+}
 
 /// Inlined body of the `tdd` baked skill — per ADR-0005, codex's
 /// kickoff carries each baked skill's body verbatim because codex has
