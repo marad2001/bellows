@@ -566,3 +566,100 @@ fn handle_implement_records_fallback_flag_for_codex_without_timestamp() {
         .unwrap();
     assert_eq!(recorded, now + Duration::minutes(5));
 }
+
+// -----------------------------------------------------------------
+// AC (j): Forced-single-engine label run bypasses chain walking
+// entirely: labeled engine used for every phase regardless of state
+// file; rate-limit on the forced engine terminates run without chain
+// walking. Run-log states `engine forced via engine:X label; chain
+// walking skipped`.
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::pick_engine_for_phase;
+
+#[test]
+fn forced_single_engine_label_bypasses_state_file_and_chain() {
+    // AC (j): operator forced codex via `engine:codex` label; state
+    // file says codex is cooling and the chain's first entry is
+    // claude. The forced override must produce codex with the
+    // ForcedViaLabel reason regardless of either.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Codex, now + Duration::minutes(30));
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine_for_phase(
+        &chain,
+        &state,
+        Some(Engine::Claude),  // prior implementer; should be ignored
+        Some(Engine::Codex),   // forced via engine:codex label
+        now,
+    )
+    .expect("forced override must yield the labeled engine");
+    assert_eq!(picked.entry.engine, Engine::Codex);
+    assert_eq!(picked.reason, PickReason::ForcedViaLabel);
+}
+
+#[test]
+fn forced_single_engine_used_for_every_phase_regardless_of_chain_order() {
+    // The forced engine is used for every phase regardless of chain
+    // config: chain[0] = claude but the operator forced codex →
+    // picker returns codex.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine_for_phase(&chain, &state, None, Some(Engine::Codex), now)
+        .unwrap();
+    assert_eq!(picked.entry.engine, Engine::Codex);
+    assert_eq!(picked.reason, PickReason::ForcedViaLabel);
+}
+
+#[test]
+fn forced_single_engine_no_override_falls_through_to_chain_walk() {
+    // No label override → pick_engine_for_phase delegates to the
+    // chain-walking picker. ForcedViaLabel must not fire.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine_for_phase(&chain, &state, None, None, now).unwrap();
+    assert_eq!(picked.entry.engine, Engine::Claude);
+    assert_eq!(picked.reason, PickReason::ChainFirstHotEntry);
+}
+
+#[test]
+fn forced_single_engine_preserves_model_pin_from_chain_when_present() {
+    // The forced engine override is engine-level. When the chain
+    // contains a model pin for that engine (e.g. `codex:gpt-5.5`),
+    // the picker still surfaces it — the operator's
+    // implement-phase chain entry for codex carries the model pin
+    // they want even when an engine:codex label forces selection.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let codex_with_model = ChainEntry {
+        engine: Engine::Codex,
+        model: Some("gpt-5.5".to_string()),
+    };
+    let chain = vec![entry(Engine::Claude), codex_with_model.clone()];
+    let picked = pick_engine_for_phase(&chain, &state, None, Some(Engine::Codex), now)
+        .unwrap();
+    assert_eq!(picked.entry, codex_with_model);
+    assert_eq!(picked.reason, PickReason::ForcedViaLabel);
+}
+
+#[test]
+fn forced_single_engine_synthesises_entry_when_chain_lacks_it() {
+    // Defensive: an operator labels `engine:codex` on an issue whose
+    // operator-config chain is `["claude"]` — the forced engine is
+    // codex, but no chain entry names codex. The picker
+    // synthesises a model-less ChainEntry so the runner can still
+    // dispatch.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude)];
+    let picked = pick_engine_for_phase(&chain, &state, None, Some(Engine::Codex), now)
+        .unwrap();
+    assert_eq!(picked.entry.engine, Engine::Codex);
+    assert_eq!(picked.entry.model, None);
+    assert_eq!(picked.reason, PickReason::ForcedViaLabel);
+}
