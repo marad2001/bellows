@@ -335,6 +335,36 @@ advancement is a cheap throughput win; review-phase in-place
 advancement is a workspace-throwing-out tax that the
 terminate-and-defer path avoids.
 
+## Operator UX
+
+Two operator-facing surfaces gain engine-awareness:
+
+**`bellows setup-auth` and `bellows refresh-auth` accept
+`--engine <name>`.** Both subcommands take an optional
+`--engine claude` / `--engine codex` flag that selects which
+engine's credentials volume the interactive flow targets. When
+the flag is omitted the **default** is the **first entry of
+`phases.implement.cli_chain`** — the engine the operator's
+implement phase is most likely to dispatch to, and therefore the
+one most likely to need credentials seeded first. Operators with
+only one engine configured never need to pass the flag; operators
+running both engines pass `--engine codex` once after the v1 →
+multi-engine upgrade to seed the new volume, and thereafter only
+when re-seeding the non-default engine.
+
+**Auth-error callout in the run-log comment names the engine.**
+When a phase exits matching an auth-error stderr signature, the
+runner produces a run-log comment with a callout that names
+**which** engine returned the error — for example, "Codex's API
+returned 401 Unauthorized — refresh your subscription auth with
+`bellows refresh-auth --engine codex`." (The codex auth-error
+substring match — `401 Unauthorized` AND `Missing bearer or basic
+authentication` — comes from the #79 spike findings, so this
+callout fires reliably.) Naming the engine is load-bearing under
+the multi-engine design: a generic "auth error" callout in a
+two-engine config leaves the operator guessing which volume to
+re-seed.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
