@@ -8,12 +8,19 @@
 //! drive the function entirely against a wiremock GitHub.
 
 use std::io::Cursor;
+use std::path::Path;
+use std::process::Command;
 use std::str::FromStr;
 
 use bellows::config::Config;
-use bellows::runner::{run_once, BlockReason, RunError, RunOutcome};
+use bellows::runner::{
+    capture_and_remove_agent_notes, post_agent_notes_comment_if_present, run_once, BlockReason,
+    RunError, RunOutcome,
+};
+use bellows::workspace;
 use serde_json::json;
-use wiremock::matchers::{method, path, query_param};
+use tempfile::TempDir;
+use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
@@ -22,6 +29,24 @@ fn octocrab_pointed_at(uri: String) -> octocrab::Octocrab {
         .expect("base uri")
         .build()
         .expect("octocrab")
+}
+
+fn init_remote_repo(path: &Path) {
+    run_git(path, &["init"]);
+    run_git(path, &["config", "user.email", "test@example.com"]);
+    run_git(path, &["config", "user.name", "Test"]);
+    std::fs::write(path.join("README.md"), "test\n").unwrap();
+    run_git(path, &["add", "."]);
+    run_git(path, &["commit", "-m", "initial"]);
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .expect("git invocation");
+    assert!(status.success(), "git {:?} failed in {:?}", args, cwd);
 }
 
 fn config_for(mock_uri: &str) -> Config {
@@ -692,4 +717,141 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
         !log_str.contains("pre-claim swept"),
         "zero-deletion ticks must stay silent, got: {log_str}",
     );
+}
+
+// ---- Issue #85: agent-notes.md must be ephemeral to the pipeline run.
+//      The file should NOT appear on the agent branch's pushed end-state
+//      (so squash-merge to master can never inherit stale notes), and
+//      its content should be surfaced via a PR comment so the operator
+//      still sees what the agent flagged. ----
+
+#[tokio::test]
+async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_tree() {
+    // Issue #85 AC #5: pipeline run with the agent writing `agent-notes.md`
+    // produces (a) a PR comment containing the content AND (b) a final push
+    // that does not include the file in its tree.
+    //
+    // Drives both helpers end-to-end against a real git workspace + wiremock
+    // GitHub: simulate an intermediate phase that commits + pushes
+    // `agent-notes.md` as part of normal phase work, then run the finalise
+    // helpers (capture+remove the file, push the deletion, post the PR
+    // comment) and assert both outcomes on the remote (tree clean) and on
+    // wiremock (POST received with the content embedded).
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .and(body_string_contains("stuck on the brief"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = workspace::prepare(&remote_url, "agent/77-ephemeral-notes")
+        .await
+        .expect("workspace::prepare should succeed");
+
+    // Simulate an intermediate pipeline phase: agent writes agent-notes.md,
+    // bellows's per-phase commit_all+push commits it onto the agent branch.
+    // After this, the remote's tree for agent/77-ephemeral-notes contains
+    // the file — this is exactly the leak the slice fixes.
+    tokio::fs::write(
+        workspace.path().join("agent-notes.md"),
+        "stuck on the brief: refactor scope unclear\n",
+    )
+    .await
+    .unwrap();
+    workspace::commit_all(&workspace)
+        .await
+        .expect("intermediate commit should succeed");
+    workspace::push_branch(&workspace)
+        .await
+        .expect("intermediate push should succeed");
+
+    // Sanity: the remote currently has agent-notes.md in the agent branch's
+    // tree (this is the pre-fix leak state).
+    let pre_tree = Command::new("git")
+        .args(["ls-tree", "--name-only", "agent/77-ephemeral-notes"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    let pre_tree_str = String::from_utf8(pre_tree.stdout).unwrap();
+    assert!(
+        pre_tree_str.contains("agent-notes.md"),
+        "test precondition: pre-finalise pushed tree should still contain the file (pre-fix leak state); got: {pre_tree_str}",
+    );
+
+    // Finalise step under test: capture the content (for classify_exit +
+    // PR comment), remove the file from the workspace.
+    let agent_notes = capture_and_remove_agent_notes(&workspace)
+        .await
+        .expect("capture_and_remove_agent_notes should succeed");
+    assert_eq!(
+        agent_notes.as_deref(),
+        Some("stuck on the brief: refactor scope unclear"),
+        "captured content should be the trimmed file body",
+    );
+    assert!(
+        !workspace.path().join("agent-notes.md").exists(),
+        "the file must be removed from the workspace after capture",
+    );
+
+    // Commit + push the deletion so the agent branch's pushed tree no
+    // longer contains the file.
+    let head_before = workspace::head_sha(&workspace).await.unwrap();
+    workspace::commit_all_and_push_if_advanced(&workspace, &head_before)
+        .await
+        .expect("final commit+push of the deletion should succeed");
+
+    // Post the PR comment with the captured content.
+    let client = octocrab_pointed_at(mock.uri());
+    post_agent_notes_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        77,
+        agent_notes.as_deref(),
+    )
+    .await
+    .expect("post_agent_notes_comment_if_present should succeed");
+
+    // Post-condition (AC #1): the pushed tree no longer contains the file.
+    let post_tree = Command::new("git")
+        .args(["ls-tree", "--name-only", "agent/77-ephemeral-notes"])
+        .current_dir(remote_dir.path())
+        .output()
+        .unwrap();
+    let post_tree_str = String::from_utf8(post_tree.stdout).unwrap();
+    assert!(
+        !post_tree_str.contains("agent-notes.md"),
+        "agent branch's pushed tree must not contain agent-notes.md after finalise; got: {post_tree_str}",
+    );
+    // mock.verify() at scope-drop enforces expect(1) on the comments POST —
+    // AC #2: the captured content was surfaced as a PR comment.
+}
+
+#[tokio::test]
+async fn no_agent_notes_means_no_pr_comment_is_posted() {
+    // Issue #85 AC #6: a bellows pipeline run where the agent does NOT write
+    // `agent-notes.md` continues to work unchanged — no spurious
+    // agent-notes-related PR comment.
+    //
+    // `expect(0)` on the comments endpoint pins the contract: if the helper
+    // posts a comment despite `agent_notes` being None, the mock-server
+    // drop verifies the violation and the test fails.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/77/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    post_agent_notes_comment_if_present(&client, "marad2001", "test-repo", 77, None)
+        .await
+        .expect("post_agent_notes_comment_if_present with None should succeed");
+    // mock.verify() at scope-drop enforces expect(0): NO POST happened.
 }
