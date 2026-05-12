@@ -1,23 +1,25 @@
-# Bellows policy image (slice 3 - real Claude agent).
+# Bellows policy image (issue #81 / ADR-0005 - multi-engine).
 #
-# Layers on top of slice 2's stub by adding Node + Claude Code, the
-# vendored skills (tdd, diagnose), a Bellows-authored baseline CLAUDE.md,
-# and an entrypoint script that copies the baked skills + CLAUDE.md into
-# Claude Code's home (where the credentials volume mounts) before exec'ing
-# run-agent.
+# Layers on top of slice 2's stub by adding Node + Claude Code and the
+# Codex CLI, the vendored skills (tdd, diagnose, triage), a Bellows-
+# authored baseline CLAUDE.md, and an entrypoint script that copies the
+# baked skills + CLAUDE.md into the CLIs' homes (where the credentials
+# volumes mount) before exec'ing run-agent.
 #
-# Pinned to a specific Rust minor for reproducibility.
-#
-# TODO(slice 3.5): pin @anthropic-ai/claude-code to a specific version
-# once we've smoke-tested which release works against the volume layout
-# below. Slice 3 MVP uses @latest; the image's content hash still flips
-# on Dockerfile/entrypoint/run-agent/skills/CLAUDE.md changes, but the
-# claude version itself can drift between rebuilds.
+# Both CLIs are pinned (issue #81 / ADR-0005 AC: "Policy image: bakes
+# both @anthropic-ai/claude-code and the Codex CLI, both pinned"):
+#   - claude-code: pinned npm version, bumped deliberately as image
+#     rebuilds.
+#   - codex: pinned to `rust-v0.130.0`, the version covered by the
+#     #79 spike findings. Installed directly from the Linux musl
+#     release tarball rather than `npm install -g @openai/codex` per
+#     the spike's recommendation.
 
 FROM rust:1.95-slim
 
 # Install Node (required for the Claude Code npm package) plus the
-# minimum runtime tooling the agent needs alongside cargo.
+# minimum runtime tooling the agent needs alongside cargo. `xz-utils`
+# is needed below for the codex release tarball.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -25,13 +27,50 @@ RUN apt-get update \
         gnupg \
         git \
         openssh-client \
+        xz-utils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI (installed system-wide as root so any user can invoke it).
-RUN npm install -g @anthropic-ai/claude-code@latest
+# Claude Code CLI, pinned. Bumped deliberately as part of an image
+# rebuild rather than drifting under `@latest` between rebuilds (the
+# previous slice-3.5 TODO).
+ARG CLAUDE_CODE_VERSION=2.1.0
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Codex CLI, pinned (issue #79 spike). The Linux musl binary is
+# preferred over `npm install -g @openai/codex` per the spike's
+# recommendation. The release tarball is named
+# `codex-x86_64-unknown-linux-musl.tar.gz` and unpacks a single
+# `codex` binary; install it system-wide so any user can invoke it.
+#
+# The download is pinned by BOTH a version tag (CODEX_VERSION) and a
+# tarball SHA-256 (CODEX_SHA256). The version tag alone is not a trust
+# anchor — GitHub release assets can in principle be replaced by a
+# maintainer (or anyone who compromises a maintainer account / GitHub
+# release infrastructure), and the resulting binary would inherit the
+# agent's container privileges at every codex-engine phase: write
+# access to `/workspace`, read access to the credentials volume at
+# `/home/bellows/.codex`, and the container's egress. Pinning the
+# tarball hash means the image build fails closed on a mismatch
+# instead of silently installing a tampered binary.
+#
+# Bump workflow: when raising CODEX_VERSION, also recompute
+# CODEX_SHA256 from the upstream release's published asset digest
+# (`gh api repos/openai/codex/releases/tags/<tag>` exposes a
+# `digest: sha256:...` field per asset) or from a freshly downloaded
+# tarball; the two ARGs must move together.
+ARG CODEX_VERSION=rust-v0.130.0
+ARG CODEX_SHA256=16779e7b7857508a768a36d7d4e084eec336ec23946ed70a9b09489b8f861190
+RUN set -eux; \
+    curl -fsSL -o /tmp/codex.tar.gz \
+        "https://github.com/openai/codex/releases/download/${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz"; \
+    echo "${CODEX_SHA256}  /tmp/codex.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/codex.tar.gz -C /tmp; \
+    install -m 0755 /tmp/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
+        || install -m 0755 /tmp/codex /usr/local/bin/codex; \
+    rm -rf /tmp/codex.tar.gz /tmp/codex /tmp/codex-x86_64-unknown-linux-musl
 
 # rust:1.95-slim ships rustc + cargo but not clippy. Slice X1's cargo
 # checks gate runs `cargo clippy --all-targets --all-features -- -D
@@ -88,9 +127,12 @@ COPY run-agent /usr/local/bin/run-agent
 COPY run-cargo-checks /usr/local/bin/run-cargo-checks
 RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/entrypoint-user /usr/local/bin/run-agent /usr/local/bin/run-cargo-checks
 
-# Pre-create the bellows user's claude home with the right ownership so
-# the named-volume mount inherits these permissions on first attach.
-RUN mkdir -p /home/bellows/.claude/skills \
+# Pre-create the bellows user's claude AND codex homes with the right
+# ownership so the per-engine named-volume mounts inherit these
+# permissions on first attach (issue #81 / ADR-0005: per-engine
+# credentials volumes mount at /home/bellows/.claude and
+# /home/bellows/.codex respectively).
+RUN mkdir -p /home/bellows/.claude/skills /home/bellows/.codex \
     && chown -R bellows:bellows /home/bellows
 
 # Pre-create the cache-volume mount points and chown them to bellows.

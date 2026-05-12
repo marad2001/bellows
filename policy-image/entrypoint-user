@@ -1,15 +1,23 @@
 #!/bin/sh
-# Bellows policy-image bellows-user phase.
+# Bellows policy-image bellows-user phase (issue #81 / ADR-0005 -
+# multi-engine).
 #
 # Runs after `entrypoint` has chowned the cache volume mount points and
 # dropped privileges to the bellows user. Copies the baked skills +
-# CLAUDE.md from /opt/bellows-policy/ into /home/bellows/.claude/ (where
-# the credentials volume mounts) so they layer with the persisted OAuth
-# tokens, then exec's run-agent.
+# CLAUDE.md from /opt/bellows-policy/ into /home/bellows/.claude/ so
+# they layer with the persisted OAuth tokens, then exec's run-agent.
 #
-# Idempotent: subsequent runs overwrite any older copies in the volume,
-# which is what we want — the policy image is the source of truth for
-# skills + CLAUDE.md, the volume is the source of truth for credentials.
+# The claude skills directory is the auto-load surface for Claude
+# Code; codex does not auto-load skills from a directory (per
+# ADR-0005 the codex kickoff inlines skill bodies into the prompt
+# itself via `policy::wrap_phase_prompt_for_engine`), so the codex
+# home does not need a skills copy here. Its credentials volume
+# mounts at /home/bellows/.codex/ from the bellows runner.
+#
+# Idempotent: subsequent runs overwrite any older copies in the
+# volume, which is what we want — the policy image is the source of
+# truth for skills + CLAUDE.md, the volume is the source of truth for
+# credentials.
 
 set -eu
 

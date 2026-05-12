@@ -2,7 +2,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::auth::Auth;
-use crate::config::{AuthMethod, Config};
+use crate::config::{AuthMethod, ChainEntry, Config, EngineLabelOverride};
 use crate::policy::{
     self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
     PhaseOutcomes, ReviewOutcome,
@@ -29,6 +29,16 @@ pub enum RunError {
          move it back to needs-triage and write the brief"
     )]
     MissingAgentBrief(u64),
+    /// Issue #81 / ADR-0005: both `engine:claude` and `engine:codex`
+    /// labels are present on the same issue. Refuse-to-claim parallel
+    /// to `MissingAgentBrief` — the polling-loop's `OutcomeTransition`
+    /// tracker dedupes recurring ambiguous-label ticks against
+    /// identical payloads via the per-variant `shape()` key.
+    #[error(
+        "issue #{0} carries both `engine:claude` and `engine:codex` labels; \
+         operator must pick one. Refusing to claim."
+    )]
+    AmbiguousEngineLabels(u64),
 }
 
 impl RunError {
@@ -60,6 +70,7 @@ impl RunError {
             RunError::Io(e) => format!("io:{e}"),
             RunError::InvalidRepoUrl(url) => format!("invalid_repo_url:{url}"),
             RunError::MissingAgentBrief(n) => format!("missing_agent_brief:{n}"),
+            RunError::AmbiguousEngineLabels(n) => format!("ambiguous_engine_labels:{n}"),
         }
     }
 }
@@ -366,6 +377,20 @@ pub async fn run_once(
         .ok_or(RunError::MissingAgentBrief(issue.number))?;
     let repo_label = format!("{}/{}", owner, repo);
 
+    // Issue #81 / ADR-0005: engine-override resolution from labels,
+    // checked BEFORE claim (parallel to MissingAgentBrief). Both
+    // `engine:claude` AND `engine:codex` present is operator error —
+    // refuse-to-claim and surface a stable shape so the polling-loop's
+    // transition tracker dedupes recurring ambiguous-label ticks. A
+    // single `engine:<name>` label forces every phase to that engine
+    // (model defaults to the CLI's pick — labels don't carry a model
+    // pin). The chain walk produces the engine when no override is
+    // present.
+    let issue_label_names: Vec<&str> =
+        issue.labels.iter().map(|l| l.name.as_str()).collect();
+    let engine_label_override = EngineLabelOverride::parse(&issue_label_names)
+        .map_err(|_| RunError::AmbiguousEngineLabels(issue.number))?;
+
     let claimed = match tracker::claim(
         client,
         &owner,
@@ -446,14 +471,48 @@ pub async fn run_once(
         .unwrap_or_default();
     let ssh_keys_volume = config.auth.ssh_keys_volume.clone();
 
-    let kickoff = policy::render_kickoff(&brief, &repo_url, &branch_name);
+    let phase_chain_entry = |phase: &crate::config::PhaseChain| -> ChainEntry {
+        // Issue #81 / ADR-0005: forced-single-engine label override
+        // takes precedence over the chain. Labels don't carry model
+        // pins, so the engine matches but `model: None` always.
+        // Otherwise this slice picks the first chain entry (chain
+        // walking ships in slice #82).
+        if let Some(engine) = engine_label_override {
+            ChainEntry { engine, model: None }
+        } else {
+            phase.first_entry().clone()
+        }
+    };
+
+    let auth_for = |entry: &ChainEntry| -> Auth {
+        match config.auth.method {
+            AuthMethod::Subscription => Auth::Subscription {
+                engine: entry.engine,
+                model: entry.model.clone(),
+                credentials_volume_name: config
+                    .auth
+                    .for_engine(entry.engine)
+                    .credentials_volume
+                    .clone(),
+            },
+        }
+    };
+
+    // Engine for the implement phase. The kickoff prompt rendering
+    // depends on the engine; subsequent phases re-resolve via
+    // `phase_chain_entry` because the brief permits each phase to
+    // dispatch to a different engine.
+    let implement_chain_entry = phase_chain_entry(&config.phases.implement);
+
+    let kickoff = policy::render_kickoff_for_engine(
+        implement_chain_entry.engine,
+        &brief,
+        &repo_url,
+        &branch_name,
+    );
     tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
 
-    let auth = match config.auth.method {
-        AuthMethod::Subscription => Auth::Subscription {
-            credentials_volume_name: config.auth.credentials_volume.clone(),
-        },
-    };
+    let auth = auth_for(&implement_chain_entry);
 
     // Per-issue wall-clock budget. Threaded through every container call
     // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
@@ -465,8 +524,9 @@ pub async fn run_once(
     // ---- Phase 1: Implement ----
     announce(
         log_writer,
-        "bellows: phase 1/7 — implement (running claude in sandbox container, this is the long one)",
+        "bellows: phase 1/7 — implement (running agent in sandbox container, this is the long one)",
     );
+    announce_phase_engine(log_writer, "implement", &implement_chain_entry);
     // Issue #52 asymmetry audit: capture HEAD before the implement
     // agent invocation for the same reason the per-finding and nit-batch
     // sites do. The agent brief discourages self-committing inside the
@@ -717,20 +777,27 @@ pub async fn run_once(
 
     if !halt_after_post_implement {
         // ---- Phase 3: Review ----
+        let review_chain_entry = phase_chain_entry(&config.phases.review);
+        let review_auth = auth_for(&review_chain_entry);
         announce(
             log_writer,
-            "bellows: phase 3/7 — review (claude reads diff, produces findings)",
+            "bellows: phase 3/7 — review (reads diff, produces findings)",
         );
+        announce_phase_engine(log_writer, "review", &review_chain_entry);
         workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
         workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
+        let review_kickoff = policy::wrap_phase_prompt_for_engine(
+            review_chain_entry.engine,
+            policy::REVIEW_PROMPT,
+        );
         tokio::fs::write(
             workspace.path().join(".bellows-kickoff.md"),
-            policy::REVIEW_PROMPT,
+            review_kickoff,
         )
         .await?;
         let review_agent_run = sandbox::run_agent(
             &workspace,
-            &auth,
+            &review_auth,
             claimed.number,
             &repo_label,
             &repo_slug,
@@ -824,6 +891,12 @@ pub async fn run_once(
                 )
             });
 
+            // Per-phase engine + auth (issue #81 / ADR-0005). The
+            // review-fix phase has its own `[phases.review_fix]
+            // cli_chain`; the per-finding loop and the nit-batch both
+            // dispatch to the same engine for the phase.
+            let review_fix_chain_entry = phase_chain_entry(&config.phases.review_fix);
+            let review_fix_auth = auth_for(&review_fix_chain_entry);
             announce(
                 log_writer,
                 &format!(
@@ -832,6 +905,7 @@ pub async fn run_once(
                     nit_findings.len(),
                 ),
             );
+            announce_phase_engine(log_writer, "review-fix", &review_fix_chain_entry);
 
             // Per-finding loop: one container per blocker/important
             // finding. Each invocation respects the remaining wall-
@@ -872,10 +946,13 @@ pub async fn run_once(
                     ),
                 );
 
-                let kickoff = policy::per_finding_kickoff(
-                    finding,
-                    policy::REVIEW_DIFF_FILE,
-                    "agent-notes.md",
+                let kickoff = policy::wrap_phase_prompt_for_engine(
+                    review_fix_chain_entry.engine,
+                    &policy::per_finding_kickoff(
+                        finding,
+                        policy::REVIEW_DIFF_FILE,
+                        "agent-notes.md",
+                    ),
                 );
                 tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff)
                     .await?;
@@ -886,7 +963,7 @@ pub async fn run_once(
                 let head_before = workspace::head_sha(&workspace).await?;
                 let per_finding_run = sandbox::run_agent(
                     &workspace,
-                    &auth,
+                    &review_fix_auth,
                     claimed.number,
                     &repo_label,
                     &repo_slug,
@@ -988,12 +1065,16 @@ pub async fn run_once(
                 }
                 nit_kickoff.push_str("\n---\n\n");
                 nit_kickoff.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
+                let nit_kickoff = policy::wrap_phase_prompt_for_engine(
+                    review_fix_chain_entry.engine,
+                    &nit_kickoff,
+                );
                 tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &nit_kickoff)
                     .await?;
                 let head_before = workspace::head_sha(&workspace).await?;
                 let nit_batch_run = sandbox::run_agent(
                     &workspace,
-                    &auth,
+                    &review_fix_auth,
                     claimed.number,
                     &repo_label,
                     &repo_slug,
@@ -1084,19 +1165,31 @@ pub async fn run_once(
         let mut halt_after_security = false;
         let mut halt_after_security_fix = false;
         if !halt_after_review && !halt_after_fix && !budget.exceeded {
+            let security_review_chain_entry =
+                phase_chain_entry(&config.phases.security_review);
+            let security_review_auth = auth_for(&security_review_chain_entry);
             announce(
                 log_writer,
-                "bellows: phase 5/7 — security-review (claude reads diff for the five security focus categories, produces findings)",
+                "bellows: phase 5/7 — security-review (reads diff for the five security focus categories, produces findings)",
+            );
+            announce_phase_engine(
+                log_writer,
+                "security-review",
+                &security_review_chain_entry,
             );
             workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+            let security_kickoff = policy::wrap_phase_prompt_for_engine(
+                security_review_chain_entry.engine,
+                policy::SECURITY_REVIEW_PROMPT,
+            );
             tokio::fs::write(
                 workspace.path().join(".bellows-kickoff.md"),
-                policy::SECURITY_REVIEW_PROMPT,
+                security_kickoff,
             )
             .await?;
             let security_agent_run = sandbox::run_agent(
                 &workspace,
-                &auth,
+                &security_review_auth,
                 claimed.number,
                 &repo_label,
                 &repo_slug,
@@ -1151,19 +1244,31 @@ pub async fn run_once(
             // security fixups are scoped tightly enough that the
             // per-finding overhead would dwarf the work).
             if !halt_after_security && has_security_findings && !budget.exceeded {
+                let security_fix_chain_entry =
+                    phase_chain_entry(&config.phases.security_fix);
+                let security_fix_auth = auth_for(&security_fix_chain_entry);
                 announce(
                     log_writer,
-                    "bellows: phase 6/7 — security-fix (claude reads findings and addresses each)",
+                    "bellows: phase 6/7 — security-fix (reads findings and addresses each)",
+                );
+                announce_phase_engine(
+                    log_writer,
+                    "security-fix",
+                    &security_fix_chain_entry,
+                );
+                let security_fix_kickoff = policy::wrap_phase_prompt_for_engine(
+                    security_fix_chain_entry.engine,
+                    policy::SECURITY_FIX_PROMPT,
                 );
                 tokio::fs::write(
                     workspace.path().join(".bellows-kickoff.md"),
-                    policy::SECURITY_FIX_PROMPT,
+                    security_fix_kickoff,
                 )
                 .await?;
                 let head_before = workspace::head_sha(&workspace).await?;
                 let security_fix_run = sandbox::run_agent(
                     &workspace,
-                    &auth,
+                    &security_fix_auth,
                     claimed.number,
                     &repo_label,
                     &repo_slug,
@@ -1612,15 +1717,32 @@ fn build_log_body(
     // a non-zero implement exit so a clean run that happens to mention
     // "refresh_token_expired" in committed docs doesn't get the
     // callout.
+    //
+    // Issue #81 / ADR-0005: the callout names the engine to refresh.
+    // The codex composite (`401 Unauthorized` AND `Missing bearer or
+    // basic authentication`) is the more specific signature; check it
+    // first so a stderr that matches both substrings is attributed to
+    // codex rather than misattributed to claude on the bare `401
+    // Unauthorized` substring.
     if outcomes.implement.exit_code != 0
-        && policy::is_auth_error_signature(&outcomes.implement.stderr_tail)
+        && policy::is_codex_auth_error_signature(&outcomes.implement.stderr_tail)
     {
         body.push_str(
-            "\n### Authentication error detected in agent stderr\n\n\
-             A claude phase exited non-zero with stderr matching a known auth-error \
-             signature (e.g. an expired OAuth refresh token). Run `bellows refresh-auth` \
-             to re-authenticate, then re-label the issue to retry. The agent output tail \
-             below contains the matched line.\n",
+            "\n### Authentication error detected in codex stderr\n\n\
+             A codex phase exited non-zero with stderr matching the codex auth-error \
+             signature (`401 Unauthorized` plus `Missing bearer or basic authentication`). \
+             Run `bellows refresh-auth --engine codex` to re-authenticate, then re-label \
+             the issue to retry. The agent output tail below contains the matched line.\n",
+        );
+    } else if outcomes.implement.exit_code != 0
+        && policy::is_claude_auth_error_signature(&outcomes.implement.stderr_tail)
+    {
+        body.push_str(
+            "\n### Authentication error detected in claude stderr\n\n\
+             A claude phase exited non-zero with stderr matching a known claude auth-error \
+             signature (e.g. an expired OAuth refresh token). Run `bellows refresh-auth \
+             --engine claude` to re-authenticate, then re-label the issue to retry. The \
+             agent output tail below contains the matched line.\n",
         );
     }
 
@@ -1751,6 +1873,27 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
 fn announce(log_writer: &mut dyn Write, line: &str) {
     println!("{}", line);
     let _ = writeln!(log_writer, "{}", line);
+}
+
+/// Issue #81 / ADR-0005 AC: at each phase-start, log the engine + the
+/// model being used. `<CLI default>` when the chain entry pinned no
+/// model. The reasoning (chain-order vs diversity-preference vs
+/// label-forced) ships with #82; for slice #81 the line is "engine +
+/// model" so the operator can audit per-phase dispatch from the
+/// polling log.
+fn announce_phase_engine(
+    log_writer: &mut dyn Write,
+    phase_name: &str,
+    entry: &ChainEntry,
+) {
+    let model_field = entry.model.as_deref().unwrap_or("<CLI default>");
+    announce(
+        log_writer,
+        &format!(
+            "bellows: phase `{phase_name}` engine={engine} model={model_field}",
+            engine = entry.engine.as_name(),
+        ),
+    );
 }
 
 /// Tracks the per-issue wall-clock budget across the slice-X1

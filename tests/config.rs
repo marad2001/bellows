@@ -49,7 +49,7 @@ fn logging_section_defaults_apply_when_omitted() {
 fn auth_section_defaults_apply_when_omitted() {
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
     assert!(matches!(config.auth.method, AuthMethod::Subscription));
-    assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
+    assert_eq!(config.auth.claude.credentials_volume, "bellows-claude-credentials");
     // Issue #69 (ADR-0002) acceptance: `[auth].ssh_keys_volume` is a
     // new sibling field to `credentials_volume`, defaulting to
     // `"bellows-deploy-keys"`. A minimal config that omits the
@@ -78,7 +78,7 @@ ssh_keys_volume = "my-custom-keys"
     assert_eq!(config.auth.ssh_keys_volume, "my-custom-keys");
     // The credentials volume default must still apply when only the
     // ssh-keys volume was overridden — the two fields are independent.
-    assert_eq!(config.auth.credentials_volume, "bellows-claude-credentials");
+    assert_eq!(config.auth.claude.credentials_volume, "bellows-claude-credentials");
 }
 
 #[test]
