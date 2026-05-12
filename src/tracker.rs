@@ -320,6 +320,121 @@ pub async fn list_open_agent_prs(
         .collect())
 }
 
+/// Single entry returned by the GitHub `git/matching-refs/{ref}` API. We
+/// only care about the fully-qualified ref name (`refs/heads/agent/16-foo`);
+/// the SHA + object metadata that GitHub also includes are ignored.
+#[derive(Debug, Deserialize)]
+struct MatchingRef {
+    #[serde(rename = "ref")]
+    ref_name: String,
+}
+
+/// Error from the pre-claim stale-branch sweep (#76 / ADR-0003). The
+/// brief's exemplar signature returns `octocrab::Error` flat, but the
+/// runner needs the failing branch name to populate
+/// `RunOutcome::Blocked`'s reason — `octocrab::Error` doesn't preserve
+/// the request URL through its Display impl, so we wrap with the
+/// branch name (and `source` for the underlying API failure that
+/// `run_once` formats for the block-reason `error` field).
+#[derive(Debug, thiserror::Error)]
+pub enum DeleteStaleBranchError {
+    /// `GET .../git/matching-refs/heads/agent/{N}-` itself failed.
+    /// `branch` is the anchored-prefix pattern in this case so the
+    /// renderer still has a meaningful identifier to surface.
+    #[error("listing stale agent branches for issue #{issue_number}: {source}")]
+    ListFailed {
+        issue_number: u64,
+        #[source]
+        source: octocrab::Error,
+    },
+    /// One specific `DELETE .../git/refs/heads/<branch>` failed. The
+    /// surrounding sweep stops on the first failure so the runner can
+    /// return Blocked and retry next tick.
+    #[error("deleting stale agent branch `{branch}`: {source}")]
+    DeleteFailed {
+        branch: String,
+        #[source]
+        source: octocrab::Error,
+    },
+}
+
+/// Pre-claim sweep (#76 / ADR-0003): delete every `agent/<issue_number>-*`
+/// ref on origin so a stale branch from a prior failed run can't crash
+/// the next reclaim with a non-fast-forward push. Lists matching refs
+/// via `GET /repos/{owner}/{repo}/git/matching-refs/heads/agent/{N}-`
+/// (the trailing dash is the anchored prefix that prevents
+/// `agent/16-*` from matching `agent/160-*`), then issues
+/// `DELETE /repos/{owner}/{repo}/git/refs/heads/{ref}` for each match.
+///
+/// Returns the short ref names (`agent/16-foo`, not the
+/// `refs/heads/...`-prefixed form) that the sweep considered
+/// successfully deleted. A 404 on an individual DELETE is folded into
+/// the success set: the branch raced out from under us, same end
+/// state. Any other non-success status (403 from branch protection or
+/// PAT scope, 5xx, network failure) surfaces as
+/// `DeleteStaleBranchError::DeleteFailed { branch, source }` so the
+/// runner can return `RunOutcome::Blocked` carrying the failing
+/// branch name; subsequent ticks retry, which is safe because the
+/// operation is idempotent.
+pub async fn delete_stale_agent_branches(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<Vec<String>, DeleteStaleBranchError> {
+    let list_route = format!(
+        "/repos/{owner}/{repo}/git/matching-refs/heads/agent/{issue_number}-",
+    );
+    let refs: Vec<MatchingRef> =
+        client
+            .get(&list_route, None::<&()>)
+            .await
+            .map_err(|source| DeleteStaleBranchError::ListFailed {
+                issue_number,
+                source,
+            })?;
+
+    let mut deleted = Vec::with_capacity(refs.len());
+    for r in refs {
+        // GitHub returns the fully-qualified `refs/heads/agent/16-foo`;
+        // strip the `refs/heads/` prefix so the DELETE URL and the
+        // returned name both use the short branch form bellows uses
+        // everywhere else.
+        let short = r
+            .ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&r.ref_name)
+            .to_string();
+        let delete_route = format!("/repos/{owner}/{repo}/git/refs/heads/{short}");
+        let response = client
+            ._delete(delete_route, None::<&()>)
+            .await
+            .map_err(|source| DeleteStaleBranchError::DeleteFailed {
+                branch: short.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if status.is_success() || status.as_u16() == 404 {
+            deleted.push(short);
+            continue;
+        }
+        // Non-404 failure: feed the raw response through octocrab's
+        // standard error-mapping so the runner sees the same
+        // `octocrab::Error::GitHub` shape any other API call would
+        // produce (status code preserved, message parsed from the
+        // body), and tag it with the branch name so the block-reason
+        // can identify exactly which ref refused.
+        let source = octocrab::map_github_error(response)
+            .await
+            .expect_err("non-success status must map to an Err");
+        return Err(DeleteStaleBranchError::DeleteFailed {
+            branch: short,
+            source,
+        });
+    }
+    Ok(deleted)
+}
+
 #[derive(Debug, Deserialize)]
 struct Comment {
     body: Option<String>,

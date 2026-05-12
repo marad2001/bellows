@@ -1477,8 +1477,8 @@ async fn run(config_path: &PathBuf) -> Result<()> {
     loop {
         let outcome = runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref()).await;
         match outcome {
-            Ok(RunOutcome::Blocked { pr_numbers }) => {
-                if let Some(line) = transition.observe_blocked(&pr_numbers) {
+            Ok(RunOutcome::Blocked { reason }) => {
+                if let Some(line) = transition.observe_blocked(&reason) {
                     log(&mut log_file, &line);
                 }
             }

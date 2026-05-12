@@ -11,7 +11,7 @@ use std::io::Cursor;
 use std::str::FromStr;
 
 use bellows::config::Config;
-use bellows::runner::{run_once, RunError, RunOutcome};
+use bellows::runner::{run_once, BlockReason, RunError, RunOutcome};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -65,10 +65,12 @@ async fn run_once_returns_blocked_when_an_open_agent_pr_exists_and_skips_find_ne
         .await
         .expect("run_once should succeed");
     match outcome {
-        RunOutcome::Blocked { pr_numbers } => {
+        RunOutcome::Blocked {
+            reason: BlockReason::OpenAgentPrs { pr_numbers },
+        } => {
             assert_eq!(pr_numbers, vec![41]);
         }
-        other => panic!("expected Blocked, got {other:?}"),
+        other => panic!("expected Blocked(OpenAgentPrs), got {other:?}"),
     }
 }
 
@@ -96,8 +98,10 @@ async fn run_once_returns_blocked_when_draft_agent_pr_is_open() {
         .await
         .expect("run_once should succeed");
     match outcome {
-        RunOutcome::Blocked { pr_numbers } => assert_eq!(pr_numbers, vec![99]),
-        other => panic!("expected Blocked {{ [99] }}, got {other:?}"),
+        RunOutcome::Blocked {
+            reason: BlockReason::OpenAgentPrs { pr_numbers },
+        } => assert_eq!(pr_numbers, vec![99]),
+        other => panic!("expected Blocked(OpenAgentPrs[99]), got {other:?}"),
     }
 }
 
@@ -162,11 +166,13 @@ async fn run_once_returns_blocked_fail_closed_when_list_prs_call_fails() {
         .expect("run_once should succeed (errors map to Blocked, not Err)");
     // pr_numbers is empty because we couldn't list them.
     match outcome {
-        RunOutcome::Blocked { pr_numbers } => assert!(
+        RunOutcome::Blocked {
+            reason: BlockReason::OpenAgentPrs { pr_numbers },
+        } => assert!(
             pr_numbers.is_empty(),
             "fail-closed Blocked has empty pr_numbers, got {pr_numbers:?}",
         ),
-        other => panic!("expected Blocked (fail-closed), got {other:?}"),
+        other => panic!("expected Blocked(OpenAgentPrs[]) (fail-closed), got {other:?}"),
     }
 }
 
@@ -230,6 +236,16 @@ async fn run_once_picks_oldest_issue_across_multiple_repos_by_created_at() {
                 "labels": [{ "name": "ready-for-agent" }]
             }
         ])))
+        .mount(&mock)
+        .await;
+
+    // Pre-claim stale-branch sweep (#76): no stale refs on repo-a for
+    // issue #10. The sweep must succeed before the runner moves on to
+    // the brief fetch, otherwise the test would surface Blocked rather
+    // than MissingAgentBrief.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/git/matching-refs/heads/agent/10-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
 
@@ -312,6 +328,13 @@ async fn run_once_only_blocks_when_every_configured_repo_is_blocked() {
         .mount(&mock)
         .await;
 
+    // Pre-claim stale-branch sweep (#76) for repo-b/#50: no stale refs.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/git/matching-refs/heads/agent/50-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
     // Brief missing on #50 -> short-circuit at MissingAgentBrief(50)
     // proves repo-b's issue was picked despite repo-a being blocked.
     Mock::given(method("GET"))
@@ -347,4 +370,326 @@ pat_env_var = "BELLOWS_TEST_PAT"
             "expected MissingAgentBrief(50) (repo-b's issue), got {other:?}",
         ),
     }
+}
+
+// ---- Issue #76 / ADR-0003: pre-claim deletion of stale agent/<N>-*
+//      branches on origin. The sweep fires after find_next_issue picks a
+//      candidate but before the claim PATCH. Successful sweep proceeds;
+//      failure path returns RunOutcome::Blocked with the failing branch
+//      named in the reason so the operator can recover. ----
+
+#[tokio::test]
+async fn run_once_sweeps_stale_agent_branches_before_claiming() {
+    // Brief AC: "`runner::run_once` calls `delete_stale_agent_branches`
+    // after `find_next_issue` and before `claim`. Success path proceeds."
+    // We drive run_once up to MissingAgentBrief (so we never hit the
+    // workspace clone) and use a wiremock `expect(1)` to assert that the
+    // DELETE against the stale ref was actually issued. If the sweep
+    // were skipped, expect(1) would fail when the MockServer drops.
+    let mock = MockServer::start().await;
+
+    // Pre-claim PR check: clear.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // One ready-for-agent issue #16.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "Pre-claim sweep target",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // matching-refs returns a stale agent/16-* ref.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-old-slug",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-old-slug",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // The DELETE must fire exactly once.
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-old-slug"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // Brief is missing on the issue -> short-circuit with MissingAgentBrief.
+    // We choose this path over a real claim because it avoids the workspace
+    // clone while still proving the sweep already happened.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None).await;
+    match outcome {
+        Err(RunError::MissingAgentBrief(16)) => {}
+        other => panic!(
+            "expected MissingAgentBrief(16) (sweep must have completed before brief fetch), got {other:?}",
+        ),
+    }
+    // mock drops at end of scope -> verifies expect(1) on the DELETE.
+}
+
+#[tokio::test]
+async fn run_once_returns_blocked_when_stale_branch_deletion_fails() {
+    // Brief AC: "On `Err`, return `RunOutcome::Blocked` with the failing
+    // branch name in the block reason." The 403 case is the canonical
+    // failure mode — branch protection or PAT scope refuses the DELETE.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "Pre-claim sweep target",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-protected",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-protected",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-protected"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "message": "Resource not accessible by integration",
+            "documentation_url": "https://docs.github.com/..."
+        })))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None)
+        .await
+        .expect("run_once should map DELETE failure to RunOutcome::Blocked, not Err");
+    match outcome {
+        RunOutcome::Blocked {
+            reason: BlockReason::StaleAgentBranchDeletionFailed { branch, .. },
+        } => {
+            assert_eq!(branch, "agent/16-protected", "block reason must name the failing branch");
+        }
+        other => panic!(
+            "expected Blocked(StaleAgentBranchDeletionFailed for agent/16-protected), got {other:?}",
+        ),
+    }
+}
+
+#[tokio::test]
+async fn run_once_does_not_sweep_stale_branches_when_blocked_by_open_pr() {
+    // Slice-b precedence AC: "if any `agent/*` PR is open anywhere, the
+    // new check is not consulted (bellows is already blocked at the
+    // slice-b layer)." Wiremock would 404 a matching-refs request because
+    // we don't mount that endpoint here; if run_once issued it, the
+    // outcome shape would change. The Blocked(OpenAgentPrs) outcome
+    // proves the sweep was skipped.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // matching-refs is intentionally NOT mocked: wiremock will 404, which
+    // would surface in run_once as an error if the sweep were called.
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None)
+        .await
+        .expect("run_once should succeed via the slice-b Blocked path");
+    match outcome {
+        RunOutcome::Blocked {
+            reason: BlockReason::OpenAgentPrs { pr_numbers },
+        } => {
+            assert_eq!(pr_numbers, vec![41]);
+        }
+        other => panic!(
+            "expected Blocked(OpenAgentPrs[41]) — sweep must not fire when slice-b already blocked, got {other:?}",
+        ),
+    }
+}
+
+#[tokio::test]
+async fn run_once_logs_sweep_summary_when_deletions_happen() {
+    // Brief AC: "Successful deletions emit a one-line summary log
+    // (`bellows: pre-claim swept N stale agent/<N>-* branch(es) before
+    // claiming issue #<N>`) once per claim, immediately before the
+    // existing `claimed issue #<N>` line." We drive run_once via the
+    // MissingAgentBrief short-circuit; the summary log fires after the
+    // sweep completes, so we can assert it from the captured log buffer
+    // even though we never reach the workspace-clone step.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "Pre-claim sweep target",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "ref": "refs/heads/agent/16-foo",
+                "node_id": "n1",
+                "url": "http://example/refs/heads/agent/16-foo",
+                "object": { "sha": "aaa", "type": "commit", "url": "http://example/commits/aaa" }
+            },
+            {
+                "ref": "refs/heads/agent/16-bar",
+                "node_id": "n2",
+                "url": "http://example/refs/heads/agent/16-bar",
+                "object": { "sha": "bbb", "type": "commit", "url": "http://example/commits/bbb" }
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-foo"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/marad2001/test-repo/git/refs/heads/agent/16-bar"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let _ = run_once(&client, &config, &mut log, None).await;
+    let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
+    assert!(
+        log_str.contains("bellows: pre-claim swept 2 stale agent/16-* branch(es) before claiming issue #16"),
+        "expected the brief's exemplar summary line, got: {log_str}",
+    );
+}
+
+#[tokio::test]
+async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
+    // Brief AC: "Successful deletions emit a one-line summary log ...
+    // once per claim". Zero deletions is the steady-state case and must
+    // stay silent — otherwise every clean tick spams the log with
+    // "swept 0 branches".
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "Clean run",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let _ = run_once(&client, &config, &mut log, None).await;
+    let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
+    assert!(
+        !log_str.contains("pre-claim swept"),
+        "zero-deletion ticks must stay silent, got: {log_str}",
+    );
 }

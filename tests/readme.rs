@@ -438,6 +438,31 @@ fn readme_v1_scope_lists_ci_gate_as_in_scope() {
 }
 
 #[test]
+fn readme_documents_pre_claim_stale_branch_sweep_abandon_contract() {
+    // Issue #76 / ADR-0003 acceptance: README documents the implicit
+    // contract: closing a bellows PR without `--delete-branch` is
+    // treated as "abandon — bellows will reclaim and overwrite the
+    // branch on the next claim." The reader needs to know:
+    //  - bellows sweeps `agent/<N>-*` refs before claiming;
+    //  - closing without deletion = abandon (you can't preserve work
+    //    on the agent branch that way);
+    //  - rebase onto a non-`agent/*` branch first if you want to
+    //    keep what an agent produced.
+    let body = read_readme();
+    assert_contains_all(
+        &body,
+        &[
+            "agent/",
+            "--delete-branch",
+            "abandon",
+            "reclaim",
+            "rebase",
+        ],
+        "pre-claim sweep / abandon contract (ADR-0003)",
+    );
+}
+
+#[test]
 fn readme_documents_auto_merge_workflow_in_operational_flow() {
     let body = read_readme();
     // Issue #43 acceptance criterion: the README gains a short note
