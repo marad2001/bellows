@@ -318,3 +318,61 @@ fn pick_engine_no_implementer_skips_cooling_first_entry() {
     assert_eq!(picked.entry.engine, Engine::Codex);
     assert_eq!(picked.reason, PickReason::ChainFirstHotEntry);
 }
+
+// -----------------------------------------------------------------
+// AC: Implement-phase rate-limit splits in two branches —
+//   - At base SHA (no commits beyond base) with no prior in-place
+//     advance → in-place chain advancement (drop workspace, swap
+//     engine, re-run).
+//   - Ahead of base SHA, OR a prior in-place advance already used
+//     in this phase invocation → terminate as RateLimited.
+//
+// Tests (e), (e2), (f) from the brief pin all three sub-cases against
+// one pure function so the runner-level decision is testable without
+// docker.
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::{decide_implement_rate_limit_action, ImplementRateLimitAction};
+
+#[test]
+fn implement_e_at_base_sha_with_no_prior_advance_advances_in_place() {
+    // AC (e): implement rate-limits with workspace at base SHA →
+    // in-place chain advancement.
+    let action = decide_implement_rate_limit_action(
+        /* at_base_sha = */ true,
+        /* advances_used = */ 0,
+    );
+    assert_eq!(action, ImplementRateLimitAction::InPlaceAdvance);
+}
+
+#[test]
+fn implement_e2_max_one_inplace_advance_terminates_on_second_rate_limit() {
+    // AC (e2): max-1 in-place advance per phase invocation. The
+    // advanced engine ALSO rate-limits before committing →
+    // terminate as RateLimited rather than walking deeper into the
+    // chain in-place. ADR-0005: preserves the single-pass-per-phase
+    // invariant.
+    let action = decide_implement_rate_limit_action(
+        /* at_base_sha = */ true,
+        /* advances_used = */ 1,
+    );
+    assert_eq!(action, ImplementRateLimitAction::Terminate);
+}
+
+#[test]
+fn implement_f_workspace_ahead_of_base_terminates_without_advance() {
+    // AC (f): workspace ahead of base SHA → terminate as RateLimited
+    // (invariant guard fires; no in-place advance regardless of
+    // advances_used). The agent committed work the runner does not
+    // want to drop.
+    let action = decide_implement_rate_limit_action(
+        /* at_base_sha = */ false,
+        /* advances_used = */ 0,
+    );
+    assert_eq!(action, ImplementRateLimitAction::Terminate);
+    let action_with_advance_used = decide_implement_rate_limit_action(
+        /* at_base_sha = */ false,
+        /* advances_used = */ 1,
+    );
+    assert_eq!(action_with_advance_used, ImplementRateLimitAction::Terminate);
+}
