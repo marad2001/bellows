@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::runner::BlockReason;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StatusError {
     #[error("io: {0}")]
@@ -19,14 +21,13 @@ pub struct Status {
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub current: Option<CurrentRun>,
-    /// Issue #42 pre-claim PR check: when the orchestrator is blocked
-    /// by one or more open `agent/*` PRs that may still gate master.
-    /// `current` and `blocked` are mutually exclusive — `write_busy`
-    /// and `write_blocked` both clear the other field.
-    ///
-    /// `pr_numbers` is empty in the fail-closed case (the GitHub
-    /// list-PRs call errored, so we don't know which PRs are open);
-    /// the summariser renders that differently from a known list.
+    /// Pre-claim block (issues #42 and #76): the orchestrator refused
+    /// to claim a new issue this tick. The carried `BlockReason`
+    /// distinguishes the slice-b case (open `agent/*` PRs gating
+    /// master) from the slice-#76 case (stale `agent/<N>-*` ref
+    /// deletion failed). `current` and `blocked` are mutually
+    /// exclusive — `write_busy` and `write_blocked` both clear the
+    /// other field.
     #[serde(default)]
     pub blocked: Option<BlockedState>,
 }
@@ -41,7 +42,7 @@ pub struct CurrentRun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedState {
-    pub pr_numbers: Vec<u64>,
+    pub reason: BlockReason,
 }
 
 /// Resolve the platform-appropriate status-file path:
@@ -218,11 +219,13 @@ impl StatusContext {
     }
 
     /// Persist the Blocked state — bellows refused to claim a new issue
-    /// because an open `agent/*` PR may still gate master. Called by
-    /// `run_once`'s pre-claim check (#42). An empty `pr_numbers` slice
-    /// means the GitHub list-PRs call failed (fail-closed); the
-    /// summariser renders that case distinctly.
-    pub async fn write_blocked(&self, pr_numbers: &[u64]) -> Result<(), StatusError> {
+    /// because either an open `agent/*` PR may still gate master (slice
+    /// b / #42) or a stale `agent/<N>-*` ref deletion failed before
+    /// claim (#76 / ADR-0003). The carried `BlockReason` distinguishes
+    /// the two cases for `bellows status`. The empty-`pr_numbers`
+    /// fail-closed case is encoded inside the `OpenAgentPrs` variant;
+    /// the summariser renders that distinctly from a known list.
+    pub async fn write_blocked(&self, reason: &BlockReason) -> Result<(), StatusError> {
         write(
             &self.path,
             &Status {
@@ -230,7 +233,7 @@ impl StatusContext {
                 started_at: self.started_at,
                 current: None,
                 blocked: Some(BlockedState {
-                    pr_numbers: pr_numbers.to_vec(),
+                    reason: reason.clone(),
                 }),
             },
         )
@@ -256,7 +259,11 @@ const RESUME_LINE: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OngoingState {
     Idle,
-    Blocked(Vec<u64>),
+    /// Carrying the whole `BlockReason` so a transition between block
+    /// kinds (PR set merges but a stale-branch sweep starts failing,
+    /// or vice versa) emits a fresh line — the dedup contract is
+    /// "same kind + same payload, silent; anything else, fresh line".
+    Blocked(BlockReason),
     /// A `RunError` whose shape (variant + payload, see
     /// `RunError::shape`) matches this key. Two consecutive `Err`s
     /// with the same shape key are treated as a continuation.
@@ -291,17 +298,19 @@ impl OutcomeTransition {
         Self::default()
     }
 
-    /// Observe a tick that returned `RunOutcome::Blocked` with these
-    /// `pr_numbers`. Returns `Some(line)` if a log line should be emitted
-    /// (the block set differs from the previous tick) or `None` if the
-    /// tick is a same-state continuation that should stay silent.
-    pub fn observe_blocked(&mut self, pr_numbers: &[u64]) -> Option<String> {
-        let new = OngoingState::Blocked(pr_numbers.to_vec());
+    /// Observe a tick that returned `RunOutcome::Blocked` with this
+    /// `reason`. Returns `Some(line)` if a log line should be emitted
+    /// (the reason differs from the previous tick) or `None` if the
+    /// tick is a same-reason continuation that should stay silent.
+    /// Slice-b's same-PR-set silence contract is preserved; slice-#76
+    /// adds the same contract for the stale-branch-deletion case.
+    pub fn observe_blocked(&mut self, reason: &BlockReason) -> Option<String> {
+        let new = OngoingState::Blocked(reason.clone());
         if self.last.as_ref() == Some(&new) {
             return None;
         }
         self.last = Some(new);
-        Some(format_blocked_line(pr_numbers))
+        Some(format_blocked_line(reason))
     }
 
     /// Observe a tick that returned `RunOutcome::Idle`. Returns the
@@ -374,17 +383,26 @@ impl OutcomeTransition {
     }
 }
 
-fn format_blocked_line(pr_numbers: &[u64]) -> String {
-    if pr_numbers.is_empty() {
-        return "bellows: blocked (could not list open agent PRs; failing closed and retrying next tick)"
-            .to_string();
+fn format_blocked_line(reason: &BlockReason) -> String {
+    match reason {
+        BlockReason::OpenAgentPrs { pr_numbers } if pr_numbers.is_empty() => {
+            "bellows: blocked (could not list open agent PRs; failing closed and retrying next tick)"
+                .to_string()
+        }
+        BlockReason::OpenAgentPrs { pr_numbers } => {
+            let joined = pr_numbers
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("bellows: blocked by open agent {joined} (waiting for merge)")
+        }
+        BlockReason::StaleAgentBranchDeletionFailed { branch, error } => {
+            format!(
+                "bellows: blocked — pre-claim deletion of stale agent branch `{branch}` failed: {error} (retrying next tick)",
+            )
+        }
     }
-    let joined = pr_numbers
-        .iter()
-        .map(|n| format!("PR #{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("bellows: blocked by open agent {joined} (waiting for merge)")
 }
 
 /// Outcome of `check_status_for_kill` — whether `bellows kill <N>`
@@ -473,25 +491,33 @@ pub fn summarise(status: Option<&Status>, pid_alive: bool) -> String {
 }
 
 fn format_blocked_summary(s: &Status, b: &BlockedState) -> String {
-    if b.pr_numbers.is_empty() {
-        return format!(
+    match &b.reason {
+        BlockReason::OpenAgentPrs { pr_numbers } if pr_numbers.is_empty() => format!(
             "bellows is running (PID {}, started at {}), blocked (could not list open agent PRs; failing closed and retrying next tick).",
             s.pid,
             s.started_at.to_rfc3339(),
-        );
+        ),
+        BlockReason::OpenAgentPrs { pr_numbers } => {
+            let joined = pr_numbers
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "bellows is running (PID {}, started at {}), blocked by open agent {} (waiting for merge).",
+                s.pid,
+                s.started_at.to_rfc3339(),
+                joined,
+            )
+        }
+        BlockReason::StaleAgentBranchDeletionFailed { branch, error } => format!(
+            "bellows is running (PID {}, started at {}), blocked — pre-claim deletion of stale agent branch `{}` failed: {} (retrying next tick).",
+            s.pid,
+            s.started_at.to_rfc3339(),
+            branch,
+            error,
+        ),
     }
-    let joined = b
-        .pr_numbers
-        .iter()
-        .map(|n| format!("PR #{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "bellows is running (PID {}, started at {}), blocked by open agent {} (waiting for merge).",
-        s.pid,
-        s.started_at.to_rfc3339(),
-        joined,
-    )
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
@@ -504,6 +530,15 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Tiny ergonomic helper so the dedup tests can still read
+    /// `prs(&[41])` rather than the multi-line `BlockReason::OpenAgentPrs
+    /// { pr_numbers: vec![...] }` literal at every call site.
+    fn prs(nums: &[u64]) -> BlockReason {
+        BlockReason::OpenAgentPrs {
+            pr_numbers: nums.to_vec(),
+        }
+    }
 
     fn sample_status() -> Status {
         Status {
@@ -758,7 +793,9 @@ mod tests {
                 .with_timezone(&Utc),
             current: None,
             blocked: Some(BlockedState {
-                pr_numbers: vec![41],
+                reason: BlockReason::OpenAgentPrs {
+                    pr_numbers: vec![41],
+                },
             }),
         };
         let s = summarise(Some(&st), true);
@@ -794,7 +831,9 @@ mod tests {
                 .with_timezone(&Utc),
             current: None,
             blocked: Some(BlockedState {
-                pr_numbers: vec![41, 60],
+                reason: BlockReason::OpenAgentPrs {
+                    pr_numbers: vec![41, 60],
+                },
             }),
         };
         let s = summarise(Some(&st), true);
@@ -816,7 +855,9 @@ mod tests {
                 .with_timezone(&Utc),
             current: None,
             blocked: Some(BlockedState {
-                pr_numbers: Vec::new(),
+                reason: BlockReason::OpenAgentPrs {
+                    pr_numbers: Vec::new(),
+                },
             }),
         };
         let s = summarise(Some(&st), true);
@@ -832,6 +873,9 @@ mod tests {
     async fn write_blocked_persists_pr_numbers_in_documented_schema() {
         // Pin the on-disk shape so a future serde rename can't silently
         // break the status command or `bellows status`'s consumers.
+        // The schema now nests under `reason.kind` (the BlockReason
+        // discriminant) so the stale-branch case from #76 can be
+        // surfaced through the same field.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("status.json");
         let ctx = StatusContext {
@@ -842,14 +886,85 @@ mod tests {
                 .with_timezone(&Utc),
         };
 
-        ctx.write_blocked(&[41, 60]).await.unwrap();
+        ctx.write_blocked(&BlockReason::OpenAgentPrs {
+            pr_numbers: vec![41, 60],
+        })
+        .await
+        .unwrap();
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["pid"], 4242);
         assert_eq!(v["started_at"], "2026-05-10T15:00:00Z");
         assert!(v["current"].is_null());
-        assert_eq!(v["blocked"]["pr_numbers"][0], 41);
-        assert_eq!(v["blocked"]["pr_numbers"][1], 60);
+        assert_eq!(v["blocked"]["reason"]["kind"], "open_agent_prs");
+        assert_eq!(v["blocked"]["reason"]["pr_numbers"][0], 41);
+        assert_eq!(v["blocked"]["reason"]["pr_numbers"][1], 60);
+    }
+
+    #[tokio::test]
+    async fn write_blocked_persists_stale_branch_failure_in_documented_schema() {
+        // Issue #76 / ADR-0003: the new failure mode's on-disk shape.
+        // Pin it the same way the slice-b case is pinned so a renamer
+        // or accidental untagged-enum change is caught by CI.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("status.json");
+        let ctx = StatusContext {
+            path: path.clone(),
+            pid: 4242,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        ctx.write_blocked(&BlockReason::StaleAgentBranchDeletionFailed {
+            branch: "agent/16-foo".to_string(),
+            error: "403: Resource not accessible by integration".to_string(),
+        })
+        .await
+        .unwrap();
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["blocked"]["reason"]["kind"],
+            "stale_agent_branch_deletion_failed",
+        );
+        assert_eq!(v["blocked"]["reason"]["branch"], "agent/16-foo");
+        assert!(
+            v["blocked"]["reason"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("403"),
+            "error string must round-trip through the JSON: {}",
+            v["blocked"]["reason"]["error"],
+        );
+    }
+
+    #[test]
+    fn summarise_blocked_status_for_stale_branch_failure_names_branch_and_remedy() {
+        // `bellows status` must distinguish the slice-#76 failure from
+        // the slice-b PR-gated case so the operator knows which lever
+        // to pull (branch protection or PAT scope, vs. wait for CI).
+        let st = Status {
+            pid: 12345,
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            current: None,
+            blocked: Some(BlockedState {
+                reason: BlockReason::StaleAgentBranchDeletionFailed {
+                    branch: "agent/16-foo".to_string(),
+                    error: "403: Resource not accessible by integration".to_string(),
+                },
+            }),
+        };
+        let s = summarise(Some(&st), true);
+        assert!(s.contains("blocked"), "{}", s);
+        assert!(s.contains("agent/16-foo"), "must name the failing branch: {s}");
+        assert!(s.contains("403"), "must include the underlying error: {s}");
+        assert!(
+            !s.contains("waiting for merge"),
+            "stale-branch case must NOT use the PR-gated wording: {s}",
+        );
     }
 
     #[tokio::test]
@@ -870,7 +985,11 @@ mod tests {
                 .with_timezone(&Utc),
         };
 
-        ctx.write_blocked(&[41]).await.unwrap();
+        ctx.write_blocked(&BlockReason::OpenAgentPrs {
+            pr_numbers: vec![41],
+        })
+        .await
+        .unwrap();
         ctx.write_idle().await.unwrap();
         let parsed = read(&path).await.unwrap().unwrap();
         assert!(parsed.blocked.is_none(), "expected blocked cleared, got {:?}", parsed.blocked);
@@ -891,7 +1010,11 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         };
-        ctx.write_blocked(&[41]).await.unwrap();
+        ctx.write_blocked(&BlockReason::OpenAgentPrs {
+            pr_numbers: vec![41],
+        })
+        .await
+        .unwrap();
         ctx.write_busy(CurrentRun {
             issue_number: 9,
             issue_title: "Test".to_string(),
@@ -913,7 +1036,7 @@ mod tests {
         // only on state transitions — not on every tick." On the
         // first tick that sees an open agent/* PR, the line fires.
         let mut tracker = OutcomeTransition::new();
-        let line = tracker.observe_blocked(&[41]);
+        let line = tracker.observe_blocked(&prs(&[41]));
         let line = line.expect("expected a transition log line");
         assert!(line.contains("blocked"), "{}", line);
         assert!(line.contains("PR #41"), "{}", line);
@@ -925,8 +1048,8 @@ mod tests {
         // would otherwise flood the log with ~10 identical "blocked"
         // lines, drowning out everything else.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&[41]);
-        let line = tracker.observe_blocked(&[41]);
+        let _ = tracker.observe_blocked(&prs(&[41]));
+        let line = tracker.observe_blocked(&prs(&[41]));
         assert!(
             line.is_none(),
             "second identical observation must not emit a log line, got {:?}",
@@ -940,8 +1063,8 @@ mod tests {
         // one opens), the block set changes and the operator wants a
         // fresh line saying so.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&[41]);
-        let line = tracker.observe_blocked(&[60]);
+        let _ = tracker.observe_blocked(&prs(&[41]));
+        let line = tracker.observe_blocked(&prs(&[60]));
         let line = line.expect("set changed; expected a transition line");
         assert!(line.contains("PR #60"), "{}", line);
     }
@@ -952,7 +1075,7 @@ mod tests {
         // see both that the block has cleared (resume line) AND that the
         // loop is back to the steady-state idle pattern.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&[41]);
+        let _ = tracker.observe_blocked(&prs(&[41]));
         let lines = tracker.observe_idle();
         assert_eq!(
             lines.len(),
@@ -979,7 +1102,7 @@ mod tests {
         // event itself is logged by the caller; the tracker is only
         // responsible for the resume-from-blocked line.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&[41]);
+        let _ = tracker.observe_blocked(&prs(&[41]));
         let line = tracker.observe_event();
         let line = line.expect("blocked->event must emit a resume line");
         assert!(
@@ -1127,7 +1250,7 @@ mod tests {
         // error state, the operator still wants the resume line so they
         // know the block cleared — followed by the new error context.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&[41]);
+        let _ = tracker.observe_blocked(&prs(&[41]));
         let lines = tracker.observe_error("missing_agent_brief:42", "brief err".to_string());
         assert_eq!(
             lines.len(),

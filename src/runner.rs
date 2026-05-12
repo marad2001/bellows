@@ -86,15 +86,43 @@ pub enum RunOutcome {
         issue_number: u64,
         pr_number: u64,
     },
-    /// The pre-claim PR check (#42) found at least one open `agent/*`
-    /// PR — that PR may still gate master, so the tick refuses to
-    /// claim a new issue. `pr_numbers` is empty if the GitHub list-PRs
-    /// call failed (fail-closed: we don't know whether master is
-    /// gated, so we behave as if it is). The polling loop turns this
-    /// into a transition-only log line and a Blocked status-file
-    /// write; the next tick retries.
+    /// The polling tick refused to claim. The shape carries WHY so the
+    /// log line and status-file rendering can distinguish the slice-b
+    /// case (open `agent/*` PR may still gate master, #42) from the
+    /// slice-#76 case (ADR-0003: deletion of a stale `agent/<N>-*`
+    /// remote branch failed before claim). Both cases are recoverable
+    /// across ticks: closing/merging the PR, or fixing branch
+    /// protection / PAT scope, lets the next tick proceed.
     Blocked {
-        pr_numbers: Vec<u64>,
+        reason: BlockReason,
+    },
+}
+
+/// Why a `RunOutcome::Blocked` tick refused to claim. Split into one
+/// variant per block source so the status file's on-disk schema, the
+/// polling-loop log line, and `bellows status`'s human-readable
+/// summary can all be specific about the action item.
+///
+/// Tagged-snake-case representation keeps the JSON readable in the
+/// status file:
+/// `{"kind": "open_agent_prs", "pr_numbers": [...]}` /
+/// `{"kind": "stale_agent_branch_deletion_failed", "branch": "...", "error": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockReason {
+    /// Slice b (#42): one or more open `agent/*` PRs may still gate
+    /// master. `pr_numbers` is empty in the fail-closed case (the
+    /// list-PRs API call failed); the renderer distinguishes that
+    /// from a known set.
+    OpenAgentPrs { pr_numbers: Vec<u64> },
+    /// Issue #76 / ADR-0003: the pre-claim sweep of `agent/<N>-*` refs
+    /// on origin failed for `branch`. `error` is the formatted
+    /// `octocrab::Error` so the operator can read it in `bellows
+    /// status` or the polling log without grepping for the underlying
+    /// request. Retried on every subsequent tick.
+    StaleAgentBranchDeletionFailed {
+        branch: String,
+        error: String,
     },
 }
 
@@ -205,8 +233,9 @@ pub async fn run_once(
             } else {
                 blocked_prs
             };
+            let reason = BlockReason::OpenAgentPrs { pr_numbers: prs };
             if let Some(ctx) = status_ctx
-                && let Err(e) = ctx.write_blocked(&prs).await
+                && let Err(e) = ctx.write_blocked(&reason).await
             {
                 let _ = writeln!(
                     log_writer,
@@ -214,7 +243,7 @@ pub async fn run_once(
                     e,
                 );
             }
-            return Ok(RunOutcome::Blocked { pr_numbers: prs });
+            return Ok(RunOutcome::Blocked { reason });
         }
 
         // Some repos cleared but produced no candidates (or all repos
@@ -265,6 +294,68 @@ pub async fn run_once(
         repo_url,
         issue,
     } = candidates.into_iter().next().expect("non-empty candidates");
+
+    // Issue #76 / ADR-0003: pre-claim sweep. Delete every `agent/<N>-*`
+    // ref on origin for the candidate's issue number before we attempt
+    // to claim. A stale ref from a prior failed run would otherwise
+    // crash the next push with a non-fast-forward — only after the
+    // agent has already spent ~30 minutes. Failure here surfaces as
+    // RunOutcome::Blocked so the next tick retries idempotently. The
+    // count drives a one-line summary log (suppressed when 0 deletions
+    // — the steady-state case).
+    let swept = match tracker::delete_stale_agent_branches(client, &owner, &repo, issue.number)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // Both error variants carry a usable branch identifier — a
+            // specific `agent/<N>-<slug>` for the DELETE-failed case,
+            // and the anchored prefix `agent/<N>-*` for the
+            // list-failed case (the operator's recovery action is the
+            // same either way: unblock GitHub access, retry the tick).
+            let (branch, source) = match &e {
+                tracker::DeleteStaleBranchError::ListFailed { issue_number, source } => {
+                    (format!("agent/{}-*", issue_number), source.to_string())
+                }
+                tracker::DeleteStaleBranchError::DeleteFailed { branch, source } => {
+                    (branch.clone(), source.to_string())
+                }
+            };
+            let reason = BlockReason::StaleAgentBranchDeletionFailed {
+                branch,
+                error: source,
+            };
+            if let Some(ctx) = status_ctx
+                && let Err(write_err) = ctx.write_blocked(&reason).await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not write blocked status (continuing): {}",
+                    write_err,
+                );
+            }
+            return Ok(RunOutcome::Blocked { reason });
+        }
+    };
+
+    // Per-claim sweep summary (suppressed on the steady-state
+    // zero-deletion case, so clean ticks don't spam the log). The line
+    // fires after a successful sweep and ahead of the brief-fetch /
+    // claim PATCH; the wording — "before claiming issue #N" — names
+    // an intent, so the log is still honest if a subsequent step
+    // short-circuits (MissingAgentBrief, ClaimError::Contended) before
+    // the matching `claimed issue` announce.
+    if !swept.is_empty() {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: pre-claim swept {} stale agent/{}-* branch(es) before claiming issue #{}",
+                swept.len(),
+                issue.number,
+                issue.number,
+            ),
+        );
+    }
 
     // Fetch the agent brief BEFORE claiming. If it's missing we return
     // an error without label-swapping the issue — the next polling tick

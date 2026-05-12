@@ -239,6 +239,16 @@ async fn run_once_picks_oldest_issue_across_multiple_repos_by_created_at() {
         .mount(&mock)
         .await;
 
+    // Pre-claim stale-branch sweep (#76): no stale refs on repo-a for
+    // issue #10. The sweep must succeed before the runner moves on to
+    // the brief fetch, otherwise the test would surface Blocked rather
+    // than MissingAgentBrief.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-a/git/matching-refs/heads/agent/10-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
     // Agent-brief comments endpoint returns empty for the chosen issue
     // so the runner surfaces `MissingAgentBrief(N)` and short-circuits
     // BEFORE touching the workspace, sandbox, or claim path. The N we
@@ -315,6 +325,13 @@ async fn run_once_only_blocks_when_every_configured_repo_is_blocked() {
                 "labels": [{ "name": "ready-for-agent" }]
             }
         ])))
+        .mount(&mock)
+        .await;
+
+    // Pre-claim stale-branch sweep (#76) for repo-b/#50: no stale refs.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/git/matching-refs/heads/agent/50-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
 
