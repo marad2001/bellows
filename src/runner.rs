@@ -1421,6 +1421,21 @@ pub async fn run_once(
     )
     .await?;
 
+    // Issue #87: the comment POST inside `finalise` is observability-
+    // only — the label transition has already completed by the time we
+    // get here regardless of whether the run-log comment landed. Surface
+    // a failure as an operator-visible warning on both `bellows.log` and
+    // the polling-loop's stdout, without collapsing the run.
+    if let Some(msg) = finalise_outcome.comment_post_failure.as_deref() {
+        let line = format!(
+            "bellows: posting the run-log comment on PR #{} failed (label \
+             transition completed; continuing): {}",
+            pr.number, msg,
+        );
+        println!("{line}");
+        let _ = writeln!(log_writer, "{line}");
+    }
+
     // Slice 9: announce we're back to idle. Best-effort —
     // halt paths still reach finalise above, so a single
     // write here covers all exit-reason variants.
