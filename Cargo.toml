@@ -20,6 +20,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
 toml = "1.1.2"
 uuid = { version = "1.23.1", features = ["v4"] }
+yaml-rust2 = "0.11.0"
 
 [dev-dependencies]
 wiremock = "0.6.5"

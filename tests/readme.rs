@@ -534,6 +534,53 @@ fn orchestrator_example_documents_ssh_keys_volume_and_deploy_keys() {
 }
 
 #[test]
+fn orchestrator_example_documents_gates_table_and_fallback_flags() {
+    // ADR-0004 acceptance: orchestrator.example.toml documents the
+    // new `[gates]` table with explanatory comments. The defaults
+    // listed must match the strict-default flags so an operator
+    // copying the example into orchestrator.toml verbatim continues
+    // to see today's behaviour.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("orchestrator.example.toml");
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("orchestrator.example.toml must exist: {}", e));
+    for needle in [
+        "[gates]",
+        "clippy_flags",
+        "test_flags",
+        "--all-targets --all-features -- -D warnings",
+        "--all-targets --all-features",
+        ".github/workflows",
+    ] {
+        assert!(
+            body.contains(needle),
+            "orchestrator.example.toml must mention `{needle}` for ADR-0004: {body}"
+        );
+    }
+}
+
+#[test]
+fn readme_documents_target_ci_mirroring_with_fallback_override() {
+    // ADR-0004 acceptance: README gains a section explaining that
+    // bellows mirrors the target's CI clippy/test commands by default
+    // and how to override via `[gates]` when the workflow can't be
+    // parsed. Pin the load-bearing nouns rather than verbatim prose
+    // so the section can evolve without breaking the test.
+    let body = read_readme();
+    assert_contains_all(
+        &body,
+        &[
+            "mirror",
+            "[gates]",
+            "clippy_flags",
+            "test_flags",
+            ".github/workflows",
+            "ADR-0004",
+        ],
+        "ci-mirroring / gates fallback",
+    );
+}
+
+#[test]
 fn readme_opens_with_overview_explaining_what_bellows_is() {
     let body = read_readme();
     // The README must answer "what is this thing?" before anything

@@ -423,7 +423,12 @@ pub async fn run_once(
         }
     }
 
-    let workspace = workspace::prepare(&repo_url, &branch_name).await?;
+    // ADR-0004: parse the target repo's CI workflow once at prepare
+    // time and snapshot the resolved gate commands (or fallback) on
+    // the Workspace. Both the post-implement and end-pipeline gates
+    // read from this snapshot so the in-flight verdict is stable
+    // across mid-pipeline `.github/workflows/ci.yml` edits.
+    let workspace = workspace::prepare_with_gates(&repo_url, &branch_name, &config.gates).await?;
 
     let repo_slug = crate::repo_slug(&repo_url);
 
@@ -593,6 +598,9 @@ pub async fn run_once(
             log_writer,
             "bellows: phase 2/7 — cargo checks gate (clippy + test, fresh container)",
         );
+        for line in workspace.gate_commands().announcement_lines() {
+            announce(log_writer, &line);
+        }
         let run = sandbox::run_cargo_checks(
             &workspace,
             claimed.number,
@@ -1204,6 +1212,9 @@ pub async fn run_once(
                 log_writer,
                 "bellows: phase 7/7 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
             );
+            for line in workspace.gate_commands().announcement_lines() {
+                announce(log_writer, &line);
+            }
             let run = sandbox::run_cargo_checks(
                 &workspace,
                 claimed.number,

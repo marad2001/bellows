@@ -24,6 +24,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub auth: AuthConfig,
     pub agent: AgentConfig,
+    pub gates: GatesConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +213,37 @@ fn default_weak_test_guard_skip_label() -> String {
     "refactor".to_string()
 }
 
+/// ADR-0004 fallback flags for the cargo-checks gate. Used when bellows
+/// cannot parse the target repo's `.github/workflows/*.yml` to extract
+/// the verbatim `cargo clippy` / `cargo test` commands. Defaults
+/// preserve today's strict bar so any existing operator
+/// `orchestrator.toml` that omits the `[gates]` table sees no change in
+/// behaviour.
+#[derive(Debug, Deserialize)]
+pub struct GatesConfig {
+    #[serde(default = "default_clippy_flags")]
+    pub clippy_flags: String,
+    #[serde(default = "default_test_flags")]
+    pub test_flags: String,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        Self {
+            clippy_flags: default_clippy_flags(),
+            test_flags: default_test_flags(),
+        }
+    }
+}
+
+fn default_clippy_flags() -> String {
+    "--all-targets --all-features -- -D warnings".to_string()
+}
+
+fn default_test_flags() -> String {
+    "--all-targets --all-features".to_string()
+}
+
 /// Wire-shape used only at deserialize time. The `repo` key accepts
 /// either a single `[repo]` table (legacy single-repo form) or a
 /// `[[repo]]` array-of-tables (multi-repo form added in issue #35).
@@ -231,6 +263,8 @@ struct RawConfig {
     auth: AuthConfig,
     #[serde(default)]
     agent: AgentConfig,
+    #[serde(default)]
+    gates: GatesConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +299,7 @@ impl FromStr for Config {
             logging: raw.logging,
             auth: raw.auth,
             agent: raw.agent,
+            gates: raw.gates,
         })
     }
 }
