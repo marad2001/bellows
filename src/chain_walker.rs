@@ -376,6 +376,66 @@ pub fn decide_non_implement_rate_limit_action(
     NonImplementRateLimitAction::Terminate
 }
 
+/// Disposition the runner consults after a rate-limit signature
+/// match. Unifies the implement and non-implement paths so the
+/// runner's phase-exit handler has one shape to match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitDisposition {
+    /// Implement-phase only: drop workspace, pick next hot chain
+    /// entry, re-run from base. Bounded to max-1 per phase
+    /// invocation via the `advances_used` parameter of
+    /// `handle_implement_rate_limit`.
+    InPlaceAdvance,
+    /// Terminate the run as `ExitReason::RateLimited`. The state
+    /// file has already been updated by the helper; the next claim
+    /// walks the chain afresh under the freshly-read cooldowns.
+    Terminate,
+}
+
+/// Compose the parse → record → decide flow for an implement-phase
+/// rate-limit signature match. Mutates `state` with the parsed (or
+/// fallback) `cooling_until` and returns the runner's next action.
+///
+/// `at_base_sha` is `head_after_implement == head_before_implement`
+/// from the runner's perspective; `advances_used` is the count of
+/// in-place advances already performed in this phase invocation
+/// (capped at 1 by `decide_implement_rate_limit_action`).
+pub fn handle_implement_rate_limit(
+    state: &mut StateFile,
+    engine: Engine,
+    stderr: &str,
+    now: DateTime<Utc>,
+    at_base_sha: bool,
+    advances_used: u8,
+) -> RateLimitDisposition {
+    let parsed = parse_cooling_until(engine, stderr, now);
+    state.record_rate_limit(engine, parsed.cooling_until);
+    match decide_implement_rate_limit_action(at_base_sha, advances_used) {
+        ImplementRateLimitAction::InPlaceAdvance => RateLimitDisposition::InPlaceAdvance,
+        ImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
+    }
+}
+
+/// Compose the parse → record → terminate flow for a non-implement-
+/// phase rate-limit signature match. Mutates `state` with the parsed
+/// (or fallback) `cooling_until` and returns
+/// `RateLimitDisposition::Terminate`. The `_phase_name` parameter is
+/// consumed by `decide_non_implement_rate_limit_action` (currently
+/// always terminates).
+pub fn handle_non_implement_rate_limit(
+    state: &mut StateFile,
+    engine: Engine,
+    phase_name: &str,
+    stderr: &str,
+    now: DateTime<Utc>,
+) -> RateLimitDisposition {
+    let parsed = parse_cooling_until(engine, stderr, now);
+    state.record_rate_limit(engine, parsed.cooling_until);
+    match decide_non_implement_rate_limit_action(phase_name) {
+        NonImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
+    }
+}
+
 /// Look for `<preamble>|<unix-epoch-seconds>` in `text` and decode the
 /// trailing digit run into a UTC timestamp. Picks the FIRST such pipe-
 /// delimited number — claude's marker is the only known shape the
