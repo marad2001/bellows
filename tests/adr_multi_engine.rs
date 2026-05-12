@@ -322,3 +322,28 @@ fn adr_0005_documents_rate_limit_behaviour_split() {
         "rate-limit-behaviour-split",
     );
 }
+
+/// AC#9 — Documents operator UX: `--engine` flag on `setup-auth`
+/// and `refresh-auth` (default = first entry of
+/// `phases.implement.cli_chain`); auth-error callout in run-log
+/// comment names the engine to refresh.
+#[test]
+fn adr_0005_documents_operator_ux() {
+    let body = read_adr();
+    assert_contains_all(
+        &body,
+        &[
+            // The flag itself + both subcommands it applies to.
+            "--engine",
+            "setup-auth",
+            "refresh-auth",
+            // The default behaviour when --engine is omitted.
+            "phases.implement.cli_chain",
+            "default",
+            // The run-log callout names the engine.
+            "run-log",
+            "auth-error",
+        ],
+        "operator-ux",
+    );
+}
