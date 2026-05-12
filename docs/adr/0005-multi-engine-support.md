@@ -187,6 +187,46 @@ unrecognised `BELLOWS_ENGINE` is a hard error from the entrypoint
 — the bellows-side dispatcher always sets it, so an unset value
 indicates a regression rather than a degraded mode worth running.
 
+## Operating context
+
+The kickoff prompt the agent reads on phase start is rendered by
+`policy::render_kickoff`. Today it is engine-agnostic — the same
+prompt body is fed into `claude -p`. With two engines, the
+renderer becomes **engine-aware**: it dispatches on the engine name
+the dispatcher passed in, and produces the shape that engine
+expects.
+
+The two engines differ in how they discover operating context.
+Claude reads `CLAUDE.md` files from the current and parent
+directories at session start; the bellows policy image already
+seeds the global `CLAUDE.md` at `/home/bellows/.claude/CLAUDE.md`
+plus a per-repo `CLAUDE.md` at the cloned workspace root, and the
+agent picks them up automatically. Claude also auto-loads skill
+bodies on demand from its skills directory.
+
+Codex's analogue (`AGENTS.md` plus on-demand skill discovery) is
+shaped differently enough that maintaining two parallel context
+trees — one under `CLAUDE.md` for claude, one under `AGENTS.md`
+for codex — would create a permanent lockstep-maintenance tax: any
+operating-context edit would have to be applied twice or drift
+class would re-emerge (exactly the failure mode ADR-0004 documents
+for the bellows-vs-CI gate spec). To avoid that, the codex path
+in `policy::render_kickoff` **inlines** the operating-context body
+plus the bodies of all baked skills directly into the kickoff
+prompt text itself. There is one source of truth (the existing
+operating-context + skills directory baked into the policy image
+at build time); the codex kickoff is a function of that one source,
+not a parallel maintained file. Skill bodies are inlined verbatim
+into the kickoff so codex sees the same operating instructions
+claude would discover via on-demand file reads.
+
+The trade-off is prompt length: codex's kickoff is materially
+longer than claude's. The empirical findings from #79 confirm
+codex's headless invocation accepts long prompts on the command
+line (no per-prompt token cap below what we'd actually inline), and
+the cost of a longer kickoff is paid once per phase — well below
+the cost of drifting operating-context maintained in two places.
+
 ## Considered alternatives
 
 (Placeholder — populated by subsequent acceptance criteria.)
