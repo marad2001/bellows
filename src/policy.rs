@@ -247,25 +247,35 @@ pub struct PhaseOutcomes {
 
 /// Decide how a finished agent run should be classified.
 ///
-/// Precedence: an agent self-report (notes file present) wins over
-/// everything else; the agent's voice always trumps tooling signals.
-/// Then any non-zero implement exit is `Crash`. Then any failing cargo
-/// gate (clippy or test, post-implement or end-pipeline) is
-/// `FinalTestsRed`. Otherwise `Success`.
-pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitReason {
-    // Issue #49: when the runner synthesised an agent-notes entry to
-    // recover from an implement-phase crash with no commits, the file
-    // exists on disk (and ships in the PR diff) but is bellows-authored,
-    // not agent-authored. The agent did not self-report; bellows wrote
-    // the note to give the run something to commit. Suppress the usual
-    // `has_agent_notes` precedence so the run classifies on its actual
-    // failure mode (Crash) rather than spuriously routing to
-    // AgentSelfReportedFailure. The synth flag only suppresses when the
-    // implement phase ACTUALLY crashed — a clean-exit run with the flag
-    // somehow set (defensive corner) still respects notes-precedence.
-    let synth_suppresses_notes =
-        outcomes.implement_crash_synthesised && outcomes.implement.exit_code != 0;
-    if has_agent_notes && !synth_suppresses_notes {
+/// Precedence (ADR-0006 / issue #95):
+///
+/// 1. `NotesShape::HasUnaddressedFinding` → `AgentSelfReportedFailure`.
+///    The structured escalation channel: an `## Unaddressed finding:`
+///    section (agent-authored or bellows-synthesised by the weak-test
+///    guard or parser-as-backstop) always wins over tooling signals,
+///    because the agent's structured voice is the most actionable
+///    self-report we have.
+/// 2. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
+///    at the budget boundary.
+/// 3. Non-zero implement exit + rate-limit stderr signature →
+///    `RateLimited`. More specific than the generic Crash so the
+///    operator gets the right follow-up signal.
+/// 4. Non-zero implement exit → `Crash`. The agent process died.
+/// 5. Failing cargo gate (clippy or test, post-implement or
+///    end-pipeline) → `FinalTestsRed`.
+/// 6. `NotesShape::InformationalOnly` → `SuccessWithNotes`. The new
+///    ADR-0006 informational channel: an otherwise-clean run with
+///    freeform agent-authored prose (no escalation heading). Should
+///    stop silent auto-merge but should NOT route to
+///    AgentSelfReportedFailure.
+/// 7. Otherwise → `Success`.
+///
+/// The issue-#49 `synth_suppresses_notes` shim is gone: synth-only
+/// agent-notes files map to `NotesShape::Absent` via the synth-suffix
+/// stripping in `classify_agent_notes`, so they route on their actual
+/// failure mode (Crash) without a per-call special case here.
+pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason {
+    if matches!(notes, NotesShape::HasUnaddressedFinding) {
         return ExitReason::AgentSelfReportedFailure;
     }
     if outcomes.wall_clock_exceeded {
@@ -292,6 +302,9 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
         && gate_failed(end_gate)
     {
         return ExitReason::FinalTestsRed;
+    }
+    if matches!(notes, NotesShape::InformationalOnly) {
+        return ExitReason::SuccessWithNotes;
     }
     ExitReason::Success
 }

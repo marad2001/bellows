@@ -1721,7 +1721,15 @@ pub async fn run_once(
         backstop_violations,
         implement_crash_synthesised,
     };
-    let pipeline_reason = policy::classify_exit(agent_notes.is_some(), &outcomes);
+    // ADR-0006 / issue #95: feed the raw agent-notes content through
+    // `classify_agent_notes` so the classifier can distinguish
+    // informational notes (SuccessWithNotes) from structured escalation
+    // (AgentSelfReportedFailure) from a synth-only file
+    // (Absent → routes on the actual phase signal, e.g. issue-#49 Crash).
+    let pipeline_reason = policy::classify_exit(
+        policy::classify_agent_notes(agent_notes.as_deref()),
+        &outcomes,
+    );
 
     // PR #33 review finding #2: detect external cancellation BEFORE
     // opening the PR. Without this check, a kill that fires in the
@@ -3209,12 +3217,17 @@ mod tests {
         // Issue #49 end-to-end shape: a PhaseOutcomes carrying the
         // synth flag (set true by the runner when implement crashed
         // with no commits) and a non-zero implement exit must route
-        // through `classify_exit` to `Crash` even with
-        // `has_agent_notes=true` (the synth wrote agent-notes.md
-        // and committed it). The resulting PR body must be the
-        // Crash body (`crashed`), NOT the AgentSelfReportedFailure
-        // body which would quote the bellows-synthesised note as if
-        // the agent had self-reported.
+        // through `classify_exit` to `Crash`. The synth wrote
+        // agent-notes.md and committed it; per ADR-0006 / issue #95
+        // that content now flows through `classify_agent_notes` which
+        // recognises the synth-only file as `NotesShape::Absent`
+        // (after the synth-suffix strip nothing agent-authored
+        // remains). Routing then falls through to Crash on the non-
+        // zero implement exit — no per-call `synth_suppresses_notes`
+        // shim needed. The resulting PR body must be the Crash body
+        // (`crashed`), NOT the AgentSelfReportedFailure body which
+        // would quote the bellows-synthesised note as if the agent
+        // had self-reported.
         let synth_note = policy::synthesize_implement_crash_entry(
             137,
             "Error: /workspace/entrypoint-user: bad interpreter",
@@ -3234,7 +3247,14 @@ mod tests {
             security: None,
             security_fix: None,
         };
-        let reason = policy::classify_exit(true, &outcomes);
+        let notes_shape = policy::classify_agent_notes(Some(&synth_note));
+        assert_eq!(
+            notes_shape,
+            policy::NotesShape::Absent,
+            "synth-only notes must classify to Absent so the routing falls through \
+             to Crash on the non-zero implement exit",
+        );
+        let reason = policy::classify_exit(notes_shape, &outcomes);
         assert_eq!(
             reason,
             ExitReason::Crash,
