@@ -1,11 +1,12 @@
 use bellows::policy::{
-    build_violation_callout, classify_agent_notes, classify_exit, compute_coverage_violations,
+    append_bellows_synth_entry, build_violation_callout, classify_agent_notes,
+    classify_agent_notes_with_synth_spans, classify_exit, compute_coverage_violations,
     diff_contains_rs_files, has_new_tests, is_auth_error_signature, is_rate_limit_signature,
     parse_agent_notes_sections, parse_findings, per_finding_kickoff, render_kickoff,
-    strip_bellows_synth_suffix, synthesize_implement_crash_entry, synthesize_no_new_tests_entry,
-    synthesize_unaddressed_entries, AgentNoteSection, AnalysisOutcome, CheckResult, ExitReason,
-    FindingCoverage, FixOutcome, GateOutcome, ImplementOutcome, NotesShape, ParsedFinding,
-    PhaseOutcomes, ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT,
+    synthesize_implement_crash_entry, synthesize_no_new_tests_entry, synthesize_unaddressed_entries,
+    AgentNoteSection, AnalysisOutcome, BellowsSynthCause, CheckResult, ExitReason, FindingCoverage,
+    FixOutcome, GateOutcome, ImplementOutcome, NotesShape, ParsedFinding, PhaseOutcomes,
+    ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT,
     NO_NEW_TESTS_FINDING_TITLE, REVIEW_COMMIT_LOG_FILE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
     SECURITY_FINDINGS_FILE, SECURITY_FIX_PROMPT, SECURITY_REVIEW_PROMPT,
 };
@@ -1425,13 +1426,19 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
     // That was the wrong routing: the agent did not self-report —
     // bellows synthesised the entry to recover from a crash.
     //
-    // Post-issue-#95 migration: the synth output is fed through
-    // `classify_agent_notes`, which strips the bellows-synth suffix
-    // and observes nothing agent-authored remains → returns
-    // `NotesShape::Absent`. With Absent + non-zero implement exit,
-    // `classify_exit` falls through to Crash on its own. The previous
-    // `synth_suppresses_notes` shim has been removed.
-    let synth_note = synthesize_implement_crash_entry(1, "boom");
+    // Post-ADR-0006 migration: the synth append site records exact
+    // byte provenance, then `classify_agent_notes_with_synth_spans`
+    // strips that recorded Bellows-authored span and observes nothing
+    // agent-authored remains → returns `NotesShape::Absent`. With
+    // Absent + non-zero implement exit, `classify_exit` falls through
+    // to Crash on its own. The previous `synth_suppresses_notes` shim
+    // has been removed.
+    let mut synth_note = String::new();
+    let synth_span = append_bellows_synth_entry(
+        &mut synth_note,
+        &synthesize_implement_crash_entry(1, "boom"),
+        BellowsSynthCause::ImplementCrash,
+    );
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
             exit_code: 1,
@@ -1447,7 +1454,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
         security: None,
         security_fix: None,
     };
-    let notes_shape = classify_agent_notes(Some(&synth_note));
+    let notes_shape = classify_agent_notes_with_synth_spans(Some(&synth_note), &[synth_span]);
     assert_eq!(
         notes_shape,
         NotesShape::Absent,
@@ -1467,8 +1474,8 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
 fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escalation_notes() {
     // Post-ADR-0006 migration: the `implement_crash_synthesised` flag
     // is no longer consumed by `classify_exit`; the bellows/agent
-    // partition is resolved upstream by `classify_agent_notes`
-    // stripping the synth suffix. This test pins the new behaviour:
+    // partition is resolved upstream by note classification using
+    // out-of-band synth provenance. This test pins the new behaviour:
     // with HasUnaddressedFinding (the structured-escalation
     // NotesShape that agent-authored notes produce), the routing is
     // AgentSelfReportedFailure regardless of the synth flag.
@@ -1508,8 +1515,8 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
     // exited zero (the canonical AgentSelfReportedFailure path) must
     // continue to route to AgentSelfReportedFailure. After the
     // ADR-0006 migration the bellows/agent partition lives in
-    // `classify_agent_notes`; bellows-synthesised crash content
-    // strips to NotesShape::Absent, while genuine agent-authored
+    // `classify_agent_notes_with_synth_spans`; bellows-synthesised
+    // crash content strips to NotesShape::Absent, while genuine agent-authored
     // escalation (`## Unaddressed finding:`) yields
     // NotesShape::HasUnaddressedFinding and wins here.
     let outcomes = PhaseOutcomes {
@@ -2190,56 +2197,64 @@ fn classify_agent_notes_returns_informational_only_for_agent_authored_prose_with
 }
 
 #[test]
+fn classify_agent_notes_treats_copied_bellows_marker_as_agent_authored_prose() {
+    // ADR-0006: HTML comments are human-readable provenance only.
+    // If an agent quotes a bellows-style marker before its actual note,
+    // that marker must not make the following prose disappear from routing.
+    let prose = "<!-- bellows copied from a previous PR comment -->\n\
+                 Note: this is still the agent's own informational note.\n";
+    assert_eq!(
+        classify_agent_notes(Some(prose)),
+        NotesShape::InformationalOnly,
+    );
+}
+
+#[test]
 fn classify_agent_notes_returns_absent_for_implement_crash_synth_only_file() {
     // Acceptance criterion (brief): "classify_agent_notes returns
     // Absent for input that is ONLY a bellows implement-crash synth
-    // block (verifies the issue-#49 shim relocation)." After stripping
-    // the bellows synth suffix, a synth-only file has no agent-authored
-    // prose remaining — so it maps to Absent and the run routes on its
-    // actual crash signal rather than through agent-notes precedence.
+    // block (verifies the issue-#49 shim relocation)." The Bellows
+    // append site records the synth span out-of-band; after stripping
+    // that recorded span, no agent-authored prose remains.
+    let mut notes = String::new();
+    let synth_span = append_bellows_synth_entry(
+        &mut notes,
+        &synthesize_implement_crash_entry(137, "boom"),
+        BellowsSynthCause::ImplementCrash,
+    );
+    assert_eq!(
+        classify_agent_notes_with_synth_spans(Some(&notes), &[synth_span]),
+        NotesShape::Absent,
+        "synth-only file must classify as Absent so the run routes on its crash \
+         signal: {notes}",
+    );
+}
+
+#[test]
+fn classify_agent_notes_without_provenance_treats_implement_crash_synth_text_as_informational() {
+    // ADR-0006: the HTML comment in the synth entry is not trusted for
+    // routing. Without the recorded span, the text is just note content.
     let synth_only = synthesize_implement_crash_entry(137, "boom");
     assert_eq!(
         classify_agent_notes(Some(&synth_only)),
-        NotesShape::Absent,
-        "synth-only file must classify as Absent so the run routes on its crash \
-         signal: {synth_only}",
+        NotesShape::InformationalOnly,
+        "unprovenanced marker text must not be stripped from routing: {synth_only}",
     );
 }
 
 #[test]
-fn strip_bellows_synth_suffix_is_identity_when_no_marker_present() {
-    // Acceptance criterion (brief): "strip_bellows_synth_suffix returns
-    // the input unchanged when no `<!-- bellows ` marker is present."
-    let text = "Just an agent-authored note.\nNo bellows synth here.\n";
-    assert_eq!(strip_bellows_synth_suffix(text), text);
-}
-
-#[test]
-fn strip_bellows_synth_suffix_truncates_at_first_marker() {
-    // Acceptance criterion (brief): "truncates at the first marker
-    // when present (verified with agent-prefix + crash-synth
-    // concatenation)." The agent/synth partition contract: synth is
-    // always APPENDED (never interleaved), so truncating at the first
-    // marker is the reliable split.
+fn classify_agent_notes_strips_recorded_synth_span_without_searching_marker_text() {
     let agent_prefix = "Note: this is the agent's own prose.\n";
-    let crash_synth = synthesize_implement_crash_entry(1, "boom");
-    let concatenated = format!("{agent_prefix}{crash_synth}");
-    let stripped = strip_bellows_synth_suffix(&concatenated);
-    assert!(
-        stripped.starts_with(agent_prefix),
-        "strip must preserve the agent-authored prefix verbatim: stripped={stripped:?}",
+    let mut notes = agent_prefix.to_string();
+    let synth_span = append_bellows_synth_entry(
+        &mut notes,
+        &synthesize_implement_crash_entry(1, "boom"),
+        BellowsSynthCause::ImplementCrash,
     );
-    assert!(
-        !stripped.contains("<!-- bellows "),
-        "strip must remove the bellows synth marker and everything after: {stripped:?}",
-    );
-    assert!(
-        !stripped.contains("Implement phase crashed"),
-        "strip must remove the bellows synth body: {stripped:?}",
-    );
-    assert!(
-        stripped.trim_end().ends_with("agent's own prose."),
-        "stripped output must end at (or just after) the agent prefix: {stripped:?}",
+    assert_eq!(
+        classify_agent_notes_with_synth_spans(Some(&notes), &[synth_span]),
+        NotesShape::InformationalOnly,
+        "recorded Bellows synth span should be removed while preserving agent prose: {notes}",
     );
 }
 
@@ -2389,18 +2404,23 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
     // Acceptance criterion (brief): "The pre-existing issue-#49 test
     // scenarios (implement crash synthesised + non-zero implement exit)
     // still classify as Crash; the test is updated to feed the bellows
-    // synth output through classify_agent_notes rather than passing
-    // `true` directly. The previous `synth_suppresses_notes` shim in
-    // classify_exit is removed."
+    // synth output and recorded span through classify_agent_notes
+    // rather than passing `true` directly. The previous
+    // `synth_suppresses_notes` shim in classify_exit is removed."
     //
     // End-to-end shape: bellows writes the synth on a crash, the runner
     // reads agent-notes.md, passes the raw content to
-    // classify_agent_notes, which returns Absent because the file is
-    // only synth (stripped to nothing). With Absent + non-zero implement
-    // exit, classify_exit routes to Crash on its own — no per-call
-    // suppression shim required.
-    let synth_only = synthesize_implement_crash_entry(137, "boom");
-    let shape = classify_agent_notes(Some(&synth_only));
+    // classify_agent_notes_with_synth_spans, which returns Absent
+    // because the file is only a recorded synth span (stripped to
+    // nothing). With Absent + non-zero implement exit, classify_exit
+    // routes to Crash on its own — no per-call suppression shim required.
+    let mut synth_only = String::new();
+    let synth_span = append_bellows_synth_entry(
+        &mut synth_only,
+        &synthesize_implement_crash_entry(137, "boom"),
+        BellowsSynthCause::ImplementCrash,
+    );
+    let shape = classify_agent_notes_with_synth_spans(Some(&synth_only), &[synth_span]);
     assert_eq!(
         shape,
         NotesShape::Absent,

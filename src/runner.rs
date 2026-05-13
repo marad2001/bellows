@@ -571,6 +571,7 @@ pub async fn run_once(
     let mut budget = WallClockBudget::new(Duration::from_secs(
         config.agent.wall_clock_minutes.get() * 60,
     ));
+    let mut agent_note_synth_spans = Vec::new();
 
     // Pre-implement chain walk (issue #82). Picks the engine for the
     // implement phase from `config.phases.implement.cli_chain` under
@@ -816,13 +817,16 @@ pub async fn run_once(
             String::new()
         };
         let mut new_notes = existing;
-        if !new_notes.is_empty() && !new_notes.ends_with('\n') {
-            new_notes.push('\n');
-        }
-        new_notes.push_str(&policy::synthesize_implement_crash_entry(
+        let synth_entry = policy::synthesize_implement_crash_entry(
             implement_agent_run.exit_code,
             &implement_agent_run.stderr_tail,
-        ));
+        );
+        let synth_span = policy::append_bellows_synth_entry(
+            &mut new_notes,
+            &synth_entry,
+            policy::BellowsSynthCause::ImplementCrash,
+        );
+        agent_note_synth_spans.push(synth_span);
         tokio::fs::write(&notes_path, new_notes).await?;
         // Bellows-write-then-bellows-commit with no intervening agent
         // invocation, so HEAD cannot have advanced under an agent
@@ -923,10 +927,13 @@ pub async fn run_once(
                 String::new()
             };
             let mut new_notes = existing;
-            if !new_notes.is_empty() && !new_notes.ends_with('\n') {
-                new_notes.push('\n');
-            }
-            new_notes.push_str(&policy::synthesize_no_new_tests_entry());
+            let synth_entry = policy::synthesize_no_new_tests_entry();
+            let synth_span = policy::append_bellows_synth_entry(
+                &mut new_notes,
+                &synth_entry,
+                policy::BellowsSynthCause::WeakTestGuard,
+            );
+            agent_note_synth_spans.push(synth_span);
             tokio::fs::write(&notes_path, new_notes).await?;
             // Issue #52 asymmetry audit: this site looks like the
             // nit-batch shape but does NOT need
@@ -1404,10 +1411,12 @@ pub async fn run_once(
                 );
                 let synth = policy::synthesize_unaddressed_entries(&violations);
                 let mut new_notes = notes_text.clone();
-                if !new_notes.ends_with('\n') && !new_notes.is_empty() {
-                    new_notes.push('\n');
-                }
-                new_notes.push_str(&synth);
+                let synth_span = policy::append_bellows_synth_entry(
+                    &mut new_notes,
+                    &synth,
+                    policy::BellowsSynthCause::ParserBackstop,
+                );
+                agent_note_synth_spans.push(synth_span);
                 tokio::fs::write(&notes_path, new_notes).await?;
                 // Issue #52 asymmetry audit: like the weak-test-guard
                 // synth above, this site is bellows-write-then-bellows-
@@ -1699,6 +1708,11 @@ pub async fn run_once(
     // after `open_pr` (replaces the pre-#85 affordance of the file
     // sitting in the PR's diff).
     let agent_notes = capture_and_remove_agent_notes(&workspace).await?;
+    let agent_notes_display = agent_notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|notes| !notes.is_empty())
+        .map(str::to_string);
     let head_before_ephemeral_cleanup = workspace::head_sha(&workspace).await?;
     let _ = workspace::commit_all_and_push_if_advanced(
         &workspace,
@@ -1721,13 +1735,15 @@ pub async fn run_once(
         backstop_violations,
         implement_crash_synthesised,
     };
-    // ADR-0006 / issue #95: feed the raw agent-notes content through
-    // `classify_agent_notes` so the classifier can distinguish
-    // informational notes (SuccessWithNotes) from structured escalation
-    // (AgentSelfReportedFailure) from a synth-only file
-    // (Absent → routes on the actual phase signal, e.g. issue-#49 Crash).
+    // ADR-0006 / issue #95: feed agent-notes content plus the
+    // out-of-band Bellows synth spans through note classification.
+    // HTML comments in the workspace file are human-readable only;
+    // routing strips only spans recorded at Bellows append sites.
     let pipeline_reason = policy::classify_exit(
-        policy::classify_agent_notes(agent_notes.as_deref()),
+        policy::classify_agent_notes_with_synth_spans(
+            agent_notes.as_deref(),
+            &agent_note_synth_spans,
+        ),
         &outcomes,
     );
 
@@ -1805,7 +1821,7 @@ pub async fn run_once(
         &reason,
         claimed.number,
         claude_pr_body.as_deref(),
-        agent_notes.as_deref(),
+        agent_notes_display.as_deref(),
     );
 
     let pr = workspace::open_pr(
@@ -1840,7 +1856,7 @@ pub async fn run_once(
         &owner,
         &repo,
         pr.number,
-        agent_notes.as_deref(),
+        agent_notes_display.as_deref(),
     )
     .await?;
 
@@ -2406,7 +2422,7 @@ impl WallClockBudget {
 }
 
 /// Issue #85: read `agent-notes.md` from the workspace (if present)
-/// and remove the file from disk in a single step. Returns the trimmed
+/// and remove the file from disk in a single step. Returns the raw
 /// content, or `None` if the file did not exist.
 ///
 /// Pipeline phases (implement, weak-test guard, review-fix's per-finding
@@ -2433,7 +2449,7 @@ pub async fn capture_and_remove_agent_notes(
         Err(e) => return Err(e),
     };
     tokio::fs::remove_file(&path).await?;
-    Ok(Some(raw.trim().to_string()))
+    Ok(Some(raw))
 }
 
 /// Issue #85: post the agent's self-flag content as a separate
@@ -3219,18 +3235,23 @@ mod tests {
         // with no commits) and a non-zero implement exit must route
         // through `classify_exit` to `Crash`. The synth wrote
         // agent-notes.md and committed it; per ADR-0006 / issue #95
-        // that content now flows through `classify_agent_notes` which
-        // recognises the synth-only file as `NotesShape::Absent`
-        // (after the synth-suffix strip nothing agent-authored
-        // remains). Routing then falls through to Crash on the non-
-        // zero implement exit — no per-call `synth_suppresses_notes`
-        // shim needed. The resulting PR body must be the Crash body
+        // that content now flows through note classification with the
+        // recorded Bellows synth span, which recognises the synth-only
+        // file as `NotesShape::Absent`. Routing then falls through to
+        // Crash on the non-zero implement exit — no per-call
+        // `synth_suppresses_notes` shim needed. The resulting PR body
+        // must be the Crash body
         // (`crashed`), NOT the AgentSelfReportedFailure body which
         // would quote the bellows-synthesised note as if the agent
         // had self-reported.
-        let synth_note = policy::synthesize_implement_crash_entry(
-            137,
-            "Error: /workspace/entrypoint-user: bad interpreter",
+        let mut synth_note = String::new();
+        let synth_span = policy::append_bellows_synth_entry(
+            &mut synth_note,
+            &policy::synthesize_implement_crash_entry(
+                137,
+                "Error: /workspace/entrypoint-user: bad interpreter",
+            ),
+            policy::BellowsSynthCause::ImplementCrash,
         );
         let outcomes = PhaseOutcomes {
             implement: ImplementOutcome {
@@ -3247,7 +3268,8 @@ mod tests {
             security: None,
             security_fix: None,
         };
-        let notes_shape = policy::classify_agent_notes(Some(&synth_note));
+        let notes_shape =
+            policy::classify_agent_notes_with_synth_spans(Some(&synth_note), &[synth_span]);
         assert_eq!(
             notes_shape,
             policy::NotesShape::Absent,
