@@ -69,7 +69,7 @@ Write `/workspace/.bellows-triage-verdict.json`:
   "category": "bug" | "enhancement",
   "state": "needs-info" | "ready-for-agent" | "ready-for-human" | "wontfix",
   "reasoning": "short prose: why this verdict",
-  "comment_body": "comment posted on the issue (bellows prepends the AI-disclaimer line)",
+  "comment_body": "1-2 sentence routing note posted on the issue (bellows prepends the AI-disclaimer); point to the questions, brief, or precedent",
   "agent_brief": "REQUIRED iff state=ready-for-agent; `## Agent Brief` per the skill template",
   "human_brief": "REQUIRED iff state=ready-for-human; `## Human Brief` per the skill template",
   "out_of_scope_filename": "REQUIRED iff state=wontfix AND category=enhancement; slug filename, e.g. \"auto-rerun.md\"",
@@ -79,6 +79,11 @@ Write `/workspace/.bellows-triage-verdict.json`:
 ```
 
 Fields not relevant to the chosen state MUST be absent (not present with `null` or empty strings). Bellows rejects mismatches, leaving the issue untouched.
+
+`comment_body` is only the top-level issue comment. Keep it to a 1-2 sentence pointer to the follow-up questions, `agent_brief`, `human_brief`, or out-of-scope precedent. Do not duplicate `agent_brief` or `human_brief` content there.
+
+Good comment_body: "Routing this to an agent. See `agent_brief` for the implementation contract."
+Bad comment_body: ## Agent Brief ...full brief pasted here...
 
 When unsure, default to `needs-info` — the skill explains why.
 
