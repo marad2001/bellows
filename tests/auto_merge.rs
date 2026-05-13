@@ -222,6 +222,29 @@ fn auto_merge_workflow_filters_fork_prs_by_head_repo_equality() {
 }
 
 #[test]
+fn auto_merge_workflow_filters_prs_labelled_agent_noted_per_adr_0006() {
+    let body = read_workflow();
+    // ADR-0006 acceptance criterion: a PR carrying the canonical
+    // `agent-noted` label MUST NOT auto-merge — the operator has been
+    // asked to read the agent's informational note before merging.
+    // The workflow's filter block sits alongside the existing draft /
+    // head.ref / fork-repo / state / base-branch filters and inspects
+    // `pr.labels` for the literal `agent-noted` string before the
+    // merge call. The block's comment must cite ADR-0006 so a future
+    // reader knows why the filter exists.
+    //
+    // Pin both the load-bearing literals (`labels`, `agent-noted`) and
+    // the ADR-0006 citation. A future drive-by edit that drops the
+    // filter — or the citation that explains why the filter exists —
+    // flips this test red.
+    assert_contains_all(
+        &body,
+        &["labels", "agent-noted", "ADR-0006"],
+        "filter / agent-noted label per ADR-0006",
+    );
+}
+
+#[test]
 fn auto_merge_workflow_filters_drafts_open_and_default_branch() {
     let body = read_workflow();
     // Brief acceptance criteria, three filters:
