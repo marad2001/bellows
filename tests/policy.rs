@@ -1,13 +1,13 @@
 use bellows::policy::{
-    build_violation_callout, classify_exit, compute_coverage_violations, diff_contains_rs_files,
-    has_new_tests, is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections,
-    parse_findings, per_finding_kickoff, render_kickoff, synthesize_implement_crash_entry,
-    synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection,
-    AnalysisOutcome, CheckResult, ExitReason, FindingCoverage, FixOutcome, GateOutcome,
-    ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome, Severity,
-    BATCH_REVIEW_FIX_NIT_PROMPT, NO_NEW_TESTS_FINDING_TITLE, REVIEW_COMMIT_LOG_FILE,
-    REVIEW_FIX_PROMPT, REVIEW_PROMPT, SECURITY_FINDINGS_FILE, SECURITY_FIX_PROMPT,
-    SECURITY_REVIEW_PROMPT,
+    build_violation_callout, classify_agent_notes, classify_exit, compute_coverage_violations,
+    diff_contains_rs_files, has_new_tests, is_auth_error_signature, is_rate_limit_signature,
+    parse_agent_notes_sections, parse_findings, per_finding_kickoff, render_kickoff,
+    strip_bellows_synth_suffix, synthesize_implement_crash_entry, synthesize_no_new_tests_entry,
+    synthesize_unaddressed_entries, AgentNoteSection, AnalysisOutcome, CheckResult, ExitReason,
+    FindingCoverage, FixOutcome, GateOutcome, ImplementOutcome, NotesShape, ParsedFinding,
+    PhaseOutcomes, ReviewOutcome, Severity, BATCH_REVIEW_FIX_NIT_PROMPT,
+    NO_NEW_TESTS_FINDING_TITLE, REVIEW_COMMIT_LOG_FILE, REVIEW_FIX_PROMPT, REVIEW_PROMPT,
+    SECURITY_FINDINGS_FILE, SECURITY_FIX_PROMPT, SECURITY_REVIEW_PROMPT,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -2101,4 +2101,132 @@ diff --git a/docs/rs-notes.md b/docs/rs-notes.md
         !diff_contains_rs_files(diff),
         "path containing `.rs` substring but ending in `.md` must NOT count: {diff}"
     );
+}
+
+// ---- Issue #95 / ADR-0006: NotesShape + classify_agent_notes ----
+
+#[test]
+fn classify_agent_notes_returns_absent_when_input_is_none() {
+    // Acceptance criterion (brief): "classify_agent_notes(None) returns Absent."
+    // No agent-notes.md on disk means no agent voice in the run — classification
+    // must route on phase signals alone.
+    assert_eq!(classify_agent_notes(None), NotesShape::Absent);
+}
+
+#[test]
+fn classify_agent_notes_returns_absent_for_empty_and_whitespace_only_input() {
+    // Acceptance criterion (brief): "Some(\"\") and whitespace-only input
+    // return Absent." A zero-byte file is indistinguishable from the
+    // file-missing case; ditto a file containing only newlines / spaces.
+    assert_eq!(classify_agent_notes(Some("")), NotesShape::Absent);
+    assert_eq!(classify_agent_notes(Some("   \n\n\t \n")), NotesShape::Absent);
+}
+
+#[test]
+fn classify_agent_notes_returns_has_unaddressed_finding_for_agent_authored_escalation_heading() {
+    // Acceptance criterion (brief): "classify_agent_notes returns
+    // HasUnaddressedFinding for raw text containing at least one
+    // `## Unaddressed finding:` heading." Agent-authored escalation
+    // path; the existing slice-9.6 contract still wins.
+    let text = "## Unaddressed finding: cannot mock external API\n\nI lacked credentials.\n";
+    assert_eq!(
+        classify_agent_notes(Some(text)),
+        NotesShape::HasUnaddressedFinding,
+    );
+}
+
+#[test]
+fn classify_agent_notes_returns_has_unaddressed_finding_for_bellows_synth_escalation() {
+    // Acceptance criterion (brief): "classify_agent_notes returns
+    // HasUnaddressedFinding for raw text containing at least one
+    // `## Unaddressed finding:` heading (agent-authored or bellows-
+    // synthesised — both the weak-test guard and parser-as-backstop
+    // synth outputs route through HasUnaddressedFinding)."
+    let weak_test = synthesize_no_new_tests_entry();
+    assert_eq!(
+        classify_agent_notes(Some(&weak_test)),
+        NotesShape::HasUnaddressedFinding,
+        "weak-test guard synth must classify as HasUnaddressedFinding: {weak_test}",
+    );
+
+    let backstop = synthesize_unaddressed_entries(&[ParsedFinding {
+        title: "silently skipped finding".to_string(),
+        severity: Severity::Blocker,
+        body: "body".to_string(),
+    }]);
+    assert_eq!(
+        classify_agent_notes(Some(&backstop)),
+        NotesShape::HasUnaddressedFinding,
+        "parser-as-backstop synth must classify as HasUnaddressedFinding: {backstop}",
+    );
+}
+
+#[test]
+fn classify_agent_notes_returns_informational_only_for_agent_authored_prose_without_heading() {
+    // Acceptance criterion (brief): "classify_agent_notes returns
+    // InformationalOnly for agent-authored prose with no `## Unaddressed
+    // finding:` heading." The new ADR-0006 informational channel: the
+    // agent wants to flag a TDD exception / trade-off but is NOT
+    // self-reporting failure.
+    let prose = "Note: the absence-of-resource AC cannot be driven test-first;\n\
+                 there is nothing to assert about a resource that does not exist.\n";
+    assert_eq!(
+        classify_agent_notes(Some(prose)),
+        NotesShape::InformationalOnly,
+    );
+}
+
+#[test]
+fn classify_agent_notes_returns_absent_for_implement_crash_synth_only_file() {
+    // Acceptance criterion (brief): "classify_agent_notes returns
+    // Absent for input that is ONLY a bellows implement-crash synth
+    // block (verifies the issue-#49 shim relocation)." After stripping
+    // the bellows synth suffix, a synth-only file has no agent-authored
+    // prose remaining — so it maps to Absent and the run routes on its
+    // actual crash signal rather than through agent-notes precedence.
+    let synth_only = synthesize_implement_crash_entry(137, "boom");
+    assert_eq!(
+        classify_agent_notes(Some(&synth_only)),
+        NotesShape::Absent,
+        "synth-only file must classify as Absent so the run routes on its crash \
+         signal: {synth_only}",
+    );
+}
+
+#[test]
+fn strip_bellows_synth_suffix_is_identity_when_no_marker_present() {
+    // Acceptance criterion (brief): "strip_bellows_synth_suffix returns
+    // the input unchanged when no `<!-- bellows ` marker is present."
+    let text = "Just an agent-authored note.\nNo bellows synth here.\n";
+    assert_eq!(strip_bellows_synth_suffix(text), text);
+}
+
+#[test]
+fn strip_bellows_synth_suffix_truncates_at_first_marker() {
+    // Acceptance criterion (brief): "truncates at the first marker
+    // when present (verified with agent-prefix + crash-synth
+    // concatenation)." The agent/synth partition contract: synth is
+    // always APPENDED (never interleaved), so truncating at the first
+    // marker is the reliable split.
+    let agent_prefix = "Note: this is the agent's own prose.\n";
+    let crash_synth = synthesize_implement_crash_entry(1, "boom");
+    let concatenated = format!("{agent_prefix}{crash_synth}");
+    assert_eq!(
+        strip_bellows_synth_suffix(&concatenated),
+        agent_prefix,
+        "strip must return the agent-authored prefix verbatim: {concatenated}",
+    );
+}
+
+#[test]
+fn notes_shape_variants_are_distinct_and_match_brief() {
+    // Acceptance criterion (brief): "NotesShape enum exists with Absent,
+    // InformationalOnly, HasUnaddressedFinding variants." Smoke-test
+    // that all three variants exist and are mutually distinct.
+    let absent: NotesShape = NotesShape::Absent;
+    let info: NotesShape = NotesShape::InformationalOnly;
+    let escal: NotesShape = NotesShape::HasUnaddressedFinding;
+    assert_ne!(absent, info);
+    assert_ne!(info, escal);
+    assert_ne!(absent, escal);
 }
