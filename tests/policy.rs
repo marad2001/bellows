@@ -2231,6 +2231,196 @@ fn strip_bellows_synth_suffix_truncates_at_first_marker() {
 }
 
 #[test]
+fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardless_of_phases() {
+    // Acceptance criterion (brief): "classify_exit routes
+    // HasUnaddressedFinding → AgentSelfReportedFailure regardless of
+    // phase outcomes (structured escalation wins)." Even with a clean
+    // implement exit AND a green gate, an `## Unaddressed finding:`
+    // section forces the AgentSelfReportedFailure outcome.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes),
+        ExitReason::AgentSelfReportedFailure,
+        "HasUnaddressedFinding must beat green-phase signals (escalation wins)",
+    );
+}
+
+#[test]
+fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_notes() {
+    // Acceptance criterion (brief): "classify_exit routes InformationalOnly
+    // + all phases clean → SuccessWithNotes." The new ADR-0006
+    // informational channel: the agent left a freeform note that should
+    // stop silent auto-merge but should NOT route to
+    // AgentSelfReportedFailure.
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        }),
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        ExitReason::SuccessWithNotes,
+    );
+}
+
+#[test]
+fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_failed() {
+    // Acceptance criterion (brief): "classify_exit prefers FinalTestsRed
+    // over SuccessWithNotes when a gate failed AND informational content
+    // present (test failure is the more actionable headline)."
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(1)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        ExitReason::FinalTestsRed,
+        "a failing gate must beat an informational note — broken tests are the \
+         more actionable headline for an operator",
+    );
+}
+
+#[test]
+fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_zero() {
+    // Acceptance criterion (brief): "classify_exit prefers Crash over
+    // SuccessWithNotes when implement exit is non-zero AND informational
+    // content present."
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 1, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        ExitReason::Crash,
+        "a non-zero implement exit must beat an informational note",
+    );
+}
+
+#[test]
+fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
+    // ADR-0006: Absent maps to Success when phases are clean — the
+    // baseline routing path. Pins the AC that Absent does NOT trigger
+    // SuccessWithNotes (only InformationalOnly does).
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        post_implement_gate: GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        },
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: Some(GateOutcome {
+            cargo_clippy: Some(check(0)),
+            cargo_test: Some(check(0)),
+        }),
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        implement_crash_synthesised: false,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(NotesShape::Absent, &outcomes),
+        ExitReason::Success,
+    );
+}
+
+#[test]
+fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes() {
+    // Acceptance criterion (brief): "The pre-existing issue-#49 test
+    // scenarios (implement crash synthesised + non-zero implement exit)
+    // still classify as Crash; the test is updated to feed the bellows
+    // synth output through classify_agent_notes rather than passing
+    // `true` directly. The previous `synth_suppresses_notes` shim in
+    // classify_exit is removed."
+    //
+    // End-to-end shape: bellows writes the synth on a crash, the runner
+    // reads agent-notes.md, passes the raw content to
+    // classify_agent_notes, which returns Absent because the file is
+    // only synth (stripped to nothing). With Absent + non-zero implement
+    // exit, classify_exit routes to Crash on its own — no per-call
+    // suppression shim required.
+    let synth_only = synthesize_implement_crash_entry(137, "boom");
+    let shape = classify_agent_notes(Some(&synth_only));
+    assert_eq!(
+        shape,
+        NotesShape::Absent,
+        "synth-only notes must classify to Absent so the routing falls through",
+    );
+    let outcomes = PhaseOutcomes {
+        implement: ImplementOutcome {
+            exit_code: 137,
+            stderr_tail: "Error: bad interpreter".to_string(),
+        },
+        post_implement_gate: GateOutcome::default(),
+        review: None,
+        review_fix: None,
+        end_pipeline_gate: None,
+        wall_clock_exceeded: false,
+        backstop_violations: Vec::new(),
+        // The runner still sets implement_crash_synthesised for the
+        // benefit of other downstream code, but classify_exit no longer
+        // needs to special-case it. The Absent shape carries the
+        // routing decision on its own.
+        implement_crash_synthesised: true,
+        security: None,
+        security_fix: None,
+    };
+    assert_eq!(
+        classify_exit(shape, &outcomes),
+        ExitReason::Crash,
+        "synth-only notes + non-zero implement exit must route to Crash without \
+         the per-call synth_suppresses_notes shim",
+    );
+}
+
+#[test]
 fn notes_shape_variants_are_distinct_and_match_brief() {
     // Acceptance criterion (brief): "NotesShape enum exists with Absent,
     // InformationalOnly, HasUnaddressedFinding variants." Smoke-test
