@@ -1445,7 +1445,21 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          - For each acceptance criterion in the brief, produce TWO commits in order: first a **failing-test commit** that adds the test(s) and would fail against the unchanged source, then a **make-it-pass commit** that changes the source so those tests pass.\n\
          - One failing-test commit then one make-it-pass commit, per acceptance criterion. Do NOT bundle tests and source into a single mega-commit. Do NOT land source-file changes before their corresponding tests.\n\
          - It is fine to add small refactors as separate follow-up commits after the make-it-pass commit. The constraint is on test-vs-source ordering, not on commit count overall.\n\
-         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), call that out in `agent-notes.md` rather than silently bundling tests and source.\n\
+         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `agent-notes.md` per the channel rules below rather than silently bundling tests and source.\n\
+         \n\
+         ## agent-notes.md channels (informational vs escalation)\n\
+         \n\
+         `agent-notes.md` has exactly two channels, and the classifier routes the PR based on which one you used. Pick deliberately:\n\
+         \n\
+         - **Informational channel** — the file exists but has *no* `## Unaddressed finding:` heading. Use this for freeform observations you want a human reviewer to see (e.g. \"I deviated from strict test-first on AC4 because it was a pure-prompt-text change with no observable behaviour\"). The classifier returns `SuccessWithNotes`, Bellows opens a normal (non-draft) PR labelled `agent-noted`, and the run still counts as a green stop.\n\
+         - **Escalation channel** — the file contains a `## Unaddressed finding: <AC title>` heading naming the unsatisfied acceptance criterion, with body text describing what you tried and why you stopped. The classifier returns `AgentSelfReportedFailure`, Bellows opens a *draft* PR labelled `agent-failed`, and a human is expected to take over.\n\
+         \n\
+         The TDD exceptions explicitly fit the **informational** channel, not the escalation one:\n\
+         \n\
+         - **absence-of-resource ACs** — acceptance criteria that assert the *absence* of something (a file that must not exist, a label that must not be applied, a code path that must not be reached). These are often hard to drive test-first because the natural test is \"nothing happened\", which can pass against unchanged source by accident. Note the deviation in the informational channel.\n\
+         - **pure-prompt-text ACs** — acceptance criteria that only change human-readable prompt text with no observable behavioural change. The same logic applies: note the deviation in the informational channel.\n\
+         \n\
+         Do NOT use the escalation channel for these. The escalation channel means \"I could not satisfy an AC and a human needs to decide\"; the informational channel means \"the AC is satisfied but I want to flag context\".\n\
          \n\
          ## Stop conditions\n\
          \n\
