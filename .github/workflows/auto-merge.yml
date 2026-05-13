@@ -105,6 +105,19 @@ jobs:
                 core.info(`Skipping PR #${pr.number}: draft.`);
                 continue;
               }
+              // Filter: PRs labelled `agent-noted` are NOT auto-merged.
+              // Per ADR-0006, a `SuccessWithNotes` run carries an
+              // informational `agent-notes.md` entry the operator must
+              // read before merge. Bellows opens those PRs non-draft
+              // with the `agent-noted` label so CI still runs, but
+              // this filter short-circuits the auto-merge step so a
+              // human clicks merge after reading the note.
+              if (pr.labels && pr.labels.some(l => l.name === 'agent-noted')) {
+                core.info(`Skipping PR #${pr.number}: labelled ` +
+                  `'agent-noted' (ADR-0006: operator must read the ` +
+                  `agent's note before merging).`);
+                continue;
+              }
               // Filter: only open PRs are candidates.
               if (pr.state !== 'open') {
                 core.info(`Skipping PR #${pr.number}: state "${pr.state}".`);

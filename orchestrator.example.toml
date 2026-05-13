@@ -61,6 +61,7 @@ pickup_label = "ready-for-agent"
 # Strings Bellows applies during a run. Defaults match these names verbatim.
 agent_in_progress = "agent-in-progress"
 agent_done        = "agent-done"
+agent_noted       = "agent-noted"
 agent_failed      = "agent-failed"
 agent_rate_limited = "agent-rate-limited"
 agent_cancelled   = "agent-cancelled"

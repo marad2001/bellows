@@ -713,6 +713,22 @@ pub async fn post_pr_comment(
     Ok(())
 }
 
+/// Add labels to an issue or PR without replacing its existing label set.
+/// Pull requests share GitHub's issue-labels API; the runner uses this
+/// for ADR-0006 `agent-noted` PR labels so the auto-merge workflow can
+/// observe the note gate on the PR object itself.
+pub async fn add_issue_labels(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    labels: &[&str],
+) -> Result<Vec<Label>, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}/labels");
+    let payload = serde_json::json!({ "labels": labels });
+    client.post(&route, Some(&payload)).await
+}
+
 pub async fn claim(
     client: &octocrab::Octocrab,
     owner: &str,
