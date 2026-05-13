@@ -127,3 +127,19 @@ fn workspace_trust_section_warns_against_silent_refusal() {
         "Workspace trust clause must instruct the agent NOT to silently refuse brief-directed edits: {section}",
     );
 }
+
+#[test]
+fn workspace_trust_section_warns_against_quoting_secret_values() {
+    // Security review: `agent-notes.md` is committed and surfaced in
+    // PR comments, so the escalation path must preserve useful context
+    // without re-publishing a credential or secret value.
+    let body = read_policy_image_claude_md();
+    let section = workspace_trust_section(&body);
+    let lower = section.to_lowercase();
+    assert!(
+        lower.contains("without quoting")
+            && (lower.contains("credential") || lower.contains("secret")),
+        "Workspace trust clause must tell agents to describe sensitive findings without quoting \
+         credential or secret values into public agent notes: {section}",
+    );
+}
