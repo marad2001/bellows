@@ -2434,6 +2434,68 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
 }
 
 #[test]
+fn rendered_kickoff_teaches_informational_vs_escalation_agent_notes_channels() {
+    // Acceptance criterion (brief): "render_kickoff output explicitly
+    // teaches the informational-vs-escalation binary; mentions both
+    // `## Unaddressed finding:` (escalation) and explicitly the
+    // absence-of-heading (informational) shapes; mentions TDD
+    // exceptions (absence-of-resource, pure-prompt-text) as fitting
+    // the informational channel."
+    let prompt = render_kickoff("any brief", "https://github.com/owner/repo", "agent/95-x");
+
+    // Escalation channel: the structured `## Unaddressed finding:`
+    // heading shape must be present and named as escalation.
+    assert!(
+        prompt.contains("## Unaddressed finding:"),
+        "kickoff must name the `## Unaddressed finding:` heading as the escalation \
+         marker so the agent knows the exact shape that routes to \
+         AgentSelfReportedFailure: {prompt}",
+    );
+    assert!(
+        prompt.to_lowercase().contains("escalation"),
+        "kickoff must use the word 'escalation' to label the structured-failure \
+         channel so the binary is explicit: {prompt}",
+    );
+
+    // Informational channel: must be explicitly identified as the
+    // no-heading shape.
+    assert!(
+        prompt.to_lowercase().contains("informational"),
+        "kickoff must use the word 'informational' to label the freeform-note \
+         channel: {prompt}",
+    );
+
+    // TDD-exception examples called out as fitting the informational
+    // channel.
+    assert!(
+        prompt.to_lowercase().contains("absence-of-resource")
+            || prompt.to_lowercase().contains("absence of resource"),
+        "kickoff must call out absence-of-resource ACs as fitting the \
+         informational channel: {prompt}",
+    );
+    assert!(
+        prompt.to_lowercase().contains("pure-prompt-text")
+            || prompt.to_lowercase().contains("pure prompt text")
+            || prompt.to_lowercase().contains("pure-prompt text"),
+        "kickoff must call out pure-prompt-text ACs as fitting the informational \
+         channel: {prompt}",
+    );
+
+    // Labels: the escalation channel maps to `agent-failed` and a
+    // draft PR; the informational channel opens a noted PR labelled
+    // `agent-noted`. The agent needs to know that to write a useful
+    // note in the right shape.
+    assert!(
+        prompt.contains("agent-failed"),
+        "kickoff must name the `agent-failed` label as the escalation outcome: {prompt}",
+    );
+    assert!(
+        prompt.contains("agent-noted"),
+        "kickoff must name the `agent-noted` label as the informational outcome: {prompt}",
+    );
+}
+
+#[test]
 fn notes_shape_variants_are_distinct_and_match_brief() {
     // Acceptance criterion (brief): "NotesShape enum exists with Absent,
     // InformationalOnly, HasUnaddressedFinding variants." Smoke-test
