@@ -1071,20 +1071,17 @@ pub fn diff_contains_rs_files(diff: &str) -> bool {
             // yields the two path tokens; either should end in `.rs`
             // for a real Rust-source change (git always renders both
             // sides even for added/deleted files).
-            if rest
-                .split_whitespace()
-                .any(|tok| path_token_is_rust(tok))
-            {
+            if rest.split_whitespace().any(path_token_is_rust) {
                 return true;
             }
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
-            if path_ends_with_rs(path) {
-                return true;
-            }
-        } else if let Some(path) = line.strip_prefix("--- a/") {
-            if path_ends_with_rs(path) {
-                return true;
-            }
+        } else if let Some(path) = line.strip_prefix("+++ b/")
+            && path_ends_with_rs(path)
+        {
+            return true;
+        } else if let Some(path) = line.strip_prefix("--- a/")
+            && path_ends_with_rs(path)
+        {
+            return true;
         }
     }
     false
