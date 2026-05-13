@@ -428,18 +428,63 @@ fn triage_prompt_documents_the_verdict_json_schema_inline() {
 }
 
 #[test]
+fn triage_prompt_constrains_comment_body_to_a_short_routing_note() {
+    // Issue #64: the triage verdict's comment_body is the top-level
+    // issue comment. The detailed brief lives in agent_brief or
+    // human_brief, so the prompt must keep comment_body short and
+    // forbid duplicating those larger payloads.
+    use bellows::triage::TRIAGE_PROMPT;
+    let lower = TRIAGE_PROMPT.to_lowercase();
+    assert!(
+        lower.contains("1-2 sentence") || lower.contains("one or two sentence"),
+        "comment_body guidance must cap the issue comment at 1-2 sentences: {TRIAGE_PROMPT}"
+    );
+    assert!(
+        lower.contains("pointer") || lower.contains("point "),
+        "comment_body guidance must frame the issue comment as a pointer to the brief, \
+         questions, or precedent: {TRIAGE_PROMPT}"
+    );
+    assert!(
+        lower.contains("do not duplicate")
+            && lower.contains("agent_brief")
+            && lower.contains("human_brief"),
+        "comment_body guidance must forbid duplicating brief bodies into the top-level \
+         comment: {TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
+fn triage_prompt_includes_right_and_wrong_comment_body_examples() {
+    // Worked examples keep the prompt's abstract length rule from
+    // being misread as "paste the whole brief into comment_body".
+    use bellows::triage::TRIAGE_PROMPT;
+    assert!(
+        TRIAGE_PROMPT.contains("Good comment_body")
+            && TRIAGE_PROMPT.contains("Bad comment_body"),
+        "prompt must include right/wrong worked comment_body examples: {TRIAGE_PROMPT}"
+    );
+    assert!(
+        TRIAGE_PROMPT.contains("See `agent_brief`")
+            && TRIAGE_PROMPT.contains("## Agent Brief"),
+        "worked examples must show a short pointer instead of an embedded brief: \
+         {TRIAGE_PROMPT}"
+    );
+}
+
+#[test]
 fn triage_prompt_is_a_thin_shim_not_a_self_contained_reimplementation() {
     // The acceptance criterion: "no longer contains a self-contained
     // reimplementation of the role taxonomy, brief template, or
     // AI-disclaimer wording." Length is a proxy for that — the old
     // vendored prompt clocked in around 3,500 characters; a thin shim
     // (skill reference + JSON schema + headless override) should be
-    // materially smaller. Pin a generous upper bound so genuinely small
-    // future edits stay green but a backslide to a self-contained
-    // re-implementation surfaces.
+    // materially smaller. Issue #64 adds compact comment_body examples,
+    // so pin a generous upper bound that keeps genuinely small future
+    // edits green but still catches a backslide to a self-contained
+    // triage manual.
     use bellows::triage::TRIAGE_PROMPT;
     assert!(
-        TRIAGE_PROMPT.len() < 3_000,
+        TRIAGE_PROMPT.len() < 3_500,
         "kickoff prompt has grown back toward the old self-contained vendored prompt \
          ({} chars); the slice-#61 contract is that the role taxonomy / brief templates / \
          AI-disclaimer wording live in the baked skill, not the kickoff. Either shrink the \
