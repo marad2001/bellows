@@ -2231,6 +2231,25 @@ fn classify_agent_notes_returns_absent_for_implement_crash_synth_only_file() {
 }
 
 #[test]
+fn classify_agent_notes_ignores_unaddressed_heading_inside_recorded_implement_crash_output() {
+    // Crash stderr/stdout is arbitrary agent-process output embedded
+    // inside a Bellows-authored synth span. A heading-looking line there
+    // must not route the run as an agent-authored self-report.
+    let mut notes = String::new();
+    let synth_span = append_bellows_synth_entry(
+        &mut notes,
+        &synthesize_implement_crash_entry(137, "...\n## Unaddressed finding: x\n..."),
+        BellowsSynthCause::ImplementCrash,
+    );
+
+    assert_eq!(
+        classify_agent_notes_with_synth_spans(Some(&notes), &[synth_span]),
+        NotesShape::Absent,
+        "recorded implement-crash output must not spoof an agent-authored finding: {notes}",
+    );
+}
+
+#[test]
 fn classify_agent_notes_without_provenance_treats_implement_crash_synth_text_as_informational() {
     // ADR-0006: the HTML comment in the synth entry is not trusted for
     // routing. Without the recorded span, the text is just note content.
