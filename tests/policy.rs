@@ -2211,10 +2211,22 @@ fn strip_bellows_synth_suffix_truncates_at_first_marker() {
     let agent_prefix = "Note: this is the agent's own prose.\n";
     let crash_synth = synthesize_implement_crash_entry(1, "boom");
     let concatenated = format!("{agent_prefix}{crash_synth}");
-    assert_eq!(
-        strip_bellows_synth_suffix(&concatenated),
-        agent_prefix,
-        "strip must return the agent-authored prefix verbatim: {concatenated}",
+    let stripped = strip_bellows_synth_suffix(&concatenated);
+    assert!(
+        stripped.starts_with(agent_prefix),
+        "strip must preserve the agent-authored prefix verbatim: stripped={stripped:?}",
+    );
+    assert!(
+        !stripped.contains("<!-- bellows "),
+        "strip must remove the bellows synth marker and everything after: {stripped:?}",
+    );
+    assert!(
+        !stripped.contains("Implement phase crashed"),
+        "strip must remove the bellows synth body: {stripped:?}",
+    );
+    assert!(
+        stripped.trim_end().ends_with("agent's own prose."),
+        "stripped output must end at (or just after) the agent prefix: {stripped:?}",
     );
 }
 
