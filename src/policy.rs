@@ -37,6 +37,102 @@ pub enum ExitReason {
     Cancelled,
 }
 
+/// Post-strip classification of `agent-notes.md` content. Drives the
+/// new `classify_exit` signature (issue #95 / ADR-0006): replaces the
+/// pre-ADR-0006 bare `has_agent_notes: bool` so the classifier can
+/// distinguish the three meaningful states of the file rather than
+/// treating "any content present" as escalation.
+///
+/// The three variants:
+///
+/// - `Absent` — no agent-notes.md, an empty file, or a file whose only
+///   content is bellows-authored synth material (issue-#49
+///   implement-crash recovery). After stripping the synth suffix
+///   nothing agent-authored remains, so the run routes on phase
+///   signals as if the file did not exist.
+/// - `InformationalOnly` — the post-strip remainder is non-whitespace
+///   agent-authored prose AND contains no `## Unaddressed finding:`
+///   heading. ADR-0006's informational channel: a TDD-exception note,
+///   trade-off, or scope judgment that should stop silent auto-merge
+///   but should NOT route the run to AgentSelfReportedFailure.
+/// - `HasUnaddressedFinding` — the raw text contains at least one
+///   `## Unaddressed finding:` heading (agent-authored or bellows-
+///   synthesised via the weak-test guard or parser-as-backstop).
+///   ADR-0006's escalation channel: the existing structured-failure
+///   contract; routes to AgentSelfReportedFailure.
+///
+/// `HasUnaddressedFinding` is checked against the RAW text (before
+/// any synth-suffix stripping) so a bellows-synthesised escalation
+/// (weak-test guard / parser-as-backstop) still routes through the
+/// escalation channel. The synth-stripping only matters for telling
+/// `Absent` apart from `InformationalOnly`, where the agent-authored
+/// remainder is the deciding signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesShape {
+    Absent,
+    InformationalOnly,
+    HasUnaddressedFinding,
+}
+
+/// Truncate `input` at the first `<!-- bellows ` occurrence. Returns
+/// the unchanged input when no marker is present.
+///
+/// Agent/synth partition contract (ADR-0006): bellows synth is always
+/// APPENDED to `agent-notes.md`, never interleaved into agent-authored
+/// content. Every bellows synth block (slice-9.6 parser-as-backstop,
+/// slice-8 weak-test guard, issue-#49 implement-crash recovery)
+/// opens with an `<!-- bellows ... -->` HTML comment as its first
+/// line. Truncating at the first marker therefore returns the
+/// agent-authored prefix verbatim.
+///
+/// Note this is structural truncation, not semantic stripping: a
+/// future agent that copies a bellows-style `<!-- bellows ... -->`
+/// comment into its own prose would have everything from that point
+/// truncated. That is the deliberate trade-off — the brief calls it
+/// out as the agent/synth partition, and the alternative (per
+/// ADR-0006: structured out-of-band provenance records) is the work
+/// of a later slice. For the runtime path today this helper is only
+/// invoked by `classify_agent_notes` and only to decide between
+/// `Absent` and `InformationalOnly`; it does NOT participate in the
+/// escalation-channel routing decision (which keys on the raw text).
+pub fn strip_bellows_synth_suffix(input: &str) -> &str {
+    match input.find("<!-- bellows ") {
+        Some(idx) => &input[..idx],
+        None => input,
+    }
+}
+
+/// Decide the `NotesShape` of an `agent-notes.md` file's raw content.
+///
+/// `None` is `Absent` (file missing). For `Some(text)` the precedence
+/// is:
+///
+/// 1. `parse_agent_notes_sections(text)` non-empty → `HasUnaddressedFinding`.
+///    Note the raw text is used here: a bellows-synthesised
+///    `## Unaddressed finding:` (weak-test guard or parser-as-backstop)
+///    intentionally routes through the escalation channel just like
+///    an agent-authored heading would.
+/// 2. After `strip_bellows_synth_suffix`, the remainder is non-whitespace
+///    → `InformationalOnly`. The new ADR-0006 informational channel.
+/// 3. Otherwise → `Absent`. Covers the file-missing case, the empty
+///    file, a whitespace-only file, and the issue-#49 synth-only file
+///    (after the implement-crash entry is stripped nothing
+///    agent-authored remains).
+pub fn classify_agent_notes(input: Option<&str>) -> NotesShape {
+    let Some(text) = input else {
+        return NotesShape::Absent;
+    };
+    if !parse_agent_notes_sections(text).is_empty() {
+        return NotesShape::HasUnaddressedFinding;
+    }
+    let stripped = strip_bellows_synth_suffix(text);
+    if stripped.trim().is_empty() {
+        NotesShape::Absent
+    } else {
+        NotesShape::InformationalOnly
+    }
+}
+
 /// Outcome of the implement run: the first phase, where claude reads
 /// the agent brief and writes code.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
