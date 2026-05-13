@@ -17,6 +17,16 @@ fn read_policy_image_claude_md() -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e))
 }
 
+fn workspace_trust_section(body: &str) -> &str {
+    let (_, after_heading) = body
+        .split_once("## Workspace trust")
+        .expect("policy-image/CLAUDE.md must contain `## Workspace trust`");
+    let (section, _) = after_heading
+        .split_once("## Hard constraints")
+        .expect("`## Workspace trust` must appear before `## Hard constraints`");
+    section
+}
+
 #[test]
 fn claude_md_has_a_workspace_trust_section() {
     let body = read_policy_image_claude_md();
@@ -50,13 +60,16 @@ fn workspace_trust_section_names_workspace_as_first_party() {
     // content. "first-party" (or the equivalent "operator-authorised"
     // wording) is the load-bearing trust term.
     let body = read_policy_image_claude_md();
+    let section = workspace_trust_section(&body);
     assert!(
-        body.contains("/workspace"),
-        "Workspace trust clause must name `/workspace` literally: {body}",
+        section.contains("/workspace"),
+        "Workspace trust clause must name `/workspace` literally: {section}",
     );
     assert!(
-        body.contains("first-party") || body.contains("operator-authorised") || body.contains("operator authorises"),
-        "Workspace trust clause must establish that `/workspace` is first-party / operator-authorised: {body}",
+        section.contains("first-party")
+            || section.contains("operator-authorised")
+            || section.contains("operator authorises"),
+        "Workspace trust clause must establish that `/workspace` is first-party / operator-authorised: {section}",
     );
 }
 
@@ -65,9 +78,18 @@ fn workspace_trust_section_scopes_the_malware_reminder() {
     // AC (a): "the malware-analysis reminder is explicitly named and
     // scoped to externally-sourced content, not `/workspace`."
     let body = read_policy_image_claude_md();
+    let section = workspace_trust_section(&body);
     assert!(
-        body.contains("malware"),
-        "Workspace trust clause must explicitly name the malware-analysis reminder: {body}",
+        section.contains("malware"),
+        "Workspace trust clause must explicitly name the malware-analysis reminder: {section}",
+    );
+    assert!(
+        section.contains("externally-sourced"),
+        "Workspace trust clause must scope the malware-analysis reminder to externally-sourced content: {section}",
+    );
+    assert!(
+        section.contains("not to `/workspace` contents"),
+        "Workspace trust clause must state that the malware-analysis reminder does not apply to `/workspace` contents: {section}",
     );
 }
 
@@ -78,14 +100,15 @@ fn workspace_trust_section_names_unaddressed_finding_escape_hatch() {
     // concerns route through bellows's existing failure channel
     // rather than silent refusal."
     let body = read_policy_image_claude_md();
+    let section = workspace_trust_section(&body);
     assert!(
-        body.contains("## Unaddressed finding:"),
+        section.contains("## Unaddressed finding:"),
         "Workspace trust clause must name the `## Unaddressed finding:` heading literally so genuine \
-         concerns route to the existing AgentSelfReportedFailure channel (ADR-0006): {body}",
+         concerns route to the existing AgentSelfReportedFailure channel (ADR-0006): {section}",
     );
     assert!(
-        body.contains("agent-notes.md"),
-        "Workspace trust clause must name `agent-notes.md` as the escalation destination: {body}",
+        section.contains("agent-notes.md"),
+        "Workspace trust clause must name `agent-notes.md` as the escalation destination: {section}",
     );
 }
 
@@ -95,11 +118,12 @@ fn workspace_trust_section_warns_against_silent_refusal() {
     // instruction that flips the witnessed failure mode (silent
     // refusal on file reads) into a routed failure.
     let body = read_policy_image_claude_md();
-    let lower = body.to_lowercase();
+    let section = workspace_trust_section(&body);
+    let lower = section.to_lowercase();
     assert!(
         lower.contains("not silently refuse")
             || lower.contains("do not refuse")
             || lower.contains("not refuse brief-directed edits"),
-        "Workspace trust clause must instruct the agent NOT to silently refuse brief-directed edits: {body}",
+        "Workspace trust clause must instruct the agent NOT to silently refuse brief-directed edits: {section}",
     );
 }
