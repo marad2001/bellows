@@ -27,6 +27,7 @@ pub struct Workspace {
     branch_name: String,
     default_branch: String,
     gate_commands: GateCommands,
+    auto_merge_workflow_supports_agent_noted_filter: bool,
 }
 
 /// ADR-0004 cargo-checks gate command snapshot, captured at
@@ -103,6 +104,21 @@ impl Workspace {
     pub fn gate_commands(&self) -> &GateCommands {
         &self.gate_commands
     }
+
+    /// ADR-0006 auto-merge filter-support snapshot. Captured at
+    /// `prepare` time by reading the target repo's
+    /// `.github/workflows/auto-merge.yml`. Returns `true` when the
+    /// target has no auto-merge workflow at all (no merge mechanism
+    /// to defeat — non-draft is safe by construction) OR when the
+    /// workflow file exists and its content contains the literal
+    /// `agent-noted` string (the filter is present). Returns `false`
+    /// when the file exists but does NOT mention `agent-noted` (the
+    /// runner must fall back to opening `SuccessWithNotes` PRs draft
+    /// so a silent auto-merge cannot bypass the operator's
+    /// read-the-note step).
+    pub fn auto_merge_workflow_supports_agent_noted_filter(&self) -> bool {
+        self.auto_merge_workflow_supports_agent_noted_filter
+    }
 }
 
 pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, WorkspaceError> {
@@ -164,12 +180,53 @@ pub async fn prepare_with_gates(
     let extracted = parse_ci_workflow(path);
     let gate_commands = materialise_gate_commands(extracted, gates);
 
+    // ADR-0006 snapshot: read `.github/workflows/auto-merge.yml` and
+    // record whether the target's workflow already carries the
+    // `agent-noted` filter. The runner reads this flag when deciding
+    // whether to open a `SuccessWithNotes` PR non-draft or fall back
+    // to draft. See `detect_auto_merge_filter_support` for the
+    // file-missing / file-present / I/O-error contract.
+    let auto_merge_workflow_supports_agent_noted_filter =
+        detect_auto_merge_filter_support(path);
+
     Ok(Workspace {
         temp_dir,
         branch_name: branch_name.to_string(),
         default_branch,
         gate_commands,
+        auto_merge_workflow_supports_agent_noted_filter,
     })
+}
+
+/// Read the target repo's `.github/workflows/auto-merge.yml` at
+/// `prepare` time and decide whether the `agent-noted` filter is
+/// present. Verbatim substring check rather than a structural YAML
+/// parse — a future operator using YAML templating that injects the
+/// label string indirectly would produce a false negative, which is
+/// the acceptable failure direction (the runner opens draft as the
+/// safe fallback).
+///
+/// Contract:
+///   * File missing (`NotFound`) → `true`: the target has no
+///     auto-merge workflow to defeat, so non-draft is safe by
+///     construction.
+///   * File present and contains the literal `agent-noted` →
+///     `true`: the filter exists.
+///   * File present and does NOT contain `agent-noted` → `false`:
+///     opening non-draft would risk silent auto-merge; the runner
+///     must fall back to draft.
+///   * Any other I/O error → `false`: safer to fall back to draft on
+///     unexpected errors than to risk a silent merge.
+fn detect_auto_merge_filter_support(repo: &Path) -> bool {
+    let path = repo
+        .join(".github")
+        .join("workflows")
+        .join("auto-merge.yml");
+    match std::fs::read_to_string(&path) {
+        Ok(body) => body.contains("agent-noted"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 /// Merge the parser output with the operator-declared fallback flags.
