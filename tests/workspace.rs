@@ -1319,6 +1319,149 @@ async fn gate_commands_announcement_lines_attribute_fallback_commands_to_config(
     );
 }
 
+// ---- ADR-0006: auto-merge.yml `agent-noted` filter-support snapshot ----
+
+fn init_remote_with_auto_merge_workflow(path: &Path, body: &str) {
+    init_remote_repo(path);
+    let dir = path.join(".github").join("workflows");
+    std::fs::create_dir_all(&dir).expect("create .github/workflows");
+    std::fs::write(dir.join("auto-merge.yml"), body).expect("write auto-merge.yml");
+    run_git(path, &["add", "."]);
+    run_git(path, &["commit", "-m", "add auto-merge workflow"]);
+}
+
+#[tokio::test]
+async fn prepare_reports_filter_supported_when_auto_merge_workflow_absent() {
+    // ADR-0006 acceptance: a target repo with NO
+    // `.github/workflows/auto-merge.yml` has no auto-merge mechanism
+    // to defeat in the first place — opening a `SuccessWithNotes` PR
+    // non-draft is safe by construction. The flag therefore reports
+    // `true` in this case so the runner does not pointlessly fall
+    // back to draft when there is no auto-merge to bypass.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/96-no-workflow")
+        .await
+        .unwrap();
+    assert!(
+        workspace.auto_merge_workflow_supports_agent_noted_filter(),
+        "absent .github/workflows/auto-merge.yml must report supported \
+         (no auto-merge to defeat; non-draft is safe)",
+    );
+}
+
+#[tokio::test]
+async fn prepare_reports_filter_supported_when_auto_merge_workflow_mentions_agent_noted() {
+    // ADR-0006 acceptance: when the target's auto-merge workflow's
+    // content contains the literal `agent-noted` string anywhere, the
+    // snapshot reports `true`. Substring check rather than structural
+    // YAML parse: a future operator using template injection that
+    // routes the label string indirectly would get a false negative,
+    // which is the acceptable failure direction (the runner opens
+    // draft as the safe fallback).
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_with_auto_merge_workflow(
+        remote_dir.path(),
+        r#"
+name: Auto-merge bellows PRs
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  auto-merge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // Filter: skip PRs labelled `agent-noted` per ADR-0006.
+            if (pr.labels && pr.labels.some(l => l.name === 'agent-noted')) {
+              core.info(`Skipping PR #${pr.number}: labelled agent-noted.`);
+              continue;
+            }
+"#,
+    );
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/96-with-filter")
+        .await
+        .unwrap();
+    assert!(
+        workspace.auto_merge_workflow_supports_agent_noted_filter(),
+        "auto-merge.yml present + mentions `agent-noted` must report \
+         supported",
+    );
+}
+
+#[tokio::test]
+async fn prepare_reports_filter_unsupported_when_auto_merge_workflow_omits_agent_noted() {
+    // ADR-0006 acceptance: when the target's auto-merge workflow file
+    // exists but does NOT contain the literal `agent-noted` string,
+    // the snapshot reports `false`. The runner then falls back to
+    // opening `SuccessWithNotes` PRs draft so a silent auto-merge
+    // cannot bypass the operator's read-the-note step.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_with_auto_merge_workflow(
+        remote_dir.path(),
+        r#"
+name: Auto-merge bellows PRs
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  auto-merge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // Legacy auto-merge with no ADR-0006 filter.
+            if (pr.draft) { continue; }
+            await github.rest.pulls.merge({ pull_number: pr.number, merge_method: 'squash' });
+"#,
+    );
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/96-without-filter")
+        .await
+        .unwrap();
+    assert!(
+        !workspace.auto_merge_workflow_supports_agent_noted_filter(),
+        "auto-merge.yml present + omits `agent-noted` must report \
+         unsupported so the runner can fall back to draft",
+    );
+}
+
+#[tokio::test]
+async fn prepare_with_gates_snapshots_auto_merge_filter_support_alongside_gate_commands() {
+    // Acceptance: `prepare_with_gates` (the runner's entry point) also
+    // populates the auto-merge filter-support flag in the same
+    // snapshot pass that populates the ADR-0004 gate commands. A
+    // present-but-no-filter workflow must report unsupported even
+    // when the parsed/fallback gates path is exercised.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_with_auto_merge_workflow(
+        remote_dir.path(),
+        "name: Auto-merge\non: push\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo no-filter\n",
+    );
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare_with_gates(
+        &remote_url,
+        "agent/96-prepare-with-gates",
+        &GatesConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !workspace.auto_merge_workflow_supports_agent_noted_filter(),
+        "prepare_with_gates must populate the filter-support snapshot; \
+         no-filter workflow must report unsupported",
+    );
+}
+
 #[tokio::test]
 async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_config() {
     // Back-compat acceptance: the legacy two-arg `prepare(url, branch)`
