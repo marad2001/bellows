@@ -791,8 +791,8 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         .expect("capture_and_remove_agent_notes should succeed");
     assert_eq!(
         agent_notes.as_deref(),
-        Some("stuck on the brief: refactor scope unclear"),
-        "captured content should be the trimmed file body",
+        Some("stuck on the brief: refactor scope unclear\n"),
+        "captured content should preserve the raw file body for byte-span provenance",
     );
     assert!(
         !workspace.path().join("agent-notes.md").exists(),

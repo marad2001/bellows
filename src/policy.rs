@@ -37,6 +37,175 @@ pub enum ExitReason {
     Cancelled,
 }
 
+/// Classification of `agent-notes.md` content. Drives the
+/// new `classify_exit` signature (issue #95 / ADR-0006): replaces the
+/// pre-ADR-0006 bare `has_agent_notes: bool` so the classifier can
+/// distinguish the three meaningful states of the file rather than
+/// treating "any content present" as escalation.
+///
+/// The three variants:
+///
+/// - `Absent` — no agent-notes.md, an empty file, or a file whose only
+///   content is bellows-authored synth material (issue-#49
+///   implement-crash recovery). After removing recorded synth spans,
+///   nothing agent-authored remains, so the run routes on phase
+///   signals as if the file did not exist.
+/// - `InformationalOnly` — the agent-authored remainder is non-whitespace
+///   prose AND contains no `## Unaddressed finding:` heading. ADR-0006's
+///   informational channel: a TDD-exception note, trade-off, or scope
+///   judgment that should stop silent auto-merge but should NOT route the
+///   run to AgentSelfReportedFailure.
+/// - `HasUnaddressedFinding` — the agent-authored text contains at
+///   least one `## Unaddressed finding:` heading, or a recorded
+///   Bellows synth span came from a cause that deliberately emits one
+///   (weak-test guard or parser-as-backstop).
+///   ADR-0006's escalation channel: the existing structured-failure
+///   contract; routes to AgentSelfReportedFailure.
+///
+/// Bellows-authored synth text is identified by structured provenance
+/// recorded at the append site, not by parsing HTML comments in the
+/// workspace file. Comments like `<!-- bellows ... -->` are
+/// human-readable only; if an agent copies that text into its own note,
+/// it remains agent-authored prose for routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesShape {
+    Absent,
+    InformationalOnly,
+    HasUnaddressedFinding,
+}
+
+/// Why Bellows appended a synthetic span to `agent-notes.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BellowsSynthCause {
+    /// Issue #49 crash recovery: Bellows wrote diagnostic notes so the
+    /// run has a commit to push, but the note is not an agent-authored
+    /// escalation.
+    ImplementCrash,
+    /// Slice-8 weak-test guard: deliberately emits an
+    /// `## Unaddressed finding:` entry and must route to failure.
+    WeakTestGuard,
+    /// Slice-9.6 parser-as-backstop: deliberately emits one or more
+    /// `## Unaddressed finding:` entries and must route to failure.
+    ParserBackstop,
+}
+
+impl BellowsSynthCause {
+    fn routes_to_unaddressed_finding(self) -> bool {
+        matches!(self, Self::WeakTestGuard | Self::ParserBackstop)
+    }
+}
+
+/// Out-of-band provenance for a Bellows-authored append to
+/// `agent-notes.md`. `start` and `end` are byte offsets into the final
+/// captured note text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BellowsSynthSpan {
+    pub start: usize,
+    pub end: usize,
+    pub cause: BellowsSynthCause,
+}
+
+/// Append one Bellows synth entry and return the exact span that was
+/// appended. The caller stores this alongside the pipeline state and
+/// later passes it to `classify_agent_notes_with_synth_spans`.
+pub fn append_bellows_synth_entry(
+    notes: &mut String,
+    entry: &str,
+    cause: BellowsSynthCause,
+) -> BellowsSynthSpan {
+    if !notes.is_empty() && !notes.ends_with('\n') {
+        notes.push('\n');
+    }
+    let start = notes.len();
+    notes.push_str(entry);
+    BellowsSynthSpan {
+        start,
+        end: notes.len(),
+        cause,
+    }
+}
+
+fn normalised_valid_synth_spans(
+    text: &str,
+    synth_spans: &[BellowsSynthSpan],
+) -> Vec<BellowsSynthSpan> {
+    let mut spans: Vec<BellowsSynthSpan> = synth_spans
+        .iter()
+        .copied()
+        .filter(|span| {
+            span.start < span.end
+                && span.end <= text.len()
+                && text.is_char_boundary(span.start)
+                && text.is_char_boundary(span.end)
+        })
+        .collect();
+    spans.sort_by_key(|span| (span.start, span.end));
+    spans
+}
+
+fn remove_synth_spans(text: &str, spans: &[BellowsSynthSpan]) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for span in spans {
+        if span.start > cursor {
+            out.push_str(&text[cursor..span.start]);
+        }
+        cursor = cursor.max(span.end);
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Decide the `NotesShape` of an `agent-notes.md` file's raw content.
+///
+/// `None` is `Absent` (file missing). For `Some(text)` the precedence
+/// is:
+///
+/// 1. Any recorded Bellows synth span whose cause deliberately emits
+///    an `## Unaddressed finding:` entry → `HasUnaddressedFinding`.
+/// 2. Any agent-authored `## Unaddressed finding:` section after
+///    removing recorded Bellows synth spans → `HasUnaddressedFinding`.
+///    Copied Bellows HTML comments are not provenance and are not
+///    removed unless their byte range is recorded out-of-band.
+/// 3. After removing recorded Bellows synth spans, the remainder is non-whitespace
+///    → `InformationalOnly`. The new ADR-0006 informational channel.
+/// 4. Otherwise → `Absent`. Covers the file-missing case, the empty
+///    file, a whitespace-only file, and the issue-#49 synth-only file
+///    (after the recorded implement-crash entry is stripped nothing
+///    agent-authored remains).
+pub fn classify_agent_notes(input: Option<&str>) -> NotesShape {
+    classify_agent_notes_with_synth_spans(input, &[])
+}
+
+pub fn classify_agent_notes_with_synth_spans(
+    input: Option<&str>,
+    synth_spans: &[BellowsSynthSpan],
+) -> NotesShape {
+    let Some(text) = input else {
+        return NotesShape::Absent;
+    };
+    let valid_spans = normalised_valid_synth_spans(text, synth_spans);
+    if valid_spans
+        .iter()
+        .any(|span| span.cause.routes_to_unaddressed_finding())
+    {
+        return NotesShape::HasUnaddressedFinding;
+    }
+    let agent_authored_text = remove_synth_spans(text, &valid_spans);
+    if !parse_agent_notes_sections(&agent_authored_text).is_empty() {
+        return NotesShape::HasUnaddressedFinding;
+    }
+    if agent_authored_text.trim().is_empty() {
+        NotesShape::Absent
+    } else {
+        NotesShape::InformationalOnly
+    }
+}
+
 /// Outcome of the implement run: the first phase, where claude reads
 /// the agent brief and writes code.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -151,25 +320,36 @@ pub struct PhaseOutcomes {
 
 /// Decide how a finished agent run should be classified.
 ///
-/// Precedence: an agent self-report (notes file present) wins over
-/// everything else; the agent's voice always trumps tooling signals.
-/// Then any non-zero implement exit is `Crash`. Then any failing cargo
-/// gate (clippy or test, post-implement or end-pipeline) is
-/// `FinalTestsRed`. Otherwise `Success`.
-pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitReason {
-    // Issue #49: when the runner synthesised an agent-notes entry to
-    // recover from an implement-phase crash with no commits, the file
-    // exists on disk (and ships in the PR diff) but is bellows-authored,
-    // not agent-authored. The agent did not self-report; bellows wrote
-    // the note to give the run something to commit. Suppress the usual
-    // `has_agent_notes` precedence so the run classifies on its actual
-    // failure mode (Crash) rather than spuriously routing to
-    // AgentSelfReportedFailure. The synth flag only suppresses when the
-    // implement phase ACTUALLY crashed — a clean-exit run with the flag
-    // somehow set (defensive corner) still respects notes-precedence.
-    let synth_suppresses_notes =
-        outcomes.implement_crash_synthesised && outcomes.implement.exit_code != 0;
-    if has_agent_notes && !synth_suppresses_notes {
+/// Precedence (ADR-0006 / issue #95):
+///
+/// 1. `NotesShape::HasUnaddressedFinding` → `AgentSelfReportedFailure`.
+///    The structured escalation channel: an `## Unaddressed finding:`
+///    section (agent-authored or bellows-synthesised by the weak-test
+///    guard or parser-as-backstop) always wins over tooling signals,
+///    because the agent's structured voice is the most actionable
+///    self-report we have.
+/// 2. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
+///    at the budget boundary.
+/// 3. Non-zero implement exit + rate-limit stderr signature →
+///    `RateLimited`. More specific than the generic Crash so the
+///    operator gets the right follow-up signal.
+/// 4. Non-zero implement exit → `Crash`. The agent process died.
+/// 5. Failing cargo gate (clippy or test, post-implement or
+///    end-pipeline) → `FinalTestsRed`.
+/// 6. `NotesShape::InformationalOnly` → `SuccessWithNotes`. The new
+///    ADR-0006 informational channel: an otherwise-clean run with
+///    freeform agent-authored prose (no escalation heading). Should
+///    stop silent auto-merge but should NOT route to
+///    AgentSelfReportedFailure.
+/// 7. Otherwise → `Success`.
+///
+/// The issue-#49 `synth_suppresses_notes` shim is gone: synth-only
+/// agent-notes files map to `NotesShape::Absent` when the runner passes
+/// the recorded implement-crash synth span to note classification, so
+/// they route on their actual failure mode (Crash) without a per-call
+/// special case here.
+pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason {
+    if matches!(notes, NotesShape::HasUnaddressedFinding) {
         return ExitReason::AgentSelfReportedFailure;
     }
     if outcomes.wall_clock_exceeded {
@@ -196,6 +376,9 @@ pub fn classify_exit(has_agent_notes: bool, outcomes: &PhaseOutcomes) -> ExitRea
         && gate_failed(end_gate)
     {
         return ExitReason::FinalTestsRed;
+    }
+    if matches!(notes, NotesShape::InformationalOnly) {
+        return ExitReason::SuccessWithNotes;
     }
     ExitReason::Success
 }
@@ -1336,7 +1519,21 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          - For each acceptance criterion in the brief, produce TWO commits in order: first a **failing-test commit** that adds the test(s) and would fail against the unchanged source, then a **make-it-pass commit** that changes the source so those tests pass.\n\
          - One failing-test commit then one make-it-pass commit, per acceptance criterion. Do NOT bundle tests and source into a single mega-commit. Do NOT land source-file changes before their corresponding tests.\n\
          - It is fine to add small refactors as separate follow-up commits after the make-it-pass commit. The constraint is on test-vs-source ordering, not on commit count overall.\n\
-         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), call that out in `agent-notes.md` rather than silently bundling tests and source.\n\
+         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `agent-notes.md` per the channel rules below rather than silently bundling tests and source.\n\
+         \n\
+         ## agent-notes.md channels (informational vs escalation)\n\
+         \n\
+         `agent-notes.md` has exactly two channels, and the classifier routes the PR based on which one you used. Pick deliberately:\n\
+         \n\
+         - **Informational channel** — the file exists but has *no* `## Unaddressed finding:` heading. Use this for freeform observations you want a human reviewer to see (e.g. \"I deviated from strict test-first on AC4 because it was a pure-prompt-text change with no observable behaviour\"). The classifier returns `SuccessWithNotes`, Bellows opens a normal (non-draft) PR labelled `agent-noted`, and the run still counts as a green stop.\n\
+         - **Escalation channel** — the file contains a `## Unaddressed finding: <AC title>` heading naming the unsatisfied acceptance criterion, with body text describing what you tried and why you stopped. The classifier returns `AgentSelfReportedFailure`, Bellows opens a *draft* PR labelled `agent-failed`, and a human is expected to take over.\n\
+         \n\
+         The TDD exceptions explicitly fit the **informational** channel, not the escalation one:\n\
+         \n\
+         - **absence-of-resource ACs** — acceptance criteria that assert the *absence* of something (a file that must not exist, a label that must not be applied, a code path that must not be reached). These are often hard to drive test-first because the natural test is \"nothing happened\", which can pass against unchanged source by accident. Note the deviation in the informational channel.\n\
+         - **pure-prompt-text ACs** — acceptance criteria that only change human-readable prompt text with no observable behavioural change. The same logic applies: note the deviation in the informational channel.\n\
+         \n\
+         Do NOT use the escalation channel for these. The escalation channel means \"I could not satisfy an AC and a human needs to decide\"; the informational channel means \"the AC is satisfied but I want to flag context\".\n\
          \n\
          ## Stop conditions\n\
          \n\
