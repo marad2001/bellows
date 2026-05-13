@@ -836,7 +836,23 @@ pub async fn run_once(
         && !budget.exceeded
     {
         let diff = workspace::compute_diff_against_base(&workspace).await?;
-        if !policy::has_new_tests(&diff) {
+        // Issue #103: short-circuit the guard on diffs that touch no
+        // Rust source at all. Doc-only briefs (ADRs, markdown
+        // updates) otherwise trip the has_new_tests scan as false-
+        // positives — the scan is looking for `#[test]` attributes
+        // in `+`-prefixed lines, of which there are none in a
+        // markdown-only diff, so the synth path fires even though
+        // there is no Rust code to test. The diff-shape check is
+        // a mechanical guard against that false-positive. The log
+        // line is distinct from the label-skip and fired paths so
+        // an operator reading bellows.log can tell which branch the
+        // guard took on this run.
+        if !policy::diff_contains_rs_files(&diff) {
+            announce(
+                log_writer,
+                "bellows: weak-test guard: diff contains no Rust source — skipping",
+            );
+        } else if !policy::has_new_tests(&diff) {
             announce(
                 log_writer,
                 "bellows: weak-test guard fired — diff against base has no new Rust test attributes; synthesising agent-notes entry to force agent-self-reported-failure",
