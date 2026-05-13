@@ -220,6 +220,8 @@ pub struct RuntimeLabelsConfig {
     pub agent_in_progress: String,
     #[serde(default = "default_agent_done")]
     pub agent_done: String,
+    #[serde(default = "default_agent_noted")]
+    pub agent_noted: String,
     #[serde(default = "default_agent_failed")]
     pub agent_failed: String,
     #[serde(default = "default_agent_rate_limited")]
@@ -233,6 +235,7 @@ impl Default for RuntimeLabelsConfig {
         Self {
             agent_in_progress: default_agent_in_progress(),
             agent_done: default_agent_done(),
+            agent_noted: default_agent_noted(),
             agent_failed: default_agent_failed(),
             agent_rate_limited: default_agent_rate_limited(),
             agent_cancelled: default_agent_cancelled(),
@@ -246,6 +249,10 @@ fn default_agent_in_progress() -> String {
 
 fn default_agent_done() -> String {
     "agent-done".to_string()
+}
+
+fn default_agent_noted() -> String {
+    "agent-noted".to_string()
 }
 
 fn default_agent_failed() -> String {

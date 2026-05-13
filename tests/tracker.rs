@@ -3,7 +3,7 @@ use wiremock::matchers::{body_json, body_partial_json, method, path, query_param
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
-    apply_verdict, claim, delete_stale_agent_branches, fetch_agent_brief,
+    add_issue_labels, apply_verdict, claim, delete_stale_agent_branches, fetch_agent_brief,
     fetch_issue_with_comments, finalise, find_next_issue, list_needs_triage_issues,
     list_open_agent_prs, post_pr_comment, transition_to_cancelled, ClaimError, FinaliseRequest,
 };
@@ -285,6 +285,35 @@ async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
     assert!(label_names.contains(&"agent-failed"));
     assert!(!label_names.contains(&"agent-in-progress"));
     assert!(!label_names.contains(&"agent-done"));
+}
+
+#[tokio::test]
+async fn add_issue_labels_posts_agent_noted_label_to_pr_issue_endpoint() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/99/labels"))
+        .and(body_json(json!({ "labels": ["agent-noted"] })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "agent-noted" }
+        ])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let labels = add_issue_labels(
+        &client,
+        "marad2001",
+        "test-repo",
+        99,
+        &["agent-noted"],
+    )
+    .await
+    .expect("add_issue_labels should succeed");
+
+    let label_names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(label_names, vec!["agent-noted"]);
 }
 
 #[tokio::test]

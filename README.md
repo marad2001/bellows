@@ -97,7 +97,7 @@ Sections of `orchestrator.toml`, all of which are read at startup:
   ready (`pickup_label`, default `ready-for-agent`).
 - **`[runtime_labels]`** — the label strings bellows applies as the
   agent moves through its state machine (`agent_in_progress`,
-  `agent_done`, `agent_failed`, `agent_rate_limited`,
+  `agent_done`, `agent_noted`, `agent_failed`, `agent_rate_limited`,
   `agent_cancelled`). Defaults match the names verbatim; override only
   if your tracker uses different strings.
 - **`[logging].path`** — where bellows writes its single log file.
@@ -241,14 +241,16 @@ issue:
 - `enhancement` — the issue describes new or changed behavior.
 
 **Runtime labels** (applied by bellows to the **issue** as a run
-progresses — the PR opened by the run is itself unlabeled; override
-the strings via `[runtime_labels]` in `orchestrator.toml` if you need
-to):
+progresses; `agent-noted` is also applied to the PR so auto-merge can
+hold it; override the strings via `[runtime_labels]` in
+`orchestrator.toml` if you need to):
 
 - `agent-in-progress` — bellows has claimed the issue; a container is
   running or about to run.
 - `agent-done` — the run finished successfully; PR opened, `cargo
   test` was green.
+- `agent-noted` — the run finished successfully with an informational
+  agent note; the PR waits for a human to read the note before merge.
 - `agent-failed` — the run finished unsuccessfully; a draft PR was
   opened with logs as a `<details>` comment.
 - `agent-rate-limited` — a draft PR was opened because Anthropic
@@ -260,7 +262,7 @@ Quick way to create all of these with the `gh` CLI:
 
 ```bash
 for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug enhancement \
-             agent-in-progress agent-done agent-failed agent-rate-limited agent-cancelled; do
+             agent-in-progress agent-done agent-noted agent-failed agent-rate-limited agent-cancelled; do
   gh label create "$label" --force
 done
 ```
@@ -455,9 +457,10 @@ single issue moves like this:
    gate.
 5. **The PR opens.** Regular PR on success; draft PR on failure,
    with the run's logs attached as a collapsible `<details>` comment.
-   The outcome label (`agent-done` / `agent-failed` /
+   The outcome label (`agent-done` / `agent-noted` / `agent-failed` /
    `agent-rate-limited` / `agent-cancelled`) is applied to the
-   **issue**, not the PR — bellows-opened PRs are unlabeled.
+   **issue**. `agent-noted` is also applied to the PR so the
+   auto-merge workflow can hold it for a human read.
 6. **The PR merges.** A bellows-authored Success PR auto-squash-merges
    to the default branch once `ci.yml` passes — see the auto-merge
    note below. Draft PRs (failure / rate-limited / cancelled runs)
@@ -649,7 +652,7 @@ chip away at them.
 - always-open-a-PR contract — regular PR on success, draft PR on
   failure with logs as a `<details>` comment;
 - GitHub label state machine across triage labels +
-  `agent-in-progress` / `agent-done` / `agent-failed` /
+  `agent-in-progress` / `agent-done` / `agent-noted` / `agent-failed` /
   `agent-rate-limited` / `agent-cancelled`.
 
 ### Not in v1
