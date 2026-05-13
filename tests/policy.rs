@@ -1,7 +1,7 @@
 use bellows::policy::{
-    build_violation_callout, classify_exit, compute_coverage_violations, has_new_tests,
-    is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections, parse_findings,
-    per_finding_kickoff, render_kickoff, synthesize_implement_crash_entry,
+    build_violation_callout, classify_exit, compute_coverage_violations, diff_contains_rs_files,
+    has_new_tests, is_auth_error_signature, is_rate_limit_signature, parse_agent_notes_sections,
+    parse_findings, per_finding_kickoff, render_kickoff, synthesize_implement_crash_entry,
     synthesize_no_new_tests_entry, synthesize_unaddressed_entries, AgentNoteSection,
     AnalysisOutcome, CheckResult, ExitReason, FindingCoverage, FixOutcome, GateOutcome,
     ImplementOutcome, ParsedFinding, PhaseOutcomes, ReviewOutcome, Severity,
@@ -1928,4 +1928,177 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
         security_fix: None,
     };
     assert_eq!(classify_exit(false, &outcomes), ExitReason::Success);
+}
+
+// ---- diff_contains_rs_files: weak-test guard doc-only short-circuit ----
+//
+// Issue #103: the weak-test guard fires on every implement-phase diff
+// that lacks new Rust test attributes, even when the diff contains zero
+// `.rs` files. Doc-only briefs (ADRs, markdown updates) thus get
+// false-positive routed to AgentSelfReportedFailure. The new
+// `diff_contains_rs_files` helper lets the runner short-circuit the
+// guard on diffs that carry no Rust source at all.
+//
+// The three parametrised cases below map to the brief's acceptance
+// criteria:
+//   - doc-only/skip:      `.rs` absent => helper returns false => guard
+//                         short-circuits and does NOT synthesise.
+//   - Rust-without-tests: `.rs` present, no test attributes => helper
+//                         returns true => existing guard fires as today.
+//   - mixed:              `.rs` + non-`.rs` present, no test attributes
+//                         => helper returns true => existing guard fires
+//                         as today (unchanged behaviour for mixed
+//                         diffs).
+//
+// Each case exercises both `diff_contains_rs_files` (the new helper)
+// and `has_new_tests` (the existing test-attribute scan) so the
+// combined predicate in the runner --
+// `diff_contains_rs_files(&diff) && !has_new_tests(&diff)` -- is
+// pinned at the unit level.
+
+fn weak_test_guard_doc_only_diff() -> &'static str {
+    "\
+diff --git a/docs/adr/0001-example.md b/docs/adr/0001-example.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/adr/0001-example.md
+@@ -0,0 +1,3 @@
++# ADR 0001: Example
++
++Body text only -- no Rust source touched.
+diff --git a/README.md b/README.md
+index 2222222..3333333 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,3 @@
+ # bellows
++
+ Updated tagline.
+"
+}
+
+fn weak_test_guard_rust_without_tests_diff() -> &'static str {
+    "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 4444444..5555555 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,5 @@
+ pub fn existing() {}
++
++pub fn new_function() -> i32 {
++    42
++}
+"
+}
+
+fn weak_test_guard_mixed_diff() -> &'static str {
+    "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 4444444..5555555 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,5 @@
+ pub fn existing() {}
++
++pub fn new_function() -> i32 {
++    42
++}
+diff --git a/README.md b/README.md
+index 6666666..7777777 100644
+--- a/README.md
++++ b/README.md
+@@ -1,1 +1,2 @@
+ # bellows
++New behaviour described.
+"
+}
+
+#[test]
+fn diff_contains_rs_files_doc_only_diff_returns_false() {
+    // Acceptance criterion: guard short-circuits when the implement
+    // diff contains zero added/modified `.rs` paths. The helper is the
+    // mechanical signal that lets the runner decide to short-circuit.
+    let diff = weak_test_guard_doc_only_diff();
+    assert!(
+        !diff_contains_rs_files(diff),
+        "doc-only diff (markdown only) must report no `.rs` files: {diff}"
+    );
+    // Sibling pin: the existing has_new_tests scan is independently
+    // false on a doc-only diff (no `#[test]` attributes anywhere).
+    // The combined runner predicate `rs && !has_new_tests` therefore
+    // collapses cleanly to "skip" when there are no `.rs` files at
+    // all, regardless of which side is checked first.
+    assert!(
+        !has_new_tests(diff),
+        "doc-only diff must independently report no new tests: {diff}"
+    );
+}
+
+#[test]
+fn diff_contains_rs_files_rust_without_tests_returns_true() {
+    // Acceptance criterion: a diff with at least one `.rs` file but no
+    // new test attributes still routes through the guard. The helper
+    // must report `.rs` files present so the runner falls through to
+    // the existing has_new_tests check.
+    let diff = weak_test_guard_rust_without_tests_diff();
+    assert!(
+        diff_contains_rs_files(diff),
+        "Rust-source diff must report `.rs` files present: {diff}"
+    );
+    assert!(
+        !has_new_tests(diff),
+        "Rust-source diff without `#[test]` must NOT register as having new tests: {diff}"
+    );
+}
+
+#[test]
+fn diff_contains_rs_files_mixed_diff_returns_true() {
+    // Acceptance criterion: a diff with both `.rs` and non-`.rs`
+    // files behaves exactly as today -- the helper reports `.rs`
+    // present so the guard proceeds to its has_new_tests check and
+    // fires when no new test attributes are found.
+    let diff = weak_test_guard_mixed_diff();
+    assert!(
+        diff_contains_rs_files(diff),
+        "mixed diff must report `.rs` files present: {diff}"
+    );
+    assert!(
+        !has_new_tests(diff),
+        "mixed diff without `#[test]` must NOT register as having new tests: {diff}"
+    );
+}
+
+#[test]
+fn diff_contains_rs_files_empty_diff_returns_false() {
+    // Edge case the runner's gating already handles indirectly: an
+    // empty diff (no commits beyond the base branch) has no `.rs`
+    // files. Pin the helper's contract on the empty-string boundary
+    // so a future refactor cannot accidentally make it crash or
+    // return true on empty input.
+    assert!(
+        !diff_contains_rs_files(""),
+        "empty diff must report no `.rs` files"
+    );
+}
+
+#[test]
+fn diff_contains_rs_files_ignores_rs_substring_in_non_rust_paths() {
+    // False-positive case: a path that contains the substring `.rs`
+    // somewhere other than the file extension (e.g. `docs/rs-notes.md`)
+    // is NOT a Rust source file. The helper must key on the `.rs`
+    // extension at the end of the path, not on any occurrence of the
+    // substring in the diff header.
+    let diff = "\
+diff --git a/docs/rs-notes.md b/docs/rs-notes.md
+--- a/docs/rs-notes.md
++++ b/docs/rs-notes.md
+@@ -0,0 +1,1 @@
++Notes about Rust, not Rust source.
+";
+    assert!(
+        !diff_contains_rs_files(diff),
+        "path containing `.rs` substring but ending in `.md` must NOT count: {diff}"
+    );
 }

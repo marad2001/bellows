@@ -1038,6 +1038,80 @@ pub fn has_new_tests(diff: &str) -> bool {
     false
 }
 
+/// Detect whether a unified diff touches at least one `.rs` file
+/// (added or modified). Issue #103: the slice-8 weak-test guard
+/// previously fired on every implement-phase diff that lacked new
+/// Rust test attributes, including doc-only briefs (ADRs, markdown
+/// updates) whose diffs carry no Rust source at all. The runner uses
+/// this helper to short-circuit the guard when there is nothing
+/// Rust-shaped in the diff for `has_new_tests` to score against.
+///
+/// Scan discipline:
+///
+/// - Looks at `diff --git a/<path> b/<path>` headers and the
+///   `+++ b/<path>` "new file" marker. Either is sufficient to
+///   declare a `.rs` file touched.
+/// - Keys on the `.rs` *extension* at the end of the path rather
+///   than the substring `.rs` anywhere in the line. A path like
+///   `docs/rs-notes.md` contains the substring but is not a Rust
+///   source file; the helper must not be confused by it.
+/// - Skips `+++ /dev/null` (the "file deleted" marker on the new
+///   side of a deletion-only diff). A pure deletion of a `.rs`
+///   file is still a Rust change for the guard's purpose because
+///   the `diff --git` header on the same hunk names the path, so
+///   the diff is correctly counted via the `diff --git` line.
+/// - Empty input returns `false` — a no-op diff touches no files
+///   of any kind, which is the right semantics for the runner's
+///   short-circuit (an empty diff has no implementation either,
+///   and the guard's outer gating handles that branch independently).
+pub fn diff_contains_rs_files(diff: &str) -> bool {
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `diff --git a/<path> b/<path>`. Splitting on whitespace
+            // yields the two path tokens; either should end in `.rs`
+            // for a real Rust-source change (git always renders both
+            // sides even for added/deleted files).
+            if rest.split_whitespace().any(path_token_is_rust) {
+                return true;
+            }
+        } else if let Some(path) = line.strip_prefix("+++ b/")
+            && path_ends_with_rs(path)
+        {
+            return true;
+        } else if let Some(path) = line.strip_prefix("--- a/")
+            && path_ends_with_rs(path)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a `diff --git` path token (`a/foo.rs` or `b/foo.rs`)
+/// names a Rust source file. Strips the `a/` or `b/` prefix git uses
+/// to disambiguate the old and new sides before extension-matching so
+/// a path like `a/src/lib.rs` is recognised but `a/docs/rs-notes.md`
+/// is not.
+fn path_token_is_rust(token: &str) -> bool {
+    let path = token
+        .strip_prefix("a/")
+        .or_else(|| token.strip_prefix("b/"))
+        .unwrap_or(token);
+    path_ends_with_rs(path)
+}
+
+/// True when a path ends in the `.rs` extension. Anchored on the end
+/// of the string so a substring match elsewhere in the path (e.g.
+/// `docs/rs-notes.md`) does not register.
+fn path_ends_with_rs(path: &str) -> bool {
+    // Trim trailing whitespace defensively — diff headers should not
+    // carry any, but a tabbed timestamp on the `+++` line (rare, but
+    // some `git diff` configurations emit it) would otherwise mask
+    // the extension.
+    let path = path.trim_end();
+    path.ends_with(".rs")
+}
+
 /// Build the markdown the slice-8 weak-test guard appends to
 /// `agent-notes.md` when the post-implement diff contains no new Rust
 /// test attributes (and the issue does not carry the skip-label). The
