@@ -3775,4 +3775,119 @@ mod tests {
         // Should be obviously well under the cap.
         assert!(body.chars().count() < 5_000);
     }
+
+    /// Issue #111: invoke both composers (PR body + run-log) and return
+    /// the (pr_body, log_body) pair so a parametrised test can assert
+    /// equivalent callout shape on both surfaces. Drift between the two
+    /// surfaces is the regression to avoid; sharing the helper here
+    /// means a one-sided fix flips the test red.
+    fn compose_both_surfaces(
+        workflow_files_changed: &[String],
+    ) -> (String, String) {
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice5_log_outcomes(0, "agent done", None);
+        let pr_body = build_pr_body(
+            &ExitReason::Success,
+            42,
+            Some("PR body from claude."),
+            None,
+            workflow_files_changed,
+        );
+        let log_body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+            workflow_files_changed,
+        );
+        (pr_body, log_body)
+    }
+
+    #[test]
+    fn workflow_file_change_callout_appears_on_both_pr_body_and_run_log_when_files_touched() {
+        // Issue #111 AC: when the diff touches one or more workflow
+        // files, BOTH the PR body and the run-log comment include a
+        // labelled section that names the file(s) and explains the
+        // gate-vs-CI gap. Parametrised over the two composers so drift
+        // between them flips this test red.
+        let files = vec![".github/workflows/ci.yml".to_string()];
+        let (pr_body, log_body) = compose_both_surfaces(&files);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            // (a) Labelled section header — operator scanning the PR
+            // body / run-log should be able to spot it as a callout.
+            assert!(
+                body.to_lowercase().contains("workflow"),
+                "{surface}: callout should mention 'workflow'; got:\n{body}",
+            );
+            // (b) Names the changed file(s) so the operator knows where
+            // to look.
+            assert!(
+                body.contains(".github/workflows/ci.yml"),
+                "{surface}: callout must name the changed file; got:\n{body}",
+            );
+            // (c) Explains the gate-vs-CI gap: mentions cargo clippy
+            // and cargo test (the only two CI steps bellows mirrors).
+            // An operator reading the callout cold should understand
+            // both facts.
+            assert!(
+                body.contains("cargo clippy"),
+                "{surface}: callout must mention cargo clippy gate scope; got:\n{body}",
+            );
+            assert!(
+                body.contains("cargo test"),
+                "{surface}: callout must mention cargo test gate scope; got:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_file_change_callout_omitted_on_both_surfaces_when_no_files_touched() {
+        // Issue #111 AC: when the diff does NOT touch any workflow
+        // file (the common case), neither surface includes the
+        // callout — no empty/header-only section, no whitespace
+        // noise. Parametrised over the two composers so drift
+        // between them flips this test red.
+        let (pr_body, log_body) = compose_both_surfaces(&[]);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            assert!(
+                !body.to_lowercase().contains("workflow"),
+                "{surface}: empty file list must omit the callout entirely; got:\n{body}",
+            );
+            // Belt-and-braces: the file path of a typical workflow
+            // file must NOT appear in the rendered body when the
+            // helper returned an empty list.
+            assert!(
+                !body.contains(".github/workflows/"),
+                "{surface}: empty file list must not leak workflow paths; got:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_file_change_callout_lists_multiple_files_on_both_surfaces() {
+        // Issue #111 AC: when multiple workflow files are touched,
+        // both surfaces name all of them so the operator can audit
+        // every CI-shape change in one pass.
+        let files = vec![
+            ".github/workflows/ci.yml".to_string(),
+            ".github/workflows/release.yaml".to_string(),
+        ];
+        let (pr_body, log_body) = compose_both_surfaces(&files);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            assert!(
+                body.contains(".github/workflows/ci.yml"),
+                "{surface}: must name ci.yml; got:\n{body}",
+            );
+            assert!(
+                body.contains(".github/workflows/release.yaml"),
+                "{surface}: must name release.yaml; got:\n{body}",
+            );
+        }
+    }
 }
