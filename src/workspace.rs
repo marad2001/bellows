@@ -610,3 +610,54 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(), WorkspaceError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_workflow_file_path_accepts_yml_under_dot_github_workflows() {
+        // Issue #111 AC: the canonical workflow path shape qualifies.
+        // GitHub Actions discovers workflows under `.github/workflows/`
+        // with either `.yml` or `.yaml` extensions; the predicate
+        // mirrors that discovery rule.
+        assert!(is_workflow_file_path(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_accepts_yaml_extension_too() {
+        // Issue #111 AC: both `.yml` and `.yaml` qualify, matching
+        // GitHub Actions' own discovery convention. The pair must
+        // share a single test to pin the equivalence so a future
+        // refactor that drops `.yaml` (the less common form in this
+        // codebase) flips the test red.
+        assert!(is_workflow_file_path(".github/workflows/release.yaml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_other_yml_under_dot_github() {
+        // Issue #111 AC: a path that merely contains `.github/`
+        // elsewhere — e.g. an issue template — must NOT qualify.
+        // The predicate keys on the `.github/workflows/` prefix, not
+        // on `.github/` alone.
+        assert!(!is_workflow_file_path(".github/ISSUE_TEMPLATE/foo.yml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_non_yaml_extensions_under_workflows() {
+        // Defensive: a stray `.md` or `.json` under `.github/workflows/`
+        // is not a workflow file as far as GitHub Actions is concerned.
+        // Only `.yml` and `.yaml` qualify.
+        assert!(!is_workflow_file_path(".github/workflows/README.md"));
+        assert!(!is_workflow_file_path(".github/workflows/data.json"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_path_outside_dot_github_workflows() {
+        // Defensive: a `.yml` file at the repo root, or under `src/`,
+        // is not a workflow file. The `.github/workflows/` prefix is
+        // load-bearing.
+        assert!(!is_workflow_file_path("ci.yml"));
+        assert!(!is_workflow_file_path("src/config.yaml"));
+    }
+}
