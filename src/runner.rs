@@ -1816,12 +1816,36 @@ pub async fn run_once(
         ),
     );
 
+    // Issue #111: surface workflow-file changes on both the PR body
+    // and the run-log comment when the agent's branch diff against
+    // the default branch touches any file under `.github/workflows/`.
+    // Best-effort: a git failure here must not block PR open — the
+    // operator-visibility callout is informational, not gating. We
+    // emit a log line and fall back to an empty list (no callout).
+    let workflow_files_changed = match workspace::workflow_files_changed_between(
+        &workspace,
+        workspace.default_branch(),
+        "HEAD",
+    )
+    .await
+    {
+        Ok(files) => files,
+        Err(e) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: workflow-file diff failed (continuing without callout): {e}",
+            );
+            Vec::new()
+        }
+    };
+
     let pr_title = format!("Bellows agent run for issue #{}", claimed.number);
     let pr_body = build_pr_body(
         &reason,
         claimed.number,
         claude_pr_body.as_deref(),
         agent_notes_display.as_deref(),
+        &workflow_files_changed,
     );
 
     let pr = workspace::open_pr(
@@ -1896,6 +1920,7 @@ pub async fn run_once(
         finished,
         &branch_name,
         &outcomes,
+        &workflow_files_changed,
     );
 
     let finalise_outcome = tracker::finalise(
@@ -1964,11 +1989,40 @@ pub async fn run_once(
     }
 }
 
+/// Issue #111: build the labelled callout that flags workflow-file
+/// changes on the agent PR. Returns an empty string when
+/// `workflow_files_changed` is empty (no callout); otherwise a
+/// markdown section that names the changed file(s) and explains the
+/// gate-vs-CI gap (bellows's cargo gates only mirror `cargo clippy`
+/// and `cargo test`, so any other new steps execute for the first
+/// time on the PR's real GitHub Actions run).
+///
+/// Shared between `build_pr_body` and `build_log_body` so the two
+/// surfaces emit equivalent callouts — drift between them is the
+/// regression the parametrised test exists to prevent.
+fn workflow_files_changed_callout(workflow_files_changed: &[String]) -> String {
+    if workflow_files_changed.is_empty() {
+        return String::new();
+    }
+    let file_list = workflow_files_changed
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n### CI workflow files changed in this PR\n\n\
+         {file_list} — bellows's cargo gates only mirror `cargo clippy` and \
+         `cargo test` from CI, so any other new steps will execute for the first \
+         time on the PR's real GitHub Actions run.\n"
+    )
+}
+
 fn build_pr_body(
     reason: &ExitReason,
     issue_number: u64,
     claude_pr_body: Option<&str>,
     agent_notes: Option<&str>,
+    workflow_files_changed: &[String],
 ) -> String {
     let header = format!("Closes #{issue_number}.\n\n");
     let body = match reason {
@@ -2021,7 +2075,11 @@ fn build_pr_body(
                 .to_string()
         }
     };
-    header + &body
+    // Issue #111: append the workflow-file change callout when the
+    // agent's branch diff touched a file under `.github/workflows/`.
+    // The helper returns an empty string for the empty list, so the
+    // common case is a no-op and there is no whitespace noise.
+    header + &body + &workflow_files_changed_callout(workflow_files_changed)
 }
 
 fn build_log_body(
@@ -2031,6 +2089,7 @@ fn build_log_body(
     finished: chrono::DateTime<chrono::Utc>,
     branch_name: &str,
     outcomes: &PhaseOutcomes,
+    workflow_files_changed: &[String],
 ) -> String {
     let mut body = format!(
         "<details><summary>Bellows run log ({reason:?})</summary>\n\n\
@@ -2141,6 +2200,13 @@ fn build_log_body(
     if !outcomes.backstop_violations.is_empty() {
         body.push_str(&policy::build_violation_callout(&outcomes.backstop_violations));
     }
+
+    // Issue #111: surface workflow-file changes so the operator
+    // reviewing the run-log gets a signal that CI's shape has
+    // changed. Pure annotation — bellows does NOT execute the new
+    // step inside the sandbox. The shared helper returns an empty
+    // string for the empty list, so the common case is a no-op.
+    body.push_str(&workflow_files_changed_callout(workflow_files_changed));
 
     if !matches!(reason, ExitReason::Success | ExitReason::SuccessWithNotes) {
         // When SIGKILL fires before any agent output flushes (typical for
@@ -2635,14 +2701,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_success_uses_claude_pr_body_when_present() {
-        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None);
+        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[]);
         assert!(body.starts_with("Closes #42.\n\n"));
         assert!(body.contains("My PR body."));
     }
 
     #[test]
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
-        let body = build_pr_body(&ExitReason::Success, 42, None, None);
+        let body = build_pr_body(&ExitReason::Success, 42, None, None, &[]);
         assert!(body.contains("the agent did not write a PR description"));
     }
 
@@ -2683,6 +2749,7 @@ mod tests {
             42,
             None,
             Some("I got stuck on the brief."),
+        &[],
         );
         assert!(body.contains("self-reported failure"));
         assert!(body.contains("I got stuck on the brief."));
@@ -2690,7 +2757,7 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_crash_mentions_stderr_tail_pointer() {
-        let body = build_pr_body(&ExitReason::Crash, 42, None, None);
+        let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[]);
         assert!(body.contains("crashed"));
         assert!(body.contains("stderr tail"));
     }
@@ -2700,7 +2767,7 @@ mod tests {
         // After slice X1 the gate runs both clippy and test, in either the
         // post-implement or end-of-pipeline position — the PR body should
         // reflect that, not pin "test" specifically.
-        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None);
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[]);
         assert!(body.to_lowercase().contains("cargo checks"));
         assert!(body.contains("run-log comment"));
     }
@@ -2716,6 +2783,7 @@ mod tests {
             finished,
             "agent/42-x",
             &slice5_log_outcomes(0, "not shown", None),
+        &[],
         );
         assert!(body.contains("Bellows run log (Success)"));
         assert!(!body.contains("### Agent output tail"));
@@ -2733,6 +2801,7 @@ mod tests {
             finished,
             "agent/42-x",
             &slice5_log_outcomes(0, "agent told you it was done", Some((101, "test foo ... FAILED"))),
+        &[],
         );
         assert!(body.contains("FinalTestsRed"));
         assert!(body.contains("### Agent output tail"));
@@ -2778,6 +2847,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(body.contains("FinalTestsRed"));
         assert!(body.contains("`cargo clippy`"));
@@ -2807,6 +2877,7 @@ mod tests {
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
+        &[],
         );
         assert!(body.contains("`cargo clippy`"));
         assert!(body.contains("clippy lint here"));
@@ -2844,6 +2915,7 @@ mod tests {
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
+        &[],
         );
         // The end-pipeline section is named distinctly from post-implement
         // so a reader knows the failure was after review-fix, not before.
@@ -2878,6 +2950,7 @@ mod tests {
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
+        &[],
         );
         assert!(body.contains("Review:"));
         assert!(body.contains("Cargo checks (post-implement)"));
@@ -2909,6 +2982,7 @@ mod tests {
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
+        &[],
         );
         assert!(body.contains("Review: crashed"));
         assert!(body.contains("137"));
@@ -2946,6 +3020,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(body.contains("WallClockExceeded"));
         assert!(body.to_lowercase().contains("wall-clock"));
@@ -2985,6 +3060,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(body.contains("RateLimited"));
         assert!(body.to_lowercase().contains("rate limit"));
@@ -3026,6 +3102,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         // The callout names the operator action explicitly.
         assert!(
@@ -3075,6 +3152,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             !body.contains("bellows refresh-auth"),
@@ -3113,6 +3191,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(body.to_lowercase().contains("no agent output was captured"));
         // The empty code fence section header is NOT emitted.
@@ -3168,6 +3247,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("### Address-or-explain contract violated"),
@@ -3207,6 +3287,7 @@ mod tests {
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
+        &[],
         );
         assert!(
             !body.contains("Address-or-explain contract violated"),
@@ -3216,14 +3297,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_wall_clock_exceeded_mentions_cap() {
-        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None);
+        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None, &[]);
         assert!(body.to_lowercase().contains("wall-clock"));
         assert!(body.contains("run-log comment"));
     }
 
     #[test]
     fn build_pr_body_for_rate_limited_mentions_rate_limit() {
-        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None);
+        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None, &[]);
         assert!(body.to_lowercase().contains("rate limit"));
         assert!(body.contains("run-log comment"));
     }
@@ -3286,7 +3367,7 @@ mod tests {
         );
         // build_pr_body for Crash must NOT quote the synth note as
         // "self-reported failure" content.
-        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()));
+        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()), &[]);
         assert!(
             pr_body.contains("crashed"),
             "PR body for the synth-driven Crash must say `crashed`: {pr_body}"
@@ -3301,7 +3382,7 @@ mod tests {
         // independent of whatever the synth note also embedded.
         let started = fixed_timestamp();
         let finished = started + chrono::Duration::seconds(5);
-        let log_body = build_log_body(&reason, 42, started, finished, "agent/42-x", &outcomes);
+        let log_body = build_log_body(&reason, 42, started, finished, "agent/42-x", &outcomes, &[]);
         assert!(
             log_body.contains("Crash"),
             "log body must include the Crash classification header: {log_body}"
@@ -3323,6 +3404,7 @@ mod tests {
             finished,
             "agent/42-x",
             &slice5_log_outcomes(0, "stuck on something", None),
+        &[],
         );
         assert!(body.contains("AgentSelfReportedFailure"));
         assert!(body.contains("### Agent output tail"));
@@ -3463,6 +3545,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("Security:"),
@@ -3496,6 +3579,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("Security: crashed"),
@@ -3534,6 +3618,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("Security: findings produced"),
@@ -3571,6 +3656,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("Security: no findings"),
@@ -3605,6 +3691,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         assert!(
             body.contains("Security: did not run"),
@@ -3659,6 +3746,7 @@ mod tests {
             finished,
             "agent/42-x",
             &outcomes,
+        &[],
         );
         // Both phases must be summarised. The exact phrasing is
         // implementation-detail, but each phase needs its own surface so
@@ -3716,6 +3804,7 @@ mod tests {
             finished,
             "agent/42-huge",
             &outcomes,
+        &[],
         );
 
         // Cap leaves headroom for any subsequent encoding / wrapping —
@@ -3764,6 +3853,7 @@ mod tests {
             finished,
             "agent/42-x",
             &slice5_log_outcomes(0, "small run", None),
+        &[],
         );
 
         assert!(
@@ -3774,5 +3864,120 @@ mod tests {
         assert!(body.trim_end().ends_with("</details>"));
         // Should be obviously well under the cap.
         assert!(body.chars().count() < 5_000);
+    }
+
+    /// Issue #111: invoke both composers (PR body + run-log) and return
+    /// the (pr_body, log_body) pair so a parametrised test can assert
+    /// equivalent callout shape on both surfaces. Drift between the two
+    /// surfaces is the regression to avoid; sharing the helper here
+    /// means a one-sided fix flips the test red.
+    fn compose_both_surfaces(
+        workflow_files_changed: &[String],
+    ) -> (String, String) {
+        let started = fixed_timestamp();
+        let finished = started;
+        let outcomes = slice5_log_outcomes(0, "agent done", None);
+        let pr_body = build_pr_body(
+            &ExitReason::Success,
+            42,
+            Some("PR body from claude."),
+            None,
+            workflow_files_changed,
+        );
+        let log_body = build_log_body(
+            &ExitReason::Success,
+            42,
+            started,
+            finished,
+            "agent/42-x",
+            &outcomes,
+            workflow_files_changed,
+        );
+        (pr_body, log_body)
+    }
+
+    #[test]
+    fn workflow_file_change_callout_appears_on_both_pr_body_and_run_log_when_files_touched() {
+        // Issue #111 AC: when the diff touches one or more workflow
+        // files, BOTH the PR body and the run-log comment include a
+        // labelled section that names the file(s) and explains the
+        // gate-vs-CI gap. Parametrised over the two composers so drift
+        // between them flips this test red.
+        let files = vec![".github/workflows/ci.yml".to_string()];
+        let (pr_body, log_body) = compose_both_surfaces(&files);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            // (a) Labelled section header — operator scanning the PR
+            // body / run-log should be able to spot it as a callout.
+            assert!(
+                body.to_lowercase().contains("workflow"),
+                "{surface}: callout should mention 'workflow'; got:\n{body}",
+            );
+            // (b) Names the changed file(s) so the operator knows where
+            // to look.
+            assert!(
+                body.contains(".github/workflows/ci.yml"),
+                "{surface}: callout must name the changed file; got:\n{body}",
+            );
+            // (c) Explains the gate-vs-CI gap: mentions cargo clippy
+            // and cargo test (the only two CI steps bellows mirrors).
+            // An operator reading the callout cold should understand
+            // both facts.
+            assert!(
+                body.contains("cargo clippy"),
+                "{surface}: callout must mention cargo clippy gate scope; got:\n{body}",
+            );
+            assert!(
+                body.contains("cargo test"),
+                "{surface}: callout must mention cargo test gate scope; got:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_file_change_callout_omitted_on_both_surfaces_when_no_files_touched() {
+        // Issue #111 AC: when the diff does NOT touch any workflow
+        // file (the common case), neither surface includes the
+        // callout — no empty/header-only section, no whitespace
+        // noise. Parametrised over the two composers so drift
+        // between them flips this test red.
+        let (pr_body, log_body) = compose_both_surfaces(&[]);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            assert!(
+                !body.to_lowercase().contains("workflow"),
+                "{surface}: empty file list must omit the callout entirely; got:\n{body}",
+            );
+            // Belt-and-braces: the file path of a typical workflow
+            // file must NOT appear in the rendered body when the
+            // helper returned an empty list.
+            assert!(
+                !body.contains(".github/workflows/"),
+                "{surface}: empty file list must not leak workflow paths; got:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_file_change_callout_lists_multiple_files_on_both_surfaces() {
+        // Issue #111 AC: when multiple workflow files are touched,
+        // both surfaces name all of them so the operator can audit
+        // every CI-shape change in one pass.
+        let files = vec![
+            ".github/workflows/ci.yml".to_string(),
+            ".github/workflows/release.yaml".to_string(),
+        ];
+        let (pr_body, log_body) = compose_both_surfaces(&files);
+
+        for (surface, body) in [("pr_body", &pr_body), ("log_body", &log_body)] {
+            assert!(
+                body.contains(".github/workflows/ci.yml"),
+                "{surface}: must name ci.yml; got:\n{body}",
+            );
+            assert!(
+                body.contains(".github/workflows/release.yaml"),
+                "{surface}: must name release.yaml; got:\n{body}",
+            );
+        }
     }
 }

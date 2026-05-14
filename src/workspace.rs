@@ -438,6 +438,82 @@ pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Whether `path` is a GitHub Actions workflow file: a `.yml` or
+/// `.yaml` file directly under `.github/workflows/`. Mirrors GitHub
+/// Actions' own discovery convention so the agent-PR-body callout
+/// surfaces exactly the files CI itself would pick up.
+///
+/// The `.github/workflows/` prefix is load-bearing: a path that
+/// merely contains `.github/` elsewhere — e.g. an issue template
+/// under `.github/ISSUE_TEMPLATE/foo.yml` — does NOT qualify, since
+/// the operator-visibility goal is to flag CI-shape changes and only
+/// files under `.github/workflows/` change CI's shape.
+///
+/// Pure data: the predicate operates on a path string with no
+/// filesystem access, so the file-path matching is unit-testable
+/// independently of any git invocation.
+pub fn is_workflow_file_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(".github/workflows/") else {
+        return false;
+    };
+    // Disallow nested subdirectories under .github/workflows/ —
+    // GitHub Actions only discovers workflows directly under that
+    // directory, not in nested subfolders. Equally, the empty `rest`
+    // case (the directory entry itself) is not a workflow file.
+    if rest.is_empty() || rest.contains('/') {
+        return false;
+    }
+    rest.ends_with(".yml") || rest.ends_with(".yaml")
+}
+
+/// Workflow files (under `.github/workflows/`) touched between `base`
+/// and `head`. Single `git diff --name-only <base> <head>` shellout
+/// filtered through [`is_workflow_file_path`]; pure-data return so the
+/// PR-body and run-log composers can call it independently and
+/// unit-test the formatting separately from the git invocation.
+///
+/// Issue #111: surfaces the names of changed workflow files for the
+/// operator-visibility callout. The callout warns that bellows's
+/// cargo-checks gates only mirror `cargo clippy` and `cargo test`
+/// from CI, so any other new steps in the changed workflow(s) are
+/// exercised for the first time on the PR's real GitHub Actions run.
+///
+/// Returns `Ok(vec![])` when no workflow files were touched (the
+/// common case) so the composers omit the callout entirely. Returns
+/// `Err(WorkspaceError::GitFailed)` if the git invocation itself fails
+/// — mirrors the error shape of the sibling
+/// [`diff_between_touches_only_agent_notes`] helper.
+pub async fn workflow_files_changed_between(
+    workspace: &Workspace,
+    base: &str,
+    head: &str,
+) -> Result<Vec<String>, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["diff", "--name-only", base, head])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec![
+                "diff".into(),
+                "--name-only".into(),
+                base.into(),
+                head.into(),
+            ],
+            status: output.status,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|line| is_workflow_file_path(line))
+        .map(|line| line.to_string())
+        .collect())
+}
+
 /// Whether the file list touched between `base` and `head` is exactly
 /// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
 /// per-finding loop after PR #38: with the agent free to self-commit
@@ -609,4 +685,55 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(), WorkspaceError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_workflow_file_path_accepts_yml_under_dot_github_workflows() {
+        // Issue #111 AC: the canonical workflow path shape qualifies.
+        // GitHub Actions discovers workflows under `.github/workflows/`
+        // with either `.yml` or `.yaml` extensions; the predicate
+        // mirrors that discovery rule.
+        assert!(is_workflow_file_path(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_accepts_yaml_extension_too() {
+        // Issue #111 AC: both `.yml` and `.yaml` qualify, matching
+        // GitHub Actions' own discovery convention. The pair must
+        // share a single test to pin the equivalence so a future
+        // refactor that drops `.yaml` (the less common form in this
+        // codebase) flips the test red.
+        assert!(is_workflow_file_path(".github/workflows/release.yaml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_other_yml_under_dot_github() {
+        // Issue #111 AC: a path that merely contains `.github/`
+        // elsewhere — e.g. an issue template — must NOT qualify.
+        // The predicate keys on the `.github/workflows/` prefix, not
+        // on `.github/` alone.
+        assert!(!is_workflow_file_path(".github/ISSUE_TEMPLATE/foo.yml"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_non_yaml_extensions_under_workflows() {
+        // Defensive: a stray `.md` or `.json` under `.github/workflows/`
+        // is not a workflow file as far as GitHub Actions is concerned.
+        // Only `.yml` and `.yaml` qualify.
+        assert!(!is_workflow_file_path(".github/workflows/README.md"));
+        assert!(!is_workflow_file_path(".github/workflows/data.json"));
+    }
+
+    #[test]
+    fn is_workflow_file_path_rejects_path_outside_dot_github_workflows() {
+        // Defensive: a `.yml` file at the repo root, or under `src/`,
+        // is not a workflow file. The `.github/workflows/` prefix is
+        // load-bearing.
+        assert!(!is_workflow_file_path("ci.yml"));
+        assert!(!is_workflow_file_path("src/config.yaml"));
+    }
 }
