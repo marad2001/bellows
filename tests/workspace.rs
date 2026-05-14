@@ -11,7 +11,7 @@ use bellows::workflow_parse::Provenance;
 use bellows::workspace::{
     commit_all, commit_all_and_push_if_advanced, commit_to_branch, compute_diff_against_base,
     diff_between_touches_only_agent_notes, generate_commit_log, head_sha, open_pr, prepare,
-    prepare_with_gates, push_branch, OpenPrRequest,
+    prepare_with_gates, push_branch, workflow_files_changed_between, OpenPrRequest,
 };
 
 fn init_remote_repo(path: &Path) {
@@ -253,6 +253,143 @@ async fn diff_between_returns_false_when_base_equals_head() {
     assert!(
         !only_notes,
         "base==head is the empty diff; cannot be exactly [agent-notes.md]"
+    );
+}
+
+#[tokio::test]
+async fn workflow_files_changed_returns_touched_workflow_paths_under_dot_github_workflows() {
+    // Issue #111 AC: when the agent's branch diff touches a file under
+    // `.github/workflows/`, the helper returns the path so the PR-body
+    // and run-log composers can emit the operator-visibility callout.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/111-flag-workflows")
+        .await
+        .unwrap();
+
+    let base = head_sha(&workspace).await.unwrap();
+
+    // Create the .github/workflows/ directory and a workflow file, then commit.
+    std::fs::create_dir_all(workspace.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        workspace.path().join(".github/workflows/ci.yml"),
+        "name: CI\non: push\njobs: {}\n",
+    )
+    .unwrap();
+    commit_all(&workspace).await.unwrap();
+    let head = head_sha(&workspace).await.unwrap();
+
+    let changed = workflow_files_changed_between(&workspace, &base, &head)
+        .await
+        .expect("helper should succeed");
+    assert_eq!(
+        changed,
+        vec![".github/workflows/ci.yml".to_string()],
+        "single workflow change must surface verbatim, top-level only"
+    );
+}
+
+#[tokio::test]
+async fn workflow_files_changed_returns_empty_when_no_workflow_files_touched() {
+    // Issue #111 AC: the common case — agent changed only source files,
+    // no workflow files. The helper returns an empty Vec so the
+    // composers omit the callout entirely (no header-only section, no
+    // whitespace noise).
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/111-flag-workflows")
+        .await
+        .unwrap();
+
+    let base = head_sha(&workspace).await.unwrap();
+
+    std::fs::write(workspace.path().join("src.rs"), "fn a() {}\n").unwrap();
+    commit_all(&workspace).await.unwrap();
+    let head = head_sha(&workspace).await.unwrap();
+
+    let changed = workflow_files_changed_between(&workspace, &base, &head)
+        .await
+        .unwrap();
+    assert!(
+        changed.is_empty(),
+        "source-only diff must return an empty list, got {:?}",
+        changed
+    );
+}
+
+#[tokio::test]
+async fn workflow_files_changed_ignores_non_workflow_files_under_dot_github() {
+    // Issue #111 AC: a path that merely contains `.github/` elsewhere
+    // (e.g. an issue template) must NOT qualify. Pins the predicate
+    // boundary end-to-end so a future refactor that loosens the filter
+    // to "anything under `.github/`" flips this test red.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/111-flag-workflows")
+        .await
+        .unwrap();
+
+    let base = head_sha(&workspace).await.unwrap();
+
+    // An issue template that lives under `.github/` but NOT under
+    // `.github/workflows/` — must be filtered out.
+    std::fs::create_dir_all(workspace.path().join(".github/ISSUE_TEMPLATE")).unwrap();
+    std::fs::write(
+        workspace.path().join(".github/ISSUE_TEMPLATE/foo.yml"),
+        "name: Bug\n",
+    )
+    .unwrap();
+    commit_all(&workspace).await.unwrap();
+    let head = head_sha(&workspace).await.unwrap();
+
+    let changed = workflow_files_changed_between(&workspace, &base, &head)
+        .await
+        .unwrap();
+    assert!(
+        changed.is_empty(),
+        ".github/ISSUE_TEMPLATE/foo.yml must NOT qualify as a workflow file, got {:?}",
+        changed
+    );
+}
+
+#[tokio::test]
+async fn workflow_files_changed_accepts_yaml_extension_too() {
+    // Issue #111 AC: both `.yml` and `.yaml` qualify, matching GitHub
+    // Actions' own discovery convention. End-to-end pin of the
+    // extension pair: a `.yaml` workflow surfaces just as a `.yml` one
+    // does.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/111-flag-workflows")
+        .await
+        .unwrap();
+
+    let base = head_sha(&workspace).await.unwrap();
+
+    std::fs::create_dir_all(workspace.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        workspace.path().join(".github/workflows/release.yaml"),
+        "name: Release\non: push\njobs: {}\n",
+    )
+    .unwrap();
+    commit_all(&workspace).await.unwrap();
+    let head = head_sha(&workspace).await.unwrap();
+
+    let changed = workflow_files_changed_between(&workspace, &base, &head)
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec![".github/workflows/release.yaml".to_string()],
+        ".yaml extension must qualify alongside .yml"
     );
 }
 
