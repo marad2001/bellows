@@ -466,6 +466,54 @@ pub fn is_workflow_file_path(path: &str) -> bool {
     rest.ends_with(".yml") || rest.ends_with(".yaml")
 }
 
+/// Workflow files (under `.github/workflows/`) touched between `base`
+/// and `head`. Single `git diff --name-only <base> <head>` shellout
+/// filtered through [`is_workflow_file_path`]; pure-data return so the
+/// PR-body and run-log composers can call it independently and
+/// unit-test the formatting separately from the git invocation.
+///
+/// Issue #111: surfaces the names of changed workflow files for the
+/// operator-visibility callout. The callout warns that bellows's
+/// cargo-checks gates only mirror `cargo clippy` and `cargo test`
+/// from CI, so any other new steps in the changed workflow(s) are
+/// exercised for the first time on the PR's real GitHub Actions run.
+///
+/// Returns `Ok(vec![])` when no workflow files were touched (the
+/// common case) so the composers omit the callout entirely. Returns
+/// `Err(WorkspaceError::GitFailed)` if the git invocation itself fails
+/// — mirrors the error shape of the sibling
+/// [`diff_between_touches_only_agent_notes`] helper.
+pub async fn workflow_files_changed_between(
+    workspace: &Workspace,
+    base: &str,
+    head: &str,
+) -> Result<Vec<String>, WorkspaceError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(["diff", "--name-only", base, head])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: vec![
+                "diff".into(),
+                "--name-only".into(),
+                base.into(),
+                head.into(),
+            ],
+            status: output.status,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|line| is_workflow_file_path(line))
+        .map(|line| line.to_string())
+        .collect())
+}
+
 /// Whether the file list touched between `base` and `head` is exactly
 /// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
 /// per-finding loop after PR #38: with the agent free to self-commit
