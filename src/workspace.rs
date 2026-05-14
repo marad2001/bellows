@@ -13,13 +13,36 @@ pub enum WorkspaceError {
     Io(#[from] std::io::Error),
     #[error("git clone failed (status {0})")]
     CloneFailed(std::process::ExitStatus),
-    #[error("git {args:?} failed (status {status})")]
+    #[error("git {args:?} failed (status {status}){}", format_stderr_suffix(stderr))]
     GitFailed {
         args: Vec<String>,
         status: std::process::ExitStatus,
+        /// Captured stderr from the failing git invocation, if the
+        /// callsite used `.output()` rather than `.status()`. Issue
+        /// #113: the workspace push helper captures this so the
+        /// runner's halt-log path can surface git's lease-rejection
+        /// message verbatim to operators. Empty string when not
+        /// captured (most internal callsites use `.status()` and
+        /// inherit the child's stderr to the parent's tty).
+        stderr: String,
     },
     #[error("agent produced no changes to commit; the brief was probably unmet")]
     NoChangesToCommit,
+}
+
+/// Render the trailing `: <stderr>` for [`WorkspaceError::GitFailed`]'s
+/// `Display`. Empty stderr (the default for `.status()`-based
+/// callsites) produces an empty suffix so the legacy single-line
+/// rendering is preserved; a non-empty stderr is appended after a
+/// colon so the operator-visible halt-log line attributes the failure
+/// to its git-side cause.
+fn format_stderr_suffix(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {trimmed}")
+    }
 }
 
 pub struct Workspace {
@@ -272,6 +295,7 @@ async fn detect_default_branch(repo: &Path) -> Result<String, WorkspaceError> {
                 "origin/HEAD".into(),
             ],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -304,6 +328,7 @@ pub async fn commit_all(workspace: &Workspace) -> Result<(), WorkspaceError> {
         return Err(WorkspaceError::GitFailed {
             args: vec!["status".into(), "--porcelain".into()],
             status: status_output.status,
+            stderr: String::from_utf8_lossy(&status_output.stderr).into_owned(),
         });
     }
     if status_output.stdout.is_empty() {
@@ -406,12 +431,63 @@ pub async fn commit_to_branch(
     Ok(())
 }
 
+/// Push the workspace's agent branch to origin.
+///
+/// Issue #113: the invocation is
+/// `git push --force-with-lease=<branch> -u origin <branch>`. The
+/// lease's expected value is the local remote-tracking ref, which git
+/// maintains automatically across this pipeline's earlier pushes
+/// within the same workspace. Four cases:
+///
+/// * **First push** (no remote-tracking ref yet): git's documented
+///   fallback applies — `--force-with-lease=<branch>` with no recorded
+///   expected value degrades to a plain push, so the implement-phase
+///   first push behaves identically to the pre-#113 plain
+///   `git push -u origin <branch>`.
+/// * **Subsequent push, no rewrite**: the lease's expected value
+///   matches; the push fast-forwards. All bellows-internal push paths
+///   (security-fix, parser-as-backstop synth, end-of-pipeline) are
+///   unchanged in shape.
+/// * **Subsequent push, agent rewrote history** (the bug case
+///   motivating #113): the lease matches because bellows is the sole
+///   writer of `agent/*` per ADR-0003, so the force-update lands and
+///   the run can finalise normally.
+/// * **Anomaly — external writer changed origin between bellows
+///   pushes**: the lease fails. The function returns
+///   [`WorkspaceError::GitFailed`] with git's captured stderr in the
+///   error's `stderr` field, so the runner's halt-log path can render
+///   the lease-rejection message verbatim and an operator can
+///   distinguish this from any other git failure.
+///
+/// ADR-0003's "Consequences" section names this `push_branch` lease
+/// policy as the realisation of the forward-referenced "force-push as
+/// a recovery primitive at push time."
+///
+/// Public function signature unchanged from the pre-#113 plain-push
+/// shape, so all existing callsites compile without modification.
 pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
-    git(
-        workspace.path(),
-        &["push", "-u", "origin", &workspace.branch_name],
-    )
-    .await
+    let lease_flag = format!("--force-with-lease={}", workspace.branch_name);
+    let args = vec![
+        "push".to_string(),
+        lease_flag,
+        "-u".to_string(),
+        "origin".to_string(),
+        workspace.branch_name.clone(),
+    ];
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace.path())
+        .args(&args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args,
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Capture the current `HEAD` SHA via `git rev-parse HEAD`. Used by
@@ -433,6 +509,7 @@ pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
         return Err(WorkspaceError::GitFailed {
             args: vec!["rev-parse".into(), "HEAD".into()],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -503,6 +580,7 @@ pub async fn workflow_files_changed_between(
                 head.into(),
             ],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -547,6 +625,7 @@ pub async fn diff_between_touches_only_agent_notes(
                 head.into(),
             ],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -602,6 +681,7 @@ pub async fn generate_commit_log(
         return Err(WorkspaceError::GitFailed {
             args: vec!["log".into(), "--name-status".into(), spec.clone()],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     let log_text = String::from_utf8_lossy(&output.stdout);
@@ -636,6 +716,7 @@ pub async fn compute_diff_against_base(
         return Err(WorkspaceError::GitFailed {
             args: vec!["diff".into(), spec.clone()],
             status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -682,6 +763,7 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(), WorkspaceError> {
         return Err(WorkspaceError::GitFailed {
             args: args.iter().map(|s| s.to_string()).collect(),
             status,
+            stderr: String::new(),
         });
     }
     Ok(())
