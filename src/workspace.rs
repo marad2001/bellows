@@ -438,6 +438,34 @@ pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Whether `path` is a GitHub Actions workflow file: a `.yml` or
+/// `.yaml` file directly under `.github/workflows/`. Mirrors GitHub
+/// Actions' own discovery convention so the agent-PR-body callout
+/// surfaces exactly the files CI itself would pick up.
+///
+/// The `.github/workflows/` prefix is load-bearing: a path that
+/// merely contains `.github/` elsewhere — e.g. an issue template
+/// under `.github/ISSUE_TEMPLATE/foo.yml` — does NOT qualify, since
+/// the operator-visibility goal is to flag CI-shape changes and only
+/// files under `.github/workflows/` change CI's shape.
+///
+/// Pure data: the predicate operates on a path string with no
+/// filesystem access, so the file-path matching is unit-testable
+/// independently of any git invocation.
+pub fn is_workflow_file_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(".github/workflows/") else {
+        return false;
+    };
+    // Disallow nested subdirectories under .github/workflows/ —
+    // GitHub Actions only discovers workflows directly under that
+    // directory, not in nested subfolders. Equally, the empty `rest`
+    // case (the directory entry itself) is not a workflow file.
+    if rest.is_empty() || rest.contains('/') {
+        return false;
+    }
+    rest.ends_with(".yml") || rest.ends_with(".yaml")
+}
+
 /// Whether the file list touched between `base` and `head` is exactly
 /// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
 /// per-finding loop after PR #38: with the agent free to self-commit
