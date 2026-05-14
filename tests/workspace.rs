@@ -1599,6 +1599,187 @@ async fn prepare_with_gates_snapshots_auto_merge_filter_support_alongside_gate_c
     );
 }
 
+// ----------------------------------------------------------------------
+// Issue #113: push_branch must use `--force-with-lease=<branch>` so the
+// per-finding review-fix agent's history rewrites (amend, split, rebase)
+// reach origin. The lease's expected value is the local
+// remote-tracking ref, which git maintains automatically across this
+// pipeline's earlier pushes within the same workspace. ADR-0003 names
+// the `agent/*` namespace as bellows-owned, so force-update inside
+// that namespace is the runner exercising its own ownership.
+// ----------------------------------------------------------------------
+
+/// Initialise a *bare* remote repo with one commit on `master`. A bare
+/// remote accepts pushes that rewind / rewrite a branch (no working
+/// tree, no `denyCurrentBranch` surprise), so the per-finding rewrite
+/// scenarios in the AC2/AC3 regression tests below can exercise the
+/// lease behaviour against a remote that mirrors how origin/github
+/// behaves in production. Note: we initialise a non-bare repo first
+/// (to seed an initial commit, which `git init --bare` plus a direct
+/// commit cannot do without a working tree) then clone it bare and
+/// return the bare path.
+fn init_bare_remote_repo(bare_path: &Path) {
+    let seed_dir = TempDir::new().unwrap();
+    init_remote_repo(seed_dir.path());
+    // Clone the seed into the bare path; the seed_dir is discarded
+    // when this function returns. The bare clone retains the master
+    // branch as a real ref so subsequent operations against it
+    // behave the same as a remote-origin GitHub repo.
+    run_git(
+        bare_path,
+        &[
+            "clone",
+            "--bare",
+            &seed_dir.path().to_string_lossy(),
+            ".",
+        ],
+    );
+}
+
+/// Read the bare remote's tip SHA for the given branch.
+fn remote_tip_sha(bare_path: &Path, branch: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .current_dir(bare_path)
+        .output()
+        .expect("git rev-parse");
+    assert!(output.status.success(), "git rev-parse on bare failed: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Read a workspace's local HEAD SHA via a synchronous `git rev-parse`.
+/// Sibling helper for tests that need the SHA outside the
+/// `workspace::head_sha` async API.
+fn workspace_head_sha(workspace_path: &Path) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_path)
+        .output()
+        .expect("git rev-parse HEAD");
+    assert!(output.status.success(), "git rev-parse HEAD failed: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[tokio::test]
+async fn push_branch_force_updates_after_local_amend_rewrites_tip() {
+    // Issue #113 AC2 (the bug case): the per-finding review-fix agent
+    // rewrites the implement-phase tip via `git commit --amend`. The
+    // second `push_branch` must succeed — local history is no longer
+    // fast-forward over origin's tip but, per ADR-0003, bellows is
+    // the sole writer of `agent/*` so the lease (against the local
+    // remote-tracking ref) matches, and the force-update lands.
+    let bare_dir = TempDir::new().unwrap();
+    init_bare_remote_repo(bare_dir.path());
+    let remote_url = bare_dir.path().to_string_lossy().to_string();
+
+    let workspace = prepare(&remote_url, "agent/113-rewrite-tip")
+        .await
+        .expect("prepare should succeed");
+
+    // First commit + push: seeds the local remote-tracking ref so the
+    // second push's lease has something to match against.
+    std::fs::write(workspace.path().join("a.txt"), "first\n").unwrap();
+    commit_all(&workspace).await.expect("first commit");
+    push_branch(&workspace).await.expect("first push should succeed");
+
+    // Rewrite the local tip via amend — local history is no longer
+    // fast-forward over the pushed branch tip on origin.
+    std::fs::write(workspace.path().join("a.txt"), "first-amended\n").unwrap();
+    run_git(workspace.path(), &["add", "a.txt"]);
+    run_git(
+        workspace.path(),
+        &["commit", "--amend", "--no-edit"],
+    );
+
+    // The second push must succeed: --force-with-lease=<branch>
+    // matches the local remote-tracking ref (bellows is the sole
+    // writer of agent/*), so the force-update lands.
+    push_branch(&workspace)
+        .await
+        .expect("second push after amend must succeed via --force-with-lease");
+
+    // The bare remote's branch tip now matches the post-amend local SHA.
+    let post_amend_local_sha = workspace_head_sha(workspace.path());
+    let remote_sha = remote_tip_sha(bare_dir.path(), "agent/113-rewrite-tip");
+    assert_eq!(
+        remote_sha, post_amend_local_sha,
+        "bare remote's agent branch tip must match the post-amend local SHA"
+    );
+}
+
+#[tokio::test]
+async fn push_branch_rejects_when_external_writer_advanced_origin_and_surfaces_stderr() {
+    // Issue #113 AC3 (the safety property): if a writer outside this
+    // workspace advanced origin's branch tip to an unrelated commit
+    // between bellows pushes, the second push from the first workspace
+    // must be rejected by the lease. The surfaced error must include
+    // git's captured stderr (the lease-rejection message) so an
+    // operator reading the runner's halt log can distinguish this from
+    // any other git failure.
+    let bare_dir = TempDir::new().unwrap();
+    init_bare_remote_repo(bare_dir.path());
+    let remote_url = bare_dir.path().to_string_lossy().to_string();
+
+    // First workspace: seeds the branch via the normal pipeline.
+    let workspace = prepare(&remote_url, "agent/113-external-writer")
+        .await
+        .expect("prepare workspace 1");
+    std::fs::write(workspace.path().join("a.txt"), "v1\n").unwrap();
+    commit_all(&workspace).await.expect("workspace 1 commit");
+    push_branch(&workspace).await.expect("workspace 1 first push");
+
+    // Sibling workspace simulates an external writer advancing origin's
+    // branch tip to an unrelated commit between the first workspace's
+    // pushes.
+    let sibling_dir = TempDir::new().unwrap();
+    run_git(
+        sibling_dir.path(),
+        &["clone", &remote_url, "."],
+    );
+    run_git(sibling_dir.path(), &["config", "user.email", "ext@example.com"]);
+    run_git(sibling_dir.path(), &["config", "user.name", "External"]);
+    run_git(
+        sibling_dir.path(),
+        &["checkout", "-b", "agent/113-external-writer", "origin/agent/113-external-writer"],
+    );
+    std::fs::write(sibling_dir.path().join("unrelated.txt"), "from-sibling\n").unwrap();
+    run_git(sibling_dir.path(), &["add", "unrelated.txt"]);
+    run_git(
+        sibling_dir.path(),
+        &["commit", "-m", "external writer advances origin"],
+    );
+    run_git(
+        sibling_dir.path(),
+        &["push", "origin", "agent/113-external-writer"],
+    );
+
+    // The first workspace now rewrites its local tip via amend.
+    std::fs::write(workspace.path().join("a.txt"), "v1-amended\n").unwrap();
+    run_git(workspace.path(), &["add", "a.txt"]);
+    run_git(workspace.path(), &["commit", "--amend", "--no-edit"]);
+
+    // The second push from the first workspace must fail: the lease's
+    // expected value (the first workspace's stale remote-tracking
+    // ref) no longer matches origin's current tip.
+    let result = push_branch(&workspace).await;
+    let err = result.expect_err(
+        "push must fail: external writer advanced origin's tip between bellows pushes",
+    );
+
+    // The surfaced error must include git's captured stderr so the
+    // runner's halt-log path can attribute the failure to a lease
+    // rejection rather than an unrelated git failure.
+    let rendered = format!("{err}");
+    let lower = rendered.to_lowercase();
+    assert!(
+        lower.contains("stale info")
+            || lower.contains("rejected")
+            || lower.contains("force-with-lease")
+            || lower.contains("non-fast-forward"),
+        "lease-rejection error must surface git's stderr in the error display, got: {rendered:?}"
+    );
+}
+
 #[tokio::test]
 async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_config() {
     // Back-compat acceptance: the legacy two-arg `prepare(url, branch)`
