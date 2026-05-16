@@ -240,6 +240,8 @@ pub struct Label {
     pub name: String,
 }
 
+const ISSUE_LIST_PER_PAGE: u32 = 100;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
     #[error("issue was already claimed by another orchestrator")]
@@ -252,15 +254,13 @@ pub enum ClaimError {
 struct ListIssuesParams<'a> {
     labels: &'a str,
     state: &'a str,
+    sort: &'a str,
+    direction: &'a str,
+    per_page: u32,
 }
 
 /// Query params for the oldest-first `needs-triage` listing used by the
-/// slice-T2 backlog drain (issue #22). Sibling of `ListIssuesParams`
-/// — separate struct because `sort` / `direction` only apply when the
-/// caller cares about ordering, and the existing `find_next_issue`
-/// path explicitly does not (its tiebreak is "first un-claimed in
-/// API-default order", and surfacing GitHub's sort/direction defaults
-/// on every list call would be churn).
+/// slice-T2 backlog drain (issue #22).
 #[derive(serde::Serialize)]
 struct ListNeedsTriageParams<'a> {
     labels: &'a str,
@@ -296,6 +296,32 @@ pub async fn list_needs_triage_issues(
     Ok(issues)
 }
 
+async fn list_all_open_issues_with_labels(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    labels: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
+    let params = ListIssuesParams {
+        labels,
+        state: "open",
+        sort: "created",
+        direction: "asc",
+        per_page: ISSUE_LIST_PER_PAGE,
+    };
+    let route = format!("/repos/{owner}/{repo}/issues");
+    let mut page: octocrab::Page<Issue> = client.get(&route, Some(&params)).await?;
+    let mut issues = page.take_items();
+    let mut next = page.next.clone();
+
+    while let Some(mut next_page) = client.get_page::<Issue>(&next).await? {
+        issues.append(&mut next_page.take_items());
+        next = next_page.next.clone();
+    }
+
+    Ok(issues)
+}
+
 /// List the open issues carrying `pickup_label` and return the
 /// lowest-`number` candidate that is neither already in progress nor
 /// labelled `blocked_by_label`.
@@ -316,17 +342,11 @@ pub async fn find_next_issue(
     in_progress_label: &str,
     blocked_by_label: &str,
 ) -> Result<Option<Issue>, octocrab::Error> {
-    let params = ListIssuesParams {
-        labels: pickup_label,
-        state: "open",
-    };
-    let route = format!("/repos/{owner}/{repo}/issues");
-    let mut issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
-    // Sort ascending by issue.number so the lowest-number un-filtered
-    // candidate wins. GitHub's default list ordering is newest-first
-    // (created_at desc), which is fine on its own — but we need a
-    // deterministic per-repo "lowest number" so the runner's cross-
-    // repo tie-break has a stable per-repo seed to compare.
+    let mut issues = list_all_open_issues_with_labels(client, owner, repo, pickup_label).await?;
+    // Sort the complete paginated candidate set by issue.number so
+    // the lowest-number un-filtered candidate wins. Sorting only the
+    // first GitHub page would miss older/lower-number issues on
+    // later pages.
     issues.sort_by_key(|i| i.number);
     Ok(issues.into_iter().find(|issue| {
         let labels = &issue.labels;
@@ -336,9 +356,9 @@ pub async fn find_next_issue(
 }
 
 /// List every open issue carrying `blocked_by_label` (the dependents
-/// the re-loop sweep needs to reconcile). Returns the issues
-/// verbatim so the sweep can fetch each brief and check each named
-/// blocker's state.
+/// the re-loop sweep needs to reconcile). Returns the full paginated
+/// set in issue-number order so the sweep can fetch each brief and
+/// check each named blocker's state.
 ///
 /// Issue #116 / ADR-0007: separate call from `find_next_issue` so
 /// the normal pass doesn't pay for the dependent list when there's
@@ -354,12 +374,8 @@ pub async fn list_blocked_by_issues(
     // server-side, so we get the intersection of `pickup_label` and
     // `blocked_by_label` in one call.
     let combined = format!("{pickup_label},{blocked_by_label}");
-    let params = ListIssuesParams {
-        labels: &combined,
-        state: "open",
-    };
-    let route = format!("/repos/{owner}/{repo}/issues");
-    let issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    let mut issues = list_all_open_issues_with_labels(client, owner, repo, &combined).await?;
+    issues.sort_by_key(|i| i.number);
     Ok(issues)
 }
 
