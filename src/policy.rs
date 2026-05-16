@@ -410,7 +410,25 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
         "rate limit:",
     ];
     let lower = text.to_lowercase();
-    SIGNATURES.iter().any(|sig| lower.contains(sig))
+    if SIGNATURES.iter().any(|sig| lower.contains(sig)) {
+        return true;
+    }
+    // Opencode (issue #120 / ADR-0008): composite AI_APICallError + 429.
+    is_opencode_rate_limit_signature(text)
+}
+
+/// Opencode-side rate-limit signature: composite match of
+/// `AI_APICallError` AND `"statusCode":429` on the ANSI-stripped form
+/// of the input (issue #120 / ADR-0008 AC4). Substrings come from the
+/// AI SDK error shape opencode emits to stderr.
+///
+/// Composite (both substrings) so a bare `429` in unrelated
+/// agent-fetched content (test fixtures, JSON byte counts, HTTP
+/// docs) does not produce a false positive — same pattern the codex
+/// auth-error signature uses for `401 Unauthorized`.
+pub fn is_opencode_rate_limit_signature(text: &str) -> bool {
+    let stripped = strip_ansi(text);
+    stripped.contains("AI_APICallError") && stripped.contains("\"statusCode\":429")
 }
 
 /// Whether the given text contains a known auth-error signature. Used
@@ -438,7 +456,9 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
 /// in the run-log comment names the engine to refresh") uses the
 /// per-engine helpers below.
 pub fn is_auth_error_signature(text: &str) -> bool {
-    is_claude_auth_error_signature(text) || is_codex_auth_error_signature(text)
+    is_claude_auth_error_signature(text)
+        || is_codex_auth_error_signature(text)
+        || is_opencode_auth_error_signature(text)
 }
 
 /// Claude-side auth-error signature subset. Returns true when the
@@ -463,6 +483,17 @@ pub fn is_codex_auth_error_signature(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("401 unauthorized")
         && lower.contains("missing bearer or basic authentication")
+}
+
+/// Opencode-side auth-error signature: composite match of
+/// `AI_APICallError` AND `"statusCode":401` on the ANSI-stripped form
+/// of the input (issue #120 / ADR-0008 AC5). Substrings come from
+/// the AI SDK error shape opencode emits to stderr. Composite to
+/// avoid false positives from a bare `401` in unrelated
+/// agent-fetched content.
+pub fn is_opencode_auth_error_signature(text: &str) -> bool {
+    let stripped = strip_ansi(text);
+    stripped.contains("AI_APICallError") && stripped.contains("\"statusCode\":401")
 }
 
 /// Strip ANSI CSI escape sequences from `s`. Used as a pre-pass before
