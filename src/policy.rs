@@ -465,6 +465,46 @@ pub fn is_codex_auth_error_signature(text: &str) -> bool {
         && lower.contains("missing bearer or basic authentication")
 }
 
+/// Strip ANSI CSI escape sequences from `s`. Used as a pre-pass before
+/// the opencode `is_*_signature` substring matchers so coloured
+/// stderr (notably opencode, which emits ANSI-styled JSON-ish error
+/// payloads by default — see ADR-0008 / issue #120 AC3) does not
+/// produce false-negative classification.
+///
+/// Implementation: state-machine scan that skips bytes from `ESC [`
+/// (0x1B, 0x5B) through the next final byte in the CSI range
+/// `0x40..=0x7E` (i.e. `@A-Z[\\]^_\`a-z{|}~`). Non-CSI text passes
+/// through unchanged; ESC bytes not followed by `[` pass through
+/// unchanged. ASCII-only output — opencode's coloured stderr is
+/// ASCII-only after stripping. No allocation when the input contains
+/// no escape sequences.
+pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // CSI: ESC [ <params> <final>. Skip until a final byte in
+            // 0x40..=0x7E, then drop the final byte itself.
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // consume the final byte
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Whether either of a gate's checks exited non-zero. Crate-public so the
 /// runner can use it for orchestration decisions ("should we halt before
 /// review?") with the same predicate `classify_exit` uses for routing —
