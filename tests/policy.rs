@@ -56,6 +56,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         implement: ImplementOutcome {
             exit_code: 0,
             stderr_tail: String::new(),
+            engine: None,
         },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
@@ -87,6 +88,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         implement: ImplementOutcome {
             exit_code: implement_exit,
             stderr_tail: String::new(),
+            engine: None,
         },
         post_implement_gate: GateOutcome {
             cargo_clippy: None,
@@ -155,7 +157,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
     // runner kills a container at the deadline OR finds remaining budget
     // <= 0 before launching a phase.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -247,6 +249,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
             stderr_tail:
                 r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
                     .to_string(),
+            engine: None,
         },
         post_implement_gate: GateOutcome::default(),
         review: None,
@@ -272,6 +275,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
             exit_code: 0,
             stderr_tail:
                 "Wrote example handling for rate_limit_error to docs.md.".to_string(),
+            engine: None,
         },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
@@ -299,7 +303,7 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
     // HasUnaddressedFinding section about why it couldn't finish,
     // that's the operator's most useful artifact.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome::default(),
         review: None,
         review_fix: None,
@@ -321,7 +325,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
     // Implement run was clean (exit 0, no notes) and cargo test passed,
     // but clippy flagged something — gate fails on clippy alone.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(101)),
             cargo_test: Some(check(0)),
@@ -344,7 +348,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
     // review-fix addressed them, but the fixups broke a test — caught
     // by the end-of-pipeline gate.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -1443,6 +1447,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
         implement: ImplementOutcome {
             exit_code: 1,
             stderr_tail: "boom".to_string(),
+            engine: None,
         },
         post_implement_gate: GateOutcome::default(),
         review: None,
@@ -1488,6 +1493,7 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         implement: ImplementOutcome {
             exit_code: 0,
             stderr_tail: String::new(),
+            engine: None,
         },
         post_implement_gate: GateOutcome::default(),
         review: None,
@@ -1523,6 +1529,7 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
         implement: ImplementOutcome {
             exit_code: 0,
             stderr_tail: String::new(),
+            engine: None,
         },
         post_implement_gate: GateOutcome::default(),
         review: None,
@@ -1901,7 +1908,7 @@ fn classify_exit_returns_success_for_clean_security_review_and_fix() {
     // chain must not regress; clean security outcomes do not flip the
     // routing.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -1930,7 +1937,7 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
     // findings file short-circuits the security-fix run cleanly as a
     // success path.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -2285,7 +2292,7 @@ fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardl
     // implement exit AND a green gate, an `## Unaddressed finding:`
     // section forces the AgentSelfReportedFailure outcome.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -2314,7 +2321,7 @@ fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_not
     // stop silent auto-merge but should NOT route to
     // AgentSelfReportedFailure.
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -2343,7 +2350,7 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
     // over SuccessWithNotes when a gate failed AND informational content
     // present (test failure is the more actionable headline)."
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(1)),
@@ -2371,7 +2378,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
     // SuccessWithNotes when implement exit is non-zero AND informational
     // content present."
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 1, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 1, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome::default(),
         review: None,
         review_fix: None,
@@ -2395,7 +2402,7 @@ fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
     // baseline routing path. Pins the AC that Absent does NOT trigger
     // SuccessWithNotes (only InformationalOnly does).
     let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+        implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
@@ -2449,6 +2456,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
         implement: ImplementOutcome {
             exit_code: 137,
             stderr_tail: "Error: bad interpreter".to_string(),
+            engine: None,
         },
         post_implement_gate: GateOutcome::default(),
         review: None,
