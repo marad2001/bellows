@@ -2969,6 +2969,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_triage_rejects_positional_and_issue_flag_as_mutually_exclusive() {
+        // Issue #115 AC5: positional `<N>` and `--issue <N>` are
+        // mutually exclusive at the clap layer. `bellows triage 42
+        // --issue 43` fails parse with a clap usage error.
+        let err = match Cli::try_parse_from(["bellows", "triage", "42", "--issue", "43"]) {
+            Ok(_) => panic!("positional <N> + --issue must be a clap usage error"),
+            Err(e) => e,
+        };
+        // Clap renders a usage error for conflicting args; we don't
+        // pin the exact wording (it varies with clap minor versions)
+        // but it must reference the conflicting flag so the operator
+        // sees what's wrong.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--issue") || msg.contains("issue"),
+            "error must reference the conflicting flag: {msg}"
+        );
+    }
+
+    #[test]
     fn cli_parses_triage_with_repo_flag_for_filtered_drain() {
         // Issue #115 AC1: `--repo <owner/name>` restricts the drain to
         // a single configured `[[repo]]`. Clap must accept the flag as
