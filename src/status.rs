@@ -531,12 +531,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Tiny ergonomic helper so the dedup tests can still read
-    /// `prs(&[41])` rather than the multi-line `BlockReason::OpenAgentPrs
-    /// { pr_numbers: vec![...] }` literal at every call site.
-    fn prs(nums: &[u64]) -> BlockReason {
-        BlockReason::OpenAgentPrs {
-            pr_numbers: nums.to_vec(),
+    /// Tiny ergonomic helper so the dedup tests can still read a single
+    /// `container("abc")` rather than the multi-line
+    /// `BlockReason::AgentContainerRunning { container_id, started_at }`
+    /// literal at every call site. `started_at` is fixed; the dedup
+    /// contract is keyed on the BlockReason value so two distinct calls
+    /// with the same id collapse to one log line.
+    fn container(id: &str) -> BlockReason {
+        BlockReason::AgentContainerRunning {
+            container_id: id.to_string(),
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
         }
     }
 
@@ -779,13 +785,13 @@ mod tests {
     }
 
     #[test]
-    fn summarise_blocked_status_names_each_pr_number_and_mentions_waiting_for_merge() {
-        // Issue #42: pre-claim PR check. When bellows is blocked by an
-        // open `agent/*` PR (CI running, in review, or stuck-draft), the
-        // status file's Blocked state is rendered with each PR number so
-        // an operator running `bellows status` knows exactly which PR is
-        // gating the next claim. The brief's exemplar string is
-        // "blocked by open agent PR #41 (waiting for merge)".
+    fn summarise_blocked_status_names_the_running_agent_container_id() {
+        // Issue #126: pre-claim check inspects the local Docker daemon
+        // for a running `bellows-*` agent container; when one is
+        // detected, the tick is `Blocked(AgentContainerRunning)` and
+        // `bellows status` must name the container id (the brief: "the
+        // status-file renderer and `bellows status` CLI summariser are
+        // updated to name what is actually blocking").
         let st = Status {
             pid: 12345,
             started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
@@ -793,8 +799,11 @@ mod tests {
                 .with_timezone(&Utc),
             current: None,
             blocked: Some(BlockedState {
-                reason: BlockReason::OpenAgentPrs {
-                    pr_numbers: vec![41],
+                reason: BlockReason::AgentContainerRunning {
+                    container_id: "abc123def456".to_string(),
+                    started_at: DateTime::parse_from_rfc3339("2026-05-10T15:20:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
                 },
             }),
         };
@@ -806,76 +815,31 @@ mod tests {
             "summary must surface the blocked state: {s}",
         );
         assert!(
-            s.contains("PR #41"),
-            "summary must name the blocking PR by number: {s}",
+            s.contains("abc123def456"),
+            "summary must name the blocking container id: {s}",
         );
         assert!(
-            s.to_lowercase().contains("waiting for merge"),
-            "summary must include the waiting-for-merge hint per the brief: {s}",
+            s.to_lowercase().contains("agent container"),
+            "summary must say it's blocked by an agent container: {s}",
         );
         assert!(
             !s.contains("currently idle"),
             "blocked is not idle — must not render the idle wording: {s}",
         );
-    }
-
-    #[test]
-    fn summarise_blocked_status_with_multiple_pr_numbers_lists_all_of_them() {
-        // Multiple open agent/* PRs (e.g. two consecutive runs both
-        // waiting on CI) — the status command must show all of them so
-        // an operator can see the full block set, not just one.
-        let st = Status {
-            pid: 12345,
-            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            current: None,
-            blocked: Some(BlockedState {
-                reason: BlockReason::OpenAgentPrs {
-                    pr_numbers: vec![41, 60],
-                },
-            }),
-        };
-        let s = summarise(Some(&st), true);
-        assert!(s.contains("PR #41"), "{}", s);
-        assert!(s.contains("PR #60"), "{}", s);
-    }
-
-    #[test]
-    fn summarise_blocked_with_empty_pr_list_renders_unknown_list_call_failed() {
-        // Fail-closed contract: when the list-PRs GitHub call fails, the
-        // tick is treated as blocked but bellows doesn't know which PRs
-        // are open. The status renderer must distinguish this case so
-        // the operator can read the orchestrator's actual state rather
-        // than seeing a misleading "blocked by PR #(none)" line.
-        let st = Status {
-            pid: 12345,
-            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            current: None,
-            blocked: Some(BlockedState {
-                reason: BlockReason::OpenAgentPrs {
-                    pr_numbers: Vec::new(),
-                },
-            }),
-        };
-        let s = summarise(Some(&st), true);
-        assert!(s.to_lowercase().contains("blocked"), "{}", s);
         assert!(
-            s.to_lowercase().contains("could not list")
-                || s.to_lowercase().contains("unknown"),
-            "must explain that PR numbers couldn't be retrieved: {s}",
+            !s.to_lowercase().contains("waiting for merge"),
+            "container-running case must NOT use the dropped PR-gated wording: {s}",
         );
     }
 
     #[tokio::test]
-    async fn write_blocked_persists_pr_numbers_in_documented_schema() {
-        // Pin the on-disk shape so a future serde rename can't silently
-        // break the status command or `bellows status`'s consumers.
-        // The schema now nests under `reason.kind` (the BlockReason
-        // discriminant) so the stale-branch case from #76 can be
-        // surfaced through the same field.
+    async fn write_blocked_persists_agent_container_in_documented_schema() {
+        // Pin the on-disk shape for the new variant so a future serde
+        // rename can't silently break the status command or
+        // `bellows status`'s consumers. The schema nests under
+        // `reason.kind` (the BlockReason discriminant) so both the
+        // stale-branch case from #76 and the container-running case
+        // from #126 can be surfaced through the same field.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("status.json");
         let ctx = StatusContext {
@@ -886,8 +850,12 @@ mod tests {
                 .with_timezone(&Utc),
         };
 
-        ctx.write_blocked(&BlockReason::OpenAgentPrs {
-            pr_numbers: vec![41, 60],
+        let container_started = DateTime::parse_from_rfc3339("2026-05-10T15:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        ctx.write_blocked(&BlockReason::AgentContainerRunning {
+            container_id: "abc123def456".to_string(),
+            started_at: container_started,
         })
         .await
         .unwrap();
@@ -896,9 +864,12 @@ mod tests {
         assert_eq!(v["pid"], 4242);
         assert_eq!(v["started_at"], "2026-05-10T15:00:00Z");
         assert!(v["current"].is_null());
-        assert_eq!(v["blocked"]["reason"]["kind"], "open_agent_prs");
-        assert_eq!(v["blocked"]["reason"]["pr_numbers"][0], 41);
-        assert_eq!(v["blocked"]["reason"]["pr_numbers"][1], 60);
+        assert_eq!(v["blocked"]["reason"]["kind"], "agent_container_running");
+        assert_eq!(v["blocked"]["reason"]["container_id"], "abc123def456");
+        assert_eq!(
+            v["blocked"]["reason"]["started_at"],
+            "2026-05-10T15:20:00Z",
+        );
     }
 
     #[tokio::test]
@@ -985,8 +956,11 @@ mod tests {
                 .with_timezone(&Utc),
         };
 
-        ctx.write_blocked(&BlockReason::OpenAgentPrs {
-            pr_numbers: vec![41],
+        ctx.write_blocked(&BlockReason::AgentContainerRunning {
+            container_id: "abc123def456".to_string(),
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:20:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
         })
         .await
         .unwrap();
@@ -1010,8 +984,11 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         };
-        ctx.write_blocked(&BlockReason::OpenAgentPrs {
-            pr_numbers: vec![41],
+        ctx.write_blocked(&BlockReason::AgentContainerRunning {
+            container_id: "abc123def456".to_string(),
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:20:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
         })
         .await
         .unwrap();
@@ -1032,24 +1009,27 @@ mod tests {
 
     #[test]
     fn outcome_transition_idle_to_blocked_emits_log_line() {
-        // Brief: "The polling loop's log emits a 'blocked by PR #...' line
-        // only on state transitions — not on every tick." On the
-        // first tick that sees an open agent/* PR, the line fires.
+        // Brief: "The polling loop's log emits a 'blocked' line only on
+        // state transitions — not on every tick." On the first tick
+        // that sees a running agent container, the line fires and names
+        // the container id so an operator running `tail -f bellows.log`
+        // knows what is gating the next claim.
         let mut tracker = OutcomeTransition::new();
-        let line = tracker.observe_blocked(&prs(&[41]));
+        let line = tracker.observe_blocked(&container("abc123"));
         let line = line.expect("expected a transition log line");
         assert!(line.contains("blocked"), "{}", line);
-        assert!(line.contains("PR #41"), "{}", line);
+        assert!(line.contains("abc123"), "{}", line);
     }
 
     #[test]
     fn outcome_transition_same_block_set_twice_in_a_row_is_silent() {
-        // The whole point of transition-only logging: a 5-minute CI cycle
-        // would otherwise flood the log with ~10 identical "blocked"
-        // lines, drowning out everything else.
+        // The whole point of transition-only logging: while a single
+        // long-running agent container is in flight, the polling loop
+        // would otherwise flood the log with ~N identical "blocked"
+        // lines every poll interval, drowning out everything else.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&prs(&[41]));
-        let line = tracker.observe_blocked(&prs(&[41]));
+        let _ = tracker.observe_blocked(&container("abc123"));
+        let line = tracker.observe_blocked(&container("abc123"));
         assert!(
             line.is_none(),
             "second identical observation must not emit a log line, got {:?}",
@@ -1059,14 +1039,15 @@ mod tests {
 
     #[test]
     fn outcome_transition_block_set_changing_emits_a_fresh_log_line() {
-        // If a second agent/* PR opens (or the prior one merges and a new
-        // one opens), the block set changes and the operator wants a
-        // fresh line saying so.
+        // If one agent container finishes and a new one starts before
+        // the next idle tick (unusual but possible — fast finalise +
+        // immediate next claim by another process holding the lock),
+        // the block set changes and the operator wants a fresh line.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&prs(&[41]));
-        let line = tracker.observe_blocked(&prs(&[60]));
+        let _ = tracker.observe_blocked(&container("abc123"));
+        let line = tracker.observe_blocked(&container("def456"));
         let line = line.expect("set changed; expected a transition line");
-        assert!(line.contains("PR #60"), "{}", line);
+        assert!(line.contains("def456"), "{}", line);
     }
 
     #[test]
@@ -1075,7 +1056,7 @@ mod tests {
         // see both that the block has cleared (resume line) AND that the
         // loop is back to the steady-state idle pattern.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&prs(&[41]));
+        let _ = tracker.observe_blocked(&container("abc123"));
         let lines = tracker.observe_idle();
         assert_eq!(
             lines.len(),
@@ -1102,7 +1083,7 @@ mod tests {
         // event itself is logged by the caller; the tracker is only
         // responsible for the resume-from-blocked line.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&prs(&[41]));
+        let _ = tracker.observe_blocked(&container("abc123"));
         let line = tracker.observe_event();
         let line = line.expect("blocked->event must emit a resume line");
         assert!(
@@ -1250,7 +1231,7 @@ mod tests {
         // error state, the operator still wants the resume line so they
         // know the block cleared — followed by the new error context.
         let mut tracker = OutcomeTransition::new();
-        let _ = tracker.observe_blocked(&prs(&[41]));
+        let _ = tracker.observe_blocked(&container("abc123"));
         let lines = tracker.observe_error("missing_agent_brief:42", "brief err".to_string());
         assert_eq!(
             lines.len(),
