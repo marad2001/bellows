@@ -3,9 +3,9 @@
 #
 # Reads the kickoff prompt Bellows wrote into the workspace before the
 # container started, removes the prompt file so it doesn't leak into
-# the resulting commit, then dispatches to either claude or codex
-# based on the per-phase BELLOWS_ENGINE env var the bellows runner
-# sets on the spawned container.
+# the resulting commit, then dispatches to either claude, codex, or
+# opencode based on the per-phase BELLOWS_ENGINE env var the bellows
+# runner sets on the spawned container.
 #
 # When the runner pinned a model on the chain entry (e.g.
 # `"claude:opus-4-7"`), BELLOWS_MODEL is set and we append
@@ -68,8 +68,28 @@ case "$BELLOWS_ENGINE" in
             exec codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$PROMPT" </dev/null
         fi
         ;;
+    opencode)
+        # OpenCode headless invocation (issue #120 / ADR-0008):
+        #   opencode run "$PROMPT" </dev/null
+        #
+        # opencode is API-key-authenticated rather than OAuth: the
+        # bellows dispatcher injects DEEPSEEK_API_KEY (and any other
+        # env-file lines) into the container's env at create-time
+        # (AC11), so the CLI can pick the key up without a
+        # credentials-volume mount.
+        #
+        # Defence-in-depth `</dev/null` stdin closure: opencode is
+        # also an npm-shipped Node CLI built on the same primitives
+        # that bit codex, so we close stdin defensively even though
+        # we don't have a confirmed empirical hang yet.
+        if [ -n "${BELLOWS_MODEL:-}" ]; then
+            exec opencode run -m "$BELLOWS_MODEL" "$PROMPT" </dev/null
+        else
+            exec opencode run "$PROMPT" </dev/null
+        fi
+        ;;
     *)
-        echo "bellows: unrecognised BELLOWS_ENGINE=$BELLOWS_ENGINE (expected 'claude' or 'codex')" >&2
+        echo "bellows: unrecognised BELLOWS_ENGINE=$BELLOWS_ENGINE (expected 'claude', 'codex', or 'opencode')" >&2
         exit 4
         ;;
 esac
