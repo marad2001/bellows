@@ -151,7 +151,8 @@ fn pr_routing_for_reason<'a>(
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
         | ExitReason::FinalTestsRed
-        | ExitReason::WallClockExceeded => PrRouting {
+        | ExitReason::WallClockExceeded
+        | ExitReason::AuthError => PrRouting {
             draft: true,
             outcome_label: &labels.agent_failed,
             pr_label: None,
@@ -849,7 +850,7 @@ pub async fn run_once(
     let head_before_implement = workspace::head_sha(&workspace).await?;
     let mut implement_advances_used: u8 = 0;
     let mut rate_limited_phase: Option<&'static str> = None;
-    let (_implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
+    let (implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
         let now = chrono::Utc::now();
         let pick_result = pick_engine_for_phase(
             &config.phases.implement.cli_chain,
@@ -1988,6 +1989,7 @@ pub async fn run_once(
         implement: ImplementOutcome {
             exit_code: implement_agent_run.exit_code,
             stderr_tail: implement_agent_run.stderr_tail.clone(),
+            engine: Some(implement_chain_entry.engine),
         },
         post_implement_gate,
         review: review_outcome,
@@ -2331,6 +2333,11 @@ fn build_pr_body(
         ExitReason::RateLimited => {
             "## Anthropic API rate limit detected\n\n\
              A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
+                .to_string()
+        }
+        ExitReason::AuthError => {
+            "## Authentication error detected\n\n\
+             An implement-phase agent reported an authentication failure (e.g. HTTP 401 from the engine's API). Run `bellows refresh-auth --engine <engine>` and re-run. See the run-log comment for the matched signature."
                 .to_string()
         }
         ExitReason::Cancelled => {
@@ -2938,6 +2945,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: implement_exit,
                 stderr_tail: tail.to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: None,
@@ -3087,6 +3095,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 0,
                 stderr_tail: "agent done".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult {
@@ -3125,7 +3134,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 101, output: "clippy lint here".to_string() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "test panicked".to_string() }),
@@ -3160,7 +3169,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3195,7 +3204,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3230,7 +3239,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3266,6 +3275,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137, // SIGKILL exit code
                 stderr_tail: "(killed by deadline)".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3306,6 +3316,7 @@ mod tests {
                 stderr_tail:
                     r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
                         .to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3348,6 +3359,7 @@ mod tests {
                 stderr_tail:
                     r#"Error: 401 Unauthorized: {"error":{"type":"authentication_error","message":"refresh_token_expired"}}"#
                         .to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3395,6 +3407,7 @@ mod tests {
                 exit_code: 0,
                 stderr_tail:
                     "Documented how to handle refresh_token_expired in docs.md.".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3437,6 +3450,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137,
                 stderr_tail: String::new(), // empty — kill happened before any flush
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3476,7 +3490,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started + chrono::Duration::seconds(120);
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3535,7 +3549,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3602,6 +3616,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137,
                 stderr_tail: "Error: /workspace/entrypoint-user: bad interpreter".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3766,7 +3781,7 @@ mod tests {
         security_fix: Option<FixOutcome>,
     ) -> PhaseOutcomes {
         PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3977,7 +3992,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -4044,6 +4059,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 0,
                 stderr_tail: huge_stderr,
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: None,

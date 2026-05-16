@@ -34,6 +34,12 @@ pub enum ExitReason {
     FinalTestsRed,
     WallClockExceeded,
     RateLimited,
+    /// ADR-0008 / issue #120 AC6: an authentication error was detected
+    /// in implement-phase stderr. Distinct from `Crash` so the run-log
+    /// builder (AC12) can name the engine to refresh — same routing
+    /// shape `RateLimited` already had for the rate-limit follow-up
+    /// signal.
+    AuthError,
     Cancelled,
 }
 
@@ -206,12 +212,21 @@ pub fn classify_agent_notes_with_synth_spans(
     }
 }
 
-/// Outcome of the implement run: the first phase, where claude reads
-/// the agent brief and writes code.
+/// Outcome of the implement run: the first phase, where the agent
+/// reads the brief and writes code.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ImplementOutcome {
     pub exit_code: i64,
     pub stderr_tail: String,
+    /// ADR-0008 / issue #120 AC6: engine that produced this outcome.
+    /// `None` preserves the pre-AC6 code path — classify_exit's
+    /// signature precedence still gates on exit_code != 0 for the
+    /// older engines (Claude, Codex) — so existing call sites that
+    /// have not been updated continue to behave as before. The
+    /// opencode path requires `Some(Engine::Opencode)` so the
+    /// signature can be treated as authoritative regardless of exit
+    /// code (opencode v1.15.3 exits 0 on 429 / 401).
+    pub engine: Option<crate::config::Engine>,
 }
 
 /// One cargo subcommand's exit code + captured output.
@@ -354,6 +369,23 @@ pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason 
     }
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
+    }
+    // ADR-0008 / issue #120 AC6: opencode v1.15.3 exits 0 on its
+    // 429 / 401 responses (the CLI surfaces the error to stderr and
+    // returns cleanly). For opencode-engine implement runs the
+    // signature is authoritative regardless of exit code; auth-error
+    // takes precedence over rate-limit since "wrong key" is a
+    // sharper operator signal than "API throttled".
+    if matches!(
+        outcomes.implement.engine,
+        Some(crate::config::Engine::Opencode)
+    ) {
+        if is_opencode_auth_error_signature(&outcomes.implement.stderr_tail) {
+            return ExitReason::AuthError;
+        }
+        if is_opencode_rate_limit_signature(&outcomes.implement.stderr_tail) {
+            return ExitReason::RateLimited;
+        }
     }
     // Rate-limit detection runs BEFORE the generic Crash check so a
     // non-zero exit caused by an Anthropic rate-limit gets the more
