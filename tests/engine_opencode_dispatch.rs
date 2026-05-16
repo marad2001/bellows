@@ -40,12 +40,20 @@ fn parse_env_file_lines_ignores_blank_lines_and_comments() {
 
 #[test]
 fn parse_env_file_lines_errors_on_malformed_line_without_equals() {
-    let body = "DEEPSEEK_API_KEY=sk-ok\nNOT_VALID_LINE\n";
+    let body = "DEEPSEEK_API_KEY=sk-ok\nsk-leaked-secret\n";
     let err = parse_env_file_lines(body).expect_err("must error on malformed line");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("NOT_VALID_LINE") || msg.to_lowercase().contains("malformed"),
-        "error should name the offending line: {msg}",
+        msg.to_lowercase().contains("malformed"),
+        "error should explain the malformed env-file line: {msg}",
+    );
+    assert!(
+        msg.contains("line 2"),
+        "error should name the line number without echoing line content: {msg}",
+    );
+    assert!(
+        !msg.contains("sk-leaked-secret"),
+        "error must not echo malformed env-file content because it may contain a secret: {msg}",
     );
 }
 

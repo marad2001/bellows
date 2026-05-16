@@ -164,17 +164,20 @@ impl Auth {
 /// Parse a `KEY=VALUE` env-file body into a `Vec<String>` of
 /// `KEY=VALUE` lines. Blank lines and `#`-prefixed comment lines are
 /// skipped. Lines without an `=` produce an `Err` that names the
-/// offending line so the operator can fix the file.
+/// physical line number without echoing the line content, since a
+/// malformed line may contain secret material.
 pub fn parse_env_file_lines(body: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for line in body.lines() {
+    for (index, line) in body.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if !trimmed.contains('=') {
             return Err(anyhow!(
-                "malformed env-file line (no `=`): {trimmed:?}",
+                "malformed env-file line (no `=`) at line {}; \
+                 rerun `bellows setup-auth --engine opencode` to rewrite the file",
+                index + 1,
             ));
         }
         out.push(trimmed.to_string());
