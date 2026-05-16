@@ -2921,4 +2921,32 @@ mod tests {
         assert!(msg.contains("not-a-number"), "{msg}");
         assert!(msg.contains("invalid issue number"), "{msg}");
     }
+
+    // ---- Issue #115: triage --repo / --issue filter flags ----
+
+    #[test]
+    fn cli_parses_triage_with_repo_flag_for_filtered_drain() {
+        // Issue #115 AC1: `--repo <owner/name>` restricts the drain to
+        // a single configured `[[repo]]`. Clap must accept the flag as
+        // an optional string; the slug-vs-config validation happens
+        // later in resolve_triage_filter.
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "triage",
+            "--repo",
+            "marad2001/bellows",
+        ])
+        .expect("bellows triage --repo <owner/name> must parse");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                repo: Some(r),
+                dry_run: false,
+                ..
+            }) => {
+                assert_eq!(r, "marad2001/bellows");
+            }
+            _ => panic!("expected Triage with repo=Some(\"marad2001/bellows\")"),
+        }
+    }
 }
