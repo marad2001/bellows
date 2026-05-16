@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use serde::Deserialize;
 
 use crate::triage::{TriageVerdict, VerdictState};
@@ -240,6 +242,8 @@ pub struct Label {
     pub name: String,
 }
 
+const ISSUE_LIST_PER_PAGE: u32 = 100;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClaimError {
     #[error("issue was already claimed by another orchestrator")]
@@ -252,15 +256,13 @@ pub enum ClaimError {
 struct ListIssuesParams<'a> {
     labels: &'a str,
     state: &'a str,
+    sort: &'a str,
+    direction: &'a str,
+    per_page: u32,
 }
 
 /// Query params for the oldest-first `needs-triage` listing used by the
-/// slice-T2 backlog drain (issue #22). Sibling of `ListIssuesParams`
-/// — separate struct because `sort` / `direction` only apply when the
-/// caller cares about ordering, and the existing `find_next_issue`
-/// path explicitly does not (its tiebreak is "first un-claimed in
-/// API-default order", and surfacing GitHub's sort/direction defaults
-/// on every list call would be churn).
+/// slice-T2 backlog drain (issue #22).
 #[derive(serde::Serialize)]
 struct ListNeedsTriageParams<'a> {
     labels: &'a str,
@@ -296,22 +298,153 @@ pub async fn list_needs_triage_issues(
     Ok(issues)
 }
 
+async fn list_all_open_issues_with_labels(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    labels: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
+    let params = ListIssuesParams {
+        labels,
+        state: "open",
+        sort: "created",
+        direction: "asc",
+        per_page: ISSUE_LIST_PER_PAGE,
+    };
+    let route = format!("/repos/{owner}/{repo}/issues");
+    let mut page: octocrab::Page<Issue> = client.get(&route, Some(&params)).await?;
+    let mut issues = page.take_items();
+    let mut next = page.next.clone();
+
+    while let Some(mut next_page) = client.get_page::<Issue>(&next).await? {
+        issues.append(&mut next_page.take_items());
+        next = next_page.next.clone();
+    }
+
+    Ok(issues)
+}
+
+/// List the open issues carrying `pickup_label` and return the
+/// lowest-`number` candidate that is neither already in progress nor
+/// labelled `blocked_by_label`.
+///
+/// Issue #116 / ADR-0007: the polling-loop's normal pass filters out
+/// issues carrying `blocked_by_label`; the re-loop sweep (run only
+/// when this returns `None` and at least one blocked-by issue
+/// exists) is the path that reconciles those dependents. Sorting
+/// here is by `issue.number` ascending so each repo contributes its
+/// lowest-number un-claimed unblocked candidate to the multi-repo
+/// pick; the runner sorts the collected per-repo candidates again
+/// (number → created_at → declared repo order) before picking.
 pub async fn find_next_issue(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
     pickup_label: &str,
     in_progress_label: &str,
+    blocked_by_label: &str,
 ) -> Result<Option<Issue>, octocrab::Error> {
-    let params = ListIssuesParams {
-        labels: pickup_label,
-        state: "open",
-    };
-    let route = format!("/repos/{owner}/{repo}/issues");
-    let issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    let mut issues = list_all_open_issues_with_labels(client, owner, repo, pickup_label).await?;
+    // Sort the complete paginated candidate set by issue.number so
+    // the lowest-number un-filtered candidate wins. Sorting only the
+    // first GitHub page would miss older/lower-number issues on
+    // later pages.
+    issues.sort_by_key(|i| i.number);
     Ok(issues.into_iter().find(|issue| {
-        !issue.labels.iter().any(|l| l.name == in_progress_label)
+        let labels = &issue.labels;
+        !labels.iter().any(|l| l.name == in_progress_label)
+            && !labels.iter().any(|l| l.name == blocked_by_label)
     }))
+}
+
+/// List every open issue carrying `blocked_by_label` (the dependents
+/// the re-loop sweep needs to reconcile). Returns the full paginated
+/// set in issue-number order so the sweep can fetch each brief and
+/// check each named blocker's state.
+///
+/// Issue #116 / ADR-0007: separate call from `find_next_issue` so
+/// the normal pass doesn't pay for the dependent list when there's
+/// claimable work waiting — re-loop is the cold path.
+pub async fn list_blocked_by_issues(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pickup_label: &str,
+    blocked_by_label: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
+    // GitHub's list-issues endpoint AND-s comma-separated labels
+    // server-side, so we get the intersection of `pickup_label` and
+    // `blocked_by_label` in one call.
+    let combined = format!("{pickup_label},{blocked_by_label}");
+    let mut issues = list_all_open_issues_with_labels(client, owner, repo, &combined).await?;
+    issues.sort_by_key(|i| i.number);
+    Ok(issues)
+}
+
+/// Minimal shape used by the re-loop sweep when checking a
+/// blocker's state. We only care about `state`; the rest of the
+/// payload is ignored.
+#[derive(Debug, Deserialize)]
+struct IssueState {
+    state: String,
+}
+
+/// Query a single issue's open/closed state. Used by the re-loop
+/// sweep (issue #116 / ADR-0007): the dependent's `blocked-by` label
+/// is stripped iff every blocker named in its brief returns
+/// `"closed"` here (any closure reason — merged PR, manual, wontfix
+/// — counts; see ADR-0007).
+pub async fn fetch_issue_state(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<IssueClosureState, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let issue: IssueState = client.get(&route, None::<&()>).await?;
+    Ok(match issue.state.as_str() {
+        "closed" => IssueClosureState::Closed,
+        _ => IssueClosureState::Open,
+    })
+}
+
+/// GitHub issue closure state. Only two variants because the re-loop
+/// sweep's "is the blocker cleared?" question is binary; the per-
+/// closure-reason distinction (merged vs wontfix vs manual) is
+/// deliberately not exposed — see ADR-0007's "trust the operator
+/// intent" rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueClosureState {
+    Open,
+    Closed,
+}
+
+/// Strip `label` from `issue_number`'s label set. GET-then-PATCH
+/// shape mirrors `claim` / `finalise` so the existing labels are
+/// preserved minus the named label. Returns the updated issue.
+///
+/// Issue #116 / ADR-0007: the re-loop sweep calls this on each
+/// dependent whose blockers have all closed; the cleared dependent
+/// becomes claimable on the next polling tick's normal pass.
+pub async fn strip_issue_label(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    label: &str,
+) -> Result<Issue, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let current: Issue = client.get(&route, None::<&()>).await?;
+    let mut new_labels: Vec<String> = current
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .filter(|n| n != label)
+        .collect();
+    new_labels.sort();
+    let body = serde_json::json!({ "labels": new_labels });
+    let updated: Issue = client.patch(&route, Some(&body)).await?;
+    Ok(updated)
 }
 
 /// Minimal shape of an open PR for the pre-claim check (#42). We only
@@ -489,6 +622,139 @@ struct Comment {
 #[derive(serde::Serialize)]
 struct ListCommentsParams {
     per_page: u32,
+}
+
+/// Parsed shape of the `**Blocked by:**` line in an agent brief.
+/// The polling-loop re-loop sweep (ADR-0007) branches on this variant
+/// when deciding whether to strip the `blocked-by` label.
+///
+/// - `NoBlockers`: the brief is present and either explicitly says
+///   `None` (with or without a verbose annotation), has no
+///   `**Blocked by:**` line at all, or only carries unparseable /
+///   cross-repo references that the v1 parser cannot verify.
+/// - `Blockers(nums)`: the brief lists one or more parseable
+///   same-repo `#N` references. The re-loop checks each `N`'s state
+///   and strips the label only when every one is `CLOSED`.
+/// - `Unverifiable`: the input is not an agent brief at all (the
+///   `## Agent Brief` header is absent). The caller leaves the
+///   `blocked-by` label in place and logs a warning naming the
+///   issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedBySection {
+    NoBlockers,
+    Blockers(Vec<u64>),
+    Unverifiable,
+}
+
+/// Parse the `**Blocked by:**` line out of an agent brief body.
+///
+/// Cases handled (ADR-0007 / brief #116):
+/// - `**Blocked by:** #95` → `Blockers([95])`
+/// - `**Blocked by:** #95, #96` → `Blockers([95, 96])`
+/// - `**Blocked by:** #95 (rationale)` → `Blockers([95])`
+/// - `**Blocked by:** None` → `NoBlockers`
+/// - `**Blocked by:** None — verbose tail` → `NoBlockers`
+/// - missing `**Blocked by:**` line → `NoBlockers`
+/// - cross-repo `owner/name#N` → ignored; when
+///   no parseable same-repo tokens remain → `NoBlockers`
+/// - malformed `#NaN`, bare `abc`, `#` → ignored; when nothing
+///   parseable remains → `NoBlockers`
+/// - missing `## Agent Brief` header entirely → `Unverifiable`
+pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
+    let mut log_writer = io::sink();
+    parse_blocked_by_section_with_log_writer(brief_body, &mut log_writer)
+}
+
+/// Parse the `**Blocked by:**` line out of an agent brief body, writing
+/// parser warnings to `log_writer`.
+pub fn parse_blocked_by_section_with_log_writer(
+    brief_body: &str,
+    log_writer: &mut dyn Write,
+) -> BlockedBySection {
+    if !brief_body.contains("## Agent Brief") {
+        return BlockedBySection::Unverifiable;
+    }
+
+    // Find the line beginning with `**Blocked by:**` (case-sensitive
+    // — this is the shape `/triage` emits). Anywhere on a line so
+    // leading whitespace / list-bullets don't break the match.
+    let prefix = "**Blocked by:**";
+    let Some(line) = brief_body.lines().find_map(|l| {
+        let trimmed = l.trim_start();
+        trimmed.strip_prefix(prefix).map(|rest| rest.trim())
+    }) else {
+        return BlockedBySection::NoBlockers;
+    };
+
+    // Drop any trailing parenthetical annotation (`#95 (rationale)`
+    // → `#95`). We only need to strip a single trailing `(...)` —
+    // the line shape is "one or more refs, optionally followed by a
+    // human-readable note in parens".
+    let body = match line.find('(') {
+        Some(idx) => line[..idx].trim(),
+        None => line,
+    };
+
+    // Explicit `None` (with or without a verbose annotation) clears
+    // any blockers. We check this BEFORE the comma-split so
+    // "None — can start immediately" matches even though the
+    // em-dash tail isn't a token.
+    let body_lower = body.to_ascii_lowercase();
+    if body_lower == "none"
+        || body_lower.starts_with("none ")
+        || body_lower.starts_with("none\t")
+        || body_lower.starts_with("none.")
+        || body_lower.starts_with("none,")
+        || body_lower.starts_with("none—")
+        || body_lower.starts_with("none–")
+        || body_lower.starts_with("none-")
+    {
+        return BlockedBySection::NoBlockers;
+    }
+
+    // Split on commas; each token must be `#N` where N parses as
+    // u64. Cross-repo `owner/name#N` and bare malformed tokens are
+    // logged through the caller-provided writer and dropped from the
+    // result.
+    let mut blockers = Vec::new();
+    for raw in body.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.contains('/') {
+            let _ = writeln!(
+                log_writer,
+                "bellows: ignoring cross-repo blocker reference `{}` in **Blocked by:** line (v1 is same-repo only; see ADR-0007)",
+                token,
+            );
+            continue;
+        }
+        let Some(num_str) = token.strip_prefix('#') else {
+            let _ = writeln!(
+                log_writer,
+                "bellows: ignoring malformed blocker token `{}` in **Blocked by:** line (expected `#N`)",
+                token,
+            );
+            continue;
+        };
+        match num_str.parse::<u64>() {
+            Ok(n) => blockers.push(n),
+            Err(_) => {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: ignoring malformed blocker token `#{}` in **Blocked by:** line (not a u64)",
+                    num_str,
+                );
+            }
+        }
+    }
+
+    if blockers.is_empty() {
+        BlockedBySection::NoBlockers
+    } else {
+        BlockedBySection::Blockers(blockers)
+    }
 }
 
 /// Look up the latest agent-brief comment on an issue (the one whose body

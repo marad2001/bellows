@@ -5,7 +5,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use bellows::tracker::{
     add_issue_labels, apply_verdict, claim, delete_stale_agent_branches, fetch_agent_brief,
     fetch_issue_with_comments, finalise, find_next_issue, list_needs_triage_issues,
-    list_open_agent_prs, post_pr_comment, transition_to_cancelled, ClaimError, FinaliseRequest,
+    list_blocked_by_issues, list_open_agent_prs, post_pr_comment, transition_to_cancelled,
+    ClaimError, FinaliseRequest,
 };
 use bellows::triage::TriageVerdict;
 use wiremock::matchers::body_string_contains;
@@ -38,6 +39,7 @@ async fn find_next_issue_returns_an_issue_when_one_carries_the_pickup_label() {
         "test-repo",
         "ready-for-agent",
         "agent-in-progress",
+        "blocked-by",
     )
     .await
     .expect("call should succeed");
@@ -79,12 +81,128 @@ async fn find_next_issue_skips_issues_already_carrying_the_in_progress_label() {
         "test-repo",
         "ready-for-agent",
         "agent-in-progress",
+        "blocked-by",
     )
     .await
     .expect("call should succeed");
 
     let issue = result.expect("expected an issue");
     assert_eq!(issue.number, 42, "should return the un-claimed issue, not the in-progress one");
+}
+
+#[tokio::test]
+async fn find_next_issue_paginates_before_choosing_lowest_number() {
+    let mock = MockServer::start().await;
+    let page_two = format!("{}/repos/marad2001/test-repo/issues?page=2", mock.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Link", format!("<{page_two}>; rel=\"next\""))
+                .set_body_json(json!([
+                    {
+                        "number": 90,
+                        "title": "first page candidate",
+                        "labels": [{ "name": "ready-for-agent" }]
+                    }
+                ])),
+        )
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 12,
+                "title": "second page lowest",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+
+    let result = find_next_issue(
+        &client,
+        "marad2001",
+        "test-repo",
+        "ready-for-agent",
+        "agent-in-progress",
+        "blocked-by",
+    )
+    .await
+    .expect("call should succeed");
+
+    let issue = result.expect("expected an issue");
+    assert_eq!(
+        issue.number, 12,
+        "pagination must happen before sorting so later pages can contain the true lowest candidate",
+    );
+}
+
+#[tokio::test]
+async fn list_blocked_by_issues_returns_dependents_from_every_page() {
+    let mock = MockServer::start().await;
+    let page_two = format!("{}/repos/marad2001/test-repo/issues?page=2", mock.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent,blocked-by"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Link", format!("<{page_two}>; rel=\"next\""))
+                .set_body_json(json!([
+                    {
+                        "number": 50,
+                        "title": "first page dependent",
+                        "labels": [
+                            { "name": "ready-for-agent" },
+                            { "name": "blocked-by" }
+                        ]
+                    }
+                ])),
+        )
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 51,
+                "title": "second page dependent",
+                "labels": [
+                    { "name": "ready-for-agent" },
+                    { "name": "blocked-by" }
+                ]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let issues = list_blocked_by_issues(
+        &client,
+        "marad2001",
+        "test-repo",
+        "ready-for-agent",
+        "blocked-by",
+    )
+    .await
+    .expect("call should succeed");
+
+    let numbers: Vec<u64> = issues.into_iter().map(|i| i.number).collect();
+    assert_eq!(
+        numbers,
+        vec![50, 51],
+        "re-loop sweeping must consider blocked dependents beyond the first GitHub page",
+    );
 }
 
 #[tokio::test]
