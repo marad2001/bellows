@@ -910,12 +910,19 @@ fn resolve_triage_filter(
     };
 
     // Explicit-issue list: positional → single-element; repeated
-    // --issue values used verbatim for now. Dedup is added in a
-    // subsequent RED-then-GREEN cycle.
+    // --issue values are silently deduplicated, operator-supplied
+    // order preserved (first occurrence wins).
     let explicit_issues = if let Some(n) = positional_issue {
         vec![n]
     } else {
-        issue_numbers.to_vec()
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(issue_numbers.len());
+        for &n in issue_numbers {
+            if seen.insert(n) {
+                out.push(n);
+            }
+        }
+        out
     };
 
     Ok(ResolvedTriageFilter {
