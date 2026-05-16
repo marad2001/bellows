@@ -296,22 +296,137 @@ pub async fn list_needs_triage_issues(
     Ok(issues)
 }
 
+/// List the open issues carrying `pickup_label` and return the
+/// lowest-`number` candidate that is neither already in progress nor
+/// labelled `blocked_by_label`.
+///
+/// Issue #116 / ADR-0007: the polling-loop's normal pass filters out
+/// issues carrying `blocked_by_label`; the re-loop sweep (run only
+/// when this returns `None` and at least one blocked-by issue
+/// exists) is the path that reconciles those dependents. Sorting
+/// here is by `issue.number` ascending so each repo contributes its
+/// lowest-number un-claimed unblocked candidate to the multi-repo
+/// pick; the runner sorts the collected per-repo candidates again
+/// (number → created_at → declared repo order) before picking.
 pub async fn find_next_issue(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
     pickup_label: &str,
     in_progress_label: &str,
+    blocked_by_label: &str,
 ) -> Result<Option<Issue>, octocrab::Error> {
     let params = ListIssuesParams {
         labels: pickup_label,
         state: "open",
     };
     let route = format!("/repos/{owner}/{repo}/issues");
-    let issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    let mut issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    // Sort ascending by issue.number so the lowest-number un-filtered
+    // candidate wins. GitHub's default list ordering is newest-first
+    // (created_at desc), which is fine on its own — but we need a
+    // deterministic per-repo "lowest number" so the runner's cross-
+    // repo tie-break has a stable per-repo seed to compare.
+    issues.sort_by_key(|i| i.number);
     Ok(issues.into_iter().find(|issue| {
-        !issue.labels.iter().any(|l| l.name == in_progress_label)
+        let labels = &issue.labels;
+        !labels.iter().any(|l| l.name == in_progress_label)
+            && !labels.iter().any(|l| l.name == blocked_by_label)
     }))
+}
+
+/// List every open issue carrying `blocked_by_label` (the dependents
+/// the re-loop sweep needs to reconcile). Returns the issues
+/// verbatim so the sweep can fetch each brief and check each named
+/// blocker's state.
+///
+/// Issue #116 / ADR-0007: separate call from `find_next_issue` so
+/// the normal pass doesn't pay for the dependent list when there's
+/// claimable work waiting — re-loop is the cold path.
+pub async fn list_blocked_by_issues(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pickup_label: &str,
+    blocked_by_label: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
+    // GitHub's list-issues endpoint AND-s comma-separated labels
+    // server-side, so we get the intersection of `pickup_label` and
+    // `blocked_by_label` in one call.
+    let combined = format!("{pickup_label},{blocked_by_label}");
+    let params = ListIssuesParams {
+        labels: &combined,
+        state: "open",
+    };
+    let route = format!("/repos/{owner}/{repo}/issues");
+    let issues: Vec<Issue> = client.get(&route, Some(&params)).await?;
+    Ok(issues)
+}
+
+/// Minimal shape used by the re-loop sweep when checking a
+/// blocker's state. We only care about `state`; the rest of the
+/// payload is ignored.
+#[derive(Debug, Deserialize)]
+struct IssueState {
+    state: String,
+}
+
+/// Query a single issue's open/closed state. Used by the re-loop
+/// sweep (issue #116 / ADR-0007): the dependent's `blocked-by` label
+/// is stripped iff every blocker named in its brief returns
+/// `"closed"` here (any closure reason — merged PR, manual, wontfix
+/// — counts; see ADR-0007).
+pub async fn fetch_issue_state(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<IssueClosureState, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let issue: IssueState = client.get(&route, None::<&()>).await?;
+    Ok(match issue.state.as_str() {
+        "closed" => IssueClosureState::Closed,
+        _ => IssueClosureState::Open,
+    })
+}
+
+/// GitHub issue closure state. Only two variants because the re-loop
+/// sweep's "is the blocker cleared?" question is binary; the per-
+/// closure-reason distinction (merged vs wontfix vs manual) is
+/// deliberately not exposed — see ADR-0007's "trust the operator
+/// intent" rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueClosureState {
+    Open,
+    Closed,
+}
+
+/// Strip `label` from `issue_number`'s label set. GET-then-PATCH
+/// shape mirrors `claim` / `finalise` so the existing labels are
+/// preserved minus the named label. Returns the updated issue.
+///
+/// Issue #116 / ADR-0007: the re-loop sweep calls this on each
+/// dependent whose blockers have all closed; the cleared dependent
+/// becomes claimable on the next polling tick's normal pass.
+pub async fn strip_issue_label(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    label: &str,
+) -> Result<Issue, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let current: Issue = client.get(&route, None::<&()>).await?;
+    let mut new_labels: Vec<String> = current
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .filter(|n| n != label)
+        .collect();
+    new_labels.sort();
+    let body = serde_json::json!({ "labels": new_labels });
+    let updated: Issue = client.patch(&route, Some(&body)).await?;
+    Ok(updated)
 }
 
 /// Minimal shape of an open PR for the pre-claim check (#42). We only

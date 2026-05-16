@@ -213,14 +213,241 @@ enum PreClaim {
 
 /// Per-repo claim candidate the multi-repo polling tick (#35)
 /// collects across configured repos before picking the
-/// globally-oldest issue. Holds the parsed `(owner, repo)` tuple plus
-/// the original repo URL so the downstream pipeline can keep using
-/// `workspace::prepare(&repo_url, ...)` without re-parsing.
+/// globally-lowest-number issue. Holds the parsed `(owner, repo)`
+/// tuple plus the original repo URL so the downstream pipeline can
+/// keep using `workspace::prepare(&repo_url, ...)` without
+/// re-parsing.
+///
+/// `repo_order` (issue #116 / ADR-0007) is the candidate's index
+/// into `config.repos`. The polling-tick sort uses it as the final
+/// tier of the tiebreak — issue.number ascending, then created_at
+/// ascending, then declared `[[repo]]` order. We embed the order
+/// in the candidate itself so the sort closure is local to the
+/// candidate list and doesn't need a parallel position table.
 struct RepoCandidate {
     owner: String,
     repo: String,
     repo_url: String,
     issue: tracker::Issue,
+    repo_order: usize,
+}
+
+/// Re-loop sweep across every cleared repo's `blocked-by` dependents.
+/// Issue #116 / ADR-0007: runs only when `run_once`'s normal pass
+/// produced an empty filtered candidate set AND at least one cleared
+/// repo exists. For each dependent the sweep:
+///
+/// 1. Lists the dependent issues (pickup_label AND blocked_by_label).
+/// 2. Fetches each dependent's brief and parses the `**Blocked by:**`
+///    line via `tracker::parse_blocked_by_section`.
+/// 3. For `Blockers(nums)`: queries each `n`'s state; strips the
+///    label iff every blocker is `IssueClosureState::Closed`.
+/// 4. For `NoBlockers` (explicit `None`, missing section, only
+///    unparseable / cross-repo tokens): strips the label
+///    unconditionally — there is nothing to wait for.
+/// 5. For `Unverifiable` (the dependent has no `## Agent Brief`
+///    comment at all): leaves the label in place and logs a warning
+///    naming the issue number.
+///
+/// Per-issue detail (which blockers were open, which closed) writes
+/// to the same log writer at a verbose prefix so an operator can
+/// `grep` the log file for stuck dependents without spamming the
+/// foreground tick line. The single foreground summary is
+/// `bellows: re-loop swept N blocked-by issues, cleared M`.
+///
+/// Errors on individual API calls are caught and logged rather than
+/// propagated: the sweep is a best-effort reconciliation. The tick
+/// it runs on still returns `RunOutcome::Idle`; the operator sees
+/// the warning lines on the next tick.
+async fn run_reloop_sweep(
+    client: &octocrab::Octocrab,
+    cleared_repos: &[(String, String, usize)],
+    pickup_label: &str,
+    blocked_by_label: &str,
+    log_writer: &mut dyn Write,
+) {
+    let mut swept = 0usize;
+    let mut cleared = 0usize;
+    for (owner, repo, _) in cleared_repos {
+        let dependents = match tracker::list_blocked_by_issues(
+            client,
+            owner,
+            repo,
+            pickup_label,
+            blocked_by_label,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: re-loop list-dependents failed for {}/{}: {}",
+                    owner, repo, e,
+                );
+                continue;
+            }
+        };
+        for dependent in dependents {
+            swept += 1;
+            if sweep_one_dependent(
+                client,
+                owner,
+                repo,
+                dependent.number,
+                blocked_by_label,
+                log_writer,
+            )
+            .await
+            {
+                cleared += 1;
+            }
+        }
+    }
+    announce(
+        log_writer,
+        &format!(
+            "bellows: re-loop swept {} blocked-by issues, cleared {}",
+            swept, cleared,
+        ),
+    );
+}
+
+/// Reconcile a single `blocked-by`-labelled dependent. Returns
+/// `true` when the label was successfully stripped (the dependent
+/// has no remaining open blockers); `false` when it was left in
+/// place (some blocker still open, the brief was unverifiable, or a
+/// per-step API call failed).
+async fn sweep_one_dependent(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    blocked_by_label: &str,
+    log_writer: &mut dyn Write,
+) -> bool {
+    let brief = match tracker::fetch_agent_brief(client, owner, repo, issue_number).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): no `## Agent Brief` comment found",
+                issue_number, owner, repo,
+            );
+            return false;
+        }
+        Err(e) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief fetch failed: {}",
+                issue_number, owner, repo, e,
+            );
+            return false;
+        }
+    };
+
+    let parsed = tracker::parse_blocked_by_section(&brief);
+    match parsed {
+        tracker::BlockedBySection::Unverifiable => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief comment present but malformed (no `## Agent Brief` header inside the parsed body)",
+                issue_number, owner, repo,
+            );
+            false
+        }
+        tracker::BlockedBySection::NoBlockers => {
+            // No parseable blockers — explicit `None`, missing
+            // section, or only unparseable / cross-repo tokens.
+            // Strip the label; the dependent becomes claimable on
+            // the next tick.
+            match tracker::strip_issue_label(
+                client,
+                owner,
+                repo,
+                issue_number,
+                blocked_by_label,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): brief lists no blockers",
+                        issue_number, owner, repo,
+                    );
+                    true
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
+                        issue_number, owner, repo, e,
+                    );
+                    false
+                }
+            }
+        }
+        tracker::BlockedBySection::Blockers(blockers) => {
+            let mut all_closed = true;
+            for blocker in &blockers {
+                match tracker::fetch_issue_state(client, owner, repo, *blocker).await {
+                    Ok(tracker::IssueClosureState::Closed) => {
+                        let _ = writeln!(
+                            log_writer,
+                            "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is closed",
+                            blocker, issue_number, owner, repo,
+                        );
+                    }
+                    Ok(tracker::IssueClosureState::Open) => {
+                        let _ = writeln!(
+                            log_writer,
+                            "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is still open",
+                            blocker, issue_number, owner, repo,
+                        );
+                        all_closed = false;
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            log_writer,
+                            "bellows: re-loop: state check for blocker #{} (dependent #{} {}/{}) failed: {}",
+                            blocker, issue_number, owner, repo, e,
+                        );
+                        all_closed = false;
+                    }
+                }
+            }
+            if !all_closed {
+                return false;
+            }
+            match tracker::strip_issue_label(
+                client,
+                owner,
+                repo,
+                issue_number,
+                blocked_by_label,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): every blocker closed",
+                        issue_number, owner, repo,
+                    );
+                    true
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
+                        issue_number, owner, repo, e,
+                    );
+                    false
+                }
+            }
+        }
+    }
 }
 
 pub async fn run_once(
@@ -247,8 +474,12 @@ pub async fn run_once(
     let mut blocked_any = false;
     let mut candidates: Vec<RepoCandidate> = Vec::new();
     let mut any_clear = false;
+    // Issue #116 / ADR-0007: parallel per-repo list of (owner, repo,
+    // repo_order) on cleared repos, used by the re-loop sweep when
+    // the normal pass produces an empty filtered candidate set.
+    let mut cleared_repos: Vec<(String, String, usize)> = Vec::new();
 
-    for repo_cfg in &config.repos {
+    for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
         let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
         let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
             Ok(prs) if prs.is_empty() => PreClaim::Clear,
@@ -279,16 +510,19 @@ pub async fn run_once(
                     &repo,
                     &config.polling.pickup_label,
                     &config.runtime_labels.agent_in_progress,
+                    &config.runtime_labels.blocked_by,
                 )
                 .await?;
                 if let Some(issue) = next {
                     candidates.push(RepoCandidate {
-                        owner,
-                        repo,
+                        owner: owner.clone(),
+                        repo: repo.clone(),
                         repo_url: repo_cfg.url.clone(),
                         issue,
+                        repo_order,
                     });
                 }
+                cleared_repos.push((owner, repo, repo_order));
             }
         }
     }
@@ -323,7 +557,22 @@ pub async fn run_once(
         // Some repos cleared but produced no candidates (or all repos
         // were blocked but at least one cleared — but that branch
         // can't happen here because candidates is empty). Either way,
-        // the steady-state log line is Idle.
+        // the steady-state log line is Idle — but FIRST, if any
+        // cleared repo has blocked-by-labelled issues, run the
+        // re-loop sweep (issue #116 / ADR-0007). The sweep runs only
+        // when there's no unblocked work to claim; a cleared
+        // dependent becomes claimable on the NEXT tick's normal
+        // pass.
+        if !cleared_repos.is_empty() {
+            run_reloop_sweep(
+                client,
+                &cleared_repos,
+                &config.polling.pickup_label,
+                &config.runtime_labels.blocked_by,
+                log_writer,
+            )
+            .await;
+        }
         if let Some(ctx) = status_ctx
             && let Err(e) = ctx.write_idle().await
         {
@@ -350,23 +599,34 @@ pub async fn run_once(
         );
     }
 
-    // Pick the oldest candidate by GitHub `created_at`. The
-    // `Option<DateTime<Utc>>` shape means an issue whose payload didn't
-    // include the field defaults to `MIN_UTC` (treated as "older than
-    // anything else") — defensive, since real GitHub payloads always
-    // include the field and the only path to a missing value is a test
-    // fixture that didn't bother. The order matches the brief's
-    // contract: "oldest by GitHub `created_at`."
-    candidates.sort_by_key(|c| {
-        c.issue
-            .created_at
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+    // Pick the lowest-`issue.number` candidate. Issue #116 /
+    // ADR-0007 promoted issue.number to the primary sort key (with
+    // created_at as the cross-repo tie-breaker, declared `[[repo]]`
+    // order as the final tie-breaker). The `Option<DateTime<Utc>>`
+    // shape on created_at means an issue whose payload didn't
+    // include the field defaults to `MIN_UTC` (treated as "older
+    // than anything else") — defensive, since real GitHub payloads
+    // always include the field and the only path to a missing
+    // value is a test fixture that didn't bother.
+    candidates.sort_by(|a, b| {
+        a.issue.number.cmp(&b.issue.number).then_with(|| {
+            let a_t = a
+                .issue
+                .created_at
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            let b_t = b
+                .issue
+                .created_at
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            a_t.cmp(&b_t).then_with(|| a.repo_order.cmp(&b.repo_order))
+        })
     });
     let RepoCandidate {
         owner,
         repo,
         repo_url,
         issue,
+        repo_order: _,
     } = candidates.into_iter().next().expect("non-empty candidates");
 
     // Issue #76 / ADR-0003: pre-claim sweep. Delete every `agent/<N>-*`
