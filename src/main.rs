@@ -2930,6 +2930,36 @@ mod tests {
     // ---- Issue #115: triage --repo / --issue filter flags ----
 
     #[test]
+    fn cli_parses_triage_with_repeated_issue_flag_captures_all_values_in_order() {
+        // Issue #115 AC2: `--issue` is repeatable; clap collects every
+        // operator-supplied value into the issue_numbers Vec in the
+        // operator-supplied order. Dedup happens later in
+        // resolve_triage_filter (a separate AC); the clap layer only
+        // collects.
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "triage",
+            "--issue",
+            "1",
+            "--issue",
+            "2",
+            "--issue",
+            "3",
+        ])
+        .expect("bellows triage --issue 1 --issue 2 --issue 3 must parse");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                issue_numbers,
+                ..
+            }) => {
+                assert_eq!(issue_numbers, vec![1, 2, 3]);
+            }
+            _ => panic!("expected Triage with issue_numbers=[1,2,3]"),
+        }
+    }
+
+    #[test]
     fn cli_parses_triage_with_repo_flag_for_filtered_drain() {
         // Issue #115 AC1: `--repo <owner/name>` restricts the drain to
         // a single configured `[[repo]]`. Clap must accept the flag as
