@@ -108,10 +108,16 @@ enum Command {
         repo: Option<String>,
         /// Repeatable: triage only the named issue number(s),
         /// regardless of their current triage-label state
-        /// (operator-override). Combinable with `--repo`. Duplicate
+        /// (operator-override). Combinable with `--repo`. Mutually
+        /// exclusive with the positional `<N>` argument. Duplicate
         /// values are silently deduplicated by the drain. Issue
         /// #115.
-        #[arg(long = "issue", value_name = "N", action = clap::ArgAction::Append)]
+        #[arg(
+            long = "issue",
+            value_name = "N",
+            action = clap::ArgAction::Append,
+            conflicts_with = "issue",
+        )]
         issue_numbers: Vec<u64>,
         /// Skip the apply step on every per-issue invocation: print
         /// each verdict and the summary, but make no mutations.
