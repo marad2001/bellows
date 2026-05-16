@@ -1570,12 +1570,15 @@ pub fn wrap_phase_prompt_for_engine(
     match engine {
         crate::config::Engine::Claude => body.to_string(),
         crate::config::Engine::Opencode => {
-            // TODO(#120 AC7): route through codex inlining for the
-            // moment as a placeholder; the failing-test commit at
-            // tests/engine_opencode_kickoff.rs documents the
-            // contract that opencode must produce the same kickoff
-            // body as claude (parity, identity-wrap).
-            wrap_phase_prompt_for_engine(crate::config::Engine::Codex, body)
+            // ADR-0008 / issue #120 AC7: opencode auto-discovers
+            // `AGENTS.md` (and per-skill markdown) from
+            // `~/.config/opencode/` inside the container — same
+            // shape as claude reading `CLAUDE.md` + the skills
+            // directory from disk — so the runner does not inline
+            // the operating context into the kickoff prompt. The
+            // wrapper is the identity function for opencode for the
+            // same reason it is for claude.
+            body.to_string()
         }
         crate::config::Engine::Codex => {
             // Inline the operating-context body + baked skill bodies.
