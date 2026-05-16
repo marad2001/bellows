@@ -252,8 +252,10 @@ struct RepoCandidate {
 /// Per-issue detail (which blockers were open, which closed) writes
 /// to the same log writer at a verbose prefix so an operator can
 /// `grep` the log file for stuck dependents without spamming the
-/// foreground tick line. The single foreground summary is
-/// `bellows: re-loop swept N blocked-by issues, cleared M`.
+/// foreground tick line. When at least one dependent is found, the
+/// single foreground summary is `bellows: re-loop swept N blocked-by
+/// issues, cleared M`; an empty dependent-list check stays quiet so
+/// normal idle ticks do not spam the foreground log.
 ///
 /// Errors on individual API calls are caught and logged rather than
 /// propagated: the sweep is a best-effort reconciliation. The tick
@@ -304,13 +306,15 @@ async fn run_reloop_sweep(
             }
         }
     }
-    announce(
-        log_writer,
-        &format!(
-            "bellows: re-loop swept {} blocked-by issues, cleared {}",
-            swept, cleared,
-        ),
-    );
+    if swept > 0 {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: re-loop swept {} blocked-by issues, cleared {}",
+                swept, cleared,
+            ),
+        );
+    }
 }
 
 /// Reconcile a single `blocked-by`-labelled dependent. Returns

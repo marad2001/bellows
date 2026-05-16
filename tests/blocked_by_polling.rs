@@ -436,6 +436,53 @@ async fn run_once_returns_idle_when_only_blocked_by_issues_exist_but_no_brief_to
 }
 
 #[tokio::test]
+async fn run_once_keeps_re_loop_quiet_when_no_blocked_by_issues_exist() {
+    // Review finding: a normal idle tick with no claimable work and no
+    // blocked-by-labelled dependents must stay quiet. The runner may
+    // perform the dependent-list check, but an empty result is not a
+    // sweep and must not announce "swept 0".
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent,blocked-by"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = single_repo_config(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None)
+        .await
+        .expect("run_once should succeed");
+    assert!(
+        matches!(outcome, RunOutcome::Idle),
+        "expected Idle when no ready work exists, got {outcome:?}",
+    );
+
+    let log_text = String::from_utf8(log.into_inner()).expect("log is utf8");
+    assert!(
+        !log_text.contains("re-loop swept"),
+        "normal idle ticks without blocked-by issues must not log a re-loop summary; got:\n{log_text}",
+    );
+}
+
+#[tokio::test]
 async fn re_loop_sweep_strips_blocked_by_when_all_blockers_closed() {
     // AC #116-3 main path: when the filtered set is empty AND a
     // blocked-by issue's brief lists `**Blocked by:** #95` and #95
