@@ -3167,6 +3167,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_triage_filter_passes_through_operator_supplied_issues_without_label_gating() {
+        // Issue #115 AC (operator-override semantics): when the
+        // operator names a specific issue via `--issue N` (or the
+        // bare positional), the helper does NOT consult or care
+        // about the issue's current label set — that's by design,
+        // because operator-override exists precisely so an issue
+        // *not* currently tagged `needs-triage` can still be
+        // triaged (e.g. re-triage after a reporter response).
+        //
+        // The helper is pure (config-only) so it can't observe
+        // labels; pinning that explicit_issues round-trips operator
+        // input verbatim is the testable surface here. Downstream
+        // dispatch in triage_cmd then walks each explicit_issue
+        // through call_triage_one, which already does not gate on
+        // needs-triage (existing slice T1 contract).
+        let repos = single_repo("https://github.com/marad2001/bellows");
+        let resolved = resolve_triage_filter(None, None, &[101], &repos)
+            .expect("operator-override path must resolve");
+        assert_eq!(
+            resolved.explicit_issues,
+            vec![101],
+            "explicit_issues is the unfiltered operator override list",
+        );
+    }
+
+    #[test]
     fn resolve_triage_filter_uses_only_repo_in_single_repo_config_without_repo_flag() {
         // Issue #115 AC: with exactly one configured `[[repo]]`, the
         // operator does not need to pass `--repo` — the bare form is
