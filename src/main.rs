@@ -100,6 +100,12 @@ enum Command {
         /// GitHub issue number to triage. Omit to drain the whole
         /// open `needs-triage` backlog (oldest-first).
         issue: Option<u64>,
+        /// Restrict the drain to a single configured `[[repo]]`,
+        /// addressed as `<owner>/<name>`. Required disambiguator
+        /// when more than one `[[repo]]` is configured and the
+        /// operator names a bare issue number. Issue #115.
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: Option<String>,
         /// Skip the apply step on every per-issue invocation: print
         /// each verdict and the summary, but make no mutations.
         #[arg(long)]
@@ -189,7 +195,11 @@ async fn main() -> Result<()> {
         Command::SetupDeployKeys { action } => setup_deploy_keys_cmd(&config_path, action).await,
         Command::Status => status_cmd().await,
         Command::Kill { target } => kill_cmd(&config_path, &target).await,
-        Command::Triage { issue, dry_run } => triage_cmd(&config_path, issue, dry_run).await,
+        Command::Triage {
+            issue,
+            repo,
+            dry_run,
+        } => triage_cmd(&config_path, issue, repo, dry_run).await,
         Command::Prune {
             all,
             yes,
@@ -219,7 +229,12 @@ async fn validate_deploy_keys_at_startup(config: &Config) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-async fn triage_cmd(config_path: &PathBuf, issue: Option<u64>, dry_run: bool) -> Result<()> {
+async fn triage_cmd(
+    config_path: &PathBuf,
+    issue: Option<u64>,
+    _repo: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
     let config = Config::from_str(&config_text)
@@ -2173,15 +2188,9 @@ mod tests {
             Some(Command::Triage {
                 issue: None,
                 dry_run: false,
+                ..
             }) => {}
-            other => panic!(
-                "expected Triage with issue=None, dry_run=false; got {:?}",
-                match other {
-                    Some(Command::Triage { issue, dry_run }) =>
-                        format!("Triage {{ issue: {:?}, dry_run: {} }}", issue, dry_run),
-                    _ => "non-Triage variant".to_string(),
-                }
-            ),
+            _ => panic!("expected Triage with issue=None, dry_run=false"),
         }
     }
 
@@ -2195,15 +2204,9 @@ mod tests {
             Some(Command::Triage {
                 issue: Some(42),
                 dry_run: false,
+                ..
             }) => {}
-            other => panic!(
-                "expected Triage with issue=Some(42), dry_run=false; got {:?}",
-                match other {
-                    Some(Command::Triage { issue, dry_run }) =>
-                        format!("Triage {{ issue: {:?}, dry_run: {} }}", issue, dry_run),
-                    _ => "non-Triage variant".to_string(),
-                }
-            ),
+            _ => panic!("expected Triage with issue=Some(42), dry_run=false"),
         }
     }
 
@@ -2215,6 +2218,7 @@ mod tests {
             Some(Command::Triage {
                 issue: None,
                 dry_run: true,
+                ..
             }) => {}
             _ => panic!("expected Triage with issue=None, dry_run=true"),
         }
@@ -2228,6 +2232,7 @@ mod tests {
             Some(Command::Triage {
                 issue: Some(42),
                 dry_run: true,
+                ..
             }) => {}
             _ => panic!("expected Triage with issue=Some(42), dry_run=true"),
         }
