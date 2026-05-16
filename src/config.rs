@@ -228,6 +228,13 @@ pub struct RuntimeLabelsConfig {
     pub agent_rate_limited: String,
     #[serde(default = "default_agent_cancelled")]
     pub agent_cancelled: String,
+    /// Issue #116 / ADR-0007: the polling loop's normal pass filters
+    /// out any `ready-for-agent` issue carrying this label, and the
+    /// re-loop sweep removes the label from any dependent whose
+    /// blockers have all closed. Operator-renameable so unusual repo
+    /// label schemes don't collide with the default.
+    #[serde(default = "default_blocked_by")]
+    pub blocked_by: String,
 }
 
 impl Default for RuntimeLabelsConfig {
@@ -239,6 +246,7 @@ impl Default for RuntimeLabelsConfig {
             agent_failed: default_agent_failed(),
             agent_rate_limited: default_agent_rate_limited(),
             agent_cancelled: default_agent_cancelled(),
+            blocked_by: default_blocked_by(),
         }
     }
 }
@@ -265,6 +273,10 @@ fn default_agent_rate_limited() -> String {
 
 fn default_agent_cancelled() -> String {
     "agent-cancelled".to_string()
+}
+
+fn default_blocked_by() -> String {
+    "blocked-by".to_string()
 }
 
 #[derive(Debug, Deserialize)]
