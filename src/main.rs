@@ -1764,10 +1764,10 @@ async fn setup_auth_opencode(config: &Config) -> Result<()> {
 /// surfaced in operator-facing config (e.g. the opencode
 /// `api_key_env_file` default `~/.config/bellows/opencode.env`).
 fn expand_tilde_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(raw)
 }

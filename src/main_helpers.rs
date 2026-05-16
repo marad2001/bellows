@@ -29,12 +29,11 @@ pub fn write_opencode_env_file(path: &Path, api_key: &str) -> Result<()> {
             path.display(),
         ));
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create env-file parent directory at {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create env-file parent directory at {}", parent.display()))?;
     }
     let body = format!("DEEPSEEK_API_KEY={trimmed}\n");
     std::fs::write(path, body)

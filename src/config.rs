@@ -156,12 +156,11 @@ impl EngineLabelOverride {
         let mut found: Vec<(Engine, String)> = Vec::new();
         for label in labels {
             let raw = label.as_ref();
-            if let Some(name) = raw.strip_prefix("engine:") {
-                if let Some(engine) = Engine::from_name(name) {
-                    if !found.iter().any(|(e, _)| *e == engine) {
-                        found.push((engine, raw.to_string()));
-                    }
-                }
+            if let Some(name) = raw.strip_prefix("engine:")
+                && let Some(engine) = Engine::from_name(name)
+                && !found.iter().any(|(e, _)| *e == engine)
+            {
+                found.push((engine, raw.to_string()));
             }
         }
         if found.len() > 1 {
