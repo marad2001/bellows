@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Context, Result};
 use bollard::models::{Mount, MountType};
 
 use crate::config::Engine;
@@ -34,6 +37,21 @@ pub enum Auth {
         model: Option<String>,
         credentials_volume_name: String,
     },
+    /// ADR-0008 / issue #120 AC11: API-key auth via a host-side
+    /// `KEY=VALUE` env-file (the moral equivalent of
+    /// `docker run --env-file <path>`, except bellows uses bollard's
+    /// structured `env: Vec<String>` rather than spawning the docker
+    /// CLI). The env-file is parsed at container-create time and
+    /// each line is appended to the container's env array.
+    EnvFile {
+        /// Engine this auth bundle dispatches to (opencode for v1).
+        engine: Engine,
+        /// Optional model pin from the chain entry, same shape as
+        /// `Subscription::model`.
+        model: Option<String>,
+        /// Host-side path to the env-file written by `setup-auth`.
+        env_file_path: PathBuf,
+    },
     ApiKey,
 }
 
@@ -44,6 +62,7 @@ impl Auth {
     pub fn engine(&self) -> Engine {
         match self {
             Auth::Subscription { engine, .. } => *engine,
+            Auth::EnvFile { engine, .. } => *engine,
             Auth::ApiKey => todo!("Auth::ApiKey is not implemented in v1"),
         }
     }
@@ -53,6 +72,7 @@ impl Auth {
     pub fn model(&self) -> Option<&str> {
         match self {
             Auth::Subscription { model, .. } => model.as_deref(),
+            Auth::EnvFile { model, .. } => model.as_deref(),
             Auth::ApiKey => None,
         }
     }
@@ -79,10 +99,20 @@ impl Auth {
                     ..Default::default()
                 }]
             }
+            // The env-file path is host-side only; it is read at
+            // container-create time and its contents are passed in
+            // via the env array (see `try_extra_env`). No bind mount
+            // and no volume mount — the API key never lives on disk
+            // inside the container.
+            Auth::EnvFile { .. } => Vec::new(),
             Auth::ApiKey => todo!("Auth::ApiKey is not implemented in v1"),
         }
     }
 
+    /// Engine env (and any pinned model env) plus, for `Auth::EnvFile`,
+    /// the parsed env-file lines. Panics if the env-file is missing
+    /// or permissively-readable — production callers should prefer
+    /// `try_extra_env` which surfaces the same conditions as `Err`.
     pub fn extra_env(&self) -> Vec<String> {
         match self {
             Auth::Subscription { engine, model, .. } => {
@@ -92,9 +122,92 @@ impl Auth {
                 }
                 env
             }
+            Auth::EnvFile { .. } => self
+                .try_extra_env()
+                .expect("Auth::EnvFile::extra_env: env-file missing or world-readable"),
             Auth::ApiKey => todo!("Auth::ApiKey is not implemented in v1"),
         }
     }
+
+    /// Fallible variant of `extra_env` that surfaces env-file
+    /// problems as `Err` rather than panicking. Production callers
+    /// (the runner) should use this so missing / loose-permission
+    /// env-files reach the operator log as a real error instead of
+    /// crashing the dispatcher.
+    pub fn try_extra_env(&self) -> Result<Vec<String>> {
+        match self {
+            Auth::Subscription { .. } | Auth::ApiKey => Ok(self.extra_env()),
+            Auth::EnvFile {
+                engine,
+                model,
+                env_file_path,
+            } => {
+                check_env_file_permissions(env_file_path)?;
+                let raw = std::fs::read_to_string(env_file_path).with_context(|| {
+                    format!(
+                        "read opencode env-file at {} (did you run \
+                         `bellows setup-auth --engine opencode`?)",
+                        env_file_path.display(),
+                    )
+                })?;
+                let mut env = vec![format!("BELLOWS_ENGINE={}", engine.as_name())];
+                if let Some(m) = model {
+                    env.push(format!("BELLOWS_MODEL={m}"));
+                }
+                env.extend(parse_env_file_lines(&raw)?);
+                Ok(env)
+            }
+        }
+    }
+}
+
+/// Parse a `KEY=VALUE` env-file body into a `Vec<String>` of
+/// `KEY=VALUE` lines. Blank lines and `#`-prefixed comment lines are
+/// skipped. Lines without an `=` produce an `Err` that names the
+/// offending line so the operator can fix the file.
+pub fn parse_env_file_lines(body: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.contains('=') {
+            return Err(anyhow!(
+                "malformed env-file line (no `=`): {trimmed:?}",
+            ));
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
+}
+
+/// Reject env-files that are readable by other host users. Defence-
+/// in-depth on top of `setup-auth`'s 0600 write — an operator (or
+/// backup-restore) may have loosened the perms between setup and
+/// dispatch. Refusing to read the file is safer than shipping the
+/// API key to a container while the key sits on disk under permissive
+/// perms.
+#[cfg(unix)]
+fn check_env_file_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat opencode env-file at {}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(anyhow!(
+            "opencode env-file at {} is mode 0{:o}; refuse to read (must be 0600). \
+             Re-run `bellows setup-auth --engine opencode` to rewrite at 0600.",
+            path.display(),
+            mode,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_env_file_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
