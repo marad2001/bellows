@@ -2112,6 +2112,7 @@ pub async fn run_once(
         claude_pr_body.as_deref(),
         agent_notes_display.as_deref(),
         &workflow_files_changed,
+        &outcomes,
     );
 
     let pr = workspace::open_pr(
@@ -2283,12 +2284,31 @@ fn workflow_files_changed_callout(workflow_files_changed: &[String]) -> String {
     )
 }
 
+/// Render the PR-body callout for `ExitReason::AuthError`, naming
+/// the specific engine to refresh based on
+/// `outcomes.implement.engine`. AC12 of issue #120: the operator
+/// must be able to copy-paste the suggested `bellows refresh-auth`
+/// command straight from the PR body. When the implement-phase
+/// engine is unknown (legacy / pre-AC12 runs with `engine: None`),
+/// fall back to the generic `<engine>` placeholder.
+pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
+    let engine_name = match outcomes.implement.engine {
+        Some(engine) => engine.as_name().to_string(),
+        None => "<engine>".to_string(),
+    };
+    format!(
+        "## Authentication error detected\n\n\
+         An implement-phase agent reported an authentication failure (e.g. HTTP 401 from the engine's API). Run `bellows refresh-auth --engine {engine_name}` and re-run. See the run-log comment for the matched signature."
+    )
+}
+
 fn build_pr_body(
     reason: &ExitReason,
     issue_number: u64,
     claude_pr_body: Option<&str>,
     agent_notes: Option<&str>,
     workflow_files_changed: &[String],
+    outcomes: &PhaseOutcomes,
 ) -> String {
     let header = format!("Closes #{issue_number}.\n\n");
     let body = match reason {
@@ -2335,11 +2355,7 @@ fn build_pr_body(
              A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
                 .to_string()
         }
-        ExitReason::AuthError => {
-            "## Authentication error detected\n\n\
-             An implement-phase agent reported an authentication failure (e.g. HTTP 401 from the engine's API). Run `bellows refresh-auth --engine <engine>` and re-run. See the run-log comment for the matched signature."
-                .to_string()
-        }
+        ExitReason::AuthError => pr_body_for_auth_error(outcomes),
         ExitReason::Cancelled => {
             "## Cancelled by operator\n\n\
              `bellows kill` was invoked against this issue mid-run. Whatever workspace state the agent had produced before cancellation is committed in this PR's diff; the run-log comment captures the per-phase summary at cancellation time. Review the partial work and either salvage it as a starting point or drop the PR."
@@ -2973,14 +2989,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_success_uses_claude_pr_body_when_present() {
-        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[]);
+        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[], &PhaseOutcomes::default());
         assert!(body.starts_with("Closes #42.\n\n"));
         assert!(body.contains("My PR body."));
     }
 
     #[test]
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
-        let body = build_pr_body(&ExitReason::Success, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::Success, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("the agent did not write a PR description"));
     }
 
@@ -3022,6 +3038,7 @@ mod tests {
             None,
             Some("I got stuck on the brief."),
         &[],
+            &PhaseOutcomes::default(),
         );
         assert!(body.contains("self-reported failure"));
         assert!(body.contains("I got stuck on the brief."));
@@ -3029,7 +3046,7 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_crash_mentions_stderr_tail_pointer() {
-        let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("crashed"));
         assert!(body.contains("stderr tail"));
     }
@@ -3039,7 +3056,7 @@ mod tests {
         // After slice X1 the gate runs both clippy and test, in either the
         // post-implement or end-of-pipeline position — the PR body should
         // reflect that, not pin "test" specifically.
-        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("cargo checks"));
         assert!(body.contains("run-log comment"));
     }
@@ -3575,14 +3592,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_wall_clock_exceeded_mentions_cap() {
-        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("wall-clock"));
         assert!(body.contains("run-log comment"));
     }
 
     #[test]
     fn build_pr_body_for_rate_limited_mentions_rate_limit() {
-        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("rate limit"));
         assert!(body.contains("run-log comment"));
     }
@@ -3646,7 +3663,7 @@ mod tests {
         );
         // build_pr_body for Crash must NOT quote the synth note as
         // "self-reported failure" content.
-        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()), &[]);
+        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()), &[], &PhaseOutcomes::default());
         assert!(
             pr_body.contains("crashed"),
             "PR body for the synth-driven Crash must say `crashed`: {pr_body}"
@@ -4163,6 +4180,7 @@ mod tests {
             Some("PR body from claude."),
             None,
             workflow_files_changed,
+            &outcomes,
         );
         let log_body = build_log_body(
             &ExitReason::Success,
