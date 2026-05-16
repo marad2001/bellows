@@ -2975,6 +2975,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_triage_filter_rejects_unknown_repo_with_clear_message() {
+        // Issue #115 acceptance: a `--repo <owner/name>` value that
+        // does not match any configured `[[repo]]` URL's slug must
+        // error at parse-or-config-load time (i.e. before any
+        // mid-drain GitHub call) with a clear "no such configured
+        // repo" message that echoes the rejected slug and lists what
+        // IS configured. Mirrors the shape of resolve_kill_target's
+        // unknown-qualifier error for operator legibility.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err = resolve_triage_filter(
+            None,
+            Some("not-configured/repo-x"),
+            &[],
+            &repos,
+        )
+        .expect_err("unknown --repo slug must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not-configured/repo-x"),
+            "error must echo the rejected slug: {msg}",
+        );
+        assert!(
+            msg.to_lowercase().contains("no such") || msg.contains("not match")
+                || msg.contains("Configured"),
+            "error must communicate 'no such configured repo': {msg}",
+        );
+    }
+
+    #[test]
     fn cli_triage_rejects_positional_and_issue_flag_as_mutually_exclusive() {
         // Issue #115 AC5: positional `<N>` and `--issue <N>` are
         // mutually exclusive at the clap layer. `bellows triage 42
