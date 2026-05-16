@@ -239,7 +239,7 @@ struct RepoCandidate {
 ///
 /// 1. Lists the dependent issues (pickup_label AND blocked_by_label).
 /// 2. Fetches each dependent's brief and parses the `**Blocked by:**`
-///    line via `tracker::parse_blocked_by_section`.
+///    line via `tracker::parse_blocked_by_section_with_log_writer`.
 /// 3. For `Blockers(nums)`: queries each `n`'s state; strips the
 ///    label iff every blocker is `IssueClosureState::Closed`.
 /// 4. For `NoBlockers` (explicit `None`, missing section, only
@@ -350,7 +350,7 @@ async fn sweep_one_dependent(
         }
     };
 
-    let parsed = tracker::parse_blocked_by_section(&brief);
+    let parsed = tracker::parse_blocked_by_section_with_log_writer(&brief, log_writer);
     match parsed {
         tracker::BlockedBySection::Unverifiable => {
             let _ = writeln!(

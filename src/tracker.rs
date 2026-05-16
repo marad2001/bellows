@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use serde::Deserialize;
 
 use crate::triage::{TriageVerdict, VerdictState};
@@ -653,12 +655,22 @@ pub enum BlockedBySection {
 /// - `**Blocked by:** None` → `NoBlockers`
 /// - `**Blocked by:** None — verbose tail` → `NoBlockers`
 /// - missing `**Blocked by:**` line → `NoBlockers`
-/// - cross-repo `owner/name#N` → ignored (logged via stderr); when
+/// - cross-repo `owner/name#N` → ignored; when
 ///   no parseable same-repo tokens remain → `NoBlockers`
 /// - malformed `#NaN`, bare `abc`, `#` → ignored; when nothing
 ///   parseable remains → `NoBlockers`
 /// - missing `## Agent Brief` header entirely → `Unverifiable`
 pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
+    let mut log_writer = io::sink();
+    parse_blocked_by_section_with_log_writer(brief_body, &mut log_writer)
+}
+
+/// Parse the `**Blocked by:**` line out of an agent brief body, writing
+/// parser warnings to `log_writer`.
+pub fn parse_blocked_by_section_with_log_writer(
+    brief_body: &str,
+    log_writer: &mut dyn Write,
+) -> BlockedBySection {
     if !brief_body.contains("## Agent Brief") {
         return BlockedBySection::Unverifiable;
     }
@@ -702,7 +714,8 @@ pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
 
     // Split on commas; each token must be `#N` where N parses as
     // u64. Cross-repo `owner/name#N` and bare malformed tokens are
-    // logged to stderr and dropped from the result.
+    // logged through the caller-provided writer and dropped from the
+    // result.
     let mut blockers = Vec::new();
     for raw in body.split(',') {
         let token = raw.trim();
@@ -710,14 +723,16 @@ pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
             continue;
         }
         if token.contains('/') {
-            eprintln!(
+            let _ = writeln!(
+                log_writer,
                 "bellows: ignoring cross-repo blocker reference `{}` in **Blocked by:** line (v1 is same-repo only; see ADR-0007)",
                 token,
             );
             continue;
         }
         let Some(num_str) = token.strip_prefix('#') else {
-            eprintln!(
+            let _ = writeln!(
+                log_writer,
                 "bellows: ignoring malformed blocker token `{}` in **Blocked by:** line (expected `#N`)",
                 token,
             );
@@ -726,7 +741,8 @@ pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
         match num_str.parse::<u64>() {
             Ok(n) => blockers.push(n),
             Err(_) => {
-                eprintln!(
+                let _ = writeln!(
+                    log_writer,
                     "bellows: ignoring malformed blocker token `#{}` in **Blocked by:** line (not a u64)",
                     num_str,
                 );

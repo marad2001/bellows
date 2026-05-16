@@ -4,7 +4,9 @@
 //! `BlockedBySection` shape — the variant the runner branches on
 //! when deciding whether to strip the `blocked-by` label.
 
-use bellows::tracker::{parse_blocked_by_section, BlockedBySection};
+use bellows::tracker::{
+    parse_blocked_by_section, parse_blocked_by_section_with_log_writer, BlockedBySection,
+};
 
 const BRIEF_HEADER: &str = "## Agent Brief";
 
@@ -82,8 +84,8 @@ fn missing_section_within_brief_returns_no_blockers() {
 
 #[test]
 fn cross_repo_reference_is_ignored_and_dropped_to_no_blockers() {
-    // **Blocked by:** owner/name#95 -> NoBlockers (logged + ignored;
-    // v1 is same-repo only per ADR-0007 known limitations).
+    // **Blocked by:** owner/name#95 -> NoBlockers (ignored; v1 is
+    // same-repo only per ADR-0007 known limitations).
     let brief = brief_with("**Blocked by:** marad2001/other-repo#95");
     assert_eq!(
         parse_blocked_by_section(&brief),
@@ -101,6 +103,21 @@ fn malformed_token_alone_drops_to_no_blockers() {
         parse_blocked_by_section(&brief),
         BlockedBySection::NoBlockers,
     );
+}
+
+#[test]
+fn malformed_token_warning_is_written_to_supplied_log_writer() {
+    let brief = brief_with("**Blocked by:** #NaN");
+    let mut log = Vec::new();
+
+    assert_eq!(
+        parse_blocked_by_section_with_log_writer(&brief, &mut log),
+        BlockedBySection::NoBlockers,
+    );
+
+    let log = String::from_utf8(log).expect("parser log should be utf-8");
+    assert!(log.contains("bellows: ignoring malformed blocker token `#NaN`"));
+    assert!(log.contains("**Blocked by:** line"));
 }
 
 #[test]
