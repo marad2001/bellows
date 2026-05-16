@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod chain_walker;
 pub mod config;
+pub mod main_helpers;
 pub mod policy;
 pub mod runner;
 pub mod sandbox;

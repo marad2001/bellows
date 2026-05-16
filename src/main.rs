@@ -1728,12 +1728,48 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
 /// at the configured `api_key_env_file` path (default
 /// `~/.config/bellows/opencode.env`). No docker container is launched —
 /// the env-file is host-side and is later passed to the agent container
-/// via `docker run --env-file`.
-///
-/// TODO(#120 AC9): full implementation lands in the make-it-pass commit
-/// for AC9 once the failing tests for the stdin/env-file flow are in.
-async fn setup_auth_opencode(_config: &Config) -> Result<()> {
-    anyhow::bail!("setup-auth --engine opencode: not yet implemented (issue #120 AC9)")
+/// via `docker run --env-file` (AC11).
+async fn setup_auth_opencode(config: &Config) -> Result<()> {
+    let raw_path = &config.auth.opencode.api_key_env_file;
+    let env_file_path = expand_tilde_path(raw_path);
+
+    print!(
+        "bellows: setup-auth --engine opencode\n\n\
+         opencode authenticates via a DeepSeek API key (not OAuth, unlike\n\
+         claude / codex). Paste your DeepSeek API key below; bellows will\n\
+         write it to a 0600 env-file at {} and pass it into the agent\n\
+         container at run-time via `docker run --env-file`.\n\n\
+         DeepSeek API key: ",
+        env_file_path.display(),
+    );
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let mut key = String::new();
+    std::io::stdin()
+        .read_line(&mut key)
+        .context("read DeepSeek API key from stdin")?;
+
+    bellows::main_helpers::write_opencode_env_file(&env_file_path, &key)?;
+
+    println!(
+        "bellows: setup-auth complete; opencode DeepSeek API key written to {}.",
+        env_file_path.display(),
+    );
+    Ok(())
+}
+
+/// Expand a leading `~/` in a path string into the operator's
+/// `$HOME`. Other paths pass through verbatim. Used for paths
+/// surfaced in operator-facing config (e.g. the opencode
+/// `api_key_env_file` default `~/.config/bellows/opencode.env`).
+fn expand_tilde_path(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
 }
 
 async fn run(config_path: &PathBuf) -> Result<()> {
