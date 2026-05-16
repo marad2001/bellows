@@ -824,6 +824,96 @@ fn resolve_kill_target(
     }
 }
 
+/// The resolved filter the operator's flags select for a triage run
+/// (issue #115). Empty `explicit_issues` means "drain the backlog";
+/// non-empty means "operator-override: triage exactly these numbers,
+/// in this order".
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedTriageFilter {
+    /// Owner of the resolved repo (e.g. `marad2001`).
+    repo_owner: String,
+    /// Name of the resolved repo (e.g. `bellows`).
+    repo_name: String,
+    /// The fully-qualified repo URL from the matching `[[repo]]`
+    /// entry — needed for the workspace::prepare call which sees the
+    /// URL form the operator wrote in orchestrator.toml.
+    repo_url: String,
+    /// Empty → drain the `needs-triage` backlog. Non-empty → triage
+    /// exactly these issue numbers (deduped, order-preserved) as an
+    /// operator-override.
+    explicit_issues: Vec<u64>,
+}
+
+/// Resolve `bellows triage`'s flag bundle to a single repo + an
+/// optional explicit issue list (issue #115). Pure function (no IO).
+/// This initial slice validates `--repo` slug against the configured
+/// `[[repo]]` entries. Subsequent commits extend the helper with the
+/// multi-repo bare-numeric-ref disambiguation and silent dedup of
+/// repeated `--issue` values.
+fn resolve_triage_filter(
+    positional_issue: Option<u64>,
+    repo_flag: Option<&str>,
+    issue_numbers: &[u64],
+    repos: &[bellows::config::RepoConfig],
+) -> Result<ResolvedTriageFilter> {
+    let (owner, name, url) = if let Some(slug) = repo_flag {
+        // --repo <owner/name> must match exactly one configured
+        // [[repo]] URL. Skip entries with a malformed URL so a
+        // single bad entry doesn't pre-empt unrelated matches
+        // (same shape as resolve_kill_target).
+        let mut found: Option<(String, String, String)> = None;
+        for r in repos {
+            if let Ok((o, n)) = parse_owner_repo(&r.url) {
+                let s = format!("{}/{}", o, n);
+                if s == slug {
+                    found = Some((o, n, r.url.clone()));
+                    break;
+                }
+            }
+        }
+        found.ok_or_else(|| {
+            let configured: Vec<String> = repos
+                .iter()
+                .filter_map(|r| {
+                    parse_owner_repo(&r.url)
+                        .ok()
+                        .map(|(o, n)| format!("{}/{}", o, n))
+                })
+                .collect();
+            anyhow!(
+                "bellows triage: no such configured repo `{}`. Configured: {:?}",
+                slug,
+                configured,
+            )
+        })?
+    } else {
+        // No --repo: fall back to the first configured repo. The
+        // multi-repo disambiguation branch arrives in a subsequent
+        // commit.
+        let r = repos.first().ok_or_else(|| {
+            anyhow!("bellows triage: no [[repo]] configured in orchestrator.toml")
+        })?;
+        let (o, n) = parse_owner_repo(&r.url)?;
+        (o, n, r.url.clone())
+    };
+
+    // Explicit-issue list: positional → single-element; repeated
+    // --issue values used verbatim for now. Dedup is added in a
+    // subsequent RED-then-GREEN cycle.
+    let explicit_issues = if let Some(n) = positional_issue {
+        vec![n]
+    } else {
+        issue_numbers.to_vec()
+    };
+
+    Ok(ResolvedTriageFilter {
+        repo_owner: owner,
+        repo_name: name,
+        repo_url: url,
+        explicit_issues,
+    })
+}
+
 async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
