@@ -142,6 +142,20 @@ future agent run mounts the same volume read-write. Concurrency=1
 prevents container races on the volume. If the refresh token expires
 later, [`bellows refresh-auth`](#daily-use) re-seeds it the same way.
 
+Bellows can also dispatch to Codex (OAuth-volume, similar to Claude)
+and OpenCode (API-key-backed). For Codex, run
+`bellows setup-auth --engine codex` and complete the equivalent
+sign-in flow inside its one-shot container. For OpenCode (issue #120
+/ ADR-0008), the auth shape is a 0600-mode env-file at the path
+configured in `[auth.opencode].api_key_env_file` rather than a
+credentials volume; seed it once with
+`bellows setup-auth --engine opencode`, which reads the
+`DEEPSEEK_API_KEY` from stdin and writes the canonical
+`DEEPSEEK_API_KEY=<value>` line. The dispatcher reads the env-file
+at container-create time and injects its `KEY=VALUE` lines into the
+agent container's env array, so opencode picks up the key without a
+mounted credentials volume.
+
 ### 4. (Optional) Seed SSH deploy keys for private cross-repo deps
 
 Skip this step if every repo bellows polls has its dependency tree

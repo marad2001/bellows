@@ -43,10 +43,10 @@ fn sample_config_mentions_opencode_engine() {
 }
 
 #[test]
-fn sample_config_shows_opencode_env_file_path_key() {
+fn sample_config_shows_opencode_api_key_env_file_key() {
     // opencode's auth shape is an env-file (not an OAuth credentials
     // volume), so the sample's `[auth.opencode]` block exposes
-    // `env_file_path` rather than `credentials_volume` — the
+    // `api_key_env_file` rather than `credentials_volume` — the
     // dispatcher reads the env-file at container-create time (AC11).
     let body = read("orchestrator.example.toml");
     assert!(
@@ -54,8 +54,8 @@ fn sample_config_shows_opencode_env_file_path_key() {
         "sample must declare [auth.opencode] block: {body}",
     );
     assert!(
-        body.contains("env_file_path"),
-        "sample must expose env_file_path for opencode auth: {body}",
+        body.contains("api_key_env_file"),
+        "sample must expose api_key_env_file for opencode auth: {body}",
     );
 }
 
