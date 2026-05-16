@@ -491,6 +491,125 @@ struct ListCommentsParams {
     per_page: u32,
 }
 
+/// Parsed shape of the `**Blocked by:**` line in an agent brief.
+/// The polling-loop re-loop sweep (ADR-0007) branches on this variant
+/// when deciding whether to strip the `blocked-by` label.
+///
+/// - `NoBlockers`: the brief is present and either explicitly says
+///   `None` (with or without a verbose annotation), has no
+///   `**Blocked by:**` line at all, or only carries unparseable /
+///   cross-repo references that the v1 parser cannot verify.
+/// - `Blockers(nums)`: the brief lists one or more parseable
+///   same-repo `#N` references. The re-loop checks each `N`'s state
+///   and strips the label only when every one is `CLOSED`.
+/// - `Unverifiable`: the input is not an agent brief at all (the
+///   `## Agent Brief` header is absent). The caller leaves the
+///   `blocked-by` label in place and logs a warning naming the
+///   issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedBySection {
+    NoBlockers,
+    Blockers(Vec<u64>),
+    Unverifiable,
+}
+
+/// Parse the `**Blocked by:**` line out of an agent brief body.
+///
+/// Cases handled (ADR-0007 / brief #116):
+/// - `**Blocked by:** #95` → `Blockers([95])`
+/// - `**Blocked by:** #95, #96` → `Blockers([95, 96])`
+/// - `**Blocked by:** #95 (rationale)` → `Blockers([95])`
+/// - `**Blocked by:** None` → `NoBlockers`
+/// - `**Blocked by:** None — verbose tail` → `NoBlockers`
+/// - missing `**Blocked by:**` line → `NoBlockers`
+/// - cross-repo `owner/name#N` → ignored (logged via stderr); when
+///   no parseable same-repo tokens remain → `NoBlockers`
+/// - malformed `#NaN`, bare `abc`, `#` → ignored; when nothing
+///   parseable remains → `NoBlockers`
+/// - missing `## Agent Brief` header entirely → `Unverifiable`
+pub fn parse_blocked_by_section(brief_body: &str) -> BlockedBySection {
+    if !brief_body.contains("## Agent Brief") {
+        return BlockedBySection::Unverifiable;
+    }
+
+    // Find the line beginning with `**Blocked by:**` (case-sensitive
+    // — this is the shape `/triage` emits). Anywhere on a line so
+    // leading whitespace / list-bullets don't break the match.
+    let prefix = "**Blocked by:**";
+    let Some(line) = brief_body.lines().find_map(|l| {
+        let trimmed = l.trim_start();
+        trimmed.strip_prefix(prefix).map(|rest| rest.trim())
+    }) else {
+        return BlockedBySection::NoBlockers;
+    };
+
+    // Drop any trailing parenthetical annotation (`#95 (rationale)`
+    // → `#95`). We only need to strip a single trailing `(...)` —
+    // the line shape is "one or more refs, optionally followed by a
+    // human-readable note in parens".
+    let body = match line.find('(') {
+        Some(idx) => line[..idx].trim(),
+        None => line,
+    };
+
+    // Explicit `None` (with or without a verbose annotation) clears
+    // any blockers. We check this BEFORE the comma-split so
+    // "None — can start immediately" matches even though the
+    // em-dash tail isn't a token.
+    let body_lower = body.to_ascii_lowercase();
+    if body_lower == "none"
+        || body_lower.starts_with("none ")
+        || body_lower.starts_with("none\t")
+        || body_lower.starts_with("none.")
+        || body_lower.starts_with("none,")
+        || body_lower.starts_with("none—")
+        || body_lower.starts_with("none–")
+        || body_lower.starts_with("none-")
+    {
+        return BlockedBySection::NoBlockers;
+    }
+
+    // Split on commas; each token must be `#N` where N parses as
+    // u64. Cross-repo `owner/name#N` and bare malformed tokens are
+    // logged to stderr and dropped from the result.
+    let mut blockers = Vec::new();
+    for raw in body.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.contains('/') {
+            eprintln!(
+                "bellows: ignoring cross-repo blocker reference `{}` in **Blocked by:** line (v1 is same-repo only; see ADR-0007)",
+                token,
+            );
+            continue;
+        }
+        let Some(num_str) = token.strip_prefix('#') else {
+            eprintln!(
+                "bellows: ignoring malformed blocker token `{}` in **Blocked by:** line (expected `#N`)",
+                token,
+            );
+            continue;
+        };
+        match num_str.parse::<u64>() {
+            Ok(n) => blockers.push(n),
+            Err(_) => {
+                eprintln!(
+                    "bellows: ignoring malformed blocker token `#{}` in **Blocked by:** line (not a u64)",
+                    num_str,
+                );
+            }
+        }
+    }
+
+    if blockers.is_empty() {
+        BlockedBySection::NoBlockers
+    } else {
+        BlockedBySection::Blockers(blockers)
+    }
+}
+
 /// Look up the latest agent-brief comment on an issue (the one whose body
 /// includes the `## Agent Brief` header that `/triage` posts). Returns
 /// `Ok(None)` if no such comment exists.
