@@ -67,6 +67,10 @@ impl Auth {
                 let target = match engine {
                     Engine::Claude => CLAUDE_HOME_IN_CONTAINER,
                     Engine::Codex => CODEX_HOME_IN_CONTAINER,
+                    Engine::Opencode => unreachable!(
+                        "Auth::Subscription is OAuth-volume; opencode is API-key-env-file and \
+                         must not construct a Subscription variant"
+                    ),
                 };
                 vec![Mount {
                     target: Some(target.to_string()),

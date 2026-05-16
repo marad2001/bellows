@@ -1466,6 +1466,14 @@ pub fn wrap_phase_prompt_for_engine(
 ) -> String {
     match engine {
         crate::config::Engine::Claude => body.to_string(),
+        crate::config::Engine::Opencode => {
+            // TODO(#120 AC7): route through codex inlining for the
+            // moment as a placeholder; the failing-test commit at
+            // tests/engine_opencode_kickoff.rs documents the
+            // contract that opencode must produce the same kickoff
+            // body as claude (parity, identity-wrap).
+            wrap_phase_prompt_for_engine(crate::config::Engine::Codex, body)
+        }
         crate::config::Engine::Codex => {
             // Inline the operating-context body + baked skill bodies.
             // Claude-specific phrasing in those bodies ("Claude Code
