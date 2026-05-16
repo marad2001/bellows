@@ -233,6 +233,29 @@ struct RepoCandidate {
     repo_order: usize,
 }
 
+fn auth_for_chain_entry(config: &Config, entry: &ChainEntry) -> Auth {
+    match &config.auth.method {
+        AuthMethod::Subscription => match entry.engine {
+            Engine::Opencode => Auth::EnvFile {
+                engine: entry.engine,
+                model: entry.model.clone(),
+                env_file_path: crate::main_helpers::expand_tilde_path(
+                    &config.auth.opencode.api_key_env_file,
+                ),
+            },
+            Engine::Claude | Engine::Codex => Auth::Subscription {
+                engine: entry.engine,
+                model: entry.model.clone(),
+                credentials_volume_name: config
+                    .auth
+                    .for_engine(entry.engine)
+                    .credentials_volume
+                    .clone(),
+            },
+        },
+    }
+}
+
 /// Re-loop sweep across every cleared repo's `blocked-by` dependents.
 /// Issue #116 / ADR-0007: runs only when `run_once`'s normal pass
 /// produced an empty filtered candidate set AND at least one cleared
@@ -816,19 +839,7 @@ pub async fn run_once(
     // diversity preference.
     let mut implementer_cli: Option<Engine> = None;
 
-    let auth_for = |entry: &ChainEntry| -> Auth {
-        match config.auth.method {
-            AuthMethod::Subscription => Auth::Subscription {
-                engine: entry.engine,
-                model: entry.model.clone(),
-                credentials_volume_name: config
-                    .auth
-                    .for_engine(entry.engine)
-                    .credentials_volume
-                    .clone(),
-            },
-        }
-    };
+    let auth_for = |entry: &ChainEntry| -> Auth { auth_for_chain_entry(config, entry) };
 
     // Per-issue wall-clock budget. Threaded through every container call
     // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
@@ -2885,6 +2896,43 @@ pub fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_for_chain_entry_opencode_uses_env_file_config_and_expands_tilde() {
+        let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[auth.opencode]
+api_key_env_file = "~/bellows-test-opencode.env"
+"#;
+        let config: Config = config_text.parse().expect("config parses");
+        let entry: ChainEntry = "opencode:deepseek/deepseek-v4-pro"
+            .parse()
+            .expect("opencode chain entry parses");
+
+        let auth = auth_for_chain_entry(&config, &entry);
+
+        let Auth::EnvFile {
+            engine,
+            model,
+            env_file_path,
+        } = auth
+        else {
+            panic!("opencode chain entries must construct Auth::EnvFile");
+        };
+        assert_eq!(engine, Engine::Opencode);
+        assert_eq!(model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(
+            env_file_path,
+            dirs::home_dir()
+                .expect("test environment has a home directory")
+                .join("bellows-test-opencode.env"),
+        );
+    }
 
     #[test]
     fn parse_owner_repo_https_happy_path() {

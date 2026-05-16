@@ -6,9 +6,22 @@
 //!
 //! Issue #120 AC9: opencode setup-auth helpers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+
+/// Expand a leading `~/` in a path string into the operator's
+/// `$HOME`. Other paths pass through verbatim. Used for paths
+/// surfaced in operator-facing config (e.g. the opencode
+/// `api_key_env_file` default `~/.config/bellows/opencode.env`).
+pub fn expand_tilde_path(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(raw)
+}
 
 /// Write the DeepSeek API key to `path` as a single canonical
 /// `DEEPSEEK_API_KEY=<key>\n` line, with permissions 0600 so other

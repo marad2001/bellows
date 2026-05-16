@@ -1731,7 +1731,7 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
 /// via `docker run --env-file` (AC11).
 async fn setup_auth_opencode(config: &Config) -> Result<()> {
     let raw_path = &config.auth.opencode.api_key_env_file;
-    let env_file_path = expand_tilde_path(raw_path);
+    let env_file_path = bellows::main_helpers::expand_tilde_path(raw_path);
 
     print!(
         "bellows: setup-auth --engine opencode\n\n\
@@ -1757,19 +1757,6 @@ async fn setup_auth_opencode(config: &Config) -> Result<()> {
         env_file_path.display(),
     );
     Ok(())
-}
-
-/// Expand a leading `~/` in a path string into the operator's
-/// `$HOME`. Other paths pass through verbatim. Used for paths
-/// surfaced in operator-facing config (e.g. the opencode
-/// `api_key_env_file` default `~/.config/bellows/opencode.env`).
-fn expand_tilde_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(raw)
 }
 
 async fn run(config_path: &PathBuf) -> Result<()> {
