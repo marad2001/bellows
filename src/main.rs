@@ -887,9 +887,21 @@ fn resolve_triage_filter(
             )
         })?
     } else {
-        // No --repo: fall back to the first configured repo. The
-        // multi-repo disambiguation branch arrives in a subsequent
-        // commit.
+        // No --repo. A bare issue reference (positional or --issue)
+        // against a multi-repo config is ambiguous — refuse with a
+        // message that mirrors resolve_kill_target's
+        // bare-form-in-multi-repo-config error shape. With exactly
+        // one configured [[repo]] the bare form is unambiguous and
+        // resolves to that single repo.
+        let issue_refs_count = positional_issue.iter().count() + issue_numbers.len();
+        if repos.len() > 1 && issue_refs_count > 0 {
+            let n = positional_issue.unwrap_or_else(|| issue_numbers[0]);
+            anyhow::bail!(
+                "bellows triage: ambiguous issue number {} ({} repos configured); pass --repo <owner>/<name> to disambiguate",
+                n,
+                repos.len(),
+            );
+        }
         let r = repos.first().ok_or_else(|| {
             anyhow!("bellows triage: no [[repo]] configured in orchestrator.toml")
         })?;
