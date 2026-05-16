@@ -283,8 +283,6 @@ async fn triage_cmd(
     // path lives in the helper too.
     let resolved =
         resolve_triage_filter(issue, repo.as_deref(), &issue_numbers, &config.repos)?;
-    let owner = resolved.repo_owner;
-    let repo_name = resolved.repo_name;
 
     // Preserve the pre-issue-#115 warning shape for the
     // bare-`bellows triage` (drain, no --repo, no --issue) path
@@ -295,17 +293,16 @@ async fn triage_cmd(
     if repo.is_none() && issue.is_none() && issue_numbers.is_empty() && config.repos.len() > 1 {
         eprintln!(
             "bellows triage: multiple repos configured; triaging against {}/{} only (first [[repo]] entry)",
-            owner, repo_name,
+            resolved.repo_owner, resolved.repo_name,
         );
     }
 
     if resolved.explicit_issues.is_empty() {
-        triage_backlog_cmd(&client, &owner, &repo_name, &config, dry_run).await
+        triage_backlog_cmd(&client, &resolved, &config, dry_run).await
     } else if resolved.explicit_issues.len() == 1 {
         triage_one_cmd(
             &client,
-            &owner,
-            &repo_name,
+            &resolved,
             &config,
             resolved.explicit_issues[0],
             dry_run,
@@ -316,12 +313,12 @@ async fn triage_cmd(
         // them serially through the same per-issue path the backlog
         // drain uses, so failures are tallied rather than aborting
         // the run.
+        let issues = resolved.explicit_issues.clone();
         triage_explicit_issues_cmd(
             &client,
-            &owner,
-            &repo_name,
+            &resolved,
             &config,
-            resolved.explicit_issues,
+            issues,
             dry_run,
         )
         .await
@@ -330,8 +327,7 @@ async fn triage_cmd(
 
 async fn triage_explicit_issues_cmd(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
+    target: &ResolvedTriageFilter,
     config: &Config,
     issues: Vec<u64>,
     dry_run: bool,
@@ -356,7 +352,7 @@ async fn triage_explicit_issues_cmd(
         .collect();
     let summary = triage::drain_backlog(issues_for_drain, dry_run, |n, dr| async move {
         println!("bellows triage: processing issue #{}", n);
-        match call_triage_one(client, owner, repo, config, n, dr).await {
+        match call_triage_one(client, target, config, n, dr).await {
             Ok(v) => {
                 println!("bellows triage: issue #{} -> {}", n, v);
                 Ok(v)
@@ -374,8 +370,7 @@ async fn triage_explicit_issues_cmd(
 
 async fn triage_one_cmd(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
+    target: &ResolvedTriageFilter,
     config: &Config,
     issue: u64,
     dry_run: bool,
@@ -384,7 +379,7 @@ async fn triage_one_cmd(
     // skill against a single issue. The backlog-drain form (T2)
     // shares this entry point so the per-issue isolation + verdict-
     // tally contract is the same in both modes.
-    match call_triage_one(client, owner, repo, config, issue, dry_run).await {
+    match call_triage_one(client, target, config, issue, dry_run).await {
         Ok(v) => {
             println!("bellows triage: issue #{} -> {}", issue, v);
             Ok(())
@@ -399,8 +394,7 @@ async fn triage_one_cmd(
 
 async fn triage_backlog_cmd(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
+    target: &ResolvedTriageFilter,
     config: &Config,
     dry_run: bool,
 ) -> Result<()> {
@@ -409,9 +403,14 @@ async fn triage_backlog_cmd(
     // through T1's per-issue triage path, tallying verdicts and
     // failures into a single end-of-run summary.
     let needs_triage_label = "needs-triage";
-    let issues = tracker::list_needs_triage_issues(client, owner, repo, needs_triage_label)
-        .await
-        .context("list open needs-triage issues")?;
+    let issues = tracker::list_needs_triage_issues(
+        client,
+        &target.repo_owner,
+        &target.repo_name,
+        needs_triage_label,
+    )
+    .await
+    .context("list open needs-triage issues")?;
 
     if issues.is_empty() {
         println!(
@@ -430,7 +429,7 @@ async fn triage_backlog_cmd(
 
     let summary = triage::drain_backlog(issues, dry_run, |n, dr| async move {
         println!("bellows triage: processing issue #{}", n);
-        match call_triage_one(client, owner, repo, config, n, dr).await {
+        match call_triage_one(client, target, config, n, dr).await {
             Ok(v) => {
                 println!("bellows triage: issue #{} -> {}", n, v);
                 Ok(v)
@@ -485,24 +484,24 @@ fn verdict_to_summary_bucket(v: &TriageVerdict) -> Verdict {
 /// the targeted form returns the error to the operator.
 async fn call_triage_one(
     client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
+    target: &ResolvedTriageFilter,
     config: &Config,
     issue: u64,
     dry_run: bool,
 ) -> Result<Verdict, String> {
-    let bundle = tracker::fetch_issue_with_comments(client, owner, repo, issue)
+    let bundle = tracker::fetch_issue_with_comments(
+        client,
+        &target.repo_owner,
+        &target.repo_name,
+        issue,
+    )
         .await
         .map_err(|e| format!("fetch issue #{issue}: {e}"))?;
 
     // Per-invocation throwaway branch name so multiple triage runs
     // against the same repo don't collide on a shared local branch.
-    let branch_name = format!("bellows-triage-tmp/{issue}");
-    let primary_repo = config
-        .repos
-        .first()
-        .expect("config.repos non-empty by FromStr invariant");
-    let workspace = workspace::prepare(&primary_repo.url, &branch_name)
+    let dispatch = triage_dispatch_plan(target, issue);
+    let workspace = workspace::prepare(&dispatch.repo_url, &dispatch.branch_name)
         .await
         .map_err(|e| format!("prepare workspace: {e}"))?;
 
@@ -522,8 +521,6 @@ async fn call_triage_one(
             credentials_volume_name: config.auth.claude.credentials_volume.clone(),
         },
     };
-    let repo_slug = bellows::repo_slug(&primary_repo.url);
-    let repo_label = format!("{}/{}", owner, repo);
     let deadline = Some(Duration::from_secs(config.agent.wall_clock_minutes.get() * 60));
 
     let mut log_writer = std::io::stderr();
@@ -531,10 +528,10 @@ async fn call_triage_one(
         &workspace,
         &auth,
         issue,
-        &repo_label,
-        &repo_slug,
+        &dispatch.repo_label,
+        &dispatch.repo_slug,
         &config.auth.ssh_keys_volume,
-        &primary_repo.deploy_keys,
+        &dispatch.deploy_keys,
         &mut log_writer,
         deadline,
     )
@@ -594,7 +591,13 @@ async fn call_triage_one(
         .map_err(|e| format!("commit_to_branch: {e}"))?;
     }
 
-    tracker::apply_verdict(client, owner, repo, issue, &verdict)
+    tracker::apply_verdict(
+        client,
+        &target.repo_owner,
+        &target.repo_name,
+        issue,
+        &verdict,
+    )
         .await
         .map_err(|e| format!("apply_verdict: {e}"))?;
 
@@ -909,10 +912,33 @@ struct ResolvedTriageFilter {
     /// entry — needed for the workspace::prepare call which sees the
     /// URL form the operator wrote in orchestrator.toml.
     repo_url: String,
+    /// Per-repo SSH deploy keys from the matching `[[repo]]` entry.
+    /// The triage sandbox must use the selected repo's keys, not the
+    /// first configured repo's keys.
+    repo_deploy_keys: Vec<String>,
     /// Empty → drain the `needs-triage` backlog. Non-empty → triage
     /// exactly these issue numbers (deduped, order-preserved) as an
     /// operator-override.
     explicit_issues: Vec<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TriageDispatchPlan {
+    branch_name: String,
+    repo_label: String,
+    repo_url: String,
+    repo_slug: String,
+    deploy_keys: Vec<String>,
+}
+
+fn triage_dispatch_plan(target: &ResolvedTriageFilter, issue: u64) -> TriageDispatchPlan {
+    TriageDispatchPlan {
+        branch_name: format!("bellows-triage-tmp/{issue}"),
+        repo_label: format!("{}/{}", target.repo_owner, target.repo_name),
+        repo_url: target.repo_url.clone(),
+        repo_slug: bellows::repo_slug(&target.repo_url),
+        deploy_keys: target.repo_deploy_keys.clone(),
+    }
 }
 
 /// Resolve `bellows triage`'s flag bundle to a single repo + an
@@ -927,17 +953,17 @@ fn resolve_triage_filter(
     issue_numbers: &[u64],
     repos: &[bellows::config::RepoConfig],
 ) -> Result<ResolvedTriageFilter> {
-    let (owner, name, url) = if let Some(slug) = repo_flag {
+    let (owner, name, url, deploy_keys) = if let Some(slug) = repo_flag {
         // --repo <owner/name> must match exactly one configured
         // [[repo]] URL. Skip entries with a malformed URL so a
         // single bad entry doesn't pre-empt unrelated matches
         // (same shape as resolve_kill_target).
-        let mut found: Option<(String, String, String)> = None;
+        let mut found: Option<(String, String, String, Vec<String>)> = None;
         for r in repos {
             if let Ok((o, n)) = parse_owner_repo(&r.url) {
                 let s = format!("{}/{}", o, n);
                 if s == slug {
-                    found = Some((o, n, r.url.clone()));
+                    found = Some((o, n, r.url.clone(), r.deploy_keys.clone()));
                     break;
                 }
             }
@@ -977,7 +1003,7 @@ fn resolve_triage_filter(
             anyhow!("bellows triage: no [[repo]] configured in orchestrator.toml")
         })?;
         let (o, n) = parse_owner_repo(&r.url)?;
-        (o, n, r.url.clone())
+        (o, n, r.url.clone(), r.deploy_keys.clone())
     };
 
     // Explicit-issue list: positional → single-element; repeated
@@ -1000,6 +1026,7 @@ fn resolve_triage_filter(
         repo_owner: owner,
         repo_name: name,
         repo_url: url,
+        repo_deploy_keys: deploy_keys,
         explicit_issues,
     })
 }
@@ -3206,6 +3233,44 @@ mod tests {
         assert_eq!(resolved.repo_owner, "marad2001");
         assert_eq!(resolved.repo_name, "repo-b");
         assert_eq!(resolved.explicit_issues, vec![1, 2]);
+    }
+
+    #[test]
+    fn triage_dispatch_plan_uses_selected_non_first_repo_workspace_and_deploy_keys() {
+        // Regression for the review finding: after --repo resolves to
+        // a non-first [[repo]], the dispatch seam must keep using that
+        // selected repo for workspace::prepare, cache slugging, and
+        // sandbox deploy keys. Falling back to config.repos.first()
+        // would clone repo-a and mount key-a for a repo-b triage.
+        let config = Config::from_str(
+            r#"
+[[repo]]
+url = "https://github.com/marad2001/repo-a"
+deploy_keys = ["key-a"]
+
+[[repo]]
+url = "https://github.com/marad2001/repo-b"
+deploy_keys = ["key-b", "shared"]
+
+[github]
+pat_env_var = "X"
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_triage_filter(
+            None,
+            Some("marad2001/repo-b"),
+            &[42],
+            &config.repos,
+        )
+        .expect("--repo must resolve to the configured non-first repo");
+
+        let plan = triage_dispatch_plan(&resolved, 42);
+
+        assert_eq!(plan.repo_label, "marad2001/repo-b");
+        assert_eq!(plan.repo_url, "https://github.com/marad2001/repo-b");
+        assert_eq!(plan.repo_slug, "marad2001-repo-b");
+        assert_eq!(plan.deploy_keys, vec!["key-b".to_string(), "shared".to_string()]);
     }
 
     #[test]
