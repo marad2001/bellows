@@ -3084,6 +3084,60 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_triage_with_repo_and_issue_flags_combined() {
+        // Issue #115 AC: --repo and --issue are combinable.
+        // `bellows triage --repo X --issue 1 --issue 2` parses with
+        // both fields populated; the helper's job is to intersect
+        // (restrict to repo X, list = [1, 2]).
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "triage",
+            "--repo",
+            "marad2001/bellows",
+            "--issue",
+            "1",
+            "--issue",
+            "2",
+        ])
+        .expect("--repo + --issue must combine");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                repo: Some(r),
+                issue_numbers,
+                dry_run: false,
+            }) => {
+                assert_eq!(r, "marad2001/bellows");
+                assert_eq!(issue_numbers, vec![1, 2]);
+            }
+            _ => panic!("expected Triage with both repo and issue_numbers"),
+        }
+    }
+
+    #[test]
+    fn resolve_triage_filter_intersects_repo_and_explicit_issues_in_multi_repo_config() {
+        // Issue #115 AC: `--repo X --issue 1 --issue 2` selects only
+        // #1 and #2 in repo X (intersection of the two filters).
+        // Even when other configured repos exist, the resolver scopes
+        // exclusively to the named repo.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+            "https://github.com/marad2001/repo-c",
+        ]);
+        let resolved = resolve_triage_filter(
+            None,
+            Some("marad2001/repo-b"),
+            &[1, 2],
+            &repos,
+        )
+        .expect("--repo + --issue intersection must resolve");
+        assert_eq!(resolved.repo_owner, "marad2001");
+        assert_eq!(resolved.repo_name, "repo-b");
+        assert_eq!(resolved.explicit_issues, vec![1, 2]);
+    }
+
+    #[test]
     fn resolve_triage_filter_uses_only_repo_in_single_repo_config_without_repo_flag() {
         // Issue #115 AC: with exactly one configured `[[repo]]`, the
         // operator does not need to pass `--repo` — the bare form is
