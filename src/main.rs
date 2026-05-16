@@ -3084,6 +3084,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_triage_filter_uses_only_repo_in_single_repo_config_without_repo_flag() {
+        // Issue #115 AC: with exactly one configured `[[repo]]`, the
+        // operator does not need to pass `--repo` — the bare form is
+        // unambiguous and the helper resolves to the single repo.
+        // Mirrors resolve_kill_target_accepts_bare_issue_in_single_repo_config.
+        let repos = single_repo("https://github.com/marad2001/bellows");
+        let resolved = resolve_triage_filter(None, None, &[42], &repos)
+            .expect("single-repo bare --issue must resolve cleanly");
+        assert_eq!(resolved.repo_owner, "marad2001");
+        assert_eq!(resolved.repo_name, "bellows");
+        assert_eq!(resolved.repo_url, "https://github.com/marad2001/bellows");
+        assert_eq!(resolved.explicit_issues, vec![42]);
+    }
+
+    #[test]
     fn resolve_triage_filter_dedups_issue_numbers_silently_preserving_order() {
         // Issue #115 AC: duplicate `--issue` values are silently
         // deduplicated; operator-supplied order is preserved (first
