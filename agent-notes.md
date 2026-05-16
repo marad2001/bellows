@@ -50,3 +50,7 @@ helper was trimmed to handle only the unknown-`--repo` branch (commit
 
 Nothing about `/workspace` raised the kind of red flags described in
 the operator brief. Everything touched is first-party Bellows source.
+
+## Unaddressed finding: several issue 115 behaviours were implemented before their tests
+
+Addressing this would require rewriting the already-published issue #115 branch history so each affected acceptance criterion has a failing RED test commit before the implementation commit that makes it pass, specifically splitting or reordering the commits called out in the review finding. I cannot safely do that in this single-finding review-fix run because the branch is already tracking `origin/agent/115-bellows-triage-repo-issue-flags-for-filtered-backl`, and Bellows's post-run flow expects an additive commit/push rather than a force-pushed history rewrite. A human operator should decide whether to rewrite the branch history or accept this PR as a failed/draft handoff.
