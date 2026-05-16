@@ -246,8 +246,8 @@ async fn validate_deploy_keys_at_startup(config: &Config) -> Result<()> {
 async fn triage_cmd(
     config_path: &PathBuf,
     issue: Option<u64>,
-    _repo: Option<String>,
-    _issue_numbers: Vec<u64>,
+    repo: Option<String>,
+    issue_numbers: Vec<u64>,
     dry_run: bool,
 ) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
@@ -275,30 +275,101 @@ async fn triage_cmd(
         .personal_token(pat)
         .build()
         .context("build octocrab client")?;
-    // Issue #35 multi-repo polling deliberately keeps `bellows triage`
-    // scoped to a single repo per invocation — the triage skill
-    // dispatches against one issue at a time and does not yet have a
-    // `<repo>/<issue>` argument shape. The first configured repo is
-    // used; operators driving triage against a non-first repo should
-    // re-order `[[repo]]` entries or run with a single-repo
-    // `orchestrator.toml`. A multi-repo-aware triage CLI is a future
-    // enhancement (not in this slice's scope).
-    let primary_repo = config
-        .repos
-        .first()
-        .expect("config.repos non-empty by FromStr invariant");
-    let (owner, repo) = parse_owner_repo(&primary_repo.url)?;
-    if config.repos.len() > 1 {
+
+    // Issue #115: resolve --repo / --issue / positional through the
+    // pure helper. This handles --repo validation, multi-repo bare-
+    // numeric-ref disambiguation, and silent dedup of repeated
+    // --issue values. The single-repo / first-[[repo]] convenience
+    // path lives in the helper too.
+    let resolved =
+        resolve_triage_filter(issue, repo.as_deref(), &issue_numbers, &config.repos)?;
+    let owner = resolved.repo_owner;
+    let repo_name = resolved.repo_name;
+
+    // Preserve the pre-issue-#115 warning shape for the
+    // bare-`bellows triage` (drain, no --repo, no --issue) path
+    // against a multi-repo config: the drain still scopes to the
+    // first [[repo]], but the operator deserves to know that.
+    // Once --repo is passed, the operator has consciously selected
+    // a repo and the warning is noise.
+    if repo.is_none() && issue.is_none() && issue_numbers.is_empty() && config.repos.len() > 1 {
         eprintln!(
             "bellows triage: multiple repos configured; triaging against {}/{} only (first [[repo]] entry)",
-            owner, repo,
+            owner, repo_name,
         );
     }
 
-    match issue {
-        Some(n) => triage_one_cmd(&client, &owner, &repo, &config, n, dry_run).await,
-        None => triage_backlog_cmd(&client, &owner, &repo, &config, dry_run).await,
+    if resolved.explicit_issues.is_empty() {
+        triage_backlog_cmd(&client, &owner, &repo_name, &config, dry_run).await
+    } else if resolved.explicit_issues.len() == 1 {
+        triage_one_cmd(
+            &client,
+            &owner,
+            &repo_name,
+            &config,
+            resolved.explicit_issues[0],
+            dry_run,
+        )
+        .await
+    } else {
+        // Operator named multiple issues via repeated --issue. Walk
+        // them serially through the same per-issue path the backlog
+        // drain uses, so failures are tallied rather than aborting
+        // the run.
+        triage_explicit_issues_cmd(
+            &client,
+            &owner,
+            &repo_name,
+            &config,
+            resolved.explicit_issues,
+            dry_run,
+        )
+        .await
     }
+}
+
+async fn triage_explicit_issues_cmd(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    config: &Config,
+    issues: Vec<u64>,
+    dry_run: bool,
+) -> Result<()> {
+    // Operator-override list (issue #115). Reuses the same
+    // tally-failures-and-continue contract as the backlog drain so
+    // a single bad issue in a `--issue 1 --issue 2 --issue 3` run
+    // doesn't lose the verdicts for the others.
+    println!(
+        "bellows triage: triaging {} operator-supplied issue(s){}",
+        issues.len(),
+        if dry_run { " (dry-run)" } else { "" },
+    );
+    let issues_for_drain: Vec<tracker::Issue> = issues
+        .iter()
+        .map(|&n| tracker::Issue {
+            number: n,
+            title: String::new(),
+            labels: vec![],
+            created_at: None,
+        })
+        .collect();
+    let summary = triage::drain_backlog(issues_for_drain, dry_run, |n, dr| async move {
+        println!("bellows triage: processing issue #{}", n);
+        match call_triage_one(client, owner, repo, config, n, dr).await {
+            Ok(v) => {
+                println!("bellows triage: issue #{} -> {}", n, v);
+                Ok(v)
+            }
+            Err(e) => {
+                eprintln!("bellows triage: issue #{} failed: {}", n, e);
+                Err(e)
+            }
+        }
+    })
+    .await;
+    print!("{}", summary);
+    Ok(())
 }
 
 async fn triage_one_cmd(
