@@ -3138,6 +3138,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_triage_with_dry_run_combined_with_repo_and_issue() {
+        // Issue #115 AC: --dry-run must remain combinable with the
+        // new filter flags. `bellows triage --repo X --issue 1
+        // --dry-run` parses with all three populated.
+        let cli = Cli::try_parse_from([
+            "bellows",
+            "triage",
+            "--repo",
+            "marad2001/bellows",
+            "--issue",
+            "7",
+            "--dry-run",
+        ])
+        .expect("--dry-run + --repo + --issue must combine");
+        match cli.command {
+            Some(Command::Triage {
+                issue: None,
+                repo: Some(r),
+                issue_numbers,
+                dry_run: true,
+            }) => {
+                assert_eq!(r, "marad2001/bellows");
+                assert_eq!(issue_numbers, vec![7]);
+            }
+            _ => panic!("expected Triage with repo, issue_numbers, dry_run=true"),
+        }
+    }
+
+    #[test]
     fn resolve_triage_filter_uses_only_repo_in_single_repo_config_without_repo_flag() {
         // Issue #115 AC: with exactly one configured `[[repo]]`, the
         // operator does not need to pass `--repo` — the bare form is
