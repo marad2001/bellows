@@ -33,6 +33,15 @@ pub enum ConfigError {
 pub enum Engine {
     Claude,
     Codex,
+    /// OpenCode CLI driving the DeepSeek V4 Pro model (issue #120 /
+    /// ADR-0008, spike #117). Auth shape is API-key-via-env-file
+    /// rather than OAuth-via-credentials-volume; the operating-
+    /// context file is built at policy-image build time from the
+    /// canonical claude CLAUDE.md with claude-specific phrasing
+    /// neutralised. opencode auto-discovers AGENTS.md and agents/
+    /// from `~/.config/opencode/` inside the container, so no
+    /// kickoff inlining is required (parity with the claude arm).
+    Opencode,
 }
 
 impl Engine {
@@ -44,6 +53,7 @@ impl Engine {
         match self {
             Engine::Claude => "claude",
             Engine::Codex => "codex",
+            Engine::Opencode => "opencode",
         }
     }
 
@@ -55,6 +65,7 @@ impl Engine {
         match name {
             "claude" => Some(Engine::Claude),
             "codex" => Some(Engine::Codex),
+            "opencode" => Some(Engine::Opencode),
             _ => None,
         }
     }
@@ -76,8 +87,10 @@ pub struct ChainEntry {
 pub enum EngineChainParseError {
     #[error("chain entry is empty")]
     Empty,
-    #[error("unknown engine `{0}` (expected `claude` or `codex`)")]
+    #[error("unknown engine `{0}` (expected `claude`, `codex`, or `opencode`)")]
     UnknownEngine(String),
+    #[error("model must not start with `-`")]
+    ModelStartsWithDash,
 }
 
 impl FromStr for ChainEntry {
@@ -97,6 +110,12 @@ impl FromStr for ChainEntry {
         };
         let engine = Engine::from_name(engine_part)
             .ok_or_else(|| EngineChainParseError::UnknownEngine(engine_part.to_string()))?;
+        if model_part
+            .as_deref()
+            .is_some_and(|model| model.starts_with('-'))
+        {
+            return Err(EngineChainParseError::ModelStartsWithDash);
+        }
         Ok(ChainEntry {
             engine,
             model: model_part,
@@ -110,11 +129,17 @@ impl FromStr for ChainEntry {
 /// (the parser only sees a label list).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EngineLabelOverrideError {
+    /// Two or more `engine:<name>` labels were present on the issue.
+    /// The `labels` field carries the verbatim conflicting label
+    /// strings (e.g. `["engine:claude", "engine:opencode"]`), sorted
+    /// alphabetically so the error message is deterministic across
+    /// runs.
     #[error(
-        "both `engine:claude` and `engine:codex` are present on this issue; \
-         operator must pick one. Refusing to claim."
+        "multiple `engine:` labels are present on this issue: {}; \
+         operator must pick exactly one. Refusing to claim.",
+        labels.join(", ")
     )]
-    AmbiguousEngineLabels,
+    AmbiguousEngineLabels { labels: Vec<String> },
 }
 
 /// Pre-claim engine-override resolution from the issue's labels. Returns
@@ -130,21 +155,29 @@ impl EngineLabelOverride {
     pub fn parse<S: AsRef<str>>(
         labels: &[S],
     ) -> Result<Option<Engine>, EngineLabelOverrideError> {
-        let mut has_claude = false;
-        let mut has_codex = false;
+        // Generalised from the slice-#81 two-engine boolean pair to a
+        // count-by-engine map so a third (or fourth, etc.) engine
+        // lands as data, not code shape (ADR-0008). Any `engine:<name>`
+        // label whose `<name>` is not a known engine is silently
+        // ignored — the operator's free to add forward-compat labels
+        // for engines bellows doesn't ship yet.
+        let mut found: Vec<(Engine, String)> = Vec::new();
         for label in labels {
-            match label.as_ref() {
-                "engine:claude" => has_claude = true,
-                "engine:codex" => has_codex = true,
-                _ => {}
+            let raw = label.as_ref();
+            if let Some(name) = raw.strip_prefix("engine:")
+                && let Some(engine) = Engine::from_name(name)
+                && !found.iter().any(|(e, _)| *e == engine)
+            {
+                found.push((engine, raw.to_string()));
             }
         }
-        match (has_claude, has_codex) {
-            (true, true) => Err(EngineLabelOverrideError::AmbiguousEngineLabels),
-            (true, false) => Ok(Some(Engine::Claude)),
-            (false, true) => Ok(Some(Engine::Codex)),
-            (false, false) => Ok(None),
+        if found.len() > 1 {
+            let mut labels: Vec<String> =
+                found.into_iter().map(|(_, label)| label).collect();
+            labels.sort();
+            return Err(EngineLabelOverrideError::AmbiguousEngineLabels { labels });
         }
+        Ok(found.into_iter().next().map(|(engine, _)| engine))
     }
 }
 
@@ -313,6 +346,11 @@ pub struct AuthConfig {
     /// phase's `cli_chain` (or a forced-single-engine `engine:codex`
     /// label) dispatches to Codex — lazy validation per ADR-0005.
     pub codex: EngineAuthConfig,
+    /// Opencode's API-key env-file (issue #120 / ADR-0008). Unlike
+    /// claude/codex (which mount an OAuth credentials volume), opencode
+    /// reads `DEEPSEEK_API_KEY` from a host-side `KEY=VALUE` env-file
+    /// that bellows seeds via `setup-auth --engine opencode`.
+    pub opencode: OpencodeAuthConfig,
     /// Name of the Docker volume holding per-repo SSH deploy keys
     /// (issue #69 / ADR-0002). Mounted into containers regardless of
     /// engine choice.
@@ -320,13 +358,26 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Per-engine credentials-volume lookup. Centralised here so the
-    /// runner and `bellows setup-auth --engine` share one source of
-    /// truth.
+    /// Per-engine credentials-volume lookup for engines that mount an
+    /// OAuth credentials volume. Centralised here so the runner and
+    /// `bellows setup-auth --engine` share one source of truth.
+    ///
+    /// Panics if called with `Engine::Opencode` — opencode's auth shape
+    /// is a host-side API-key env-file, not a credentials volume. The
+    /// caller is expected to branch on engine and read
+    /// `AuthConfig::opencode` directly for the opencode path. This is
+    /// a debug-only panic gate; the runner's dispatch code never reaches
+    /// this branch for opencode because the opencode path takes a
+    /// different code path (env-file mount, not volume mount).
     pub fn for_engine(&self, engine: Engine) -> &EngineAuthConfig {
         match engine {
             Engine::Claude => &self.claude,
             Engine::Codex => &self.codex,
+            Engine::Opencode => panic!(
+                "AuthConfig::for_engine called with Engine::Opencode; \
+                 opencode uses an API-key env-file, not a credentials \
+                 volume — read AuthConfig::opencode instead",
+            ),
         }
     }
 }
@@ -338,6 +389,27 @@ impl AuthConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct EngineAuthConfig {
     pub credentials_volume: String,
+}
+
+/// Opencode auth settings (issue #120 / ADR-0008). Carries the
+/// host-side path to the API-key env-file bellows reads with
+/// `--env-file` when dispatching opencode runs. The env-file's
+/// contents are `KEY=VALUE` one-per-line (e.g. `DEEPSEEK_API_KEY=...`),
+/// mode 0600, owned by the bellows operator account; the file is
+/// created/updated by `bellows setup-auth --engine opencode` and
+/// `bellows refresh-auth --engine opencode`.
+#[derive(Debug, Clone)]
+pub struct OpencodeAuthConfig {
+    /// Host path of the env-file. Resolved at runtime (a leading `~`
+    /// expands to `$HOME`). Default: `~/.config/bellows/opencode.env`.
+    pub api_key_env_file: String,
+}
+
+impl OpencodeAuthConfig {
+    /// Default host path of the opencode API-key env-file.
+    pub fn default_api_key_env_file() -> String {
+        "~/.config/bellows/opencode.env".to_string()
+    }
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq, Eq)]
@@ -356,6 +428,9 @@ impl Default for AuthConfig {
             },
             codex: EngineAuthConfig {
                 credentials_volume: default_codex_credentials_volume(),
+            },
+            opencode: OpencodeAuthConfig {
+                api_key_env_file: OpencodeAuthConfig::default_api_key_env_file(),
             },
             ssh_keys_volume: default_ssh_keys_volume(),
         }
@@ -393,6 +468,15 @@ struct RawAuthConfig {
     ssh_keys_volume: Option<String>,
     claude: Option<EngineAuthConfig>,
     codex: Option<EngineAuthConfig>,
+    /// `[auth.opencode]` subtable (issue #120 / ADR-0008). Currently
+    /// just `api_key_env_file`; required only when some phase's
+    /// `cli_chain` dispatches to opencode (lazy validation).
+    opencode: Option<RawOpencodeAuthConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawOpencodeAuthConfig {
+    api_key_env_file: Option<String>,
 }
 
 impl RawAuthConfig {
@@ -411,10 +495,17 @@ impl RawAuthConfig {
         let codex = self.codex.unwrap_or_else(|| EngineAuthConfig {
             credentials_volume: default_codex_credentials_volume(),
         });
+        let opencode = OpencodeAuthConfig {
+            api_key_env_file: self
+                .opencode
+                .and_then(|o| o.api_key_env_file)
+                .unwrap_or_else(OpencodeAuthConfig::default_api_key_env_file),
+        };
         AuthConfig {
             method: self.method,
             claude,
             codex,
+            opencode,
             ssh_keys_volume: self
                 .ssh_keys_volume
                 .unwrap_or_else(default_ssh_keys_volume),

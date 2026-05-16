@@ -95,22 +95,36 @@ ssh_keys_volume = "bellows-deploy-keys"
 credentials_volume = "bellows-claude-credentials"
 [auth.codex]
 credentials_volume = "bellows-codex-credentials"
+# OpenCode (issue #120 / ADR-0008) authenticates with an API key
+# rather than an OAuth session, so its auth shape is an env-file
+# (mode 0600) rather than a credentials volume. The env-file is
+# seeded by `bellows setup-auth --engine opencode` (which reads the
+# DEEPSEEK_API_KEY from stdin and writes the canonical
+# `DEEPSEEK_API_KEY=...\n` line at the configured path); the
+# dispatcher reads it at container-create time (AC11) and injects
+# its KEY=VALUE lines into the agent container's env array.
+[auth.opencode]
+api_key_env_file = "~/.config/bellows/opencode.env"
 
-# Per-phase engine-selection chain (issue #81 / ADR-0005). Each
-# agent-invoking phase has its own `cli_chain: Vec<...>` declaring the
-# preferred engine order. Each entry is either a bare engine name
-# (`"claude"`, `"codex"`) or an engine-with-model pin
-# (`"claude:opus-4-7"`, `"codex:gpt-5.5"`). Model is opaque
-# pass-through — the CLI reports unknown-model at run time.
+# Per-phase engine-selection chain (issue #81 / ADR-0005, extended
+# by issue #120 / ADR-0008 for opencode). Each agent-invoking phase
+# has its own `cli_chain: Vec<...>` declaring the preferred engine
+# order. Each entry is either a bare engine name
+# (`"claude"`, `"codex"`, `"opencode"`) or an engine-with-model pin
+# (`"claude:opus-4-7"`, `"codex:gpt-5.5"`,
+# `"opencode:deepseek/deepseek-v4-pro"`). Model is opaque
+# pass-through — the CLI reports unknown-model at run time. The
+# opencode form's `provider/model` shape is preserved verbatim
+# (ChainEntry splits on the FIRST `:` only).
 #
 # Default-default for each phase is `["claude"]` (slice-#82 chain
 # walking + diversity-preference layers on top of the same shape).
 # In this slice (#81) bellows always uses the FIRST chain entry; the
 # rest of the chain is consulted in slice #82.
 #
-# The per-issue `engine:claude` / `engine:codex` labels override the
-# chain for that run (forced-single-engine). Both labels on the same
-# issue = refuse-to-claim.
+# The per-issue `engine:claude` / `engine:codex` / `engine:opencode`
+# labels override the chain for that run (forced-single-engine).
+# Two or more such labels on the same issue = refuse-to-claim.
 #
 # [phases.implement]
 # cli_chain = ["claude:opus-4-7", "codex:gpt-5.5"]
@@ -126,6 +140,9 @@ credentials_volume = "bellows-codex-credentials"
 #
 # [phases.security_fix]
 # cli_chain = ["claude", "codex"]
+#
+# [phases.implement]
+# cli_chain = ["opencode:deepseek/deepseek-v4-pro", "claude"]
 
 [agent]
 # Per-issue wall-clock budget. Bellows tracks elapsed time across all

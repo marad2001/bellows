@@ -34,6 +34,12 @@ pub enum ExitReason {
     FinalTestsRed,
     WallClockExceeded,
     RateLimited,
+    /// ADR-0008 / issue #120 AC6: an authentication error was detected
+    /// in implement-phase stderr. Distinct from `Crash` so the run-log
+    /// builder (AC12) can name the engine to refresh — same routing
+    /// shape `RateLimited` already had for the rate-limit follow-up
+    /// signal.
+    AuthError,
     Cancelled,
 }
 
@@ -206,12 +212,21 @@ pub fn classify_agent_notes_with_synth_spans(
     }
 }
 
-/// Outcome of the implement run: the first phase, where claude reads
-/// the agent brief and writes code.
+/// Outcome of the implement run: the first phase, where the agent
+/// reads the brief and writes code.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ImplementOutcome {
     pub exit_code: i64,
     pub stderr_tail: String,
+    /// ADR-0008 / issue #120 AC6: engine that produced this outcome.
+    /// `None` preserves the pre-AC6 code path — classify_exit's
+    /// signature precedence still gates on exit_code != 0 for the
+    /// older engines (Claude, Codex) — so existing call sites that
+    /// have not been updated continue to behave as before. The
+    /// opencode path requires `Some(Engine::Opencode)` so the
+    /// signature can be treated as authoritative regardless of exit
+    /// code (opencode v1.15.3 exits 0 on 429 / 401).
+    pub engine: Option<crate::config::Engine>,
 }
 
 /// One cargo subcommand's exit code + captured output.
@@ -355,6 +370,23 @@ pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason 
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
     }
+    // ADR-0008 / issue #120 AC6: opencode v1.15.3 exits 0 on its
+    // 429 / 401 responses (the CLI surfaces the error to stderr and
+    // returns cleanly). For opencode-engine implement runs the
+    // signature is authoritative regardless of exit code; auth-error
+    // takes precedence over rate-limit since "wrong key" is a
+    // sharper operator signal than "API throttled".
+    if matches!(
+        outcomes.implement.engine,
+        Some(crate::config::Engine::Opencode)
+    ) {
+        if is_opencode_auth_error_signature(&outcomes.implement.stderr_tail) {
+            return ExitReason::AuthError;
+        }
+        if is_opencode_rate_limit_signature(&outcomes.implement.stderr_tail) {
+            return ExitReason::RateLimited;
+        }
+    }
     // Rate-limit detection runs BEFORE the generic Crash check so a
     // non-zero exit caused by an Anthropic rate-limit gets the more
     // specific operator signal. Signature alone is insufficient — the
@@ -410,7 +442,25 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
         "rate limit:",
     ];
     let lower = text.to_lowercase();
-    SIGNATURES.iter().any(|sig| lower.contains(sig))
+    if SIGNATURES.iter().any(|sig| lower.contains(sig)) {
+        return true;
+    }
+    // Opencode (issue #120 / ADR-0008): composite AI_APICallError + 429.
+    is_opencode_rate_limit_signature(text)
+}
+
+/// Opencode-side rate-limit signature: composite match of
+/// `AI_APICallError` AND `"statusCode":429` on the ANSI-stripped form
+/// of the input (issue #120 / ADR-0008 AC4). Substrings come from the
+/// AI SDK error shape opencode emits to stderr.
+///
+/// Composite (both substrings) so a bare `429` in unrelated
+/// agent-fetched content (test fixtures, JSON byte counts, HTTP
+/// docs) does not produce a false positive — same pattern the codex
+/// auth-error signature uses for `401 Unauthorized`.
+pub fn is_opencode_rate_limit_signature(text: &str) -> bool {
+    let stripped = strip_ansi(text);
+    stripped.contains("AI_APICallError") && stripped.contains("\"statusCode\":429")
 }
 
 /// Whether the given text contains a known auth-error signature. Used
@@ -438,7 +488,9 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
 /// in the run-log comment names the engine to refresh") uses the
 /// per-engine helpers below.
 pub fn is_auth_error_signature(text: &str) -> bool {
-    is_claude_auth_error_signature(text) || is_codex_auth_error_signature(text)
+    is_claude_auth_error_signature(text)
+        || is_codex_auth_error_signature(text)
+        || is_opencode_auth_error_signature(text)
 }
 
 /// Claude-side auth-error signature subset. Returns true when the
@@ -463,6 +515,57 @@ pub fn is_codex_auth_error_signature(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("401 unauthorized")
         && lower.contains("missing bearer or basic authentication")
+}
+
+/// Opencode-side auth-error signature: composite match of
+/// `AI_APICallError` AND `"statusCode":401` on the ANSI-stripped form
+/// of the input (issue #120 / ADR-0008 AC5). Substrings come from
+/// the AI SDK error shape opencode emits to stderr. Composite to
+/// avoid false positives from a bare `401` in unrelated
+/// agent-fetched content.
+pub fn is_opencode_auth_error_signature(text: &str) -> bool {
+    let stripped = strip_ansi(text);
+    stripped.contains("AI_APICallError") && stripped.contains("\"statusCode\":401")
+}
+
+/// Strip ANSI CSI escape sequences from `s`. Used as a pre-pass before
+/// the opencode `is_*_signature` substring matchers so coloured
+/// stderr (notably opencode, which emits ANSI-styled JSON-ish error
+/// payloads by default — see ADR-0008 / issue #120 AC3) does not
+/// produce false-negative classification.
+///
+/// Implementation: state-machine scan that skips bytes from `ESC [`
+/// (0x1B, 0x5B) through the next final byte in the CSI range
+/// `0x40..=0x7E` (i.e. `@A-Z[\\]^_\`a-z{|}~`). Non-CSI text passes
+/// through unchanged; ESC bytes not followed by `[` pass through
+/// unchanged. ASCII-only output — opencode's coloured stderr is
+/// ASCII-only after stripping. No allocation when the input contains
+/// no escape sequences.
+pub fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // CSI: ESC [ <params> <final>. Skip until a final byte in
+            // 0x40..=0x7E, then drop the final byte itself.
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // consume the final byte
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Whether either of a gate's checks exited non-zero. Crate-public so the
@@ -1466,6 +1569,17 @@ pub fn wrap_phase_prompt_for_engine(
 ) -> String {
     match engine {
         crate::config::Engine::Claude => body.to_string(),
+        crate::config::Engine::Opencode => {
+            // ADR-0008 / issue #120 AC7: opencode auto-discovers
+            // `AGENTS.md` (and per-skill markdown) from
+            // `~/.config/opencode/` inside the container — same
+            // shape as claude reading `CLAUDE.md` + the skills
+            // directory from disk — so the runner does not inline
+            // the operating context into the kickoff prompt. The
+            // wrapper is the identity function for opencode for the
+            // same reason it is for claude.
+            body.to_string()
+        }
         crate::config::Engine::Codex => {
             // Inline the operating-context body + baked skill bodies.
             // Claude-specific phrasing in those bodies ("Claude Code

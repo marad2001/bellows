@@ -1609,6 +1609,10 @@ fn setup_auth_docker_args(
             args.push("login".to_string());
             args.push("--device-auth".to_string());
         }
+        bellows::config::Engine::Opencode => unreachable!(
+            "opencode setup-auth does not run a docker container; \
+             setup_auth must branch on engine before calling setup_auth_docker_args"
+        ),
     }
     args
 }
@@ -1645,6 +1649,10 @@ fn setup_auth_preflight_instructions(
                 "bellows: codex writes auth.json into the credentials volume once the device is approved, then exits on its own — the container exits and the volume retains the credentials.\n",
             );
         }
+        bellows::config::Engine::Opencode => unreachable!(
+            "opencode setup-auth does not run a docker container; \
+             setup_auth must branch on engine before calling setup_auth_preflight_instructions"
+        ),
     }
     out
 }
@@ -1663,11 +1671,20 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
     let engine = match engine_flag {
         Some(name) => bellows::config::Engine::from_name(name).ok_or_else(|| {
             anyhow!(
-                "unknown --engine `{name}` (expected `claude` or `codex`)",
+                "unknown --engine `{name}` (expected `claude`, `codex`, or `opencode`)",
             )
         })?,
         None => config.phases.implement.first_entry().engine,
     };
+
+    // ADR-0008 / issue #120 AC9: opencode setup-auth is API-key, not
+    // OAuth — there is no docker container to drive, no credentials
+    // volume to seed. Branch out before any of the OAuth-shaped
+    // docker plumbing below so the docker helpers can stay
+    // unreachable for opencode.
+    if let bellows::config::Engine::Opencode = engine {
+        return setup_auth_opencode(&config).await;
+    }
 
     let image_tag = sandbox::ensure_policy_image()
         .await
@@ -1679,6 +1696,9 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
     let home_in_container = match engine {
         bellows::config::Engine::Claude => CLAUDE_HOME_IN_CONTAINER,
         bellows::config::Engine::Codex => bellows::auth::CODEX_HOME_IN_CONTAINER,
+        bellows::config::Engine::Opencode => unreachable!(
+            "opencode branch above returned early; this match only runs for OAuth engines"
+        ),
     };
 
     // Engine-specific pre-flight text + docker argv (issue #100). The
@@ -1699,6 +1719,42 @@ async fn setup_auth(config_path: &PathBuf, engine_flag: Option<&str>) -> Result<
     println!(
         "bellows: setup-auth complete; {engine_name} credentials volume `{}` is seeded.",
         volume,
+    );
+    Ok(())
+}
+
+/// ADR-0008 / issue #120 AC9: opencode setup-auth.
+/// Reads a DeepSeek API key from stdin and writes it to a 0600 env-file
+/// at the configured `api_key_env_file` path (default
+/// `~/.config/bellows/opencode.env`). No docker container is launched —
+/// the env-file is host-side and is later passed to the agent container
+/// via `docker run --env-file` (AC11).
+async fn setup_auth_opencode(config: &Config) -> Result<()> {
+    let raw_path = &config.auth.opencode.api_key_env_file;
+    let env_file_path = bellows::main_helpers::expand_tilde_path(raw_path);
+
+    print!(
+        "bellows: setup-auth --engine opencode\n\n\
+         opencode authenticates via a DeepSeek API key (not OAuth, unlike\n\
+         claude / codex). Paste your DeepSeek API key below; bellows will\n\
+         write it to a 0600 env-file at {} and pass it into the agent\n\
+         container at run-time via `docker run --env-file`.\n\n\
+         DeepSeek API key: ",
+        env_file_path.display(),
+    );
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let mut key = String::new();
+    std::io::stdin()
+        .read_line(&mut key)
+        .context("read DeepSeek API key from stdin")?;
+
+    bellows::main_helpers::write_opencode_env_file(&env_file_path, &key)?;
+
+    println!(
+        "bellows: setup-auth complete; opencode DeepSeek API key written to {}.",
+        env_file_path.display(),
     );
     Ok(())
 }

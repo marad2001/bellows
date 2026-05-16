@@ -151,7 +151,8 @@ fn pr_routing_for_reason<'a>(
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
         | ExitReason::FinalTestsRed
-        | ExitReason::WallClockExceeded => PrRouting {
+        | ExitReason::WallClockExceeded
+        | ExitReason::AuthError => PrRouting {
             draft: true,
             outcome_label: &labels.agent_failed,
             pr_label: None,
@@ -230,6 +231,29 @@ struct RepoCandidate {
     repo_url: String,
     issue: tracker::Issue,
     repo_order: usize,
+}
+
+fn auth_for_chain_entry(config: &Config, entry: &ChainEntry) -> Auth {
+    match &config.auth.method {
+        AuthMethod::Subscription => match entry.engine {
+            Engine::Opencode => Auth::EnvFile {
+                engine: entry.engine,
+                model: entry.model.clone(),
+                env_file_path: crate::main_helpers::expand_tilde_path(
+                    &config.auth.opencode.api_key_env_file,
+                ),
+            },
+            Engine::Claude | Engine::Codex => Auth::Subscription {
+                engine: entry.engine,
+                model: entry.model.clone(),
+                credentials_volume_name: config
+                    .auth
+                    .for_engine(entry.engine)
+                    .credentials_volume
+                    .clone(),
+            },
+        },
+    }
 }
 
 /// Re-loop sweep across every cleared repo's `blocked-by` dependents.
@@ -815,19 +839,7 @@ pub async fn run_once(
     // diversity preference.
     let mut implementer_cli: Option<Engine> = None;
 
-    let auth_for = |entry: &ChainEntry| -> Auth {
-        match config.auth.method {
-            AuthMethod::Subscription => Auth::Subscription {
-                engine: entry.engine,
-                model: entry.model.clone(),
-                credentials_volume_name: config
-                    .auth
-                    .for_engine(entry.engine)
-                    .credentials_volume
-                    .clone(),
-            },
-        }
-    };
+    let auth_for = |entry: &ChainEntry| -> Auth { auth_for_chain_entry(config, entry) };
 
     // Per-issue wall-clock budget. Threaded through every container call
     // below; `mark_killed_if` flips `exceeded` whenever a sandbox run
@@ -849,7 +861,7 @@ pub async fn run_once(
     let head_before_implement = workspace::head_sha(&workspace).await?;
     let mut implement_advances_used: u8 = 0;
     let mut rate_limited_phase: Option<&'static str> = None;
-    let (_implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
+    let (implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
         let now = chrono::Utc::now();
         let pick_result = pick_engine_for_phase(
             &config.phases.implement.cli_chain,
@@ -1988,6 +2000,7 @@ pub async fn run_once(
         implement: ImplementOutcome {
             exit_code: implement_agent_run.exit_code,
             stderr_tail: implement_agent_run.stderr_tail.clone(),
+            engine: Some(implement_chain_entry.engine),
         },
         post_implement_gate,
         review: review_outcome,
@@ -2110,6 +2123,7 @@ pub async fn run_once(
         claude_pr_body.as_deref(),
         agent_notes_display.as_deref(),
         &workflow_files_changed,
+        &outcomes,
     );
 
     let pr = workspace::open_pr(
@@ -2281,12 +2295,31 @@ fn workflow_files_changed_callout(workflow_files_changed: &[String]) -> String {
     )
 }
 
+/// Render the PR-body callout for `ExitReason::AuthError`, naming
+/// the specific engine to refresh based on
+/// `outcomes.implement.engine`. AC12 of issue #120: the operator
+/// must be able to copy-paste the suggested `bellows refresh-auth`
+/// command straight from the PR body. When the implement-phase
+/// engine is unknown (legacy / pre-AC12 runs with `engine: None`),
+/// fall back to the generic `<engine>` placeholder.
+pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
+    let engine_name = match outcomes.implement.engine {
+        Some(engine) => engine.as_name().to_string(),
+        None => "<engine>".to_string(),
+    };
+    format!(
+        "## Authentication error detected\n\n\
+         An implement-phase agent reported an authentication failure (e.g. HTTP 401 from the engine's API). Run `bellows refresh-auth --engine {engine_name}` and re-run. See the run-log comment for the matched signature."
+    )
+}
+
 fn build_pr_body(
     reason: &ExitReason,
     issue_number: u64,
     claude_pr_body: Option<&str>,
     agent_notes: Option<&str>,
     workflow_files_changed: &[String],
+    outcomes: &PhaseOutcomes,
 ) -> String {
     let header = format!("Closes #{issue_number}.\n\n");
     let body = match reason {
@@ -2333,6 +2366,7 @@ fn build_pr_body(
              A claude phase exited non-zero with stderr matching a known rate-limit signature. The PR is left open for re-run once the rate-limit window clears. See the run-log comment for the matched signature."
                 .to_string()
         }
+        ExitReason::AuthError => pr_body_for_auth_error(outcomes),
         ExitReason::Cancelled => {
             "## Cancelled by operator\n\n\
              `bellows kill` was invoked against this issue mid-run. Whatever workspace state the agent had produced before cancellation is committed in this PR's diff; the run-log comment captures the per-phase summary at cancellation time. Review the partial work and either salvage it as a starting point or drop the PR."
@@ -2864,6 +2898,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auth_for_chain_entry_opencode_uses_env_file_config_and_expands_tilde() {
+        let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[auth.opencode]
+api_key_env_file = "~/bellows-test-opencode.env"
+"#;
+        let config: Config = config_text.parse().expect("config parses");
+        let entry: ChainEntry = "opencode:deepseek/deepseek-v4-pro"
+            .parse()
+            .expect("opencode chain entry parses");
+
+        let auth = auth_for_chain_entry(&config, &entry);
+
+        let Auth::EnvFile {
+            engine,
+            model,
+            env_file_path,
+        } = auth
+        else {
+            panic!("opencode chain entries must construct Auth::EnvFile");
+        };
+        assert_eq!(engine, Engine::Opencode);
+        assert_eq!(model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+        assert_eq!(
+            env_file_path,
+            dirs::home_dir()
+                .expect("test environment has a home directory")
+                .join("bellows-test-opencode.env"),
+        );
+    }
+
+    #[test]
     fn parse_owner_repo_https_happy_path() {
         let (owner, repo) =
             parse_owner_repo("https://github.com/marad2001/bellows-test").unwrap();
@@ -2938,6 +3009,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: implement_exit,
                 stderr_tail: tail.to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: None,
@@ -2965,14 +3037,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_success_uses_claude_pr_body_when_present() {
-        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[]);
+        let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[], &PhaseOutcomes::default());
         assert!(body.starts_with("Closes #42.\n\n"));
         assert!(body.contains("My PR body."));
     }
 
     #[test]
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
-        let body = build_pr_body(&ExitReason::Success, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::Success, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("the agent did not write a PR description"));
     }
 
@@ -3014,6 +3086,7 @@ mod tests {
             None,
             Some("I got stuck on the brief."),
         &[],
+            &PhaseOutcomes::default(),
         );
         assert!(body.contains("self-reported failure"));
         assert!(body.contains("I got stuck on the brief."));
@@ -3021,7 +3094,7 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_crash_mentions_stderr_tail_pointer() {
-        let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("crashed"));
         assert!(body.contains("stderr tail"));
     }
@@ -3031,7 +3104,7 @@ mod tests {
         // After slice X1 the gate runs both clippy and test, in either the
         // post-implement or end-of-pipeline position — the PR body should
         // reflect that, not pin "test" specifically.
-        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("cargo checks"));
         assert!(body.contains("run-log comment"));
     }
@@ -3087,6 +3160,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 0,
                 stderr_tail: "agent done".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult {
@@ -3125,7 +3199,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 101, output: "clippy lint here".to_string() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "test panicked".to_string() }),
@@ -3160,7 +3234,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3195,7 +3269,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3230,7 +3304,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3266,6 +3340,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137, // SIGKILL exit code
                 stderr_tail: "(killed by deadline)".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3306,6 +3381,7 @@ mod tests {
                 stderr_tail:
                     r#"Error: API request failed: {"type":"rate_limit_error","message":"slow down"}"#
                         .to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3348,6 +3424,7 @@ mod tests {
                 stderr_tail:
                     r#"Error: 401 Unauthorized: {"error":{"type":"authentication_error","message":"refresh_token_expired"}}"#
                         .to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3395,6 +3472,7 @@ mod tests {
                 exit_code: 0,
                 stderr_tail:
                     "Documented how to handle refresh_token_expired in docs.md.".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3437,6 +3515,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137,
                 stderr_tail: String::new(), // empty — kill happened before any flush
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3476,7 +3555,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started + chrono::Duration::seconds(120);
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3535,7 +3614,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3561,14 +3640,14 @@ mod tests {
 
     #[test]
     fn build_pr_body_for_wall_clock_exceeded_mentions_cap() {
-        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::WallClockExceeded, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("wall-clock"));
         assert!(body.contains("run-log comment"));
     }
 
     #[test]
     fn build_pr_body_for_rate_limited_mentions_rate_limit() {
-        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None, &[]);
+        let body = build_pr_body(&ExitReason::RateLimited, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.to_lowercase().contains("rate limit"));
         assert!(body.contains("run-log comment"));
     }
@@ -3602,6 +3681,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 137,
                 stderr_tail: "Error: /workspace/entrypoint-user: bad interpreter".to_string(),
+                engine: None,
             },
             post_implement_gate: GateOutcome::default(),
             review: None,
@@ -3631,7 +3711,7 @@ mod tests {
         );
         // build_pr_body for Crash must NOT quote the synth note as
         // "self-reported failure" content.
-        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()), &[]);
+        let pr_body = build_pr_body(&reason, 42, None, Some(synth_note.trim()), &[], &PhaseOutcomes::default());
         assert!(
             pr_body.contains("crashed"),
             "PR body for the synth-driven Crash must say `crashed`: {pr_body}"
@@ -3766,7 +3846,7 @@ mod tests {
         security_fix: Option<FixOutcome>,
     ) -> PhaseOutcomes {
         PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -3977,7 +4057,7 @@ mod tests {
         let started = fixed_timestamp();
         let finished = started;
         let outcomes = PhaseOutcomes {
-            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new() },
+            implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
             post_implement_gate: GateOutcome {
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
@@ -4044,6 +4124,7 @@ mod tests {
             implement: ImplementOutcome {
                 exit_code: 0,
                 stderr_tail: huge_stderr,
+                engine: None,
             },
             post_implement_gate: GateOutcome {
                 cargo_clippy: None,
@@ -4147,6 +4228,7 @@ mod tests {
             Some("PR body from claude."),
             None,
             workflow_files_changed,
+            &outcomes,
         );
         let log_body = build_log_body(
             &ExitReason::Success,

@@ -222,6 +222,8 @@ pub enum SandboxError {
     MissingDeployKeys(#[from] MissingDeployKeysError),
     #[error("could not list filenames in deploy-keys volume `{volume}`: docker run exited with status {status}")]
     DeployKeysVolumeListFailed { volume: String, status: String },
+    #[error("auth env: {0}")]
+    AuthEnv(#[source] anyhow::Error),
 }
 
 /// List every regular filename in the named deploy-keys volume (issue
@@ -480,6 +482,8 @@ pub async fn run_agent(
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
 ) -> Result<AgentRun, SandboxError> {
+    let env = build_agent_env(issue_number, auth)?;
+
     let image_tag = ensure_policy_image().await?;
 
     let docker = Docker::connect_with_local_defaults()?;
@@ -491,9 +495,6 @@ pub async fn run_agent(
     let workspace_path = workspace.path().to_string_lossy().to_string();
 
     let labels = build_managed_labels(&run_id, issue_number, repo, None);
-
-    let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
-    env.extend(auth.extra_env());
 
     // Structured Mount API rather than `binds: Vec<String>` to avoid
     // collision with bind syntax's `:` separator on Windows drive
@@ -540,6 +541,12 @@ pub async fn run_agent(
         stderr_tail: outcome.captured,
         killed_by_deadline: outcome.killed_by_deadline,
     })
+}
+
+fn build_agent_env(issue_number: u64, auth: &Auth) -> Result<Vec<String>, SandboxError> {
+    let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
+    env.extend(auth.try_extra_env().map_err(SandboxError::AuthEnv)?);
+    Ok(env)
 }
 
 /// Workspace-side files written by the policy image's `run-cargo-checks`
@@ -1217,7 +1224,22 @@ pub async fn remove_cache_volume(docker: &Docker, name: &str) -> Result<(), Sand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Engine;
     use tempfile::TempDir;
+
+    #[test]
+    fn build_agent_env_surfaces_env_file_errors_without_panicking() {
+        let dir = TempDir::new().unwrap();
+        let auth = Auth::EnvFile {
+            engine: Engine::Opencode,
+            model: None,
+            env_file_path: dir.path().join("missing.env"),
+        };
+
+        let err = build_agent_env(42, &auth).expect_err("missing env-file must error");
+
+        assert!(matches!(err, SandboxError::AuthEnv(_)));
+    }
 
     #[test]
     fn format_orphan_log_line_contains_short_id_and_orphan_word() {
