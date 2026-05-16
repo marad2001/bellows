@@ -3077,6 +3077,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_triage_filter_dedups_issue_numbers_silently_preserving_order() {
+        // Issue #115 AC: duplicate `--issue` values are silently
+        // deduplicated; operator-supplied order is preserved (first
+        // occurrence wins). The brief calls this out explicitly so
+        // an operator who pastes `--issue 1 --issue 2 --issue 1`
+        // ends up triaging [1, 2], not [1, 2, 1].
+        let repos = single_repo("https://github.com/marad2001/bellows");
+        let resolved = resolve_triage_filter(None, None, &[3, 1, 2, 1, 3, 4], &repos)
+            .expect("dedup must succeed");
+        assert_eq!(resolved.explicit_issues, vec![3, 1, 2, 4]);
+    }
+
+    #[test]
     fn resolve_triage_filter_rejects_bare_issue_in_multi_repo_config() {
         // Issue #115 AC: `bellows triage --issue 42` with multiple
         // `[[repo]]` configured AND no `--repo` is ambiguous — the
