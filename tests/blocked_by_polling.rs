@@ -387,6 +387,25 @@ async fn run_once_returns_idle_when_only_blocked_by_issues_exist_but_no_brief_to
         .mount(&mock)
         .await;
 
+    // Re-loop step 0: list-dependents call ANDs both labels server-
+    // side, so the URL carries `labels=ready-for-agent,blocked-by`.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent,blocked-by"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 42,
+                "title": "dependent",
+                "created_at": "2026-05-01T00:00:00Z",
+                "labels": [
+                    { "name": "ready-for-agent" },
+                    { "name": "blocked-by" }
+                ]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
     // Re-loop sweep tries to fetch the dependent's agent brief.
     // We return a comment without a `## Agent Brief` header — the
     // parser treats this as Unverifiable, the runner leaves the
@@ -436,6 +455,24 @@ async fn re_loop_sweep_strips_blocked_by_when_all_blockers_closed() {
     Mock::given(method("GET"))
         .and(path("/repos/marad2001/test-repo/issues"))
         .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 100,
+                "title": "dependent",
+                "created_at": "2026-05-01T00:00:00Z",
+                "labels": [
+                    { "name": "ready-for-agent" },
+                    { "name": "blocked-by" }
+                ]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // Re-loop step 0: list-dependents call.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent,blocked-by"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {
                 "number": 100,
@@ -609,6 +646,24 @@ async fn re_loop_sweep_leaves_label_when_blocker_still_open() {
     Mock::given(method("GET"))
         .and(path("/repos/marad2001/test-repo/issues"))
         .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 200,
+                "title": "dependent",
+                "created_at": "2026-05-01T00:00:00Z",
+                "labels": [
+                    { "name": "ready-for-agent" },
+                    { "name": "blocked-by" }
+                ]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // Re-loop step 0: list-dependents call.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent,blocked-by"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {
                 "number": 200,

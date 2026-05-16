@@ -38,6 +38,7 @@ async fn find_next_issue_returns_an_issue_when_one_carries_the_pickup_label() {
         "test-repo",
         "ready-for-agent",
         "agent-in-progress",
+        "blocked-by",
     )
     .await
     .expect("call should succeed");
@@ -79,6 +80,7 @@ async fn find_next_issue_skips_issues_already_carrying_the_in_progress_label() {
         "test-repo",
         "ready-for-agent",
         "agent-in-progress",
+        "blocked-by",
     )
     .await
     .expect("call should succeed");
