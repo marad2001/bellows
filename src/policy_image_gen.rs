@@ -39,10 +39,10 @@ pub fn opencode_install_snippet() -> String {
          # together.\n\
          ARG OPENCODE_VERSION={OPENCODE_VERSION}\n\
          ARG OPENCODE_SHA256={OPENCODE_SHA256}\n\
-         RUN set -eux; \\\n\
-             npm pack opencode-ai@${{OPENCODE_VERSION}} --pack-destination /tmp; \\\n\
-             echo \"${{OPENCODE_SHA256}}  /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\" | sha256sum -c -; \\\n\
-             npm install -g opencode-ai@${{OPENCODE_VERSION}}; \\\n\
-             rm -f /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\n"
+         RUN set -eux; \\\n    \
+         npm pack opencode-ai@${{OPENCODE_VERSION}} --pack-destination /tmp; \\\n    \
+         echo \"${{OPENCODE_SHA256}}  /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\" | sha256sum -c -; \\\n    \
+         npm install -g opencode-ai@${{OPENCODE_VERSION}}; \\\n    \
+         rm -f /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\n"
     )
 }
