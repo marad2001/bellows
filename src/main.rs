@@ -3065,6 +3065,58 @@ mod tests {
     }
 
     #[test]
+    fn resolve_triage_filter_rejects_bare_issue_in_multi_repo_config() {
+        // Issue #115 AC: `bellows triage --issue 42` with multiple
+        // `[[repo]]` configured AND no `--repo` is ambiguous — the
+        // helper must error at parse-or-load time with a message that
+        // names the issue number and the repo count, and points the
+        // operator at `--repo <owner>/<name>`. Mirrors the
+        // resolve_kill_target multi-repo disambiguation.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err = resolve_triage_filter(None, None, &[42], &repos)
+            .expect_err("multi-repo + --issue without --repo must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ambiguous issue number 42"),
+            "error must name the ambiguous issue number: {msg}",
+        );
+        assert!(
+            msg.contains("2 repos"),
+            "error must surface the repo count for context: {msg}",
+        );
+        assert!(
+            msg.contains("--repo"),
+            "error must instruct the operator on the fix: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_triage_filter_rejects_bare_positional_in_multi_repo_config() {
+        // Issue #115 AC: same disambiguation must trigger when the
+        // operator passes the positional `<N>` against a multi-repo
+        // config without `--repo`. The positional path and the
+        // --issue path share the same disambiguation logic.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err = resolve_triage_filter(Some(7), None, &[], &repos)
+            .expect_err("multi-repo + positional <N> without --repo must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ambiguous issue number 7"),
+            "error must name the ambiguous issue number: {msg}",
+        );
+        assert!(
+            msg.contains("--repo"),
+            "error must instruct the operator on the fix: {msg}",
+        );
+    }
+
+    #[test]
     fn resolve_triage_filter_rejects_unknown_repo_with_clear_message() {
         // Issue #115 acceptance: a `--repo <owner/name>` value that
         // does not match any configured `[[repo]]` URL's slug must
