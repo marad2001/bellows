@@ -106,6 +106,13 @@ enum Command {
         /// operator names a bare issue number. Issue #115.
         #[arg(long, value_name = "OWNER/NAME")]
         repo: Option<String>,
+        /// Repeatable: triage only the named issue number(s),
+        /// regardless of their current triage-label state
+        /// (operator-override). Combinable with `--repo`. Duplicate
+        /// values are silently deduplicated by the drain. Issue
+        /// #115.
+        #[arg(long = "issue", value_name = "N", action = clap::ArgAction::Append)]
+        issue_numbers: Vec<u64>,
         /// Skip the apply step on every per-issue invocation: print
         /// each verdict and the summary, but make no mutations.
         #[arg(long)]
@@ -198,8 +205,9 @@ async fn main() -> Result<()> {
         Command::Triage {
             issue,
             repo,
+            issue_numbers,
             dry_run,
-        } => triage_cmd(&config_path, issue, repo, dry_run).await,
+        } => triage_cmd(&config_path, issue, repo, issue_numbers, dry_run).await,
         Command::Prune {
             all,
             yes,
@@ -233,6 +241,7 @@ async fn triage_cmd(
     config_path: &PathBuf,
     issue: Option<u64>,
     _repo: Option<String>,
+    _issue_numbers: Vec<u64>,
     dry_run: bool,
 ) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
