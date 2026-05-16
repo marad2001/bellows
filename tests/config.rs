@@ -38,6 +38,11 @@ fn runtime_labels_section_defaults_apply_when_omitted() {
     assert_eq!(config.runtime_labels.agent_failed, "agent-failed");
     assert_eq!(config.runtime_labels.agent_rate_limited, "agent-rate-limited");
     assert_eq!(config.runtime_labels.agent_cancelled, "agent-cancelled");
+    // Issue #116 / ADR-0007: the polling loop's normal pass filters
+    // out issues carrying this label. Default lives alongside the
+    // rest of the runtime-label set so operators can rename it
+    // (e.g. to `dep-blocked`) without touching the source.
+    assert_eq!(config.runtime_labels.blocked_by, "blocked-by");
 }
 
 #[test]
