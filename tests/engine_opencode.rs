@@ -48,6 +48,22 @@ fn chain_entry_parses_opencode_with_provider_model_string_containing_slash() {
 }
 
 #[test]
+fn chain_entry_rejects_opencode_model_that_starts_with_dash() {
+    let err = "opencode:--some-opencode-flag"
+        .parse::<ChainEntry>()
+        .expect_err("model pins must not be accepted as CLI flags");
+    let msg = format!("{err}");
+    assert!(
+        matches!(err, EngineChainParseError::ModelStartsWithDash),
+        "expected ModelStartsWithDash, got {err:?}",
+    );
+    assert!(
+        msg.contains("model must not start with `-`"),
+        "error should explain the leading-dash guard: {msg}",
+    );
+}
+
+#[test]
 fn chain_entry_unknown_engine_error_message_mentions_opencode() {
     // The error message should mention opencode now that it's a known
     // engine, so an operator scanning the error sees the full set.

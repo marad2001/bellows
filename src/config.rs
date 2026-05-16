@@ -89,6 +89,8 @@ pub enum EngineChainParseError {
     Empty,
     #[error("unknown engine `{0}` (expected `claude`, `codex`, or `opencode`)")]
     UnknownEngine(String),
+    #[error("model must not start with `-`")]
+    ModelStartsWithDash,
 }
 
 impl FromStr for ChainEntry {
@@ -108,6 +110,12 @@ impl FromStr for ChainEntry {
         };
         let engine = Engine::from_name(engine_part)
             .ok_or_else(|| EngineChainParseError::UnknownEngine(engine_part.to_string()))?;
+        if model_part
+            .as_deref()
+            .is_some_and(|model| model.starts_with('-'))
+        {
+            return Err(EngineChainParseError::ModelStartsWithDash);
+        }
         Ok(ChainEntry {
             engine,
             model: model_part,
