@@ -136,7 +136,8 @@ impl Auth {
     /// crashing the dispatcher.
     pub fn try_extra_env(&self) -> Result<Vec<String>> {
         match self {
-            Auth::Subscription { .. } | Auth::ApiKey => Ok(self.extra_env()),
+            Auth::Subscription { .. } => Ok(self.extra_env()),
+            Auth::ApiKey => Err(anyhow!("Auth::ApiKey is not implemented in v1")),
             Auth::EnvFile {
                 engine,
                 model,
@@ -301,5 +302,17 @@ mod tests {
             .extra_env()
             .iter()
             .any(|e| e.starts_with("BELLOWS_MODEL=")));
+    }
+
+    #[test]
+    fn apikey_try_extra_env_returns_error_instead_of_panicking() {
+        let err = Auth::ApiKey
+            .try_extra_env()
+            .expect_err("fallible env path must report unsupported API-key auth");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Auth::ApiKey is not implemented"),
+            "error should explain that API-key auth is unsupported: {msg}",
+        );
     }
 }
