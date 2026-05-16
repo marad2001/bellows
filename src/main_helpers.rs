@@ -49,24 +49,72 @@ pub fn write_opencode_env_file(path: &Path, api_key: &str) -> Result<()> {
             .with_context(|| format!("create env-file parent directory at {}", parent.display()))?;
     }
     let body = format!("DEEPSEEK_API_KEY={trimmed}\n");
-    std::fs::write(path, body)
+    write_env_file_atomically_0600(path, body.as_bytes())
         .with_context(|| format!("write opencode env-file at {}", path.display()))?;
-    set_mode_0600(path)
-        .with_context(|| format!("chmod 0600 on env-file at {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_mode_0600(path: &Path) -> std::io::Result<()> {
+fn write_env_file_atomically_0600(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::ffi::OsString;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "opencode env-file path must include a file name",
+        )
+    })?;
+
     use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)
+
+    for _ in 0..16 {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(".");
+        temp_name.push(uuid::Uuid::new_v4().to_string());
+        temp_name.push(".tmp");
+        let temp_path = parent.join(temp_name);
+
+        let mut temp_file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+
+        let result = (|| {
+            temp_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            temp_file.write_all(body)?;
+            temp_file.sync_all()?;
+            std::fs::rename(&temp_path, path)
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        return result;
+    }
+
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        "could not create unique opencode env-file temporary path",
+    ))
 }
 
 #[cfg(not(unix))]
-fn set_mode_0600(_path: &Path) -> std::io::Result<()> {
+fn write_env_file_atomically_0600(path: &Path, body: &[u8]) -> std::io::Result<()> {
     // Non-unix targets do not have POSIX permission bits in this
     // shape; bellows only ships unix builds, so this is a no-op for
     // cross-platform compile cleanliness.
-    Ok(())
+    std::fs::write(path, body)
 }

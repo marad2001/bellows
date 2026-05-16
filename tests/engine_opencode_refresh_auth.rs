@@ -37,6 +37,40 @@ fn refresh_auth_opencode_overwrites_existing_env_file_with_new_key() {
 }
 
 #[test]
+fn refresh_auth_opencode_does_not_write_new_key_into_loosened_file() {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("opencode.env");
+    write_opencode_env_file(&path, "sk-original").expect("initial write");
+
+    // Operator (or backup-restore) accidentally loosens the existing
+    // env-file. A reader that could open the loosened file before
+    // rotation must not observe the new key through the same file
+    // descriptor after refresh-auth runs.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+    let mut stale_reader = std::fs::File::open(&path).expect("open loose file");
+
+    write_opencode_env_file(&path, "sk-rotated").expect("rotation write");
+
+    stale_reader
+        .seek(SeekFrom::Start(0))
+        .expect("rewind stale reader");
+    let mut stale_body = String::new();
+    stale_reader
+        .read_to_string(&mut stale_body)
+        .expect("read stale reader");
+    assert_eq!(
+        stale_body, "DEEPSEEK_API_KEY=sk-original\n",
+        "refresh-auth must replace a loose env-file instead of writing the new key into it",
+    );
+
+    let rotated = std::fs::read_to_string(&path).expect("read rotated");
+    assert_eq!(rotated, "DEEPSEEK_API_KEY=sk-rotated\n");
+}
+
+#[test]
 fn refresh_auth_opencode_overwrite_preserves_0600_mode() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
