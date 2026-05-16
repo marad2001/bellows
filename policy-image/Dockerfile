@@ -73,7 +73,7 @@ RUN set -eux; \
     rm -rf /tmp/codex.tar.gz /tmp/codex /tmp/codex-x86_64-unknown-linux-musl
 
 # OpenCode CLI, pinned (issue #120 / ADR-0008). Installed via
-# `npm install` against a sha256-verified tarball so a tampered
+# `npm install` from a sha256-verified tarball so a tampered
 # registry response fails the image build closed rather than
 # silently installing a binary that would inherit the agent's
 # container privileges at every opencode-engine phase.
@@ -87,7 +87,7 @@ ARG OPENCODE_SHA256=f8ae8678c9bccdbaf99777f36ff2d5efe689d473384f2e94b84d6cda256d
 RUN set -eux; \
     npm pack opencode-ai@${OPENCODE_VERSION} --pack-destination /tmp; \
     echo "${OPENCODE_SHA256}  /tmp/opencode-ai-${OPENCODE_VERSION}.tgz" | sha256sum -c -; \
-    npm install -g opencode-ai@${OPENCODE_VERSION}; \
+    npm install -g /tmp/opencode-ai-${OPENCODE_VERSION}.tgz; \
     rm -f /tmp/opencode-ai-${OPENCODE_VERSION}.tgz
 
 # rust:1.95-slim ships rustc + cargo but not clippy. Slice X1's cargo

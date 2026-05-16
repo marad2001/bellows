@@ -28,7 +28,7 @@ pub const OPENCODE_SHA256: &str =
 pub fn opencode_install_snippet() -> String {
     format!(
         "# OpenCode CLI, pinned (issue #120 / ADR-0008). Installed via\n\
-         # `npm install` against a sha256-verified tarball so a tampered\n\
+         # `npm install` from a sha256-verified tarball so a tampered\n\
          # registry response fails the image build closed rather than\n\
          # silently installing a binary that would inherit the agent's\n\
          # container privileges at every opencode-engine phase.\n\
@@ -42,7 +42,7 @@ pub fn opencode_install_snippet() -> String {
          RUN set -eux; \\\n    \
          npm pack opencode-ai@${{OPENCODE_VERSION}} --pack-destination /tmp; \\\n    \
          echo \"${{OPENCODE_SHA256}}  /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\" | sha256sum -c -; \\\n    \
-         npm install -g opencode-ai@${{OPENCODE_VERSION}}; \\\n    \
+         npm install -g /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz; \\\n    \
          rm -f /tmp/opencode-ai-${{OPENCODE_VERSION}}.tgz\n"
     )
 }

@@ -52,11 +52,15 @@ fn dockerfile_verifies_opencode_tarball_via_sha256sum() {
 }
 
 #[test]
-fn dockerfile_installs_opencode_globally_with_npm() {
+fn dockerfile_installs_opencode_from_the_verified_tarball() {
     let dockerfile = read_dockerfile();
     assert!(
-        dockerfile.contains("npm install -g opencode-ai@"),
-        "Dockerfile must install opencode-ai globally via npm: {dockerfile}",
+        dockerfile.contains("npm install -g /tmp/opencode-ai-${OPENCODE_VERSION}.tgz"),
+        "Dockerfile must install the sha256-verified opencode tarball: {dockerfile}",
+    );
+    assert!(
+        !dockerfile.contains("npm install -g opencode-ai@"),
+        "Dockerfile must not fetch opencode from the registry after verification: {dockerfile}",
     );
     assert!(
         !dockerfile.contains("opencode-ai@latest"),

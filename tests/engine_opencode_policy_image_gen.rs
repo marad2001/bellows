@@ -1,6 +1,7 @@
 //! AC13 of issue #120: the `policy-image-gen` binary is the canonical
 //! source for the opencode install commands the policy-image Dockerfile
-//! must contain (version pin + sha256 pin + npm install line).
+//! must contain (version pin + sha256 pin + verified local tarball
+//! install line).
 //!
 //! AC13's purpose: lock the opencode install snippet in Rust code so
 //! the Dockerfile in AC14 has a mechanically-verifiable target to
@@ -57,14 +58,18 @@ fn opencode_install_snippet_mentions_pinned_version_and_sha256() {
 }
 
 #[test]
-fn opencode_install_snippet_uses_npm_install_g_with_pinned_version() {
-    // opencode ships as an npm package (opencode-ai). The snippet
-    // must install it globally pinned to OPENCODE_VERSION rather
-    // than @latest so day-to-day image rebuilds are reproducible.
+fn opencode_install_snippet_installs_the_verified_tarball() {
+    // opencode ships as an npm package (opencode-ai), but the image
+    // build must install the sha256-checked tarball from /tmp rather
+    // than making a second registry request after verification.
     let snippet = opencode_install_snippet();
     assert!(
-        snippet.contains("npm install -g opencode-ai@"),
-        "snippet must use `npm install -g opencode-ai@<version>`: {snippet}",
+        snippet.contains("npm install -g /tmp/opencode-ai-${OPENCODE_VERSION}.tgz"),
+        "snippet must install the verified local tarball: {snippet}",
+    );
+    assert!(
+        !snippet.contains("npm install -g opencode-ai@"),
+        "snippet must not fetch opencode from the registry after verification: {snippet}",
     );
     assert!(
         !snippet.contains("opencode-ai@latest"),
