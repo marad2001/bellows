@@ -163,3 +163,52 @@ fn classify_exit_routes_hold_noted_verdict_over_informational_notes_to_success_w
     );
 }
 
+// -----------------------------------------------------------------
+// AC3 — `None` verdict falls back to the exact pre-slice classifier
+// (Q4-Option-A neutrality). A merger that didn't run, was skipped
+// because the agent output couldn't be parsed, or hit a rate-limit
+// must not regress routing. The three NotesShape variants below
+// pin the pre-slice mapping byte-for-byte.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_none_verdict_falls_back_has_unaddressed_finding_to_agent_self_reported_failure() {
+    // Pre-slice: agent-authored `## Unaddressed finding:` heading
+    // alone routed to AgentSelfReportedFailure. Without a merger
+    // verdict the slice-2 classifier must reproduce that exactly.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert_eq!(
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
+        ExitReason::AgentSelfReportedFailure,
+        "None verdict + agent-authored heading must fall through to \
+         the pre-slice AgentSelfReportedFailure routing — merger \
+         failure is strictly additive on throughput (Q4-Option-A)",
+    );
+}
+
+#[test]
+fn classify_exit_none_verdict_falls_back_informational_only_to_success_with_notes() {
+    // Pre-slice: ADR-0006's informational channel routed to
+    // SuccessWithNotes (non-draft + agent-noted label).
+    let outcomes = clean_outcomes_with_informational_notes();
+    assert_eq!(
+        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
+        ExitReason::SuccessWithNotes,
+        "None verdict + informational notes must fall through to \
+         the pre-slice SuccessWithNotes routing",
+    );
+}
+
+#[test]
+fn classify_exit_none_verdict_falls_back_absent_notes_to_success() {
+    // Pre-slice: no agent-notes.md at all (or fully empty) routed
+    // to plain Success.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert_eq!(
+        classify_exit(NotesShape::Absent, &outcomes, None),
+        ExitReason::Success,
+        "None verdict + absent notes must fall through to the \
+         pre-slice Success routing",
+    );
+}
+
