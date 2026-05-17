@@ -21,6 +21,15 @@ pub enum ConfigError {
         #[source]
         source: EngineChainParseError,
     },
+    /// Issue #125 / ADR-0009: `[phases.merge].posting` accepts exactly
+    /// `"post-always"` or `"post-on-hold-only"`. Surfacing typos at
+    /// parse time (rather than silently defaulting) keeps the
+    /// surfacing behaviour the operator opted into honest.
+    #[error(
+        "[phases.merge].posting must be `post-always` or `post-on-hold-only`; \
+         got `{value}`"
+    )]
+    InvalidPostingMode { value: String },
 }
 
 /// One of the two engines bellows can dispatch to. Wired through the
@@ -622,9 +631,19 @@ impl Default for PhasesConfig {
 /// — i.e. the v1 single-engine claude-only behaviour. The chain is
 /// always non-empty (an empty `cli_chain = []` is rejected at
 /// config-load time).
+///
+/// Issue #125 / ADR-0009: the phase-8 merger phase carries an
+/// additional `posting` toggle controlling whether the merger's prose
+/// is surfaced as a "Merge verdict" PR comment. The toggle is only
+/// meaningful for the merger phase; for all other phases it stays at
+/// its default (`PostAlways`) and is unread.
 #[derive(Debug, Clone)]
 pub struct PhaseChain {
     pub cli_chain: Vec<ChainEntry>,
+    /// Issue #125 / ADR-0009: surfacing toggle for the phase-8
+    /// merger's prose. Default `PostAlways` per audit-trail-by-
+    /// default. Unread for non-merger phases.
+    pub posting: PostingMode,
 }
 
 impl Default for PhaseChain {
@@ -634,8 +653,34 @@ impl Default for PhaseChain {
                 engine: Engine::Claude,
                 model: None,
             }],
+            posting: PostingMode::default(),
         }
     }
+}
+
+/// Issue #125 / ADR-0009: surfacing behaviour for the phase-8 merger's
+/// full prose body, posted as a "Merge verdict" PR comment after the
+/// run.
+///
+/// - `PostAlways` (default per ADR-0009): every PR receives a
+///   "Merge verdict" comment, including clean `MERGE` runs. Full
+///   audit trail.
+/// - `PostOnHoldOnly`: only `HOLD-NOTED` and `HOLD-DRAFT` verdicts
+///   post the comment; `MERGE` runs auto-merge silently with no
+///   comment.
+///
+/// Either way, a `None` merger verdict (slice-1 fallback path) does
+/// NOT post a comment — the audit trail belongs to the merger, not
+/// to the fallback classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostingMode {
+    /// Audit-trail-by-default. Every parseable merger verdict gets
+    /// surfaced as a PR comment.
+    #[default]
+    PostAlways,
+    /// Quiet-on-clean. Only `HOLD-NOTED` and `HOLD-DRAFT` verdicts
+    /// surface a comment; `MERGE` verdicts auto-merge silently.
+    PostOnHoldOnly,
 }
 
 impl PhaseChain {
@@ -662,6 +707,7 @@ impl PhaseChain {
                 engine: Engine::Claude,
                 model: Some("claude-opus-4-7".to_string()),
             }],
+            posting: PostingMode::default(),
         }
     }
 }
@@ -670,10 +716,21 @@ impl PhaseChain {
 /// `ChainEntry::from_str` after deserialization — `serde` only gives us
 /// `Vec<String>` here since the chain entry grammar is bellows-internal,
 /// not TOML-native.
+///
+/// Issue #125 / ADR-0009: `posting` is only meaningful on
+/// `[phases.merge]`. It's deserialized for every phase table for wire-
+/// shape uniformity but only consumed for the merger phase; on other
+/// phases it stays at its default and is unread.
 #[derive(Debug, Deserialize, Default)]
 struct RawPhaseChain {
     #[serde(default)]
     cli_chain: Option<Vec<String>>,
+    /// Issue #125 / ADR-0009: `[phases.merge].posting` toggle.
+    /// `None` → use default (`PostAlways`). Validated at parse time
+    /// (any value other than `"post-always"` / `"post-on-hold-only"`
+    /// is rejected).
+    #[serde(default)]
+    posting: Option<String>,
 }
 
 impl RawPhaseChain {
@@ -692,8 +749,26 @@ impl RawPhaseChain {
         phase: &'static str,
         fallback: impl FnOnce() -> PhaseChain,
     ) -> Result<PhaseChain, ConfigError> {
+        // Issue #125 / ADR-0009: parse the posting toggle first so a
+        // typo surfaces even when the rest of the [phases.merge]
+        // table is otherwise default (cli_chain omitted).
+        let posting = match self.posting.as_deref() {
+            None => PostingMode::default(),
+            Some("post-always") => PostingMode::PostAlways,
+            Some("post-on-hold-only") => PostingMode::PostOnHoldOnly,
+            Some(other) => {
+                return Err(ConfigError::InvalidPostingMode {
+                    value: other.to_string(),
+                });
+            }
+        };
         let Some(raw) = self.cli_chain else {
-            return Ok(fallback());
+            // No cli_chain on the wire: fallback supplies the chain
+            // (and its default posting); we then overlay any explicit
+            // posting value parsed above.
+            let mut chain = fallback();
+            chain.posting = posting;
+            return Ok(chain);
         };
         if raw.is_empty() {
             return Err(ConfigError::EmptyCliChain { phase });
@@ -709,7 +784,10 @@ impl RawPhaseChain {
                 })?;
             entries.push(entry);
         }
-        Ok(PhaseChain { cli_chain: entries })
+        Ok(PhaseChain {
+            cli_chain: entries,
+            posting,
+        })
     }
 }
 
