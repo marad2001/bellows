@@ -31,3 +31,38 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Issue #132: build the policy image on every PR so a sha256 drift
+  # between any pinned engine const (CLAUDE_CODE_VERSION, CODEX_SHA256,
+  # OPENCODE_SHA256, future engines) and what the upstream
+  # registry/release currently serves fails at PR time instead of in
+  # `bellows run` on the operator's laptop.
+  #
+  # The existing unit tests in tests/engine_opencode_dockerfile.rs and
+  # tests/engine_opencode_policy_image_gen.rs catch const-vs-Dockerfile
+  # drift, but only an actual `docker build` runs the `sha256sum -c -`
+  # step against the live tarball, which is what catches the case PR
+  # #131 hit (const and Dockerfile both pointing at the wrong sha).
+  #
+  # Runs in parallel with `ci` above (separate top-level jobs entry, no
+  # `needs:` dependency) so the two surfaces — cargo correctness vs
+  # supply-chain pin integrity — surface their own errors independently.
+  policy-image-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build policy image (verifies every pinned engine sha256)
+        uses: docker/build-push-action@v5
+        with:
+          context: policy-image/
+          file: policy-image/Dockerfile
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
