@@ -16,7 +16,8 @@ use bellows::config::{Config, PostingMode};
 use bellows::policy::MergerVerdict;
 use bellows::runner::{
     capture_and_remove_agent_notes, post_agent_notes_comment_if_present,
-    post_merge_verdict_comment_if_present, run_once, BlockReason, RunError, RunOutcome,
+    post_merge_verdict_comment_if_present, run_once, BlockReason, MergeVerdictPost, RunError,
+    RunOutcome,
 };
 use bellows::workspace;
 use serde_json::json;
@@ -888,8 +889,10 @@ async fn merge_verdict_post_always_posts_prose_and_verdict_line_for_merge() {
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::Merge),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::Merge,
+            prose,
+        }),
         PostingMode::PostAlways,
         &mut log,
     )
@@ -920,8 +923,10 @@ async fn merge_verdict_post_on_hold_only_skips_comment_for_merge_verdict() {
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::Merge),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::Merge,
+            prose,
+        }),
         PostingMode::PostOnHoldOnly,
         &mut log,
     )
@@ -955,8 +960,10 @@ async fn merge_verdict_post_on_hold_only_posts_comment_for_hold_noted() {
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::HoldNoted),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::HoldNoted,
+            prose,
+        }),
         PostingMode::PostOnHoldOnly,
         &mut log,
     )
@@ -987,8 +994,10 @@ async fn merge_verdict_post_on_hold_only_posts_comment_for_hold_draft() {
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::HoldDraft),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::HoldDraft,
+            prose,
+        }),
         PostingMode::PostOnHoldOnly,
         &mut log,
     )
@@ -1019,8 +1028,7 @@ async fn merge_verdict_none_suppresses_comment_under_post_always() {
         "marad2001",
         "test-repo",
         125,
-        None,
-        Some("some prose but no verdict line at all\n"),
+        MergeVerdictPost::from_parts(None, Some("some prose but no verdict line at all\n")),
         PostingMode::PostAlways,
         &mut log,
     )
@@ -1047,8 +1055,7 @@ async fn merge_verdict_none_suppresses_comment_under_post_on_hold_only() {
         "marad2001",
         "test-repo",
         125,
-        None,
-        Some("garbage\n"),
+        MergeVerdictPost::from_parts(None, Some("garbage\n")),
         PostingMode::PostOnHoldOnly,
         &mut log,
     )
@@ -1077,8 +1084,10 @@ async fn merge_verdict_post_failure_is_logged_as_warning_and_does_not_fail_the_r
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::Merge),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::Merge,
+            prose,
+        }),
         PostingMode::PostAlways,
         &mut log,
     )
@@ -1126,8 +1135,10 @@ async fn merge_verdict_prose_over_64kib_is_truncated_with_marker() {
         "marad2001",
         "test-repo",
         125,
-        Some(MergerVerdict::HoldDraft),
-        Some(&big_prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::HoldDraft,
+            prose: &big_prose,
+        }),
         PostingMode::PostAlways,
         &mut log,
     )
@@ -1190,8 +1201,10 @@ async fn merge_verdict_post_always_mode_surfaces_merge_verdict_through_run_once_
         "marad2001",
         "test-repo",
         200,
-        Some(MergerVerdict::Merge),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::Merge,
+            prose,
+        }),
         PostingMode::PostAlways,
         &mut log,
     )
@@ -1219,8 +1232,10 @@ async fn merge_verdict_post_on_hold_only_mode_silently_suppresses_merge_comment(
         "marad2001",
         "test-repo",
         200,
-        Some(MergerVerdict::Merge),
-        Some(prose),
+        Some(MergeVerdictPost {
+            verdict: MergerVerdict::Merge,
+            prose,
+        }),
         PostingMode::PostOnHoldOnly,
         &mut log,
     )

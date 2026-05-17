@@ -2346,8 +2346,10 @@ pub async fn run_once(
         &owner,
         &repo,
         pr.number,
-        outcomes.merger_verdict,
-        outcomes.merger_prose.as_deref(),
+        MergeVerdictPost::from_parts(
+            outcomes.merger_verdict,
+            outcomes.merger_prose.as_deref(),
+        ),
         config.phases.merge.posting,
         log_writer,
     )
@@ -3063,6 +3065,36 @@ pub async fn post_agent_notes_comment_if_present(
     tracker::post_pr_comment(client, owner, repo, pr_number, &body).await
 }
 
+/// Phase-8 merger output bundled for the `## Merge verdict` PR-comment
+/// post site. Both fields come from the same merger invocation: either
+/// the phase ran, parsed a verdict, and retained its prose (both
+/// present), or the run took the fallback classifier path and neither
+/// is available (see AC6). Grouping them at the type level makes the
+/// correlation explicit and keeps
+/// [`post_merge_verdict_comment_if_present`]'s argument count below
+/// clippy's `too_many_arguments` threshold.
+pub struct MergeVerdictPost<'a> {
+    pub verdict: crate::policy::MergerVerdict,
+    pub prose: &'a str,
+}
+
+impl<'a> MergeVerdictPost<'a> {
+    /// Construct from the `(merger_verdict, merger_prose)` pair the
+    /// runner threads through `PhaseOutcomes`. Returns `None` when
+    /// either component is missing — matching the pre-refactor
+    /// semantics that treated a missing verdict OR a missing prose as
+    /// "nothing to surface."
+    pub fn from_parts(
+        verdict: Option<crate::policy::MergerVerdict>,
+        prose: Option<&'a str>,
+    ) -> Option<Self> {
+        match (verdict, prose) {
+            (Some(verdict), Some(prose)) => Some(Self { verdict, prose }),
+            _ => None,
+        }
+    }
+}
+
 /// Issue #125 / ADR-0009 slice 3: post the phase-8 merger's full prose
 /// review as a "Merge verdict" PR comment.
 ///
@@ -3075,6 +3107,7 @@ pub async fn post_agent_notes_comment_if_present(
 ///
 /// Surfacing depends on the operator's `[phases.merge].posting`
 /// toggle:
+///
 /// - `PostAlways` (default): every parseable verdict surfaces a
 ///   comment, including clean `MERGE` runs. Full audit trail.
 /// - `PostOnHoldOnly`: only `HoldNoted` and `HoldDraft` verdicts
@@ -3082,12 +3115,11 @@ pub async fn post_agent_notes_comment_if_present(
 ///   comment.
 ///
 /// Regardless of the toggle:
-/// - A `None` `verdict` (slice-1 fallback path — unparseable output,
-///   merger crash, rate-limit skip) does NOT post a comment. The
-///   audit trail belongs to the merger, not to the fallback
-///   classifier.
-/// - A `None` `prose` (the merger never wrote its output file) does
-///   not post a comment either; we have no body to surface.
+///
+/// - A `None` `post` argument (slice-1 fallback path — unparseable
+///   output, merger crash, rate-limit skip, or the merger never wrote
+///   its output file) does NOT post a comment. The audit trail
+///   belongs to the merger, not to the fallback classifier.
 /// - If `prose` exceeds GitHub's 64 KiB comment limit, the body is
 ///   truncated with a `[truncated — full prose in bellows.log]`
 ///   marker (precedent: issue #87 run-log truncation).
@@ -3100,19 +3132,14 @@ pub async fn post_merge_verdict_comment_if_present<W: Write + ?Sized>(
     owner: &str,
     repo: &str,
     pr_number: u64,
-    verdict: Option<crate::policy::MergerVerdict>,
-    prose: Option<&str>,
+    post: Option<MergeVerdictPost<'_>>,
     posting: PostingMode,
     log_writer: &mut W,
 ) -> Result<(), octocrab::Error> {
-    // Verdict=None: audit trail belongs to the merger, not to the
-    // fallback classifier (AC6). Skip silently.
-    let Some(verdict) = verdict else {
-        return Ok(());
-    };
-    // No prose to surface — nothing to post. (The verdict alone is
-    // logged on `bellows.log` by the runner regardless.)
-    let Some(prose) = prose else {
+    // post=None: phase 8 didn't emit a parsed verdict, or its prose
+    // was absent (the AC6 fallback path). Audit trail belongs to the
+    // merger, not the fallback classifier — skip silently.
+    let Some(MergeVerdictPost { verdict, prose }) = post else {
         return Ok(());
     };
     if prose.trim().is_empty() {
