@@ -2130,12 +2130,19 @@ pub async fn run_once(
     // out-of-band Bellows synth spans through note classification.
     // HTML comments in the workspace file are human-readable only;
     // routing strips only spans recorded at Bellows append sites.
+    //
+    // ADR-0009 slice 2 / issue #124: thread the phase-8 merger
+    // verdict captured above (None if phase 8 didn't run or its
+    // output was unparseable) into the classifier so it can drive
+    // the (α) agent-authored routing branch. Q4-Option-A: None
+    // falls back to the pre-slice classifier behaviour.
     let pipeline_reason = policy::classify_exit(
         policy::classify_agent_notes_with_synth_spans(
             agent_notes.as_deref(),
             &agent_note_synth_spans,
         ),
         &outcomes,
+        outcomes.merger_verdict,
     );
 
     // PR #33 review finding #2: detect external cancellation BEFORE
@@ -3935,7 +3942,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             "synth-only notes must classify to Absent so the routing falls through \
              to Crash on the non-zero implement exit",
         );
-        let reason = policy::classify_exit(notes_shape, &outcomes);
+        let reason = policy::classify_exit(notes_shape, &outcomes, None);
         assert_eq!(
             reason,
             ExitReason::Crash,

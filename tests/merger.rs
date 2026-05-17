@@ -8,8 +8,7 @@ use std::str::FromStr;
 
 use bellows::config::{Config, Engine};
 use bellows::policy::{
-    classify_exit, parse_merger_verdict, render_merger_prompt, MergerVerdict, NotesShape,
-    PhaseOutcomes,
+    parse_merger_verdict, render_merger_prompt, MergerVerdict, PhaseOutcomes,
 };
 
 // -----------------------------------------------------------------
@@ -331,41 +330,14 @@ fn phase_outcomes_merger_verdict_round_trips_all_three_variants() {
 }
 
 // -----------------------------------------------------------------
-// AC: 'Routing in this slice is identical to today.' Slice 1
-// stores the verdict but does NOT yet route on it; `classify_exit`
-// must return the same `ExitReason` whether the verdict slot is
-// empty or carries any of the three variants. Slice 2 (#124) will
-// wire the verdict into routing.
+// Note: the slice-1 `classify_exit_is_invariant_under_merger_verdict_in_slice_1`
+// test that previously lived here is gone. Slice 2 (issue #124 /
+// ADR-0009) wires the merger verdict into routing, so the slice-1
+// invariance no longer holds: `Some(Merge)` is now a Success
+// signal, `Some(HoldNoted)` is `SuccessWithNotes`, and
+// `Some(HoldDraft)` is `AgentSelfReportedFailure`. The slice-2
+// precedence-table tests live in `tests/policy_merger_routing.rs`.
 // -----------------------------------------------------------------
-
-#[test]
-fn classify_exit_is_invariant_under_merger_verdict_in_slice_1() {
-    // Pick a baseline outcome shape that classifies cleanly today —
-    // a fresh-default `PhaseOutcomes` with `NotesShape::Absent` →
-    // `ExitReason::Success` — and assert that flipping the verdict
-    // through all variants (including None) does not change the
-    // classification.
-    let base = PhaseOutcomes::default();
-    let baseline = classify_exit(NotesShape::Absent, &base);
-
-    for verdict_slot in [
-        None,
-        Some(MergerVerdict::Merge),
-        Some(MergerVerdict::HoldNoted),
-        Some(MergerVerdict::HoldDraft),
-    ] {
-        let outcomes = PhaseOutcomes {
-            merger_verdict: verdict_slot,
-            ..PhaseOutcomes::default()
-        };
-        assert_eq!(
-            classify_exit(NotesShape::Absent, &outcomes),
-            baseline,
-            "classify_exit must NOT route on merger_verdict in slice 1 \
-             (verdict={verdict_slot:?})",
-        );
-    }
-}
 
 #[test]
 fn config_phases_merge_rejects_empty_cli_chain() {

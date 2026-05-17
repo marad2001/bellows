@@ -78,7 +78,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::Success);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
 
 /// Helper for migrated tests: an `Outcomes` shape representing the
@@ -110,7 +110,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
 #[test]
 fn classify_exit_returns_success_for_clean_run_with_tests_green() {
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(0))),
+        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(0)), None),
         ExitReason::Success
     );
 }
@@ -120,7 +120,7 @@ fn classify_exit_returns_success_when_cargo_test_gate_was_skipped() {
     // None means the workspace had no Cargo.toml at root; the runner
     // skipped the cargo test gate. Non-Rust briefs are a valid use case.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, None)),
+        classify_exit(NotesShape::Absent, &slice5_shaped(0, None), None),
         ExitReason::Success
     );
 }
@@ -133,7 +133,7 @@ fn classify_exit_returns_self_reported_failure_when_agent_notes_present() {
     // per issue #95: HasUnaddressedFinding is the post-ADR-0006 form
     // of "agent-notes present and signalling failure."
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &slice5_shaped(0, Some(0))),
+        classify_exit(NotesShape::HasUnaddressedFinding, &slice5_shaped(0, Some(0)), None),
         ExitReason::AgentSelfReportedFailure
     );
 }
@@ -143,11 +143,11 @@ fn classify_exit_returns_crash_when_agent_exits_non_zero_without_notes() {
     // Agent process died (claude itself errored, OOM, etc.). No notes
     // file means the agent didn't get to write a structured report.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(1, None)),
+        classify_exit(NotesShape::Absent, &slice5_shaped(1, None), None),
         ExitReason::Crash
     );
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(137, Some(0))),
+        classify_exit(NotesShape::Absent, &slice5_shaped(137, Some(0)), None),
         ExitReason::Crash
     );
 }
@@ -174,7 +174,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::WallClockExceeded);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::WallClockExceeded);
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::RateLimited);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::RateLimited);
 }
 
 #[test]
@@ -295,18 +295,31 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::Success);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
 
 #[test]
-fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
-    // Notes-precedence: even when the runner halted due to wall-clock,
-    // a structured `## Unaddressed finding:` section in agent-notes.md
-    // still classifies as AgentSelfReportedFailure. The agent's
-    // structured voice trumps tooling signals, including the
-    // wall-clock kill — if claude got far enough to write a
-    // HasUnaddressedFinding section about why it couldn't finish,
-    // that's the operator's most useful artifact.
+fn classify_exit_wall_clock_exceeded_wins_over_self_reported_failure() {
+    // Slice-2 / ADR-0009 precedence change: the brief's explicit
+    // precedence ladder is
+    //
+    //   wall-clock-exceeded
+    //   > rate-limit + non-zero implement exit
+    //   > non-zero implement exit
+    //   > gate-failed
+    //   > merger-verdict-or-classifier-fallback
+    //
+    // The (α) agent-authored `## Unaddressed finding:` branch lives
+    // in the classifier-fallback at the bottom of the ladder (or in
+    // the merger branch above it when the verdict is `Some`). A
+    // wall-clock kill is a hard operator signal that the run did not
+    // complete on its own; it now wins over the agent-authored
+    // heading regardless of merger verdict, matching the rate-limit
+    // / non-zero-exit / gate-failed precedences. The slice-1 shape
+    // of this test asserted the opposite (notes won); slice 2
+    // reverses that because the merger can now vote past the heading
+    // and the operator-facing signal that the run ran out of
+    // wall-clock time is the more useful artifact.
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome::default(),
@@ -321,8 +334,10 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes),
-        ExitReason::AgentSelfReportedFailure,
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
+        ExitReason::WallClockExceeded,
+        "wall-clock-exceeded must beat the agent-authored HasUnaddressedFinding \
+         branch under the slice-2 precedence ladder",
     );
 }
 
@@ -346,7 +361,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::FinalTestsRed);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
 }
 
 #[test]
@@ -373,7 +388,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         security: None,
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::FinalTestsRed);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
 }
 
 #[test]
@@ -381,11 +396,11 @@ fn classify_exit_returns_final_tests_red_when_cargo_test_failed() {
     // Agent thought it was done (exit 0, no notes), but the cargo test
     // gate caught failing tests.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(1))),
+        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(1)), None),
         ExitReason::FinalTestsRed
     );
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(101))),
+        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(101)), None),
         ExitReason::FinalTestsRed
     );
 }
@@ -1308,7 +1323,7 @@ fn synthesize_no_new_tests_entry_routes_through_classify_exit_to_self_reported_f
     // precedence: appending the synthesised entry to agent-notes.md
     // must, in turn, make `parse_agent_notes_sections` see an
     // Unaddressed-finding section with the canonical title. Without
-    // that, `classify_exit(has_agent_notes=true, ...)` would still
+    // that, `classify_exit(has_agent_notes=true, ..., None)` would still
     // fire (notes present), but the per-finding cross-reference any
     // future caller might run would silently miss the section. Pin
     // the round-trip here so a future "clean up the wording" PR
@@ -1477,7 +1492,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
          `synth_suppresses_notes` shim",
     );
     assert_eq!(
-        classify_exit(notes_shape, &outcomes),
+        classify_exit(notes_shape, &outcomes, None),
         ExitReason::Crash,
         "implement-crash synth must classify as Crash, not AgentSelfReportedFailure \
          (the notes are bellows-synthesised, not agent-authored)",
@@ -1517,7 +1532,7 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes),
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
         ExitReason::AgentSelfReportedFailure,
         "HasUnaddressedFinding always routes to AgentSelfReportedFailure; the \
          synth flag is no longer consulted by classify_exit",
@@ -1553,7 +1568,7 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes),
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
         ExitReason::AgentSelfReportedFailure,
     );
 }
@@ -1940,7 +1955,7 @@ fn classify_exit_returns_success_for_clean_security_review_and_fix() {
         }),
         security_fix: Some(FixOutcome { exit_code: 0 }),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::Success);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
 
 #[test]
@@ -1967,7 +1982,7 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
         security: Some(AnalysisOutcome { findings_text: None, exit_code: 0 }),
         security_fix: None,
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes), ExitReason::Success);
+    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
 
 // ---- diff_contains_rs_files: weak-test guard doc-only short-circuit ----
@@ -2321,7 +2336,7 @@ fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardl
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes),
+        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
         ExitReason::AgentSelfReportedFailure,
         "HasUnaddressedFinding must beat green-phase signals (escalation wins)",
     );
@@ -2354,7 +2369,7 @@ fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_not
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
         ExitReason::SuccessWithNotes,
     );
 }
@@ -2381,7 +2396,7 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
         ExitReason::FinalTestsRed,
         "a failing gate must beat an informational note — broken tests are the \
          more actionable headline for an operator",
@@ -2407,7 +2422,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes),
+        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
         ExitReason::Crash,
         "a non-zero implement exit must beat an informational note",
     );
@@ -2438,7 +2453,7 @@ fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(NotesShape::Absent, &outcomes),
+        classify_exit(NotesShape::Absent, &outcomes, None),
         ExitReason::Success,
     );
 }
@@ -2492,7 +2507,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
         security_fix: None,
     };
     assert_eq!(
-        classify_exit(shape, &outcomes),
+        classify_exit(shape, &outcomes, None),
         ExitReason::Crash,
         "synth-only notes + non-zero implement exit must route to Crash without \
          the per-call synth_suppresses_notes shim",

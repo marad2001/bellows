@@ -343,38 +343,42 @@ pub struct PhaseOutcomes {
 
 /// Decide how a finished agent run should be classified.
 ///
-/// Precedence (ADR-0006 / issue #95):
+/// Precedence (ADR-0006 / issue #95, refined by ADR-0009 / issue #124
+/// slice 2 — the phase-8 merger verdict now drives the (α) agent-
+/// authored routing branch):
 ///
-/// 1. `NotesShape::HasUnaddressedFinding` → `AgentSelfReportedFailure`.
-///    The structured escalation channel: an `## Unaddressed finding:`
-///    section (agent-authored or bellows-synthesised by the weak-test
-///    guard or parser-as-backstop) always wins over tooling signals,
-///    because the agent's structured voice is the most actionable
-///    self-report we have.
-/// 2. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
+/// 1. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
 ///    at the budget boundary.
-/// 3. Non-zero implement exit + rate-limit stderr signature →
+/// 2. Non-zero implement exit + rate-limit stderr signature →
 ///    `RateLimited`. More specific than the generic Crash so the
 ///    operator gets the right follow-up signal.
-/// 4. Non-zero implement exit → `Crash`. The agent process died.
-/// 5. Failing cargo gate (clippy or test, post-implement or
+/// 3. Non-zero implement exit → `Crash`. The agent process died.
+/// 4. Failing cargo gate (clippy or test, post-implement or
 ///    end-pipeline) → `FinalTestsRed`.
-/// 6. `NotesShape::InformationalOnly` → `SuccessWithNotes`. The new
-///    ADR-0006 informational channel: an otherwise-clean run with
-///    freeform agent-authored prose (no escalation heading). Should
-///    stop silent auto-merge but should NOT route to
-///    AgentSelfReportedFailure.
-/// 7. Otherwise → `Success`.
+/// 5. Merger verdict (when `Some` and no (β)/(γ) hard override fires,
+///    see runner-side construction of `outcomes`):
+///    `Merge` → `Success`, `HoldNoted` → `SuccessWithNotes`,
+///    `HoldDraft` → `AgentSelfReportedFailure`. Replaces the
+///    pre-slice-2 (α) auto-fatal `NotesShape::HasUnaddressedFinding`
+///    branch.
+/// 6. Q4-Option-A fallback (merger verdict is `None` — phase didn't
+///    run, output was unparseable, rate-limit skip): behaves exactly
+///    as the pre-slice-2 classifier. `HasUnaddressedFinding` →
+///    `AgentSelfReportedFailure`, `InformationalOnly` →
+///    `SuccessWithNotes`, otherwise → `Success`. Strictly additive on
+///    throughput: a working merger raises it; a failing merger is
+///    neutral.
 ///
 /// The issue-#49 `synth_suppresses_notes` shim is gone: synth-only
 /// agent-notes files map to `NotesShape::Absent` when the runner passes
 /// the recorded implement-crash synth span to note classification, so
 /// they route on their actual failure mode (Crash) without a per-call
 /// special case here.
-pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason {
-    if matches!(notes, NotesShape::HasUnaddressedFinding) {
-        return ExitReason::AgentSelfReportedFailure;
-    }
+pub fn classify_exit(
+    notes: NotesShape,
+    outcomes: &PhaseOutcomes,
+    merger_verdict: Option<MergerVerdict>,
+) -> ExitReason {
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
     }
@@ -416,6 +420,30 @@ pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason 
         && gate_failed(end_gate)
     {
         return ExitReason::FinalTestsRed;
+    }
+    // ADR-0009 slice 2 / issue #124 (α) replacement: when the merger
+    // produced a parseable verdict, it drives routing on the
+    // agent-authored channel. The merger has already screened against
+    // the run's full context (diff, ACs, agent-notes, CI status); if
+    // it voted `Merge` the substantive code is good and the heading
+    // shape that would otherwise auto-fatal the run is overridden.
+    //
+    // Q4-Option-A fallback (per ADR-0009): if the verdict is `None`
+    // (merger phase didn't run, agent output was unparseable, or the
+    // merger hit a rate-limit and was skipped), fall through to the
+    // pre-slice classifier below. Strictly additive on throughput: a
+    // working merger raises it; a failing merger is neutral.
+    if let Some(verdict) = merger_verdict {
+        return match verdict {
+            MergerVerdict::Merge => ExitReason::Success,
+            MergerVerdict::HoldNoted => ExitReason::SuccessWithNotes,
+            MergerVerdict::HoldDraft => ExitReason::AgentSelfReportedFailure,
+        };
+    }
+    // Q4-Option-A fallback path. Pre-slice-2 behaviour preserved
+    // exactly so a missing merger verdict is a no-op on routing.
+    if matches!(notes, NotesShape::HasUnaddressedFinding) {
+        return ExitReason::AgentSelfReportedFailure;
     }
     if matches!(notes, NotesShape::InformationalOnly) {
         return ExitReason::SuccessWithNotes;
