@@ -331,6 +331,14 @@ pub struct PhaseOutcomes {
     /// implement actually exited non-zero, letting the run classify
     /// as `Crash` instead.
     pub implement_crash_synthesised: bool,
+    /// Issue #123 / ADR-0009 slice 1: the phase-8 merger's parsed
+    /// verdict. `None` means either the phase didn't run (runner
+    /// halted before phase 8) or the agent's output did not contain
+    /// a recognised `VERDICT: <token>` line — both are logged but
+    /// neither yet feeds `classify_exit` (slice 2 / issue #124 will
+    /// wire routing). Stored here so the runner can carry it across
+    /// the gap from phase-8 dispatch to the PR/log build sites.
+    pub merger_verdict: Option<MergerVerdict>,
 }
 
 /// Decide how a finished agent run should be classified.
@@ -577,11 +585,164 @@ pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
     nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
 }
 
+/// Phase 8 merger verdict vocabulary (issue #123 / ADR-0009 slice 1).
+///
+/// The merger agent emits a natural-language prose review followed by a
+/// trailing `VERDICT: <token>` line carrying exactly one of these three
+/// values. Bellows parses the line and stores the verdict in run state
+/// for later wiring (slice 2 / #124 feeds it into `classify_exit`).
+///
+/// Variants:
+/// - `Merge` — the diff satisfies the brief's ACs and the agent
+///   recommends opening a normal (non-draft) PR.
+/// - `HoldNoted` — the diff is broadly OK but a gap was flagged in
+///   `agent-notes.md`; the merger surfaces it for human review.
+/// - `HoldDraft` — the diff does not yet satisfy the brief; the merger
+///   recommends opening a draft PR so a human can take over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergerVerdict {
+    Merge,
+    HoldNoted,
+    HoldDraft,
+}
+
+impl MergerVerdict {
+    /// Canonical token string as it appears on the agent's verdict
+    /// line. Used for the run-log line bellows writes after parsing.
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            MergerVerdict::Merge => "MERGE",
+            MergerVerdict::HoldNoted => "HOLD-NOTED",
+            MergerVerdict::HoldDraft => "HOLD-DRAFT",
+        }
+    }
+}
+
+/// Phase 8 merger verdict parser (issue #123 / ADR-0009 slice 1).
+///
+/// Requires exactly one standalone `VERDICT: <TOKEN>` line (matching
+/// exactly one of `MERGE`, `HOLD-NOTED`, `HOLD-DRAFT`), and that line
+/// must be the last non-empty line in `agent_output`. Returns `None`
+/// for:
+///
+/// - missing — no verdict line at all,
+/// - off-vocabulary — verdict line carries a token outside the closed
+///   set (e.g. `LGTM`, `merge`, `OK`),
+/// - ambiguous / off-contract — any additional standalone `VERDICT:`
+///   line appears before the trailing verdict line,
+/// - non-trailing — prose or any other non-empty line appears after
+///   the only standalone `VERDICT:` line,
+/// - empty input.
+///
+/// Tolerates trailing whitespace (spaces / tabs) on the verdict line
+/// and CRLF line endings — both are common when the agent's harness
+/// rewraps prose.
+pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
+    let mut verdict_line_count = 0;
+    let mut last_non_empty_line = None;
+
+    for raw_line in agent_output.lines() {
+        // Strip a trailing `\r` (handles CRLF) and trailing whitespace.
+        let line = raw_line.trim_end_matches('\r').trim_end();
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Count every standalone verdict-looking line, including
+        // off-vocabulary tokens. If the agent emitted more than one,
+        // the output is off-contract regardless of whether the final
+        // token is otherwise parseable.
+        if line.trim_start().starts_with("VERDICT:") {
+            verdict_line_count += 1;
+        }
+
+        last_non_empty_line = Some(line);
+    }
+
+    if verdict_line_count != 1 {
+        return None;
+    }
+
+    let line = last_non_empty_line?;
+    let token = line.strip_prefix("VERDICT: ")?;
+    match token {
+        "MERGE" => Some(MergerVerdict::Merge),
+        "HOLD-NOTED" => Some(MergerVerdict::HoldNoted),
+        "HOLD-DRAFT" => Some(MergerVerdict::HoldDraft),
+        _ => None,
+    }
+}
+
+/// Phase-8 merger prompt (issue #123 / ADR-0009 slice 1).
+///
+/// Mirrors the existing `REVIEW_PROMPT` / `SECURITY_REVIEW_PROMPT`
+/// shape but is read-only and emits a natural-language prose review
+/// ending in a `VERDICT: <token>` line carrying exactly one of
+/// `MERGE`, `HOLD-NOTED`, or `HOLD-DRAFT`. The merger reads the diff
+/// vs master, the brief's verbatim ACs (appended by the runner to the
+/// kickoff prompt), the final `agent-notes.md` content (with synth-
+/// provenance markers), and end-pipeline cargo-checks status (also
+/// appended by the runner) — then judges whether the diff satisfies
+/// the ACs. Notes are treated as agent-stated
+/// reasoning, NOT evidence the code is correct; the diff and ACs are
+/// the anchor.
+pub fn render_merger_prompt() -> String {
+    MERGER_PROMPT.to_string()
+}
+
+const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bellows agent pipeline. The implement → cargo-checks → review → review-fix → security-review → security-fix → cargo-checks phases have already run; your job is to integrate the resulting diff, the brief's acceptance criteria, the final `agent-notes.md` content, and the CI / cargo-checks status into a single end-of-pipeline judgement.
+
+## Inputs
+
+- `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta this run produced against master. Read this as the primary anchor.
+- The agent brief (with its verbatim `## Acceptance criteria` list) is appended to this kickoff under `## Bellows-supplied run inputs`. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
+- `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
+- The end-pipeline cargo-checks gate status is appended to this kickoff under `## Bellows-supplied run inputs`. Treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
+
+## What this phase does NOT do
+
+You are read-only with respect to the repo contents: do NOT edit any tracked files, do NOT create commits, do NOT push. The single exception is writing your output file `/workspace/.bellows-merger-output.md` (untracked; Bellows reads and removes it after your run). Your output is the prose review and the trailing verdict line — that is the entire job.
+
+## Output
+
+Write your natural-language prose review to `/workspace/.bellows-merger-output.md`. Cover:
+
+1. Whether each acceptance criterion in the brief is satisfied by the diff. Reference the diff (file paths, function names) for each AC you confirm or flag.
+2. Whether `agent-notes.md` raises any concern the diff has not addressed. Remember: notes are reasoning, not evidence. A note that says "I deviated from strict test-first on AC4" is fine; a note that says "I couldn't satisfy AC2" is a hold signal.
+3. Whether the cargo-checks gate's outcome is consistent with the diff (e.g. green gate over a diff that touches Rust source is the expected shape; green gate over a no-Rust-source diff is also fine).
+
+End the file's contents with a SINGLE trailing line of the EXACT form:
+
+```
+VERDICT: <TOKEN>
+```
+
+where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctuation):
+
+- `MERGE` — the diff satisfies the brief's ACs and the run should land as a normal (non-draft) PR.
+- `HOLD-NOTED` — the diff broadly satisfies the ACs but `agent-notes.md` flags a gap a human reviewer should see before merge.
+- `HOLD-DRAFT` — the diff does NOT satisfy the brief's ACs; a draft PR is the right shape so a human can take over.
+
+The trailing verdict line is load-bearing — Bellows greps `/workspace/.bellows-merger-output.md` for it after your run. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
+
+## When you cannot complete
+
+If the diff is malformed, missing, or you genuinely cannot judge it, emit a `VERDICT: HOLD-DRAFT` line (so the run lands as a draft for a human) and explain what stopped you in the prose above the verdict line. Do NOT emit a different token, and do NOT omit the verdict line — a missing verdict produces an ambiguous run-log entry.
+"#;
+
 /// Workspace-relative path of the diff file the runner writes before
 /// the review phase. Read-only input to the review prompt; the runner
 /// generates this on the host (via `git diff`) and removes it after
 /// the review-fix phase completes.
 pub const REVIEW_DIFF_FILE: &str = ".bellows-review-diff.patch";
+
+/// Workspace-relative path of the merger output file the phase-8
+/// prompt writes (issue #123 / ADR-0009 slice 1). Bellows reads this
+/// after the merger agent run, parses the trailing `VERDICT: <token>`
+/// line with `parse_merger_verdict`, and removes the file before the
+/// final commit so it never lands in the PR diff.
+pub const MERGER_OUTPUT_FILE: &str = ".bellows-merger-output.md";
 
 /// Workspace-relative path of the findings file the review prompt
 /// writes. The runner reads it after the review run and posts the

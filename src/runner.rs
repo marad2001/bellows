@@ -856,7 +856,7 @@ pub async fn run_once(
     // in-place-advance once before terminating.
     announce(
         log_writer,
-        "bellows: phase 1/7 — implement (running agent in sandbox container, this is the long one)",
+        "bellows: phase 1/8 — implement (running agent in sandbox container, this is the long one)",
     );
     let head_before_implement = workspace::head_sha(&workspace).await?;
     let mut implement_advances_used: u8 = 0;
@@ -1125,7 +1125,7 @@ pub async fn run_once(
     {
         announce(
             log_writer,
-            "bellows: phase 2/7 — cargo checks gate (clippy + test, fresh container)",
+            "bellows: phase 2/8 — cargo checks gate (clippy + test, fresh container)",
         );
         for line in workspace.gate_commands().announcement_lines() {
             announce(log_writer, &line);
@@ -1256,6 +1256,10 @@ pub async fn run_once(
     let mut security_outcome: Option<AnalysisOutcome> = None;
     let mut security_fix_outcome: Option<FixOutcome> = None;
     let mut end_pipeline_gate: Option<GateOutcome> = None;
+    // Issue #123 / ADR-0009 slice 1: phase-8 merger verdict. Stored
+    // in PhaseOutcomes for the PR/log build sites; does NOT yet feed
+    // classify_exit (slice 2 / #124 wires routing).
+    let mut merger_verdict: Option<policy::MergerVerdict> = None;
     // Slice 9.6: parser-as-backstop violations. Populated after the
     // per-finding/nit-batch review-fix invocations complete and the
     // parser cross-references findings against agent-notes sections.
@@ -1267,7 +1271,7 @@ pub async fn run_once(
         // ---- Phase 3: Review ----
         announce(
             log_writer,
-            "bellows: phase 3/7 — review (reads diff, produces findings)",
+            "bellows: phase 3/8 — review (reads diff, produces findings)",
         );
         let review_picked_opt = pick_non_implement_engine(
             &config.phases.review.cli_chain,
@@ -1420,7 +1424,7 @@ pub async fn run_once(
             announce(
                 log_writer,
                 &format!(
-                    "bellows: phase 4/7 — review-fix ({} blocker/important per-finding invocation(s) + {} batched nit(s))",
+                    "bellows: phase 4/8 — review-fix ({} blocker/important per-finding invocation(s) + {} batched nit(s))",
                     urgent_findings.len(),
                     nit_findings.len(),
                 ),
@@ -1735,7 +1739,7 @@ pub async fn run_once(
         {
             announce(
                 log_writer,
-                "bellows: phase 5/7 — security-review (reads diff for the five security focus categories, produces findings)",
+                "bellows: phase 5/8 — security-review (reads diff for the five security focus categories, produces findings)",
             );
             let security_review_picked_opt = pick_non_implement_engine(
                 &config.phases.security_review.cli_chain,
@@ -1846,7 +1850,7 @@ pub async fn run_once(
             {
                 announce(
                     log_writer,
-                    "bellows: phase 6/7 — security-fix (reads findings and addresses each)",
+                    "bellows: phase 6/8 — security-fix (reads findings and addresses each)",
                 );
                 let security_fix_picked_opt = pick_non_implement_engine(
                     &config.phases.security_fix.cli_chain,
@@ -1944,7 +1948,7 @@ pub async fn run_once(
         {
             announce(
                 log_writer,
-                "bellows: phase 7/7 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
+                "bellows: phase 7/8 — end-of-pipeline cargo checks gate (clippy + test after fixups)",
             );
             for line in workspace.gate_commands().announcement_lines() {
                 announce(log_writer, &line);
@@ -1962,6 +1966,112 @@ pub async fn run_once(
             .await?;
             budget.mark_killed_if(run.killed_by_deadline);
             end_pipeline_gate = Some(run.gate);
+        }
+
+        // ---- Phase 8 (issue #123 / ADR-0009 slice 1): Merger ----
+        //
+        // Read-only end-of-pipeline judgement. Reads the squashed
+        // diff, the brief's verbatim ACs (carried in the kickoff
+        // prompt), the final `agent-notes.md` content, and the
+        // cargo-checks gate status; writes its prose review to
+        // `MERGER_OUTPUT_FILE` ending with a `VERDICT: <token>` line.
+        // Bellows parses the verdict and stores it in `PhaseOutcomes`.
+        //
+        // Routing in this slice is identical to today — the verdict
+        // is logged but does NOT yet feed `classify_exit`. Slice 2
+        // (#124) will wire routing.
+        //
+        // Gated on every halt flag (mirrors the phase-7 gate) so a
+        // failed earlier phase short-circuits cleanly without burning
+        // a merger run.
+        if !halt_after_review
+            && !halt_after_fix
+            && !halt_after_security
+            && !halt_after_security_fix
+            && !budget.exceeded
+            && rate_limited_phase.is_none()
+        {
+            announce(
+                log_writer,
+                "bellows: phase 8/8 — merger (read-only end-of-pipeline verdict on the diff vs ACs)",
+            );
+            let merger_picked_opt = pick_non_implement_engine(
+                &config.phases.merge.cli_chain,
+                &state,
+                implementer_cli,
+                engine_label_override,
+                "merger",
+                log_writer,
+            );
+            if merger_picked_opt.is_none() {
+                rate_limited_phase = Some("merger");
+            }
+            let merger_picked = merger_picked_opt.unwrap_or(PickedEntry {
+                entry: ChainEntry { engine: Engine::Claude, model: None },
+                reason: PickReason::ChainFirstHotEntry,
+            });
+            let merger_chain_entry = merger_picked.entry.clone();
+            let merger_auth = auth_for(&merger_chain_entry);
+            if rate_limited_phase.is_none() {
+                workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+                let merger_kickoff = render_merger_kickoff_for_engine(
+                    merger_chain_entry.engine,
+                    &brief,
+                    &end_pipeline_gate,
+                );
+                tokio::fs::write(
+                    workspace.path().join(".bellows-kickoff.md"),
+                    merger_kickoff,
+                )
+                .await?;
+                let run = sandbox::run_agent(
+                    &workspace,
+                    &merger_auth,
+                    claimed.number,
+                    &repo_label,
+                    &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
+                    log_writer,
+                    budget.deadline_or_halt(),
+                )
+                .await?;
+                budget.mark_killed_if(run.killed_by_deadline);
+                if process_non_implement_rate_limit(
+                    &mut state,
+                    &state_path,
+                    merger_chain_entry.engine,
+                    "merger",
+                    &run,
+                    log_writer,
+                ) {
+                    rate_limited_phase = Some("merger");
+                }
+
+                // Parse the verdict from the merger's output file.
+                // Missing file / unrecognised / ambiguous → None,
+                // logged and stored (does NOT yet feed classify_exit).
+                let merger_output_path = workspace.path().join(policy::MERGER_OUTPUT_FILE);
+                let merger_output_text = match tokio::fs::read_to_string(&merger_output_path).await
+                {
+                    Ok(s) => Some(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.into()),
+                };
+                merger_verdict = merger_output_text
+                    .as_deref()
+                    .and_then(policy::parse_merger_verdict);
+                match merger_verdict {
+                    Some(v) => announce(
+                        log_writer,
+                        &format!("bellows: merger verdict: {}", v.as_token()),
+                    ),
+                    None => announce(
+                        log_writer,
+                        "bellows: merger produced no parseable verdict (logged; routing unchanged)",
+                    ),
+                }
+            }
         }
 
         // Defensive cleanup: even on halt paths the diff file should not
@@ -2011,6 +2121,10 @@ pub async fn run_once(
         wall_clock_exceeded: budget.exceeded,
         backstop_violations,
         implement_crash_synthesised,
+        // Issue #123 / ADR-0009 slice 1: phase-8 verdict populated by
+        // the merger phase above when it ran; `None` when phase 8 was
+        // halted or its output was unparseable.
+        merger_verdict,
     };
     // ADR-0006 / issue #95: feed agent-notes content plus the
     // out-of-band Bellows synth spans through note classification.
@@ -2552,6 +2666,64 @@ fn gate_summary_line(gate: &GateOutcome) -> String {
     )
 }
 
+fn render_merger_kickoff_for_engine(
+    engine: Engine,
+    brief: &str,
+    end_pipeline_gate: &Option<GateOutcome>,
+) -> String {
+    let mut body = policy::render_merger_prompt();
+    body.push_str("\n\n## Bellows-supplied run inputs\n\n");
+    body.push_str(
+        "The runner injects these values directly into the kickoff because the merger \
+         sandbox only has `/workspace` mounted and cannot read the host run log.\n\n",
+    );
+    body.push_str("### Agent brief\n\n");
+    body.push_str("```markdown\n");
+    body.push_str(brief.trim_end());
+    body.push_str("\n```\n\n");
+    body.push_str("### End-pipeline cargo-checks gate\n\n");
+    body.push_str("```text\n");
+    body.push_str(&merger_gate_summary(end_pipeline_gate));
+    body.push_str("```\n");
+    policy::wrap_phase_prompt_for_engine(engine, &body)
+}
+
+fn merger_gate_summary(end_pipeline_gate: &Option<GateOutcome>) -> String {
+    let mut out = String::new();
+    out.push_str("end_pipeline_gate:\n");
+    match end_pipeline_gate {
+        Some(gate) => {
+            out.push_str("  status: ran\n");
+            push_merger_check_summary(&mut out, "cargo_clippy", &gate.cargo_clippy);
+            push_merger_check_summary(&mut out, "cargo_test", &gate.cargo_test);
+        }
+        None => {
+            out.push_str("  status: did-not-run\n");
+            push_merger_check_summary(&mut out, "cargo_clippy", &None);
+            push_merger_check_summary(&mut out, "cargo_test", &None);
+        }
+    }
+    out
+}
+
+fn push_merger_check_summary(out: &mut String, name: &str, check: &Option<CheckResult>) {
+    out.push_str(&format!("  {name}:\n"));
+    match check {
+        Some(result) if result.exit_code == 0 => {
+            out.push_str("    status: passed\n");
+            out.push_str(&format!("    exit_code: {}\n", result.exit_code));
+        }
+        Some(result) => {
+            out.push_str("    status: failed\n");
+            out.push_str(&format!("    exit_code: {}\n", result.exit_code));
+        }
+        None => {
+            out.push_str("    status: did-not-run\n");
+            out.push_str("    exit_code: n/a\n");
+        }
+    }
+}
+
 fn review_summary(review: &Option<ReviewOutcome>) -> String {
     match review {
         None => "did not run".to_string(),
@@ -2860,6 +3032,7 @@ async fn cleanup_phase_handoff_files(
         policy::REVIEW_FINDINGS_FILE,
         policy::REVIEW_COMMIT_LOG_FILE,
         policy::SECURITY_FINDINGS_FILE,
+        policy::MERGER_OUTPUT_FILE,
     ] {
         let path = workspace.path().join(name);
         match tokio::fs::remove_file(&path).await {
@@ -3024,6 +3197,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         }
@@ -3175,6 +3349,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3210,6 +3385,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3248,6 +3424,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3283,6 +3460,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3293,6 +3471,53 @@ api_key_env_file = "~/bellows-test-opencode.env"
         assert!(body.contains("Review:"));
         assert!(body.contains("Cargo checks (post-implement)"));
         assert!(body.contains("Cargo checks (end-pipeline)"));
+    }
+
+    #[test]
+    fn render_merger_kickoff_includes_brief_and_end_pipeline_gate_status() {
+        let brief = r#"## Agent Brief
+
+**Acceptance criteria:**
+- [ ] Behaviour test: preserve the frobnicator output.
+"#;
+        let end_pipeline_gate = Some(GateOutcome {
+            cargo_clippy: Some(CheckResult {
+                exit_code: 0,
+                output: "clippy ok".to_string(),
+            }),
+            cargo_test: Some(CheckResult {
+                exit_code: 101,
+                output: "one regression failed".to_string(),
+            }),
+        });
+
+        let kickoff =
+            render_merger_kickoff_for_engine(Engine::Claude, brief, &end_pipeline_gate);
+
+        assert!(
+            kickoff.contains("preserve the frobnicator output"),
+            "merger kickoff must embed the fetched agent brief: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("end_pipeline_gate:"),
+            "merger kickoff must embed a structured gate summary: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("status: ran"),
+            "merger kickoff must say the end-pipeline gate ran: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("cargo_clippy:")
+                && kickoff.contains("status: passed")
+                && kickoff.contains("exit_code: 0"),
+            "merger kickoff must include clippy status and exit code: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("cargo_test:")
+                && kickoff.contains("status: failed")
+                && kickoff.contains("exit_code: 101"),
+            "merger kickoff must include test status and exit code: {kickoff}",
+        );
     }
 
     #[test]
@@ -3315,6 +3540,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3349,6 +3575,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3390,6 +3617,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3433,6 +3661,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3484,6 +3713,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3524,6 +3754,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3580,6 +3811,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 },
             ],
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3625,6 +3857,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3690,6 +3923,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3860,6 +4094,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security,
             security_fix,
         }
@@ -4074,6 +4309,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: Some(crate::policy::AnalysisOutcome {
                 findings_text: Some(
                     "## Findings\n\n### 1. command injection in shell call — blocker\n\nbody"
@@ -4139,6 +4375,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };

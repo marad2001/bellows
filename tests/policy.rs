@@ -74,6 +74,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -100,6 +101,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     }
@@ -168,6 +170,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -258,6 +261,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -287,6 +291,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -311,6 +316,7 @@ fn classify_exit_self_reported_failure_wins_over_wall_clock_exceeded() {
         wall_clock_exceeded: true,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -336,6 +342,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -362,6 +369,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -1456,6 +1464,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: true,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -1503,6 +1512,7 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         backstop_violations: Vec::new(),
         // Synth flag set defensively; classify_exit ignores it.
         implement_crash_synthesised: true,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -1538,6 +1548,7 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -1922,6 +1933,7 @@ fn classify_exit_returns_success_for_clean_security_review_and_fix() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: Some(AnalysisOutcome {
             findings_text: Some("findings".to_string()),
             exit_code: 0,
@@ -1951,6 +1963,7 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: Some(AnalysisOutcome { findings_text: None, exit_code: 0 }),
         security_fix: None,
     };
@@ -2303,6 +2316,7 @@ fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardl
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -2335,6 +2349,7 @@ fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_not
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -2361,6 +2376,7 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -2386,6 +2402,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -2416,6 +2433,7 @@ fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
@@ -2469,6 +2487,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
         // needs to special-case it. The Absent shape carries the
         // routing decision on its own.
         implement_crash_synthesised: true,
+        merger_verdict: None,
         security: None,
         security_fix: None,
     };
