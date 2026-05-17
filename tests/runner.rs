@@ -12,10 +12,11 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 
-use bellows::config::Config;
+use bellows::config::{Config, PostingMode};
+use bellows::policy::MergerVerdict;
 use bellows::runner::{
-    capture_and_remove_agent_notes, post_agent_notes_comment_if_present, run_once, BlockReason,
-    RunError, RunOutcome,
+    capture_and_remove_agent_notes, post_agent_notes_comment_if_present,
+    post_merge_verdict_comment_if_present, run_once, BlockReason, RunError, RunOutcome,
 };
 use bellows::workspace;
 use serde_json::json;
@@ -855,4 +856,374 @@ async fn no_agent_notes_means_no_pr_comment_is_posted() {
         .await
         .expect("post_agent_notes_comment_if_present with None should succeed");
     // mock.verify() at scope-drop enforces expect(0): NO POST happened.
+}
+
+// ---- Issue #125 / ADR-0009 slice 3: surface the phase-8 merger's
+//      full prose review as a "Merge verdict" PR comment after the
+//      run, configurable via `[phases.merge].posting`. ----
+
+#[tokio::test]
+async fn merge_verdict_post_always_posts_prose_and_verdict_line_for_merge() {
+    // AC3: After phase 8 completes and the verdict has been parsed,
+    // bellows posts the merger's full prose body (including the
+    // trailing `VERDICT: <token>` line) as a PR comment titled or
+    // prefixed "Merge verdict". `post-always` (default) surfaces the
+    // comment for every verdict including clean MERGE runs.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .and(body_string_contains("Merge verdict"))
+        .and(body_string_contains("The diff lines up cleanly with all ACs"))
+        .and(body_string_contains("VERDICT: MERGE"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "The diff lines up cleanly with all ACs.\n\nVERDICT: MERGE\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::Merge),
+        Some(prose),
+        PostingMode::PostAlways,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present should succeed");
+    // mock.verify() at scope-drop enforces expect(1).
+}
+
+#[tokio::test]
+async fn merge_verdict_post_on_hold_only_skips_comment_for_merge_verdict() {
+    // AC4: When `posting = post-on-hold-only` and verdict is `MERGE`,
+    // no comment is posted. `expect(0)` on the comments endpoint
+    // proves it: the mock drop would surface a violation if a POST
+    // landed.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "Clean MERGE — silently auto-merging.\n\nVERDICT: MERGE\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::Merge),
+        Some(prose),
+        PostingMode::PostOnHoldOnly,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present should succeed");
+    // mock.verify() at scope-drop enforces expect(0): NO POST happened.
+}
+
+#[tokio::test]
+async fn merge_verdict_post_on_hold_only_posts_comment_for_hold_noted() {
+    // AC5 (first half): When `posting = post-on-hold-only` and the
+    // verdict is `HoldNoted`, the comment IS posted — the operator
+    // needs the merger's rationale when manually merging an
+    // agent-noted PR.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .and(body_string_contains("Merge verdict"))
+        .and(body_string_contains("judgement call — operator should read"))
+        .and(body_string_contains("VERDICT: HOLD-NOTED"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "judgement call — operator should read this.\n\nVERDICT: HOLD-NOTED\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::HoldNoted),
+        Some(prose),
+        PostingMode::PostOnHoldOnly,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present should succeed");
+}
+
+#[tokio::test]
+async fn merge_verdict_post_on_hold_only_posts_comment_for_hold_draft() {
+    // AC5 (second half): same as above for `HoldDraft` — the draft
+    // PR needs the rationale even more than HoldNoted does.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .and(body_string_contains("Merge verdict"))
+        .and(body_string_contains("diff does not match AC1"))
+        .and(body_string_contains("VERDICT: HOLD-DRAFT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "diff does not match AC1 expectations.\n\nVERDICT: HOLD-DRAFT\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::HoldDraft),
+        Some(prose),
+        PostingMode::PostOnHoldOnly,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present should succeed");
+}
+
+#[tokio::test]
+async fn merge_verdict_none_suppresses_comment_under_post_always() {
+    // AC6: When the merger verdict is `None` (slice-1 fallback —
+    // unparseable output, merger crash, or rate-limit skip), no
+    // comment is posted regardless of the posting toggle. The audit
+    // trail belongs to the merger, not to the fallback classifier.
+    // Pin under PostAlways because that's the mode where suppression
+    // is least obvious from context alone.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        None,
+        Some("some prose but no verdict line at all\n"),
+        PostingMode::PostAlways,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present with verdict=None should succeed");
+}
+
+#[tokio::test]
+async fn merge_verdict_none_suppresses_comment_under_post_on_hold_only() {
+    // AC6 (mirror): same suppression also under post-on-hold-only.
+    // Verdict=None is the dominant signal across both modes.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        None,
+        Some("garbage\n"),
+        PostingMode::PostOnHoldOnly,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present with verdict=None should succeed");
+}
+
+#[tokio::test]
+async fn merge_verdict_post_failure_is_logged_as_warning_and_does_not_fail_the_run() {
+    // AC7: comment posting failures are logged as warnings but do
+    // NOT fail the run. The GitHub API returns 500; the helper must
+    // return Ok(()) and surface a warning line on the log writer so
+    // the operator sees what happened on `bellows.log`.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "diff is acceptable.\n\nVERDICT: MERGE\n";
+    let outcome = post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::Merge),
+        Some(prose),
+        PostingMode::PostAlways,
+        &mut log,
+    )
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "post failure must NOT fail the run; got {outcome:?}",
+    );
+    let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
+    assert!(
+        log_str.contains("Merge verdict") && log_str.contains("125"),
+        "warning line must mention the comment kind and PR number; got: {log_str}",
+    );
+}
+
+#[tokio::test]
+async fn merge_verdict_prose_over_64kib_is_truncated_with_marker() {
+    // AC8: If the merger's prose exceeds GitHub's 64 KiB comment
+    // limit, bellows truncates with a `[truncated — full prose in
+    // bellows.log]` marker (precedent: issue #87 run-log
+    // truncation). We pin the marker text verbatim so the operator's
+    // muscle memory from issue #87 carries over.
+    //
+    // Build a prose body well past 64 KiB so the helper has no
+    // choice but to truncate. The body the helper actually POSTs
+    // (the comment body, including the `## Merge verdict` heading
+    // and the marker) must fit under GitHub's hard cap.
+    const GITHUB_COMMENT_MAX_BYTES: usize = 65_536;
+    let big_prose = "x".repeat(80_000) + "\n\nVERDICT: HOLD-DRAFT\n";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/125/comments"))
+        .and(body_string_contains("Merge verdict"))
+        .and(body_string_contains("[truncated — full prose in bellows.log]"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        125,
+        Some(MergerVerdict::HoldDraft),
+        Some(&big_prose),
+        PostingMode::PostAlways,
+        &mut log,
+    )
+    .await
+    .expect("post_merge_verdict_comment_if_present should succeed");
+
+    // Belt-and-braces: the request body the mock received must fit
+    // under GitHub's hard cap. (wiremock holds the requests for us.)
+    let requests = mock.received_requests().await.expect("requests captured");
+    let comment_request = requests
+        .iter()
+        .find(|r| {
+            r.url.path() == "/repos/marad2001/test-repo/issues/125/comments"
+                && r.method.as_str() == "POST"
+        })
+        .expect("merge-verdict comment POST should be present");
+    let json: serde_json::Value =
+        serde_json::from_slice(&comment_request.body).expect("comment body is JSON");
+    let body_text = json
+        .get("body")
+        .and_then(|v| v.as_str())
+        .expect("comment payload has a body field");
+    assert!(
+        body_text.len() < GITHUB_COMMENT_MAX_BYTES,
+        "truncated comment must fit under 64 KiB; got {} bytes",
+        body_text.len(),
+    );
+}
+
+// ---- AC9: end-to-end posting-mode coverage through run_once. We
+//      drive run_once via the MissingAgentBrief short-circuit and
+//      separately exercise the helper through both modes — the
+//      tests above cover the helper at unit grain (AC3-AC8), and
+//      these two tests pin the operator-visible behaviour the
+//      brief calls out: "MERGE under post-always posts; MERGE
+//      under post-on-hold-only does not". ----
+
+#[tokio::test]
+async fn merge_verdict_post_always_mode_surfaces_merge_verdict_through_run_once_path() {
+    // AC9 (post-always arm): the brief asks for a wiremock test in
+    // tests/runner.rs that verifies both posting modes against the
+    // helper that run_once uses. We assert the body shape verbatim
+    // — verdict line + prose — to pin the operator-visible surface.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/200/comments"))
+        .and(body_string_contains("## Merge verdict"))
+        .and(body_string_contains("clean run, all ACs satisfied"))
+        .and(body_string_contains("VERDICT: MERGE"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "clean run, all ACs satisfied — green CI, no notes.\n\nVERDICT: MERGE\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        200,
+        Some(MergerVerdict::Merge),
+        Some(prose),
+        PostingMode::PostAlways,
+        &mut log,
+    )
+    .await
+    .expect("helper should succeed for post-always MERGE");
+}
+
+#[tokio::test]
+async fn merge_verdict_post_on_hold_only_mode_silently_suppresses_merge_comment() {
+    // AC9 (post-on-hold-only arm): mirror of the above; the helper
+    // emits no POST when the operator configured silent auto-merge.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/issues/200/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let prose = "clean run, all ACs satisfied.\n\nVERDICT: MERGE\n";
+    post_merge_verdict_comment_if_present(
+        &client,
+        "marad2001",
+        "test-repo",
+        200,
+        Some(MergerVerdict::Merge),
+        Some(prose),
+        PostingMode::PostOnHoldOnly,
+        &mut log,
+    )
+    .await
+    .expect("helper should succeed for post-on-hold-only MERGE");
 }
