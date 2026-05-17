@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
-    KillContainerOptions, ListContainersOptionsBuilder, ListVolumesOptionsBuilder,
-    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
+    InspectContainerOptionsBuilder, KillContainerOptions, ListContainersOptionsBuilder,
+    ListVolumesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RemoveVolumeOptionsBuilder,
 };
 use bollard::Docker;
 use sha2::{Digest, Sha256};
@@ -1097,20 +1098,57 @@ impl crate::runner::AgentContainerProbe for DockerContainerProbe {
             // all of them. If two are somehow running (a state the
             // invariant says shouldn't exist), reporting one is
             // enough for the operator to start investigating.
-            let first = containers.into_iter().find_map(|c| {
-                let id = c.id?;
-                let started_at = c
-                    .created
-                    .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
-                    .unwrap_or_else(chrono::Utc::now);
-                Some(crate::runner::RunningAgentContainer {
+            for c in containers {
+                let Some(id) = c.id else {
+                    continue;
+                };
+                let inspect_options = InspectContainerOptionsBuilder::default()
+                    .size(false)
+                    .build();
+                let details = match self
+                    .docker
+                    .inspect_container(&id, Some(inspect_options))
+                    .await
+                {
+                    Ok(details) => details,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => continue,
+                    Err(e) => return Err(crate::runner::ProbeError::Daemon(format!("{e}"))),
+                };
+                let started_at = started_at_from_inspect(&id, details)?;
+                return Ok(Some(crate::runner::RunningAgentContainer {
                     container_id: id,
                     started_at,
-                })
-            });
-            Ok(first)
+                }));
+            }
+            Ok(None)
         })
     }
+}
+
+fn started_at_from_inspect(
+    container_id: &str,
+    details: bollard::models::ContainerInspectResponse,
+) -> Result<chrono::DateTime<chrono::Utc>, crate::runner::ProbeError> {
+    let raw_started_at = details
+        .state
+        .and_then(|state| state.started_at)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            crate::runner::ProbeError::Daemon(format!(
+                "docker inspect for container {container_id} did not include State.StartedAt",
+            ))
+        })?;
+
+    chrono::DateTime::parse_from_rfc3339(&raw_started_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            crate::runner::ProbeError::Daemon(format!(
+                "docker inspect for container {container_id} returned invalid State.StartedAt `{raw_started_at}`: {e}",
+            ))
+        })
 }
 
 /// Force-remove stopped containers carrying the `bellows-managed=true`
@@ -1304,7 +1342,11 @@ pub async fn remove_cache_volume(docker: &Docker, name: &str) -> Result<(), Sand
 mod tests {
     use super::*;
     use crate::config::Engine;
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn build_agent_env_surfaces_env_file_errors_without_panicking() {
@@ -1408,6 +1450,69 @@ mod tests {
             "cleanup must not include running containers: {:?}",
             status_values,
         );
+    }
+
+    #[tokio::test]
+    async fn docker_container_probe_reports_inspect_state_started_at() {
+        // Docker's list summary `Created` is the container creation
+        // time, not the process start time surfaced by inspect's
+        // `State.StartedAt`. The status contract promises the latter.
+        let mock = MockServer::start().await;
+        let container_id =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let created_at: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        let started_at: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2026-05-17T10:30:00.123456789Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+        Mock::given(method("GET"))
+            .and(path("/containers/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "Id": container_id,
+                    "Created": created_at.timestamp(),
+                    "Labels": { "bellows-managed": "true" },
+                    "State": "running"
+                }
+            ])))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/containers/{container_id}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Id": container_id,
+                "Created": created_at.to_rfc3339(),
+                "State": {
+                    "Status": "running",
+                    "Running": true,
+                    "StartedAt": started_at.to_rfc3339()
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let docker = Docker::connect_with_http(&mock.uri(), 5, bollard::API_DEFAULT_VERSION)
+            .expect("mock Docker connection");
+        let probe = DockerContainerProbe { docker };
+
+        let detected = <DockerContainerProbe as crate::runner::AgentContainerProbe>::detect(&probe)
+            .await
+            .expect("probe should read mocked Docker responses")
+            .expect("mocked running container should be detected");
+
+        assert_eq!(detected.container_id, container_id);
+        assert_eq!(
+            detected.started_at, started_at,
+            "probe must report inspect State.StartedAt, not list Created",
+        );
+        assert_ne!(detected.started_at, created_at);
     }
 
     #[test]
