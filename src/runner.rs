@@ -1260,6 +1260,12 @@ pub async fn run_once(
     // in PhaseOutcomes for the PR/log build sites; does NOT yet feed
     // classify_exit (slice 2 / #124 wires routing).
     let mut merger_verdict: Option<policy::MergerVerdict> = None;
+    // Issue #125 / ADR-0009 slice 3: retain the merger's full prose
+    // body so we can post it as a `## Merge verdict` PR comment after
+    // PR-open (see `post_merge_verdict_comment_if_present`). Mirrors
+    // `merger_verdict`: populated only when phase 8 ran and wrote its
+    // output file; `None` on any halt-before-phase-8 path.
+    let mut merger_prose: Option<String> = None;
     // Slice 9.6: parser-as-backstop violations. Populated after the
     // per-finding/nit-batch review-fix invocations complete and the
     // parser cross-references findings against agent-notes sections.
@@ -2061,6 +2067,9 @@ pub async fn run_once(
                 merger_verdict = merger_output_text
                     .as_deref()
                     .and_then(policy::parse_merger_verdict);
+                // Issue #125 / ADR-0009 slice 3: stash the prose so
+                // it survives down to the post-PR-open comment site.
+                merger_prose = merger_output_text;
                 match merger_verdict {
                     Some(v) => announce(
                         log_writer,
@@ -2125,6 +2134,11 @@ pub async fn run_once(
         // the merger phase above when it ran; `None` when phase 8 was
         // halted or its output was unparseable.
         merger_verdict,
+        // Issue #125 / ADR-0009 slice 3: phase-8 merger's full prose
+        // body, plumbed to the post-PR-open `## Merge verdict`
+        // comment site. `None` whenever the merger didn't run or
+        // didn't write its output file.
+        merger_prose,
         // Issue #124 / ADR-0009 slice 2: project the recorded
         // out-of-band synth spans down to their causes. The
         // (β) hard-override branch in classify_exit consumes this so
@@ -2320,6 +2334,24 @@ pub async fn run_once(
         let comment_body = format!("## Security findings\n\n{security_findings}");
         tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
     }
+
+    // Issue #125 / ADR-0009 slice 3: post the phase-8 merger's full
+    // prose review as a `## Merge verdict` PR comment, gated by the
+    // operator's `[phases.merge].posting` toggle. Internally
+    // no-ops on every suppression branch (verdict=None, no prose,
+    // PostOnHoldOnly+Merge); on post-failure it logs a warning and
+    // returns `Ok(())` so the run still completes (AC7).
+    post_merge_verdict_comment_if_present(
+        client,
+        &owner,
+        &repo,
+        pr.number,
+        outcomes.merger_verdict,
+        outcomes.merger_prose.as_deref(),
+        config.phases.merge.posting,
+        log_writer,
+    )
+    .await?;
 
     let finished = chrono::Utc::now();
     let log_body = build_log_body(
@@ -3063,7 +3095,7 @@ pub async fn post_agent_notes_comment_if_present(
 ///   error is logged as a warning on `log_writer` and the function
 ///   returns `Ok(())` — consistent with the existing run-log
 ///   comment-post behaviour (issue #87). The run continues.
-pub async fn post_merge_verdict_comment_if_present<W: Write>(
+pub async fn post_merge_verdict_comment_if_present<W: Write + ?Sized>(
     client: &octocrab::Octocrab,
     owner: &str,
     repo: &str,
@@ -3329,6 +3361,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             synth_causes: Vec::new(),
             security: None,
             security_fix: None,
@@ -3482,6 +3515,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3519,6 +3553,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3559,6 +3594,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3596,6 +3632,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3677,6 +3714,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3713,6 +3751,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3756,6 +3795,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3801,6 +3841,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3854,6 +3895,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3896,6 +3938,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3954,6 +3997,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             ],
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -4001,6 +4045,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -4068,6 +4113,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -4240,6 +4286,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             synth_causes: Vec::new(),
             security,
             security_fix,
@@ -4456,6 +4503,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: Some(crate::policy::AnalysisOutcome {
                 findings_text: Some(
                     "## Findings\n\n### 1. command injection in shell call — blocker\n\nbody"
@@ -4523,6 +4571,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
