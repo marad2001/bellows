@@ -77,6 +77,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
@@ -102,6 +103,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
         merger_verdict: None,
+        synth_causes: Vec::new(),
         security: None,
         security_fix: None,
     }
@@ -173,6 +175,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::WallClockExceeded);
 }
@@ -264,6 +267,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::RateLimited);
 }
@@ -294,6 +298,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
@@ -332,6 +337,7 @@ fn classify_exit_wall_clock_exceeded_wins_over_self_reported_failure() {
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
@@ -360,6 +366,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
 }
@@ -387,6 +394,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
 }
@@ -1482,6 +1490,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     let notes_shape = classify_agent_notes_with_synth_spans(Some(&synth_note), &[synth_span]);
     assert_eq!(
@@ -1530,6 +1539,7 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
@@ -1566,6 +1576,7 @@ fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_fail
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
@@ -1954,6 +1965,7 @@ fn classify_exit_returns_success_for_clean_security_review_and_fix() {
             exit_code: 0,
         }),
         security_fix: Some(FixOutcome { exit_code: 0 }),
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
@@ -1981,6 +1993,7 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
         merger_verdict: None,
         security: Some(AnalysisOutcome { findings_text: None, exit_code: 0 }),
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
 }
@@ -2334,6 +2347,7 @@ fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardl
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
@@ -2367,6 +2381,7 @@ fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_not
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::InformationalOnly, &outcomes, None),
@@ -2394,6 +2409,7 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::InformationalOnly, &outcomes, None),
@@ -2420,6 +2436,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::InformationalOnly, &outcomes, None),
@@ -2451,6 +2468,7 @@ fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(NotesShape::Absent, &outcomes, None),
@@ -2505,6 +2523,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
         merger_verdict: None,
         security: None,
         security_fix: None,
+        synth_causes: Vec::new(),
     };
     assert_eq!(
         classify_exit(shape, &outcomes, None),

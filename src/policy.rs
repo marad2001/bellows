@@ -339,6 +339,18 @@ pub struct PhaseOutcomes {
     /// wire routing). Stored here so the runner can carry it across
     /// the gap from phase-8 dispatch to the PR/log build sites.
     pub merger_verdict: Option<MergerVerdict>,
+    /// Issue #124 / ADR-0009 slice 2: out-of-band provenance for any
+    /// Bellows-authored `## Unaddressed finding:` spans appended to
+    /// `agent-notes.md` during this run. The runner populates this
+    /// from the `BellowsSynthSpan`s recorded by
+    /// `append_bellows_synth_entry`. `classify_exit` treats these as
+    /// a hard override: when any of `WeakTestGuard`,
+    /// `ParserBackstop`, or `ImplementCrash` is present the merger
+    /// verdict cannot upgrade routing past `AgentSelfReportedFailure`
+    /// — the synth-provenance is evidence Bellows itself decided the
+    /// run was not mergeable, and the agent-authored merger vote
+    /// cannot overrule that.
+    pub synth_causes: Vec<BellowsSynthCause>,
 }
 
 /// Decide how a finished agent run should be classified.
@@ -434,6 +446,26 @@ pub fn classify_exit(
     // pre-slice classifier below. Strictly additive on throughput: a
     // working merger raises it; a failing merger is neutral.
     if let Some(verdict) = merger_verdict {
+        // (β) synth-provenance hard override: any recorded
+        // `WeakTestGuard` / `ParserBackstop` / `ImplementCrash`
+        // is out-of-band evidence Bellows itself authored an
+        // `## Unaddressed finding:` span. The merger cannot vote
+        // past these — the run routes to AgentSelfReportedFailure
+        // regardless of the verdict token.
+        if outcomes
+            .synth_causes
+            .iter()
+            .any(|cause| {
+                matches!(
+                    cause,
+                    BellowsSynthCause::WeakTestGuard
+                        | BellowsSynthCause::ParserBackstop
+                        | BellowsSynthCause::ImplementCrash
+                )
+            })
+        {
+            return ExitReason::AgentSelfReportedFailure;
+        }
         return match verdict {
             MergerVerdict::Merge => ExitReason::Success,
             MergerVerdict::HoldNoted => ExitReason::SuccessWithNotes,

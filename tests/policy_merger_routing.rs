@@ -51,6 +51,7 @@ fn clean_outcomes_with_agent_authored_heading() -> PhaseOutcomes {
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
         merger_verdict: None,
+        synth_causes: Vec::new(),
         security: None,
         security_fix: None,
     }
