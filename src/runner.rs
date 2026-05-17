@@ -263,6 +263,14 @@ impl AgentContainerProbe for NoAgentContainer {
     }
 }
 
+fn docker_created_timestamp_to_utc(created: Option<i64>) -> chrono::DateTime<chrono::Utc> {
+    // bollard reports created/started as i64 unix seconds.
+    created
+        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+        .or_else(|| created.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis))
+        .unwrap_or_else(chrono::Utc::now)
+}
+
 /// Production `AgentContainerProbe` impl: queries the local Docker
 /// daemon via bollard for any running container whose name starts
 /// with `bellows-` (matching the convention `sandbox::run_agent`
@@ -311,15 +319,7 @@ impl<'a> AgentContainerProbe for BollardAgentContainerProbe<'a> {
                 continue;
             }
             let id = c.id.unwrap_or_default();
-            // bollard reports created/started as i64 unix seconds.
-            let started_at = c
-                .created
-                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                .or_else(|| {
-                    c.created
-                        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-                })
-                .unwrap_or_else(chrono::Utc::now);
+            let started_at = docker_created_timestamp_to_utc(c.created);
             return Ok(Some(RunningAgentContainer {
                 container_id: id,
                 started_at,
@@ -3053,6 +3053,18 @@ pub fn parse_owner_repo(url: &str) -> Result<(String, String), RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_created_timestamp_uses_unix_seconds_before_milliseconds() {
+        let created = 1_778_970_000;
+        let started_at = docker_created_timestamp_to_utc(Some(created));
+
+        assert_eq!(
+            started_at,
+            chrono::DateTime::<chrono::Utc>::from_timestamp(created, 0).unwrap(),
+            "Docker reports container created timestamps in Unix seconds"
+        );
+    }
 
     #[test]
     fn auth_for_chain_entry_opencode_uses_env_file_config_and_expands_tilde() {
