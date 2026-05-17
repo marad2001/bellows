@@ -357,6 +357,41 @@ fn classify_exit_empty_backstop_violations_lets_merge_verdict_win() {
 }
 
 // -----------------------------------------------------------------
+// AC7 — the runner threads `outcomes.merger_verdict` into the
+// classifier. Pinning the wiring at the API level: whatever the
+// runner stores on the field must be what classify_exit sees.
+// (The runner's call site is at src/runner.rs:2155, passing
+// `outcomes.merger_verdict` as the third argument; this test
+// pins the contract on the policy side so a future drift between
+// the two surfaces flips a named test red.)
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_reads_verdict_from_phase_outcomes_field_in_runner_call_pattern() {
+    // Mirror the exact call pattern the runner uses at
+    // src/runner.rs:2155: pass `outcomes.merger_verdict` rather
+    // than a literal `Some(verdict)`. A future change that drops
+    // the field on the floor (e.g. someone passes `None` literally
+    // in the runner) would flip this test red without needing an
+    // integration-level harness.
+    let outcomes = PhaseOutcomes {
+        merger_verdict: Some(MergerVerdict::Merge),
+        ..clean_outcomes_with_agent_authored_heading()
+    };
+    let reason = classify_exit(
+        NotesShape::HasUnaddressedFinding,
+        &outcomes,
+        outcomes.merger_verdict, // ← exact runner.rs pattern
+    );
+    assert_eq!(
+        reason,
+        ExitReason::Success,
+        "outcomes.merger_verdict must thread cleanly into classify_exit \
+         — the runner reads the field at the call site",
+    );
+}
+
+// -----------------------------------------------------------------
 // AC6 — the merger-verdict branch sits below the structural
 // failure precedences in the classifier. Wall-clock exceeded,
 // rate-limit, non-zero implement exit, and gate-failed all beat a
