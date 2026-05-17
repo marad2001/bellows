@@ -1,5 +1,9 @@
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use crate::auth::Auth;
 use crate::chain_walker::{
@@ -180,16 +184,21 @@ fn pr_routing_for_reason<'a>(
 ///
 /// Tagged-snake-case representation keeps the JSON readable in the
 /// status file:
-/// `{"kind": "open_agent_prs", "pr_numbers": [...]}` /
+/// `{"kind": "agent_container_running", "container_id": "...", "started_at": "..."}` /
 /// `{"kind": "stale_agent_branch_deletion_failed", "branch": "...", "error": "..."}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BlockReason {
-    /// Slice b (#42): one or more open `agent/*` PRs may still gate
-    /// master. `pr_numbers` is empty in the fail-closed case (the
-    /// list-PRs API call failed); the renderer distinguishes that
-    /// from a known set.
-    OpenAgentPrs { pr_numbers: Vec<u64> },
+    /// Issue #126 / ADR-0009 slice 4: a `bellows-managed=true`
+    /// container is currently running on the host. The concurrency=1
+    /// invariant prevents starting a second agent run, so this tick
+    /// refuses to claim. Replaces the old `OpenAgentPrs` proxy that
+    /// blocked on open `agent/*` PRs; the new check enforces the
+    /// invariant directly via the local Docker daemon.
+    AgentContainerRunning {
+        container_id: String,
+        started_at: DateTime<Utc>,
+    },
     /// Issue #76 / ADR-0003: the pre-claim sweep of `agent/<N>-*` refs
     /// on origin failed for `branch`. `error` is the formatted
     /// `octocrab::Error` so the operator can read it in `bellows
@@ -201,15 +210,47 @@ pub enum BlockReason {
     },
 }
 
-/// Outcome of `tracker::list_open_agent_prs` as the pre-claim check sees
-/// it. Three variants because the polling loop has to distinguish the
-/// API-failure case (we don't know which PRs are open) from the
-/// genuinely-blocked case (we have a list) — both fail-close to
-/// `RunOutcome::Blocked`, but the status file's rendering differs.
-enum PreClaim {
-    Clear,
-    Blocked(Vec<u64>),
-    BlockedUnknown,
+/// A bellows-managed agent container detected by the pre-claim
+/// container-presence probe. Carries the docker container id and the
+/// time the daemon reports the container started; both surface on the
+/// status file and `bellows status` so the operator knows exactly
+/// which container is holding the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningAgentContainer {
+    pub container_id: String,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Errors raised by an [`AgentContainerProbe`]. The probe is the only
+/// fallible part of the pre-claim container check; we surface the
+/// daemon-side failure verbatim so the polling loop's
+/// `OutcomeTransition` tracker can dedup recurring identical failures
+/// without losing the operator-actionable detail.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeError {
+    /// The probe couldn't reach the Docker daemon or its list call
+    /// failed. The wrapped `String` is the formatted underlying error;
+    /// we don't expose the bollard type directly so the trait stays
+    /// dependency-free for test doubles.
+    #[error("container probe failed: {0}")]
+    Daemon(String),
+}
+
+/// The pre-claim concurrency=1 check (issue #126 / ADR-0009 slice 4):
+/// before claiming the next issue, `run_once` asks the host whether a
+/// bellows-managed agent container is already running. If yes, the
+/// tick is `Blocked(AgentContainerRunning)`; otherwise it proceeds.
+///
+/// Trait-object-safe by returning `Pin<Box<dyn Future>>` rather than
+/// using async-fn-in-trait — the runner stores the probe behind a
+/// `&dyn AgentContainerProbe`, and tests inject simple in-process
+/// doubles without needing a real Docker daemon. Production wires
+/// this to a bollard-backed implementation that filters
+/// containers on `bellows-managed=true` + `status=running`.
+pub trait AgentContainerProbe: Send + Sync {
+    fn detect<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RunningAgentContainer>, ProbeError>> + Send + 'a>>;
 }
 
 /// Per-repo claim candidate the multi-repo polling tick (#35)
@@ -483,109 +524,83 @@ pub async fn run_once(
     config: &Config,
     log_writer: &mut dyn Write,
     status_ctx: Option<&StatusContext>,
+    container_probe: Option<&dyn AgentContainerProbe>,
 ) -> Result<RunOutcome, RunError> {
-    // Issue #35: multi-repo polling. For each configured repo, do the
-    // per-repo pre-claim PR check (#42), and on cleared repos collect
-    // the oldest open `ready-for-agent` issue. Across the combined set
-    // of cleared repos, claim the GLOBALLY-oldest issue by
-    // `created_at`.
-    //
-    // Per-repo pre-claim isolation: repo A being blocked by its own
-    // open `agent/*` PR does NOT block claims from unblocked repo B —
-    // the gating rationale (prior agent's PR may still gate THIS
-    // repo's master) is per-repo, and the cross-repo invariant is just
-    // concurrency=1 which the loop maintains by virtue of being serial
-    // anyway. Only when EVERY repo is blocked does the tick return
-    // `RunOutcome::Blocked`.
-    let mut blocked_prs: Vec<u64> = Vec::new();
-    let mut any_blocked_unknown = false;
-    let mut blocked_any = false;
-    let mut candidates: Vec<RepoCandidate> = Vec::new();
-    let mut any_clear = false;
-    // Issue #116 / ADR-0007: parallel per-repo list of (owner, repo,
-    // repo_order) on cleared repos, used by the re-loop sweep when
-    // the normal pass produces an empty filtered candidate set.
-    let mut cleared_repos: Vec<(String, String, usize)> = Vec::new();
-
-    for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
-        let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
-        let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
-            Ok(prs) if prs.is_empty() => PreClaim::Clear,
-            Ok(prs) => PreClaim::Blocked(prs),
+    // Issue #126 / ADR-0009 slice 4: pre-claim concurrency=1 gate.
+    // Before any per-repo work, ask the host whether a
+    // `bellows-managed=true` container is already running; if yes,
+    // refuse to claim. This is a GLOBAL check across the polling
+    // loop — a container running for repo A blocks claim attempts on
+    // repo B. Replaces the old per-repo open-`agent/*`-PR gate (#42)
+    // that ADR-0009 retires.
+    if let Some(probe) = container_probe {
+        match probe.detect().await {
+            Ok(Some(c)) => {
+                let reason = BlockReason::AgentContainerRunning {
+                    container_id: c.container_id,
+                    started_at: c.started_at,
+                };
+                if let Some(ctx) = status_ctx
+                    && let Err(e) = ctx.write_blocked(&reason).await
+                {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: could not write blocked status (continuing): {}",
+                        e,
+                    );
+                }
+                return Ok(RunOutcome::Blocked { reason });
+            }
+            Ok(None) => {}
             Err(e) => {
+                // Probe failure is logged but not fail-closed: the
+                // concurrency=1 invariant is also enforced by the
+                // serial polling loop itself, so a transient daemon
+                // hiccup must not stall every repo's throughput.
+                // Subsequent ticks retry the probe.
                 let _ = writeln!(
                     log_writer,
-                    "bellows: pre-claim PR check failed for {}/{}; failing closed (treating that repo as blocked this tick): {}",
-                    owner, repo, e,
+                    "bellows: pre-claim container probe failed (proceeding this tick): {}",
+                    e,
                 );
-                PreClaim::BlockedUnknown
-            }
-        };
-        match preclaim {
-            PreClaim::Blocked(prs) => {
-                blocked_any = true;
-                blocked_prs.extend(prs);
-            }
-            PreClaim::BlockedUnknown => {
-                blocked_any = true;
-                any_blocked_unknown = true;
-            }
-            PreClaim::Clear => {
-                any_clear = true;
-                let next = tracker::find_next_issue(
-                    client,
-                    &owner,
-                    &repo,
-                    &config.polling.pickup_label,
-                    &config.runtime_labels.agent_in_progress,
-                    &config.runtime_labels.blocked_by,
-                )
-                .await?;
-                if let Some(issue) = next {
-                    candidates.push(RepoCandidate {
-                        owner: owner.clone(),
-                        repo: repo.clone(),
-                        repo_url: repo_cfg.url.clone(),
-                        issue,
-                        repo_order,
-                    });
-                }
-                cleared_repos.push((owner, repo, repo_order));
             }
         }
     }
 
-    // No cleared repo produced a claimable issue. If at least one repo
-    // was blocked, this whole tick is "blocked" from the operator's
-    // perspective; otherwise it's idle.
-    if candidates.is_empty() {
-        if blocked_any && !any_clear {
-            // Every configured repo was blocked. Report the union of
-            // known blocking PR numbers (empty when every blocker was
-            // an unknown / list-PRs failure — same fail-closed contract
-            // as the single-repo path).
-            let prs = if any_blocked_unknown && blocked_prs.is_empty() {
-                Vec::new()
-            } else {
-                blocked_prs
-            };
-            let reason = BlockReason::OpenAgentPrs { pr_numbers: prs };
-            if let Some(ctx) = status_ctx
-                && let Err(e) = ctx.write_blocked(&reason).await
-            {
-                let _ = writeln!(
-                    log_writer,
-                    "bellows: could not write blocked status (continuing): {}",
-                    e,
-                );
-            }
-            return Ok(RunOutcome::Blocked { reason });
-        }
+    // Issue #35: multi-repo polling. For each configured repo, collect
+    // the oldest open `ready-for-agent` issue. Across the combined set
+    // of repos, claim the GLOBALLY-oldest issue by `created_at`.
+    let mut candidates: Vec<RepoCandidate> = Vec::new();
+    // Issue #116 / ADR-0007: parallel per-repo list of (owner, repo,
+    // repo_order), used by the re-loop sweep when the normal pass
+    // produces an empty filtered candidate set.
+    let mut cleared_repos: Vec<(String, String, usize)> = Vec::new();
 
-        // Some repos cleared but produced no candidates (or all repos
-        // were blocked but at least one cleared — but that branch
-        // can't happen here because candidates is empty). Either way,
-        // the steady-state log line is Idle — but FIRST, if any
+    for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
+        let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
+        let next = tracker::find_next_issue(
+            client,
+            &owner,
+            &repo,
+            &config.polling.pickup_label,
+            &config.runtime_labels.agent_in_progress,
+            &config.runtime_labels.blocked_by,
+        )
+        .await?;
+        if let Some(issue) = next {
+            candidates.push(RepoCandidate {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                repo_url: repo_cfg.url.clone(),
+                issue,
+                repo_order,
+            });
+        }
+        cleared_repos.push((owner, repo, repo_order));
+    }
+
+    if candidates.is_empty() {
+        // No repo produced a claimable issue this tick. If any
         // cleared repo has blocked-by-labelled issues, run the
         // re-loop sweep (issue #116 / ADR-0007). The sweep runs only
         // when there's no unblocked work to claim; a cleared

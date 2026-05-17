@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use bollard::query_parameters::{
-    KillContainerOptions, ListContainersOptionsBuilder, ListVolumesOptionsBuilder,
-    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder,
+    InspectContainerOptionsBuilder, KillContainerOptions, ListContainersOptionsBuilder,
+    ListVolumesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RemoveVolumeOptionsBuilder,
 };
 use bollard::Docker;
 use sha2::{Digest, Sha256};
@@ -1028,19 +1029,139 @@ fn orphan_info_from_labels(id: &str, labels: &HashMap<String, String>) -> Orphan
     }
 }
 
-/// Force-remove every container carrying the `bellows-managed=true`
+fn build_orphan_container_filter() -> HashMap<String, Vec<String>> {
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
+    );
+    filters.insert("status".to_string(), vec!["exited".to_string()]);
+    filters
+}
+
+/// Bollard-backed implementation of [`crate::runner::AgentContainerProbe`].
+///
+/// Queries the local Docker daemon for any running container carrying
+/// the `bellows-managed=true` label. Returns the first match's
+/// container id + start time, or `None` if no such container is
+/// running. Used by `runner::run_once`'s pre-claim concurrency=1 gate
+/// (issue #126 / ADR-0009 slice 4), replacing the old
+/// open-`agent/*`-PR proxy with a direct enforcement of the invariant.
+pub struct DockerContainerProbe {
+    docker: Docker,
+}
+
+impl DockerContainerProbe {
+    /// Build a probe wired to the local Docker daemon — same connection
+    /// style every other `sandbox.rs` daemon call uses.
+    pub fn new() -> Result<Self, SandboxError> {
+        let docker = Docker::connect_with_local_defaults()?;
+        Ok(Self { docker })
+    }
+}
+
+impl crate::runner::AgentContainerProbe for DockerContainerProbe {
+    fn detect<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::runner::RunningAgentContainer>,
+                        crate::runner::ProbeError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+            filters.insert(
+                "label".to_string(),
+                vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
+            );
+            // Server-side filter on `status=running` so stopped corpses
+            // (the slice-7 orphan-cleanup target) do NOT trip the
+            // concurrency=1 gate. The orphan-cleanup path at startup
+            // is the right tool for those.
+            filters.insert("status".to_string(), vec!["running".to_string()]);
+            let options = ListContainersOptionsBuilder::default()
+                .filters(&filters)
+                .build();
+            let containers = self
+                .docker
+                .list_containers(Some(options))
+                .await
+                .map_err(|e| crate::runner::ProbeError::Daemon(format!("{e}")))?;
+            // Return the first match; for the concurrency=1 invariant
+            // we only need to know IF any is running, not enumerate
+            // all of them. If two are somehow running (a state the
+            // invariant says shouldn't exist), reporting one is
+            // enough for the operator to start investigating.
+            for c in containers {
+                let Some(id) = c.id else {
+                    continue;
+                };
+                let inspect_options = InspectContainerOptionsBuilder::default()
+                    .size(false)
+                    .build();
+                let details = match self
+                    .docker
+                    .inspect_container(&id, Some(inspect_options))
+                    .await
+                {
+                    Ok(details) => details,
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => continue,
+                    Err(e) => return Err(crate::runner::ProbeError::Daemon(format!("{e}"))),
+                };
+                let started_at = started_at_from_inspect(&id, details)?;
+                return Ok(Some(crate::runner::RunningAgentContainer {
+                    container_id: id,
+                    started_at,
+                }));
+            }
+            Ok(None)
+        })
+    }
+}
+
+fn started_at_from_inspect(
+    container_id: &str,
+    details: bollard::models::ContainerInspectResponse,
+) -> Result<chrono::DateTime<chrono::Utc>, crate::runner::ProbeError> {
+    let raw_started_at = details
+        .state
+        .and_then(|state| state.started_at)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            crate::runner::ProbeError::Daemon(format!(
+                "docker inspect for container {container_id} did not include State.StartedAt",
+            ))
+        })?;
+
+    chrono::DateTime::parse_from_rfc3339(&raw_started_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            crate::runner::ProbeError::Daemon(format!(
+                "docker inspect for container {container_id} returned invalid State.StartedAt `{raw_started_at}`: {e}",
+            ))
+        })
+}
+
+/// Force-remove stopped containers carrying the `bellows-managed=true`
 /// label. Called once at `bellows run` startup, before the polling loop.
 /// Containers that completed normally were already removed by their
-/// own lifecycle (see `run_container`'s drop path); anything still
-/// present is by definition an orphan from a prior bellows process
-/// that didn't shut down cleanly (Ctrl-C, SIGKILL, panic, machine
-/// sleep).
+/// own lifecycle (see `run_container`'s drop path); a stopped managed
+/// container still present is an orphan from a prior bellows process
+/// that didn't finish cleanup.
 ///
-/// Single-instance assumption: this rule assumes only one `bellows
-/// run` process exists at a time. Running two instances in parallel
-/// would clobber the other's running containers. Acceptable for v1;
-/// `bellows-process-id` labeling is a future enhancement for
-/// multi-instance support.
+/// Running managed containers are intentionally ignored here. The
+/// pre-claim container probe reports them as
+/// `Blocked(AgentContainerRunning)`, so startup cleanup must not remove
+/// a live container before the concurrency gate can block.
 ///
 /// GitHub state is NOT touched. Issues that were `agent-in-progress`
 /// when the prior bellows died stay there until the operator
@@ -1060,13 +1181,9 @@ pub async fn cleanup_orphan_containers(
     docker: &Docker,
     log_writer: &mut dyn Write,
 ) -> Result<Vec<String>, SandboxError> {
-    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec!["bellows-managed=true".to_string()],
-    );
+    let filters = build_orphan_container_filter();
     let options = ListContainersOptionsBuilder::default()
-        .all(true) // include stopped containers as well as running
+        .all(true) // required for Docker to return stopped containers
         .filters(&filters)
         .build();
 
@@ -1225,7 +1342,11 @@ pub async fn remove_cache_volume(docker: &Docker, name: &str) -> Result<(), Sand
 mod tests {
     use super::*;
     use crate::config::Engine;
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn build_agent_env_surfaces_env_file_errors_without_panicking() {
@@ -1299,6 +1420,99 @@ mod tests {
             Some("deadbeef-1234-5678-9abc-def012345678"),
         );
         assert_eq!(info.purpose, None); // bellows-purpose not present
+    }
+
+    #[test]
+    fn orphan_cleanup_filter_targets_stopped_containers_only() {
+        // Startup cleanup must not delete a still-running managed
+        // container before the pre-claim gate can report it as
+        // Blocked(AgentContainerRunning). Docker exposes stopped
+        // containers to list filters as status=exited.
+        let filter = build_orphan_container_filter();
+
+        let label_values = filter.get("label").expect("label key required");
+        assert_eq!(
+            label_values,
+            &vec!["bellows-managed=true".to_string()],
+            "cleanup must stay scoped to bellows-managed containers: {:?}",
+            label_values,
+        );
+
+        let status_values = filter.get("status").expect("status key required");
+        assert_eq!(
+            status_values,
+            &vec!["exited".to_string()],
+            "cleanup must only target stopped containers: {:?}",
+            status_values,
+        );
+        assert!(
+            !status_values.iter().any(|v| v == "running"),
+            "cleanup must not include running containers: {:?}",
+            status_values,
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_container_probe_reports_inspect_state_started_at() {
+        // Docker's list summary `Created` is the container creation
+        // time, not the process start time surfaced by inspect's
+        // `State.StartedAt`. The status contract promises the latter.
+        let mock = MockServer::start().await;
+        let container_id =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let created_at: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+        let started_at: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2026-05-17T10:30:00.123456789Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+        Mock::given(method("GET"))
+            .and(path("/containers/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "Id": container_id,
+                    "Created": created_at.timestamp(),
+                    "Labels": { "bellows-managed": "true" },
+                    "State": "running"
+                }
+            ])))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/containers/{container_id}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Id": container_id,
+                "Created": created_at.to_rfc3339(),
+                "State": {
+                    "Status": "running",
+                    "Running": true,
+                    "StartedAt": started_at.to_rfc3339()
+                }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let docker = Docker::connect_with_http(&mock.uri(), 5, bollard::API_DEFAULT_VERSION)
+            .expect("mock Docker connection");
+        let probe = DockerContainerProbe { docker };
+
+        let detected = <DockerContainerProbe as crate::runner::AgentContainerProbe>::detect(&probe)
+            .await
+            .expect("probe should read mocked Docker responses")
+            .expect("mocked running container should be detected");
+
+        assert_eq!(detected.container_id, container_id);
+        assert_eq!(
+            detected.started_at, started_at,
+            "probe must report inspect State.StartedAt, not list Created",
+        );
+        assert_ne!(detected.started_at, created_at);
     }
 
     #[test]

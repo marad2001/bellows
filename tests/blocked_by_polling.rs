@@ -101,7 +101,7 @@ async fn normal_pass_filters_out_issues_carrying_blocked_by_label() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
             n, 2,
@@ -161,7 +161,7 @@ async fn claim_order_is_ascending_issue_number_not_created_at() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
             n, 5,
@@ -246,7 +246,7 @@ pat_env_var = "BELLOWS_TEST_PAT"
     let config = Config::from_str(&toml).expect("multi-repo config parses");
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
             n, 7,
@@ -337,7 +337,7 @@ pat_env_var = "BELLOWS_TEST_PAT"
     let config = Config::from_str(&toml).expect("multi-repo config parses");
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
             n, 11,
@@ -421,7 +421,7 @@ async fn run_once_returns_idle_when_only_blocked_by_issues_exist_but_no_brief_to
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await
+    let outcome = run_once(&client, &config, &mut log, None, None).await
         .expect("run_once should succeed");
     assert!(
         matches!(outcome, RunOutcome::Idle),
@@ -467,7 +467,7 @@ async fn run_once_keeps_re_loop_quiet_when_no_blocked_by_issues_exist() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
+    let outcome = run_once(&client, &config, &mut log, None, None)
         .await
         .expect("run_once should succeed");
     assert!(
@@ -590,7 +590,7 @@ async fn re_loop_sweep_strips_blocked_by_when_all_blockers_closed() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await
+    let outcome = run_once(&client, &config, &mut log, None, None).await
         .expect("run_once should succeed");
     assert!(
         matches!(outcome, RunOutcome::Idle),
@@ -662,7 +662,7 @@ async fn re_loop_sweep_does_not_run_when_normal_pass_found_work() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(9)) => {}
         other => panic!(
@@ -747,7 +747,7 @@ async fn re_loop_sweep_leaves_label_when_blocker_still_open() {
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await
+    let outcome = run_once(&client, &config, &mut log, None, None).await
         .expect("run_once should succeed");
     assert!(matches!(outcome, RunOutcome::Idle));
 

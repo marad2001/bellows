@@ -447,58 +447,6 @@ pub async fn strip_issue_label(
     Ok(updated)
 }
 
-/// Minimal shape of an open PR for the pre-claim check (#42). We only
-/// care about the PR number (for the block-set log line) and the head
-/// ref's name (to filter to bellows-authored `agent/*` branches).
-#[derive(Debug, Deserialize)]
-struct PullRequest {
-    number: u64,
-    head: PullRequestRef,
-}
-
-#[derive(Debug, Deserialize)]
-struct PullRequestRef {
-    #[serde(rename = "ref")]
-    ref_name: String,
-}
-
-#[derive(serde::Serialize)]
-struct ListPullsParams<'a> {
-    state: &'a str,
-    per_page: u32,
-}
-
-/// List the numbers of open PRs whose head ref starts with `agent/`
-/// (the bellows branch-naming convention enforced by `agent_branch_name`).
-///
-/// Used by `run_once`'s pre-claim PR check (#42): when any such PR is
-/// open, the polling tick must refuse to claim the next issue because
-/// the prior PR may still gate master. The strict `agent/` prefix is
-/// intentional — human-authored PRs on non-`agent/*` branches must not
-/// stall bellows.
-///
-/// The GitHub list-pulls endpoint doesn't accept a head-prefix filter
-/// server-side, so we paginate (well — request `per_page=100`, matching
-/// the rest of bellows's GitHub-list calls; in practice bellows-on-bellows
-/// has 0 or 1 open agent PRs at a time) and filter client-side.
-pub async fn list_open_agent_prs(
-    client: &octocrab::Octocrab,
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<u64>, octocrab::Error> {
-    let route = format!("/repos/{owner}/{repo}/pulls");
-    let params = ListPullsParams {
-        state: "open",
-        per_page: 100,
-    };
-    let prs: Vec<PullRequest> = client.get(&route, Some(&params)).await?;
-    Ok(prs
-        .into_iter()
-        .filter(|p| p.head.ref_name.starts_with("agent/"))
-        .map(|p| p.number)
-        .collect())
-}
-
 /// Single entry returned by the GitHub `git/matching-refs/{ref}` API. We
 /// only care about the fully-qualified ref name (`refs/heads/agent/16-foo`);
 /// the SHA + object metadata that GitHub also includes are ignored.

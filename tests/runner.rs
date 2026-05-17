@@ -66,142 +66,13 @@ pat_env_var = "BELLOWS_TEST_PAT"
     Config::from_str(&toml).expect("config parses")
 }
 
-#[tokio::test]
-async fn run_once_returns_blocked_when_an_open_agent_pr_exists_and_skips_find_next_issue() {
-    // Brief: "A polling tick that finds at least one open `agent/*` PR
-    // returns `RunOutcome::Blocked` and does NOT call `find_next_issue`
-    // or claim any issue." We deliberately mount NO mock for the issues
-    // endpoint — if `run_once` called it, wiremock would 404 and the
-    // run would surface a different RunOutcome (or error). The Blocked
-    // outcome here is what proves the issues call was skipped.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let config = config_for(&mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
-        .await
-        .expect("run_once should succeed");
-    match outcome {
-        RunOutcome::Blocked {
-            reason: BlockReason::OpenAgentPrs { pr_numbers },
-        } => {
-            assert_eq!(pr_numbers, vec![41]);
-        }
-        other => panic!("expected Blocked(OpenAgentPrs), got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn run_once_returns_blocked_when_draft_agent_pr_is_open() {
-    // Brief: "Draft PRs on `agent/*` branches block exactly like
-    // ready-for-review PRs". A draft agent PR is bellows's typical
-    // stuck-after-CI-failure state — exactly the situation the pre-claim
-    // check exists to catch.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 99, "head": { "ref": "agent/99-draft" }, "draft": true }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let config = config_for(&mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
-        .await
-        .expect("run_once should succeed");
-    match outcome {
-        RunOutcome::Blocked {
-            reason: BlockReason::OpenAgentPrs { pr_numbers },
-        } => assert_eq!(pr_numbers, vec![99]),
-        other => panic!("expected Blocked(OpenAgentPrs[99]), got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn run_once_does_not_block_on_open_prs_with_non_agent_branches() {
-    // Brief: "Manual / human-authored PRs on non-`agent/*` branches do
-    // NOT block. The filter is strict on the `agent/` prefix." With only
-    // a human-authored PR open and no ready-for-agent issues, the
-    // pre-claim check passes and the tick falls through to the existing
-    // Idle path.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 50, "head": { "ref": "fix-something-human" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    // No issues labelled ready-for-agent — pre-claim check passes, the
-    // issues endpoint returns empty, and run_once should return Idle.
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/issues"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let config = config_for(&mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
-        .await
-        .expect("run_once should succeed");
-    assert!(
-        matches!(outcome, RunOutcome::Idle),
-        "expected Idle (human PR must not block), got {outcome:?}",
-    );
-}
-
-#[tokio::test]
-async fn run_once_returns_blocked_fail_closed_when_list_prs_call_fails() {
-    // Brief: "When the GitHub list-PRs API call fails for any reason,
-    // bellows treats it as blocked (fail-closed). The next polling
-    // tick retries." When we don't know whether master is gated, the
-    // safe answer is to refuse to claim — the same answer we give
-    // when we *know* master is gated.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let config = config_for(&mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
-        .await
-        .expect("run_once should succeed (errors map to Blocked, not Err)");
-    // pr_numbers is empty because we couldn't list them.
-    match outcome {
-        RunOutcome::Blocked {
-            reason: BlockReason::OpenAgentPrs { pr_numbers },
-        } => assert!(
-            pr_numbers.is_empty(),
-            "fail-closed Blocked has empty pr_numbers, got {pr_numbers:?}",
-        ),
-        other => panic!("expected Blocked(OpenAgentPrs[]) (fail-closed), got {other:?}"),
-    }
-}
+// ---- Issue #126 / ADR-0009 slice 4: the pre-claim PR-open gate has
+//      been removed and replaced with a global container-presence
+//      probe. The four tests that used to live here pinned the old
+//      behavior (Blocked(OpenAgentPrs) on open agent PRs, fail-closed
+//      Blocked on a 500 from /pulls). New coverage for the
+//      container-gate replacement lives in
+//      `tests/runner_container_gate.rs`. ----
 
 // ---- Issue #35: multi-repo polling. Oldest-by-`created_at` across all
 //      configured repos is claimed first. ----
@@ -302,7 +173,7 @@ pat_env_var = "BELLOWS_TEST_PAT"
     let config = Config::from_str(&toml).expect("multi-repo config parses");
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
 
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
@@ -315,89 +186,17 @@ pat_env_var = "BELLOWS_TEST_PAT"
     }
 }
 
-#[tokio::test]
-async fn run_once_only_blocks_when_every_configured_repo_is_blocked() {
-    // Issue #35 nuance: per-repo pre-claim check. Repo A being blocked
-    // by its own open `agent/*` PR must NOT block claims from repo B.
-    // The cross-repo invariant is concurrency=1, which the polling loop
-    // maintains by being serial. Verifying this avoids regressing into
-    // a "block everything if any repo is blocked" behaviour that would
-    // stall multi-repo deployments whenever any one repo's CI is slow.
-    let mock = MockServer::start().await;
-
-    // repo-a is blocked by its own open agent PR.
-    Mock::given(method("GET"))
-        .and(path("/repos/owner-x/repo-a/pulls"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    // repo-b is clear.
-    Mock::given(method("GET"))
-        .and(path("/repos/owner-x/repo-b/pulls"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
-
-    // repo-b has a ready-for-agent issue #50.
-    Mock::given(method("GET"))
-        .and(path("/repos/owner-x/repo-b/issues"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "number": 50,
-                "title": "unblocked issue from repo-b",
-                "created_at": "2026-03-01T00:00:00Z",
-                "labels": [{ "name": "ready-for-agent" }]
-            }
-        ])))
-        .mount(&mock)
-        .await;
-
-    // Pre-claim stale-branch sweep (#76) for repo-b/#50: no stale refs.
-    Mock::given(method("GET"))
-        .and(path("/repos/owner-x/repo-b/git/matching-refs/heads/agent/50-"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
-
-    // Brief missing on #50 -> short-circuit at MissingAgentBrief(50)
-    // proves repo-b's issue was picked despite repo-a being blocked.
-    Mock::given(method("GET"))
-        .and(path("/repos/owner-x/repo-b/issues/50/comments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
-
-    let toml = format!(
-        r#"
-[[repo]]
-url = "{base}/owner-x/repo-a"
-
-[[repo]]
-url = "{base}/owner-x/repo-b"
-
-[github]
-pat_env_var = "BELLOWS_TEST_PAT"
-"#,
-        base = mock.uri(),
-    );
-    let config = Config::from_str(&toml).expect("multi-repo config parses");
-    let client = octocrab_pointed_at(mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
-
-    match outcome {
-        Err(RunError::MissingAgentBrief(n)) => assert_eq!(
-            n, 50,
-            "repo-b's unblocked issue should be selected even when repo-a is blocked",
-        ),
-        other => panic!(
-            "expected MissingAgentBrief(50) (repo-b's issue), got {other:?}",
-        ),
-    }
-}
+// Issue #126 / ADR-0009 slice 4: the original
+// `run_once_only_blocks_when_every_configured_repo_is_blocked` test
+// pinned the OLD per-repo PR-open gate's anti-regression invariant
+// ("repo A's open `agent/*` PR must not block claims from repo B").
+// With the PR-open gate dropped entirely, that invariant is moot —
+// the new gate is the GLOBAL container-presence probe, and its
+// cross-repo behaviour is covered by
+// `tests/runner_container_gate.rs::run_once_container_gate_blocks_globally_across_all_repos`.
+// The remaining issue-#35 multi-repo-oldest-first behaviour is still
+// covered by `run_once_picks_oldest_issue_across_multiple_repos_by_created_at`
+// above.
 
 // ---- Issue #76 / ADR-0003: pre-claim deletion of stale agent/<N>-*
 //      branches on origin. The sweep fires after find_next_issue picks a
@@ -472,7 +271,7 @@ async fn run_once_sweeps_stale_agent_branches_before_claiming() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
         Err(RunError::MissingAgentBrief(16)) => {}
         other => panic!(
@@ -535,7 +334,7 @@ async fn run_once_returns_blocked_when_stale_branch_deletion_fails() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
+    let outcome = run_once(&client, &config, &mut log, None, None)
         .await
         .expect("run_once should map DELETE failure to RunOutcome::Blocked, not Err");
     match outcome {
@@ -550,45 +349,15 @@ async fn run_once_returns_blocked_when_stale_branch_deletion_fails() {
     }
 }
 
-#[tokio::test]
-async fn run_once_does_not_sweep_stale_branches_when_blocked_by_open_pr() {
-    // Slice-b precedence AC: "if any `agent/*` PR is open anywhere, the
-    // new check is not consulted (bellows is already blocked at the
-    // slice-b layer)." Wiremock would 404 a matching-refs request because
-    // we don't mount that endpoint here; if run_once issued it, the
-    // outcome shape would change. The Blocked(OpenAgentPrs) outcome
-    // proves the sweep was skipped.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    // matching-refs is intentionally NOT mocked: wiremock will 404, which
-    // would surface in run_once as an error if the sweep were called.
-
-    let client = octocrab_pointed_at(mock.uri());
-    let config = config_for(&mock.uri());
-    let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None)
-        .await
-        .expect("run_once should succeed via the slice-b Blocked path");
-    match outcome {
-        RunOutcome::Blocked {
-            reason: BlockReason::OpenAgentPrs { pr_numbers },
-        } => {
-            assert_eq!(pr_numbers, vec![41]);
-        }
-        other => panic!(
-            "expected Blocked(OpenAgentPrs[41]) — sweep must not fire when slice-b already blocked, got {other:?}",
-        ),
-    }
-}
+// Issue #126 / ADR-0009 slice 4: the slice-b precedence test for
+// "sweep does not fire when blocked by open PR" has been removed.
+// With the PR-open gate dropped, there is no slice-b layer to skip
+// the sweep behind. The new container-presence gate's analogous
+// precedence behaviour (probe fires before any per-repo work, so
+// the sweep is skipped when blocked) is covered by
+// `tests/runner_container_gate.rs::run_once_returns_blocked_when_agent_container_is_running`,
+// which mounts no /git/matching-refs mock and asserts the
+// Blocked outcome — symmetric to the deleted test.
 
 #[tokio::test]
 async fn run_once_logs_sweep_summary_when_deletions_happen() {
@@ -661,7 +430,7 @@ async fn run_once_logs_sweep_summary_when_deletions_happen() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let _ = run_once(&client, &config, &mut log, None).await;
+    let _ = run_once(&client, &config, &mut log, None, None).await;
     let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
     assert!(
         log_str.contains("bellows: pre-claim swept 2 stale agent/16-* branch(es) before claiming issue #16"),
@@ -713,7 +482,7 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let _ = run_once(&client, &config, &mut log, None).await;
+    let _ = run_once(&client, &config, &mut log, None, None).await;
     let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
     assert!(
         !log_str.contains("pre-claim swept"),
