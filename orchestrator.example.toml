@@ -143,11 +143,27 @@ api_key_env_file = "~/.config/bellows/opencode.env"
 #
 # [phases.implement]
 # cli_chain = ["opencode:deepseek/deepseek-v4-pro", "claude"]
+#
+# Phase 8 — merger (issue #123 / ADR-0009 slice 1). Read-only
+# end-of-pipeline judgement: reads the diff, the brief's ACs, the
+# final agent-notes content, and the cargo-checks gate status, then
+# emits a `VERDICT: <MERGE|HOLD-NOTED|HOLD-DRAFT>` line. The verdict
+# is logged and stored in run state; routing on it is wired in
+# slice 2 (#124).
+#
+# Default-default for this phase is `["claude:claude-opus-4-7"]`
+# (opus is the first-look-judgement role; cross-family independence
+# from codex which originates most agent-authored unaddressed-finding
+# headings in phase 4).
+#
+# [phases.merge]
+# cli_chain = ["claude:claude-opus-4-7"]
 
 [agent]
 # Per-issue wall-clock budget. Bellows tracks elapsed time across all
 # container runs in one pipeline (implement, post-implement gate,
-# review, review-fix, end-pipeline gate); when the budget is spent or
+# review, review-fix, security-review, security-fix, end-pipeline gate,
+# merger); when the budget is spent or
 # the deadline fires mid-container, the run halts and routes to a
 # draft PR with the `agent-failed` label. Default: 60 minutes.
 # Single global cap shared across every configured repo (per-repo
