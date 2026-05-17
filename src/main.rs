@@ -3541,4 +3541,102 @@ pat_env_var = "X"
             _ => panic!("expected Triage with repo=Some(\"marad2001/bellows\")"),
         }
     }
+
+    // ---- Issue #127: --repo flag on `bellows triage` for single-repo
+    // scoping. These ACs are satisfied by the implementation that
+    // landed for #115; the tests below pin the operator-visible
+    // surface against the specific scenarios #127's brief calls out
+    // so a future refactor cannot silently regress them.
+
+    #[test]
+    fn cli_triage_help_surfaces_the_repo_flag_with_owner_name_value_name() {
+        // Issue #127 AC1: `bellows triage --help` must show a
+        // `--repo <owner>/<name>` option. An operator discovering the
+        // single-repo-scoping behaviour by scanning `--help` must
+        // see both the flag name and a value placeholder that
+        // communicates the expected slug shape (so they know to
+        // pass `marad2001/bellows`, not just `bellows`).
+        let mut cmd = Cli::command();
+        let triage_help = cmd
+            .find_subcommand_mut("triage")
+            .expect("triage subcommand missing")
+            .render_help()
+            .to_string();
+        assert!(
+            triage_help.contains("--repo"),
+            "triage --help must surface the --repo flag: {triage_help}"
+        );
+        assert!(
+            triage_help.contains("OWNER/NAME") || triage_help.contains("owner/name"),
+            "triage --help must show the <owner>/<name> value placeholder so the operator knows the expected slug shape: {triage_help}"
+        );
+    }
+
+    #[test]
+    fn resolve_triage_filter_positional_with_repo_flag_resolves_to_named_repo() {
+        // Issue #127 AC3: `bellows triage 42 --repo marad2001/repo-b`
+        // must triage issue #42 on `repo-b` — NOT the first-configured
+        // repo. This is the per-issue disambiguation form. Without
+        // --repo, the positional path falls back to the first repo
+        // (preserving pre-#115 behaviour via a warning); with --repo,
+        // the named repo wins regardless of [[repo]] ordering.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+            "https://github.com/marad2001/repo-c",
+        ]);
+        let resolved = resolve_triage_filter(
+            Some(42),
+            Some("marad2001/repo-b"),
+            &[],
+            &repos,
+        )
+        .expect("positional <N> + --repo must resolve to the named repo");
+        assert_eq!(resolved.repo_owner, "marad2001");
+        assert_eq!(
+            resolved.repo_name, "repo-b",
+            "--repo must override the first-[[repo]] fallback for the positional form"
+        );
+        assert_eq!(
+            resolved.repo_url,
+            "https://github.com/marad2001/repo-b",
+            "the resolved repo_url must be repo-b's URL, not repo-a's"
+        );
+        assert_eq!(
+            resolved.explicit_issues,
+            vec![42],
+            "positional <N> must round-trip into explicit_issues as a single-element list"
+        );
+    }
+
+    #[test]
+    fn resolve_triage_filter_no_repo_flag_in_multi_repo_drain_falls_back_to_first_repo() {
+        // Issue #127 AC5 (backwards compatibility): when --repo is
+        // omitted AND no issue is named (the bare backlog-drain
+        // form), behaviour is unchanged from pre-#115 — the drain
+        // scopes to the first configured [[repo]]. The operator-
+        // visible warning that this is happening is emitted by
+        // triage_cmd (impure, not tested here); the pure resolver's
+        // contract is to round-trip the first repo so the drain
+        // walks its needs-triage backlog.
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-first",
+            "https://github.com/marad2001/repo-second",
+            "https://github.com/marad2001/repo-third",
+        ]);
+        let resolved = resolve_triage_filter(None, None, &[], &repos)
+            .expect("bare drain without --repo must resolve in multi-repo config");
+        assert_eq!(
+            resolved.repo_owner, "marad2001",
+            "fallback must use the first [[repo]] entry's owner"
+        );
+        assert_eq!(
+            resolved.repo_name, "repo-first",
+            "fallback must use the first [[repo]] entry's name, not repo-second or repo-third"
+        );
+        assert!(
+            resolved.explicit_issues.is_empty(),
+            "no positional or --issue means drain mode: explicit_issues must be empty"
+        );
+    }
 }
