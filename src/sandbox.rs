@@ -1028,6 +1028,16 @@ fn orphan_info_from_labels(id: &str, labels: &HashMap<String, String>) -> Orphan
     }
 }
 
+fn build_orphan_container_filter() -> HashMap<String, Vec<String>> {
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
+    );
+    filters.insert("status".to_string(), vec!["exited".to_string()]);
+    filters
+}
+
 /// Bollard-backed implementation of [`crate::runner::AgentContainerProbe`].
 ///
 /// Queries the local Docker daemon for any running container carrying
@@ -1103,19 +1113,17 @@ impl crate::runner::AgentContainerProbe for DockerContainerProbe {
     }
 }
 
-/// Force-remove every container carrying the `bellows-managed=true`
+/// Force-remove stopped containers carrying the `bellows-managed=true`
 /// label. Called once at `bellows run` startup, before the polling loop.
 /// Containers that completed normally were already removed by their
-/// own lifecycle (see `run_container`'s drop path); anything still
-/// present is by definition an orphan from a prior bellows process
-/// that didn't shut down cleanly (Ctrl-C, SIGKILL, panic, machine
-/// sleep).
+/// own lifecycle (see `run_container`'s drop path); a stopped managed
+/// container still present is an orphan from a prior bellows process
+/// that didn't finish cleanup.
 ///
-/// Single-instance assumption: this rule assumes only one `bellows
-/// run` process exists at a time. Running two instances in parallel
-/// would clobber the other's running containers. Acceptable for v1;
-/// `bellows-process-id` labeling is a future enhancement for
-/// multi-instance support.
+/// Running managed containers are intentionally ignored here. The
+/// pre-claim container probe reports them as
+/// `Blocked(AgentContainerRunning)`, so startup cleanup must not remove
+/// a live container before the concurrency gate can block.
 ///
 /// GitHub state is NOT touched. Issues that were `agent-in-progress`
 /// when the prior bellows died stay there until the operator
@@ -1135,13 +1143,9 @@ pub async fn cleanup_orphan_containers(
     docker: &Docker,
     log_writer: &mut dyn Write,
 ) -> Result<Vec<String>, SandboxError> {
-    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec!["bellows-managed=true".to_string()],
-    );
+    let filters = build_orphan_container_filter();
     let options = ListContainersOptionsBuilder::default()
-        .all(true) // include stopped containers as well as running
+        .all(true) // required for Docker to return stopped containers
         .filters(&filters)
         .build();
 
@@ -1374,6 +1378,36 @@ mod tests {
             Some("deadbeef-1234-5678-9abc-def012345678"),
         );
         assert_eq!(info.purpose, None); // bellows-purpose not present
+    }
+
+    #[test]
+    fn orphan_cleanup_filter_targets_stopped_containers_only() {
+        // Startup cleanup must not delete a still-running managed
+        // container before the pre-claim gate can report it as
+        // Blocked(AgentContainerRunning). Docker exposes stopped
+        // containers to list filters as status=exited.
+        let filter = build_orphan_container_filter();
+
+        let label_values = filter.get("label").expect("label key required");
+        assert_eq!(
+            label_values,
+            &vec!["bellows-managed=true".to_string()],
+            "cleanup must stay scoped to bellows-managed containers: {:?}",
+            label_values,
+        );
+
+        let status_values = filter.get("status").expect("status key required");
+        assert_eq!(
+            status_values,
+            &vec!["exited".to_string()],
+            "cleanup must only target stopped containers: {:?}",
+            status_values,
+        );
+        assert!(
+            !status_values.iter().any(|v| v == "running"),
+            "cleanup must not include running containers: {:?}",
+            status_values,
+        );
     }
 
     #[test]
