@@ -666,6 +666,62 @@ pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
     found
 }
 
+/// Phase-8 merger prompt (issue #123 / ADR-0009 slice 1).
+///
+/// Mirrors the existing `REVIEW_PROMPT` / `SECURITY_REVIEW_PROMPT`
+/// shape but is read-only and emits a natural-language prose review
+/// ending in a `VERDICT: <token>` line carrying exactly one of
+/// `MERGE`, `HOLD-NOTED`, or `HOLD-DRAFT`. The merger reads the diff
+/// vs master, the brief's verbatim ACs (passed via the kickoff
+/// prompt), the final `agent-notes.md` content (with synth-provenance
+/// markers), and CI / cargo-checks status — then judges whether the
+/// diff satisfies the ACs. Notes are treated as agent-stated
+/// reasoning, NOT evidence the code is correct; the diff and ACs are
+/// the anchor.
+pub fn render_merger_prompt() -> String {
+    MERGER_PROMPT.to_string()
+}
+
+const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bellows agent pipeline. The implement → cargo-checks → review → review-fix → security-review → security-fix → cargo-checks phases have already run; your job is to integrate the resulting diff, the brief's acceptance criteria, the final `agent-notes.md` content, and the CI / cargo-checks status into a single end-of-pipeline judgement.
+
+## Inputs
+
+- `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta this run produced against master. Read this as the primary anchor.
+- The agent brief (with its verbatim `## Acceptance criteria` list) is in the kickoff context. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
+- `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
+- The cargo-checks gate (clippy + test) ran at end-of-pipeline. CI status is captured in the run-log; treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
+
+## What this phase does NOT do
+
+You are read-only. Do NOT edit any files. Do NOT create commits. Do NOT push. Your output is the prose review and the trailing verdict line — that is the entire job.
+
+## Output
+
+Write a natural-language prose review covering:
+
+1. Whether each acceptance criterion in the brief is satisfied by the diff. Reference the diff (file paths, function names) for each AC you confirm or flag.
+2. Whether `agent-notes.md` raises any concern the diff has not addressed. Remember: notes are reasoning, not evidence. A note that says "I deviated from strict test-first on AC4" is fine; a note that says "I couldn't satisfy AC2" is a hold signal.
+3. Whether the cargo-checks gate's outcome is consistent with the diff (e.g. green gate over a diff that touches Rust source is the expected shape; green gate over a no-Rust-source diff is also fine).
+
+End your output with a SINGLE trailing line of the EXACT form:
+
+```
+VERDICT: <TOKEN>
+```
+
+where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctuation):
+
+- `MERGE` — the diff satisfies the brief's ACs and the run should land as a normal (non-draft) PR.
+- `HOLD-NOTED` — the diff broadly satisfies the ACs but `agent-notes.md` flags a gap a human reviewer should see before merge.
+- `HOLD-DRAFT` — the diff does NOT satisfy the brief's ACs; a draft PR is the right shape so a human can take over.
+
+The trailing verdict line is load-bearing — Bellows greps for it after your run. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
+
+## When you cannot complete
+
+If the diff is malformed, missing, or you genuinely cannot judge it, emit a `VERDICT: HOLD-DRAFT` line (so the run lands as a draft for a human) and explain what stopped you in the prose above the verdict line. Do NOT emit a different token, and do NOT omit the verdict line — a missing verdict produces an ambiguous run-log entry.
+"#;
+
 /// Workspace-relative path of the diff file the runner writes before
 /// the review phase. Read-only input to the review prompt; the runner
 /// generates this on the host (via `git diff`) and removes it after
