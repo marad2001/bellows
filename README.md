@@ -511,6 +511,18 @@ the work an agent produced on a closed PR, `git checkout` and rebase
 those commits onto a non-`agent/*` branch first — bellows does not
 look at non-`agent/*` branches.
 
+The `concurrency=1` invariant is enforced structurally at the start
+of each polling tick by inspecting the local Docker daemon for any
+running `bellows-managed=true` agent container (the cargo-checks-gate
+container, which carries a `bellows-purpose` label, is excluded). If
+such a container exists, the tick is `Blocked(AgentContainerRunning)`
+and `find_next_issue` is not called — so even if multiple repos are
+configured and an in-flight agent's PR has already merged on origin,
+the polling loop will not claim a second issue until the prior
+container exits. Open agent PRs no longer gate claims by themselves;
+the gate is what is actually running locally, not what is open on
+GitHub.
+
 Bellows does **not** auto-retry. If a run lands at `agent-failed` and
 you want to try again, fix whatever needs fixing (the agent brief, the
 test environment, an upstream dep) and re-label the issue back to

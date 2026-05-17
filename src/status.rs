@@ -247,7 +247,7 @@ impl StatusContext {
 pub const IDLE_LINE: &str = "bellows: idle (no ready-for-agent issues)";
 
 const RESUME_LINE: &str =
-    "bellows: no longer blocked by open agent PRs; resuming normal claim behaviour";
+    "bellows: no longer blocked by a running agent container; resuming normal claim behaviour";
 
 /// The "ongoing" outcome states whose log lines are deduplicated. A
 /// continuation tick in any of these states stays silent; only a
@@ -385,17 +385,14 @@ impl OutcomeTransition {
 
 fn format_blocked_line(reason: &BlockReason) -> String {
     match reason {
-        BlockReason::OpenAgentPrs { pr_numbers } if pr_numbers.is_empty() => {
-            "bellows: blocked (could not list open agent PRs; failing closed and retrying next tick)"
+        BlockReason::AgentContainerRunning { container_id, .. } if container_id.is_empty() => {
+            "bellows: blocked (could not probe local Docker daemon for running agent containers; failing closed and retrying next tick)"
                 .to_string()
         }
-        BlockReason::OpenAgentPrs { pr_numbers } => {
-            let joined = pr_numbers
-                .iter()
-                .map(|n| format!("PR #{n}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("bellows: blocked by open agent {joined} (waiting for merge)")
+        BlockReason::AgentContainerRunning { container_id, .. } => {
+            format!(
+                "bellows: blocked by running agent container {container_id} (waiting for it to exit)",
+            )
         }
         BlockReason::StaleAgentBranchDeletionFailed { branch, error } => {
             format!(
@@ -466,7 +463,8 @@ pub fn summarise(status: Option<&Status>, pid_alive: bool) -> String {
             // mutually exclusive on the writer side, but a defensive
             // priority here matches the brief: a Blocked status is
             // the operator's headline when bellows is refusing to
-            // claim because of an open agent PR.
+            // claim because a running agent container holds the
+            // concurrency=1 slot.
             if let Some(b) = &s.blocked {
                 return format_blocked_summary(s, b);
             }
@@ -492,24 +490,23 @@ pub fn summarise(status: Option<&Status>, pid_alive: bool) -> String {
 
 fn format_blocked_summary(s: &Status, b: &BlockedState) -> String {
     match &b.reason {
-        BlockReason::OpenAgentPrs { pr_numbers } if pr_numbers.is_empty() => format!(
-            "bellows is running (PID {}, started at {}), blocked (could not list open agent PRs; failing closed and retrying next tick).",
-            s.pid,
-            s.started_at.to_rfc3339(),
-        ),
-        BlockReason::OpenAgentPrs { pr_numbers } => {
-            let joined = pr_numbers
-                .iter()
-                .map(|n| format!("PR #{n}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+        BlockReason::AgentContainerRunning { container_id, .. } if container_id.is_empty() => {
             format!(
-                "bellows is running (PID {}, started at {}), blocked by open agent {} (waiting for merge).",
+                "bellows is running (PID {}, started at {}), blocked (could not probe local Docker daemon for running agent containers; failing closed and retrying next tick).",
                 s.pid,
                 s.started_at.to_rfc3339(),
-                joined,
             )
         }
+        BlockReason::AgentContainerRunning {
+            container_id,
+            started_at,
+        } => format!(
+            "bellows is running (PID {}, started at {}), blocked by running agent container {} (started at {}, waiting for it to exit).",
+            s.pid,
+            s.started_at.to_rfc3339(),
+            container_id,
+            started_at.to_rfc3339(),
+        ),
         BlockReason::StaleAgentBranchDeletionFailed { branch, error } => format!(
             "bellows is running (PID {}, started at {}), blocked — pre-claim deletion of stale agent branch `{}` failed: {} (retrying next tick).",
             s.pid,

@@ -180,16 +180,28 @@ fn pr_routing_for_reason<'a>(
 ///
 /// Tagged-snake-case representation keeps the JSON readable in the
 /// status file:
-/// `{"kind": "open_agent_prs", "pr_numbers": [...]}` /
+/// `{"kind": "agent_container_running", "container_id": "...", "started_at": "..."}` /
 /// `{"kind": "stale_agent_branch_deletion_failed", "branch": "...", "error": "..."}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BlockReason {
-    /// Slice b (#42): one or more open `agent/*` PRs may still gate
-    /// master. `pr_numbers` is empty in the fail-closed case (the
-    /// list-PRs API call failed); the renderer distinguishes that
-    /// from a known set.
-    OpenAgentPrs { pr_numbers: Vec<u64> },
+    /// Issue #126 / ADR-0009: a `bellows-*` agent container is already
+    /// running on the local Docker daemon. The polling tick refuses to
+    /// claim a new issue because doing so would violate the
+    /// concurrency=1 subscription-terms invariant. This GLOBAL check
+    /// replaces the per-repo slice-b PR-open gate (the old
+    /// `OpenAgentPrs` variant): PR-state gating of master is delegated
+    /// to the auto-merge workflow's SHA-pin + branch protection, so
+    /// open `agent/*` PRs no longer halt the polling loop.
+    ///
+    /// `container_id` is the daemon's container id (short or full —
+    /// whatever the probe returns) so `bellows status` and the log
+    /// line can name what is actually blocking. `started_at` lets the
+    /// operator see how long the in-flight run has been going.
+    AgentContainerRunning {
+        container_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Issue #76 / ADR-0003: the pre-claim sweep of `agent/<N>-*` refs
     /// on origin failed for `branch`. `error` is the formatted
     /// `octocrab::Error` so the operator can read it in `bellows
@@ -201,15 +213,120 @@ pub enum BlockReason {
     },
 }
 
-/// Outcome of `tracker::list_open_agent_prs` as the pre-claim check sees
-/// it. Three variants because the polling loop has to distinguish the
-/// API-failure case (we don't know which PRs are open) from the
-/// genuinely-blocked case (we have a list) — both fail-close to
-/// `RunOutcome::Blocked`, but the status file's rendering differs.
-enum PreClaim {
-    Clear,
-    Blocked(Vec<u64>),
-    BlockedUnknown,
+/// One running `bellows-*` agent container as reported by an
+/// `AgentContainerProbe`. The probe abstracts over the live Docker
+/// daemon (production) and an in-memory fake (tests), so `run_once`'s
+/// pre-claim concurrency=1 check is exercisable without spinning up
+/// a real container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningAgentContainer {
+    pub container_id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Error from an `AgentContainerProbe`. The production impl wraps a
+/// `bollard::errors::Error`; the tests' fake always succeeds. The
+/// runner fails closed on any probe error — same posture as the
+/// slice-b PR-open gate's `BlockedUnknown` case it replaces — so the
+/// concurrency=1 invariant is never weakened by a transient Docker
+/// hiccup.
+#[derive(Debug, thiserror::Error)]
+#[error("agent container probe: {0}")]
+pub struct AgentContainerProbeError(#[from] pub anyhow::Error);
+
+/// Pre-claim concurrency=1 check (issue #126 / ADR-0009). The polling
+/// loop calls `find_running_agent_container` BEFORE iterating
+/// configured repos; a `Some(_)` return means another agent run is
+/// already in flight and the tick is `Blocked(AgentContainerRunning)`.
+///
+/// The trait is implemented for the production `bollard::Docker`
+/// client (`BollardAgentContainerProbe`) and for the `NoAgentContainer`
+/// stub used by tests where the container path is not the focus.
+pub trait AgentContainerProbe {
+    fn find_running_agent_container(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<Option<RunningAgentContainer>, AgentContainerProbeError>,
+    > + Send;
+}
+
+/// Zero-cost stub probe used by tests (and as the conservative default
+/// when an embedded use of `run_once` has no Docker daemon to query).
+/// Always reports "no container running"; never errors.
+pub struct NoAgentContainer;
+
+impl AgentContainerProbe for NoAgentContainer {
+    async fn find_running_agent_container(
+        &self,
+    ) -> Result<Option<RunningAgentContainer>, AgentContainerProbeError> {
+        Ok(None)
+    }
+}
+
+/// Production `AgentContainerProbe` impl: queries the local Docker
+/// daemon via bollard for any running container whose name starts
+/// with `bellows-` (matching the convention `sandbox::run_agent`
+/// uses) and that is NOT the cargo-checks-gate container (filtered
+/// by the absence of the `bellows-purpose` label). The first match
+/// is returned; concurrency=1 means there is at most one anyway.
+pub struct BollardAgentContainerProbe<'a> {
+    pub docker: &'a bollard::Docker,
+}
+
+impl<'a> AgentContainerProbe for BollardAgentContainerProbe<'a> {
+    async fn find_running_agent_container(
+        &self,
+    ) -> Result<Option<RunningAgentContainer>, AgentContainerProbeError> {
+        use bollard::query_parameters::ListContainersOptionsBuilder;
+        let mut filters = std::collections::HashMap::new();
+        // `status=running` so a stopped-but-not-removed container does
+        // not register as a concurrency violation. `label=bellows-managed`
+        // narrows to bellows-spawned containers — `name=bellows-` would
+        // also work but the label is the canonical marker, used by
+        // `cleanup_orphan_containers` too.
+        filters.insert("status".to_string(), vec!["running".to_string()]);
+        filters.insert(
+            "label".to_string(),
+            vec![format!("{}=true", sandbox::BELLOWS_MANAGED_LABEL)],
+        );
+        let opts = ListContainersOptionsBuilder::default()
+            .all(false)
+            .filters(&filters)
+            .build();
+        let containers = self
+            .docker
+            .list_containers(Some(opts))
+            .await
+            .map_err(|e| AgentContainerProbeError(anyhow::Error::from(e)))?;
+        for c in containers {
+            // Exclude the cargo-checks-gate container: it carries the
+            // `bellows-purpose=cargo-checks-gate` label, while the agent
+            // run container does not set `bellows-purpose` at all.
+            let purpose = c
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("bellows-purpose"))
+                .map(|s| s.as_str());
+            if purpose.is_some() {
+                continue;
+            }
+            let id = c.id.unwrap_or_default();
+            // bollard reports created/started as i64 unix seconds.
+            let started_at = c
+                .created
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .or_else(|| {
+                    c.created
+                        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+                })
+                .unwrap_or_else(chrono::Utc::now);
+            return Ok(Some(RunningAgentContainer {
+                container_id: id,
+                started_at,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 /// Per-repo claim candidate the multi-repo polling tick (#35)
@@ -483,93 +600,24 @@ pub async fn run_once(
     config: &Config,
     log_writer: &mut dyn Write,
     status_ctx: Option<&StatusContext>,
+    container_probe: &impl AgentContainerProbe,
 ) -> Result<RunOutcome, RunError> {
-    // Issue #35: multi-repo polling. For each configured repo, do the
-    // per-repo pre-claim PR check (#42), and on cleared repos collect
-    // the oldest open `ready-for-agent` issue. Across the combined set
-    // of cleared repos, claim the GLOBALLY-oldest issue by
-    // `created_at`.
-    //
-    // Per-repo pre-claim isolation: repo A being blocked by its own
-    // open `agent/*` PR does NOT block claims from unblocked repo B —
-    // the gating rationale (prior agent's PR may still gate THIS
-    // repo's master) is per-repo, and the cross-repo invariant is just
-    // concurrency=1 which the loop maintains by virtue of being serial
-    // anyway. Only when EVERY repo is blocked does the tick return
-    // `RunOutcome::Blocked`.
-    let mut blocked_prs: Vec<u64> = Vec::new();
-    let mut any_blocked_unknown = false;
-    let mut blocked_any = false;
-    let mut candidates: Vec<RepoCandidate> = Vec::new();
-    let mut any_clear = false;
-    // Issue #116 / ADR-0007: parallel per-repo list of (owner, repo,
-    // repo_order) on cleared repos, used by the re-loop sweep when
-    // the normal pass produces an empty filtered candidate set.
-    let mut cleared_repos: Vec<(String, String, usize)> = Vec::new();
-
-    for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
-        let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
-        let preclaim = match tracker::list_open_agent_prs(client, &owner, &repo).await {
-            Ok(prs) if prs.is_empty() => PreClaim::Clear,
-            Ok(prs) => PreClaim::Blocked(prs),
-            Err(e) => {
-                let _ = writeln!(
-                    log_writer,
-                    "bellows: pre-claim PR check failed for {}/{}; failing closed (treating that repo as blocked this tick): {}",
-                    owner, repo, e,
-                );
-                PreClaim::BlockedUnknown
-            }
-        };
-        match preclaim {
-            PreClaim::Blocked(prs) => {
-                blocked_any = true;
-                blocked_prs.extend(prs);
-            }
-            PreClaim::BlockedUnknown => {
-                blocked_any = true;
-                any_blocked_unknown = true;
-            }
-            PreClaim::Clear => {
-                any_clear = true;
-                let next = tracker::find_next_issue(
-                    client,
-                    &owner,
-                    &repo,
-                    &config.polling.pickup_label,
-                    &config.runtime_labels.agent_in_progress,
-                    &config.runtime_labels.blocked_by,
-                )
-                .await?;
-                if let Some(issue) = next {
-                    candidates.push(RepoCandidate {
-                        owner: owner.clone(),
-                        repo: repo.clone(),
-                        repo_url: repo_cfg.url.clone(),
-                        issue,
-                        repo_order,
-                    });
-                }
-                cleared_repos.push((owner, repo, repo_order));
-            }
-        }
-    }
-
-    // No cleared repo produced a claimable issue. If at least one repo
-    // was blocked, this whole tick is "blocked" from the operator's
-    // perspective; otherwise it's idle.
-    if candidates.is_empty() {
-        if blocked_any && !any_clear {
-            // Every configured repo was blocked. Report the union of
-            // known blocking PR numbers (empty when every blocker was
-            // an unknown / list-PRs failure — same fail-closed contract
-            // as the single-repo path).
-            let prs = if any_blocked_unknown && blocked_prs.is_empty() {
-                Vec::new()
-            } else {
-                blocked_prs
+    // Issue #126 / ADR-0009: GLOBAL pre-claim concurrency=1 check. If a
+    // `bellows-*` agent container is already running on the local
+    // Docker daemon, refuse the tick before iterating repos — a
+    // container running for repo A must also block claim attempts on
+    // repo B (the concurrency=1 invariant is global). This REPLACES
+    // the per-repo open-`agent/*`-PR gate (slice b / #42), whose cost
+    // — one held draft PR halts the whole repo's polling loop for
+    // hours — is eliminated. PR-state gating of master is delegated
+    // to the auto-merge workflow's SHA-pin + branch protection (per
+    // ADR-0009).
+    match container_probe.find_running_agent_container().await {
+        Ok(Some(running)) => {
+            let reason = BlockReason::AgentContainerRunning {
+                container_id: running.container_id,
+                started_at: running.started_at,
             };
-            let reason = BlockReason::OpenAgentPrs { pr_numbers: prs };
             if let Some(ctx) = status_ctx
                 && let Err(e) = ctx.write_blocked(&reason).await
             {
@@ -581,16 +629,72 @@ pub async fn run_once(
             }
             return Ok(RunOutcome::Blocked { reason });
         }
+        Ok(None) => {}
+        Err(e) => {
+            // Fail-closed on a probe error: we don't know whether a
+            // container is running, so treat it as if one were. The
+            // log line carries the underlying error for the operator.
+            let _ = writeln!(
+                log_writer,
+                "bellows: pre-claim container probe failed; failing closed (treating tick as blocked): {}",
+                e,
+            );
+            let reason = BlockReason::AgentContainerRunning {
+                container_id: String::new(),
+                started_at: chrono::Utc::now(),
+            };
+            if let Some(ctx) = status_ctx
+                && let Err(e) = ctx.write_blocked(&reason).await
+            {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: could not write blocked status (continuing): {}",
+                    e,
+                );
+            }
+            return Ok(RunOutcome::Blocked { reason });
+        }
+    }
 
-        // Some repos cleared but produced no candidates (or all repos
-        // were blocked but at least one cleared — but that branch
-        // can't happen here because candidates is empty). Either way,
-        // the steady-state log line is Idle — but FIRST, if any
-        // cleared repo has blocked-by-labelled issues, run the
-        // re-loop sweep (issue #116 / ADR-0007). The sweep runs only
-        // when there's no unblocked work to claim; a cleared
-        // dependent becomes claimable on the NEXT tick's normal
-        // pass.
+    // Issue #35: multi-repo polling. For each configured repo, collect
+    // the oldest open `ready-for-agent` issue. Across the combined set
+    // of repos, claim the GLOBALLY-lowest-number issue (#116). The
+    // per-repo PR-open gate is gone — every repo is "cleared" by
+    // construction now.
+    let mut candidates: Vec<RepoCandidate> = Vec::new();
+    // Issue #116 / ADR-0007: parallel per-repo list of (owner, repo,
+    // repo_order), used by the re-loop sweep when the normal pass
+    // produces an empty filtered candidate set.
+    let mut cleared_repos: Vec<(String, String, usize)> = Vec::new();
+
+    for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
+        let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
+        let next = tracker::find_next_issue(
+            client,
+            &owner,
+            &repo,
+            &config.polling.pickup_label,
+            &config.runtime_labels.agent_in_progress,
+            &config.runtime_labels.blocked_by,
+        )
+        .await?;
+        if let Some(issue) = next {
+            candidates.push(RepoCandidate {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                repo_url: repo_cfg.url.clone(),
+                issue,
+                repo_order,
+            });
+        }
+        cleared_repos.push((owner, repo, repo_order));
+    }
+
+    // No repo produced a claimable issue — run the cleared-repo
+    // re-loop sweep (issue #116 / ADR-0007) and report Idle. The
+    // sweep is the only way a `blocked-by` dependent becomes
+    // claimable on the next tick, so we do it on every empty tick.
+    if candidates.is_empty() {
         if !cleared_repos.is_empty() {
             run_reloop_sweep(
                 client,
