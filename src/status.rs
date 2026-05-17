@@ -249,6 +249,42 @@ pub const IDLE_LINE: &str = "bellows: idle (no ready-for-agent issues)";
 const RESUME_LINE: &str =
     "bellows: no longer blocked by a running agent container; resuming normal claim behaviour";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockedTransitionKey {
+    UnknownAgentContainer,
+    AgentContainerRunning {
+        container_id: String,
+        started_at: DateTime<Utc>,
+    },
+    StaleAgentBranchDeletionFailed {
+        branch: String,
+        error: String,
+    },
+}
+
+impl BlockedTransitionKey {
+    fn from_reason(reason: &BlockReason) -> Self {
+        match reason {
+            BlockReason::AgentContainerRunning { container_id, .. } if container_id.is_empty() => {
+                Self::UnknownAgentContainer
+            }
+            BlockReason::AgentContainerRunning {
+                container_id,
+                started_at,
+            } => Self::AgentContainerRunning {
+                container_id: container_id.clone(),
+                started_at: *started_at,
+            },
+            BlockReason::StaleAgentBranchDeletionFailed { branch, error } => {
+                Self::StaleAgentBranchDeletionFailed {
+                    branch: branch.clone(),
+                    error: error.clone(),
+                }
+            }
+        }
+    }
+}
+
 /// The "ongoing" outcome states whose log lines are deduplicated. A
 /// continuation tick in any of these states stays silent; only a
 /// transition between distinct shapes emits a fresh line.
@@ -259,11 +295,10 @@ const RESUME_LINE: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OngoingState {
     Idle,
-    /// Carrying the whole `BlockReason` so a transition between block
-    /// kinds (PR set merges but a stale-branch sweep starts failing,
-    /// or vice versa) emits a fresh line — the dedup contract is
-    /// "same kind + same payload, silent; anything else, fresh line".
-    Blocked(BlockReason),
+    /// Carrying a transition key so a transition between block kinds
+    /// emits a fresh line. Probe-error blocks have no container id, so
+    /// their timestamp is intentionally ignored for deduplication.
+    Blocked(BlockedTransitionKey),
     /// A `RunError` whose shape (variant + payload, see
     /// `RunError::shape`) matches this key. Two consecutive `Err`s
     /// with the same shape key are treated as a continuation.
@@ -305,7 +340,7 @@ impl OutcomeTransition {
     /// Slice-b's same-PR-set silence contract is preserved; slice-#76
     /// adds the same contract for the stale-branch-deletion case.
     pub fn observe_blocked(&mut self, reason: &BlockReason) -> Option<String> {
-        let new = OngoingState::Blocked(reason.clone());
+        let new = OngoingState::Blocked(BlockedTransitionKey::from_reason(reason));
         if self.last.as_ref() == Some(&new) {
             return None;
         }
@@ -1030,6 +1065,38 @@ mod tests {
         assert!(
             line.is_none(),
             "second identical observation must not emit a log line, got {:?}",
+            line,
+        );
+    }
+
+    #[test]
+    fn outcome_transition_probe_error_block_is_silent_across_timestamps() {
+        // Probe errors fail closed with an empty container id and a
+        // best-effort observation time. The operator-facing condition
+        // is unchanged across ticks even though the timestamp moves, so
+        // transition-only logging must keep the repeated block silent.
+        let mut tracker = OutcomeTransition::new();
+        let first = BlockReason::AgentContainerRunning {
+            container_id: String::new(),
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let second = BlockReason::AgentContainerRunning {
+            container_id: String::new(),
+            started_at: DateTime::parse_from_rfc3339("2026-05-10T15:00:30Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        let line = tracker
+            .observe_blocked(&first)
+            .expect("first probe-error block should emit");
+        assert!(line.contains("could not probe"), "{line}");
+        let line = tracker.observe_blocked(&second);
+        assert!(
+            line.is_none(),
+            "same probe-error block with a new timestamp must stay silent, got {:?}",
             line,
         );
     }
