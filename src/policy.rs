@@ -331,6 +331,14 @@ pub struct PhaseOutcomes {
     /// implement actually exited non-zero, letting the run classify
     /// as `Crash` instead.
     pub implement_crash_synthesised: bool,
+    /// Issue #123 / ADR-0009 slice 1: the phase-8 merger's parsed
+    /// verdict. `None` means either the phase didn't run (runner
+    /// halted before phase 8) or the agent's output did not contain
+    /// a recognised `VERDICT: <token>` line — both are logged but
+    /// neither yet feeds `classify_exit` (slice 2 / issue #124 will
+    /// wire routing). Stored here so the runner can carry it across
+    /// the gap from phase-8 dispatch to the PR/log build sites.
+    pub merger_verdict: Option<MergerVerdict>,
 }
 
 /// Decide how a finished agent run should be classified.

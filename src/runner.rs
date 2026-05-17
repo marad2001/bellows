@@ -2011,6 +2011,9 @@ pub async fn run_once(
         wall_clock_exceeded: budget.exceeded,
         backstop_violations,
         implement_crash_synthesised,
+        // Issue #123 / ADR-0009 slice 1: phase-8 dispatch wired in
+        // the next commit will set this from `parse_merger_verdict`.
+        merger_verdict: None,
     };
     // ADR-0006 / issue #95: feed agent-notes content plus the
     // out-of-band Bellows synth spans through note classification.
@@ -3024,6 +3027,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         }
@@ -3175,6 +3179,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3210,6 +3215,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3248,6 +3254,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3283,6 +3290,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3315,6 +3323,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3349,6 +3358,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3390,6 +3400,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3433,6 +3444,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3484,6 +3496,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3524,6 +3537,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3580,6 +3594,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 },
             ],
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3625,6 +3640,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3690,6 +3706,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
@@ -3860,6 +3877,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security,
             security_fix,
         }
@@ -4074,6 +4092,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: Some(crate::policy::AnalysisOutcome {
                 findings_text: Some(
                     "## Findings\n\n### 1. command injection in shell call — blocker\n\nbody"
@@ -4139,6 +4158,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
+            merger_verdict: None,
             security: None,
             security_fix: None,
         };
