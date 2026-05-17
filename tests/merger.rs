@@ -7,7 +7,10 @@
 use std::str::FromStr;
 
 use bellows::config::{Config, Engine};
-use bellows::policy::{parse_merger_verdict, render_merger_prompt, MergerVerdict};
+use bellows::policy::{
+    classify_exit, parse_merger_verdict, render_merger_prompt, ExitReason, ImplementOutcome,
+    MergerVerdict, NotesShape, PhaseOutcomes,
+};
 
 // -----------------------------------------------------------------
 // AC: parse_merger_verdict for the three valid tokens, garbage,
@@ -242,6 +245,121 @@ cli_chain = ["codex:gpt-5.5", "claude:claude-opus-4-7"]
     assert_eq!(merge[0].model.as_deref(), Some("gpt-5.5"));
     assert_eq!(merge[1].engine, Engine::Claude);
     assert_eq!(merge[1].model.as_deref(), Some("claude-opus-4-7"));
+}
+
+// -----------------------------------------------------------------
+// AC: Runner phase-8 dispatch reads the configured engine from
+// phases.merge.cli_chain (mirroring the existing phase-dispatch
+// test shape — config-driven, not container-side).
+// -----------------------------------------------------------------
+
+#[test]
+fn config_phases_merge_first_entry_drives_phase_8_dispatch() {
+    // Mirrors `config_phases_implement_first_entry_drives_default_engine_for_setup_auth`
+    // in tests/engine_dispatch.rs. The first chain entry of
+    // phases.merge is what the phase-8 runner will dispatch with.
+    let minimal = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let config = Config::from_str(minimal).unwrap();
+    let entry = config.phases.merge.first_entry();
+    assert_eq!(entry.engine, Engine::Claude);
+    assert_eq!(entry.model.as_deref(), Some("claude-opus-4-7"));
+
+    let codex_first = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+cli_chain = ["codex:gpt-5.5", "claude:claude-opus-4-7"]
+"#;
+    let config = Config::from_str(codex_first).unwrap();
+    let entry = config.phases.merge.first_entry();
+    assert_eq!(entry.engine, Engine::Codex);
+    assert_eq!(entry.model.as_deref(), Some("gpt-5.5"));
+}
+
+// -----------------------------------------------------------------
+// AC: 'Merger verdict is logged and stored in the run state but does
+// NOT yet feed `classify_exit`.' The parsed verdict has to land on a
+// `PhaseOutcomes` field so the runner can carry it across the gap
+// from phase-8 dispatch to the PR/log build sites. Slice 2 (#124)
+// wires the verdict into routing; in this slice it must be stored.
+// -----------------------------------------------------------------
+
+#[test]
+fn phase_outcomes_carry_optional_merger_verdict_defaulting_to_none() {
+    // Default `PhaseOutcomes` represents an unrun pipeline; the
+    // merger verdict must be `None` (no run yet → no parseable
+    // verdict). This is the slot the runner writes into when phase
+    // 8 produces a recognised verdict line.
+    let outcomes = PhaseOutcomes::default();
+    assert_eq!(
+        outcomes.merger_verdict, None,
+        "default PhaseOutcomes.merger_verdict must be None",
+    );
+}
+
+#[test]
+fn phase_outcomes_merger_verdict_round_trips_all_three_variants() {
+    // Pin every variant separately so a future enum extension can't
+    // silently lose a value. Each verdict has to land on the slot
+    // cleanly.
+    for verdict in [
+        MergerVerdict::Merge,
+        MergerVerdict::HoldNoted,
+        MergerVerdict::HoldDraft,
+    ] {
+        let outcomes = PhaseOutcomes {
+            merger_verdict: Some(verdict),
+            ..PhaseOutcomes::default()
+        };
+        assert_eq!(outcomes.merger_verdict, Some(verdict));
+    }
+}
+
+// -----------------------------------------------------------------
+// AC: 'Routing in this slice is identical to today.' Slice 1
+// stores the verdict but does NOT yet route on it; `classify_exit`
+// must return the same `ExitReason` whether the verdict slot is
+// empty or carries any of the three variants. Slice 2 (#124) will
+// wire the verdict into routing.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_is_invariant_under_merger_verdict_in_slice_1() {
+    // Pick a baseline outcome shape that classifies cleanly today —
+    // a fresh-default `PhaseOutcomes` with `NotesShape::Absent` →
+    // `ExitReason::Success` — and assert that flipping the verdict
+    // through all variants (including None) does not change the
+    // classification.
+    let base = PhaseOutcomes::default();
+    let baseline = classify_exit(NotesShape::Absent, &base);
+
+    for verdict_slot in [
+        None,
+        Some(MergerVerdict::Merge),
+        Some(MergerVerdict::HoldNoted),
+        Some(MergerVerdict::HoldDraft),
+    ] {
+        let outcomes = PhaseOutcomes {
+            merger_verdict: verdict_slot,
+            ..PhaseOutcomes::default()
+        };
+        assert_eq!(
+            classify_exit(NotesShape::Absent, &outcomes),
+            baseline,
+            "classify_exit must NOT route on merger_verdict in slice 1 \
+             (verdict={verdict_slot:?})",
+        );
+    }
 }
 
 #[test]
