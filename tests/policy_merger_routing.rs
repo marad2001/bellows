@@ -356,6 +356,111 @@ fn classify_exit_empty_backstop_violations_lets_merge_verdict_win() {
     );
 }
 
+// -----------------------------------------------------------------
+// AC6 — the merger-verdict branch sits below the structural
+// failure precedences in the classifier. Wall-clock exceeded,
+// rate-limit, non-zero implement exit, and gate-failed all beat a
+// merger Merge — the run had a real problem that the merger's
+// agent-authored vote cannot paper over.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_wall_clock_exceeded_beats_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.wall_clock_exceeded = true;
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::WallClockExceeded,
+        "wall-clock-exceeded must beat merger Merge — the runner \
+         killed the pipeline at the budget boundary, the merger's \
+         vote is on stale or partial context",
+    );
+}
+
+#[test]
+fn classify_exit_rate_limit_beats_merge_verdict() {
+    // Non-zero exit + rate-limit signature is more specific than the
+    // generic Crash precedence — the merger Merge must lose to it.
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.implement = ImplementOutcome {
+        exit_code: 1,
+        stderr_tail: "rate_limit_error: anthropic API throttled".to_string(),
+        engine: None,
+    };
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::RateLimited,
+        "rate-limit must beat merger Merge — leave the PR open for \
+         re-run when the cooling window clears",
+    );
+}
+
+#[test]
+fn classify_exit_non_zero_implement_exit_beats_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.implement = ImplementOutcome {
+        exit_code: 137,
+        stderr_tail: "agent process killed".to_string(),
+        engine: None,
+    };
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::Crash,
+        "non-zero implement exit must beat merger Merge — the agent \
+         process died and any verdict the merger emitted is on a \
+         broken pipeline state",
+    );
+}
+
+#[test]
+fn classify_exit_failing_post_implement_gate_beats_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.post_implement_gate = GateOutcome {
+        cargo_clippy: Some(check(0)),
+        cargo_test: Some(check(101)),
+    };
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::FinalTestsRed,
+        "failing post-implement cargo test must beat merger Merge — \
+         a red CI build cannot be merged regardless of verdict",
+    );
+}
+
+#[test]
+fn classify_exit_failing_end_pipeline_gate_beats_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.end_pipeline_gate = Some(GateOutcome {
+        cargo_clippy: Some(check(1)),
+        cargo_test: Some(check(0)),
+    });
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::FinalTestsRed,
+        "failing end-pipeline clippy must beat merger Merge",
+    );
+}
+
 #[test]
 fn classify_exit_none_verdict_falls_back_absent_notes_to_success() {
     // Pre-slice: no agent-notes.md at all (or fully empty) routed
