@@ -35,3 +35,7 @@ every tick, so a missing daemon does not flood the log.
 ## Unaddressed finding: no new tests added
 
 Bellows-synthesised entry. The implement phase produced a diff against the base branch with no new Rust test attributes detected by the slice-8 weak-test guard. A green cargo-checks gate over an unchanged test suite is a poor signal of correctness; the brief's acceptance criteria typically require accompanying tests. The weak-test guard synthesised this entry so the run routes to agent-self-reported-failure for a human reviewer.
+
+## Unaddressed finding: Make it pass commit mixes implementation with test edits
+
+I rebuilt the local branch so the stale `tests/runner.rs` deletions are in the red test commit and the replayed make-it-pass commit no longer touches `tests/runner.rs`; the final tree differs from the pre-rewrite tree only by removing the obsolete agent-note text about those deletions. I cannot complete the required code-fix path in this run because `cargo check --all-targets --all-features` cannot run in this container (`cargo` and `rustc` are not installed and no repo wrapper is available), so a human/operator needs to run the Rust verification in an environment with the toolchain and decide whether to force-push the rewritten branch.
