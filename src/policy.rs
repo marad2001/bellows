@@ -577,6 +577,95 @@ pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
     nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
 }
 
+/// Phase 8 merger verdict vocabulary (issue #123 / ADR-0009 slice 1).
+///
+/// The merger agent emits a natural-language prose review followed by a
+/// trailing `VERDICT: <token>` line carrying exactly one of these three
+/// values. Bellows parses the line and stores the verdict in run state
+/// for later wiring (slice 2 / #124 feeds it into `classify_exit`).
+///
+/// Variants:
+/// - `Merge` — the diff satisfies the brief's ACs and the agent
+///   recommends opening a normal (non-draft) PR.
+/// - `HoldNoted` — the diff is broadly OK but a gap was flagged in
+///   `agent-notes.md`; the merger surfaces it for human review.
+/// - `HoldDraft` — the diff does not yet satisfy the brief; the merger
+///   recommends opening a draft PR so a human can take over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergerVerdict {
+    Merge,
+    HoldNoted,
+    HoldDraft,
+}
+
+impl MergerVerdict {
+    /// Canonical token string as it appears on the agent's verdict
+    /// line. Used for the run-log line bellows writes after parsing.
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            MergerVerdict::Merge => "MERGE",
+            MergerVerdict::HoldNoted => "HOLD-NOTED",
+            MergerVerdict::HoldDraft => "HOLD-DRAFT",
+        }
+    }
+}
+
+/// Phase 8 merger verdict parser (issue #123 / ADR-0009 slice 1).
+///
+/// Scans `agent_output` for `VERDICT: <TOKEN>` lines (matching exactly
+/// one of `MERGE`, `HOLD-NOTED`, `HOLD-DRAFT`) and returns the parsed
+/// `MergerVerdict`. Returns `None` for:
+///
+/// - missing — no verdict line at all,
+/// - off-vocabulary — verdict line carries a token outside the closed
+///   set (e.g. `LGTM`, `merge`, `OK`),
+/// - ambiguous — two or more verdict lines carry DIFFERENT tokens;
+///   duplicate lines with the SAME token are fine (the agent may have
+///   quoted itself in the prose),
+/// - empty input.
+///
+/// Tolerates trailing whitespace (spaces / tabs) on the verdict line
+/// and CRLF line endings — both are common when the agent's harness
+/// rewraps prose.
+pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
+    let mut found: Option<MergerVerdict> = None;
+    for raw_line in agent_output.lines() {
+        // Strip a trailing `\r` (handles CRLF) and trailing whitespace.
+        let line = raw_line.trim_end_matches('\r').trim_end();
+        // Require the line to start with `VERDICT: ` (after any leading
+        // whitespace). Anchoring on the line start prevents matching
+        // mid-prose appearances of the substring `VERDICT:`.
+        let Some(rest) = line.trim_start().strip_prefix("VERDICT: ") else {
+            continue;
+        };
+        // The token must be exactly one of the three canonical values,
+        // with NO trailing content (everything after the token must be
+        // whitespace — already stripped by `trim_end` above, so an
+        // empty remainder is the contract).
+        let token = rest.trim_end();
+        let candidate = match token {
+            "MERGE" => MergerVerdict::Merge,
+            "HOLD-NOTED" => MergerVerdict::HoldNoted,
+            "HOLD-DRAFT" => MergerVerdict::HoldDraft,
+            _ => continue,
+        };
+        match found {
+            None => found = Some(candidate),
+            Some(prev) if prev == candidate => {
+                // Duplicate verdict with the same token — not
+                // ambiguous, keep going.
+            }
+            Some(_) => {
+                // Two verdict lines with DIFFERENT canonical tokens.
+                // Refuse to pick one arbitrarily — the brief says
+                // ambiguous returns None.
+                return None;
+            }
+        }
+    }
+    found
+}
+
 /// Workspace-relative path of the diff file the runner writes before
 /// the review phase. Read-only input to the review prompt; the runner
 /// generates this on the host (via `git diff`) and removes it after
