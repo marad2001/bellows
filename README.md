@@ -511,6 +511,18 @@ the work an agent produced on a closed PR, `git checkout` and rebase
 those commits onto a non-`agent/*` branch first — bellows does not
 look at non-`agent/*` branches.
 
+Bellows enforces its concurrency=1 invariant directly: per
+[ADR-0009](docs/adr/0009-merger-phase-and-pre-claim-gate-drop.md)
+slice 4 (issue #126), every polling tick first queries the local
+Docker daemon for any running `bellows-managed=true` container; if
+one exists, the tick is `Blocked` and refuses to claim until the
+container exits. The check is **global** across the polling loop —
+a container running an agent run for repo A also blocks claim
+attempts on repo B. Open `agent/*` PRs no longer block; only an
+actually-running sandbox container does. `bellows status` surfaces
+the blocking container's short id and start time so the operator
+can see exactly which run is holding the gate.
+
 Bellows does **not** auto-retry. If a run lands at `agent-failed` and
 you want to try again, fix whatever needs fixing (the agent brief, the
 test environment, an upstream dep) and re-label the issue back to

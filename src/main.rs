@@ -1893,15 +1893,45 @@ async fn run(config_path: &PathBuf) -> Result<()> {
     // Polling-loop transition tracker (issues #42 and #50). Without
     // dedup, a 30s tick floods the log with identical "idle (no
     // ready-for-agent issues)" lines between events and identical
-    // "blocked by PR #N" / `MissingAgentBrief(N)` lines while an
-    // ongoing condition persists. `OutcomeTransition` collapses each
-    // ongoing-state run to a single line emitted on transition into
-    // that state; per-event outcomes (Finalised/Contended/Cancelled)
-    // bypass dedup and always log.
+    // "blocked by container <id>" / `MissingAgentBrief(N)` lines
+    // while an ongoing condition persists. `OutcomeTransition`
+    // collapses each ongoing-state run to a single line emitted on
+    // transition into that state; per-event outcomes
+    // (Finalised/Contended/Cancelled) bypass dedup and always log.
     let mut transition = OutcomeTransition::new();
 
+    // Issue #126 / ADR-0009 slice 4: pre-claim concurrency=1 gate.
+    // Before each tick, ask the Docker daemon whether a
+    // `bellows-managed=true` container is already running; if yes,
+    // the tick is `Blocked(AgentContainerRunning)`. A failure to
+    // build the probe (no daemon socket, permission denied) falls
+    // back to passing `None` — the polling loop is still serial so
+    // concurrency=1 holds, and the operator sees the warning in the
+    // log.
+    let container_probe: Option<Box<dyn runner::AgentContainerProbe>> =
+        match sandbox::DockerContainerProbe::new() {
+            Ok(p) => Some(Box::new(p)),
+            Err(e) => {
+                log(
+                    &mut log_file,
+                    &format!(
+                        "bellows: could not connect to Docker for pre-claim container probe (continuing without the gate; the polling loop is still serial): {}",
+                        format_error_chain(&e),
+                    ),
+                );
+                None
+            }
+        };
+
     loop {
-        let outcome = runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref()).await;
+        let outcome = runner::run_once(
+            &client,
+            &config,
+            &mut log_file,
+            status_ctx.as_ref(),
+            container_probe.as_deref(),
+        )
+        .await;
         match outcome {
             Ok(RunOutcome::Blocked { reason }) => {
                 if let Some(line) = transition.observe_blocked(&reason) {

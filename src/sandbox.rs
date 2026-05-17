@@ -1028,6 +1028,81 @@ fn orphan_info_from_labels(id: &str, labels: &HashMap<String, String>) -> Orphan
     }
 }
 
+/// Bollard-backed implementation of [`crate::runner::AgentContainerProbe`].
+///
+/// Queries the local Docker daemon for any running container carrying
+/// the `bellows-managed=true` label. Returns the first match's
+/// container id + start time, or `None` if no such container is
+/// running. Used by `runner::run_once`'s pre-claim concurrency=1 gate
+/// (issue #126 / ADR-0009 slice 4), replacing the old
+/// open-`agent/*`-PR proxy with a direct enforcement of the invariant.
+pub struct DockerContainerProbe {
+    docker: Docker,
+}
+
+impl DockerContainerProbe {
+    /// Build a probe wired to the local Docker daemon — same connection
+    /// style every other `sandbox.rs` daemon call uses.
+    pub fn new() -> Result<Self, SandboxError> {
+        let docker = Docker::connect_with_local_defaults()?;
+        Ok(Self { docker })
+    }
+}
+
+impl crate::runner::AgentContainerProbe for DockerContainerProbe {
+    fn detect<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::runner::RunningAgentContainer>,
+                        crate::runner::ProbeError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+            filters.insert(
+                "label".to_string(),
+                vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
+            );
+            // Server-side filter on `status=running` so stopped corpses
+            // (the slice-7 orphan-cleanup target) do NOT trip the
+            // concurrency=1 gate. The orphan-cleanup path at startup
+            // is the right tool for those.
+            filters.insert("status".to_string(), vec!["running".to_string()]);
+            let options = ListContainersOptionsBuilder::default()
+                .filters(&filters)
+                .build();
+            let containers = self
+                .docker
+                .list_containers(Some(options))
+                .await
+                .map_err(|e| crate::runner::ProbeError::Daemon(format!("{e}")))?;
+            // Return the first match; for the concurrency=1 invariant
+            // we only need to know IF any is running, not enumerate
+            // all of them. If two are somehow running (a state the
+            // invariant says shouldn't exist), reporting one is
+            // enough for the operator to start investigating.
+            let first = containers.into_iter().find_map(|c| {
+                let id = c.id?;
+                let started_at = c
+                    .created
+                    .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
+                    .unwrap_or_else(chrono::Utc::now);
+                Some(crate::runner::RunningAgentContainer {
+                    container_id: id,
+                    started_at,
+                })
+            });
+            Ok(first)
+        })
+    }
+}
+
 /// Force-remove every container carrying the `bellows-managed=true`
 /// label. Called once at `bellows run` startup, before the polling loop.
 /// Containers that completed normally were already removed by their

@@ -4,9 +4,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::tracker::{
     add_issue_labels, apply_verdict, claim, delete_stale_agent_branches, fetch_agent_brief,
-    fetch_issue_with_comments, finalise, find_next_issue, list_needs_triage_issues,
-    list_blocked_by_issues, list_open_agent_prs, post_pr_comment, transition_to_cancelled,
-    ClaimError, FinaliseRequest,
+    fetch_issue_with_comments, finalise, find_next_issue, list_blocked_by_issues,
+    list_needs_triage_issues, post_pr_comment, transition_to_cancelled, ClaimError,
+    FinaliseRequest,
 };
 use bellows::triage::TriageVerdict;
 use wiremock::matchers::body_string_contains;
@@ -808,119 +808,10 @@ async fn fetch_agent_brief_returns_none_when_no_brief_comment_exists() {
     assert!(brief.is_none(), "expected None, got {:?}", brief);
 }
 
-#[tokio::test]
-async fn list_open_agent_prs_returns_only_prs_whose_head_ref_starts_with_agent_slash() {
-    // #42 pre-claim PR check: the polling tick must refuse to claim a new
-    // issue while any open `agent/*` PR may still gate master. The filter
-    // is strict on the head.ref `agent/` prefix — human-authored PRs on
-    // non-`agent/*` branches must NOT appear in the block set, otherwise
-    // operator work would spuriously stall bellows.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 41, "head": { "ref": "agent/41-foo" }, "draft": false },
-            { "number": 50, "head": { "ref": "fix-something-human" }, "draft": false },
-            { "number": 60, "head": { "ref": "agent/60-bar" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let prs = list_open_agent_prs(&client, "marad2001", "test-repo")
-        .await
-        .expect("call should succeed");
-    assert_eq!(
-        prs,
-        vec![41, 60],
-        "should include both agent/* PRs and exclude the human-authored one",
-    );
-}
-
-#[tokio::test]
-async fn list_open_agent_prs_includes_draft_prs() {
-    // Brief contract: "Draft PRs on `agent/*` branches block exactly like
-    // ready-for-review PRs — the filter is `state == open`, regardless of
-    // draft." A draft PR represents work that may still gate master once
-    // CI catches up and the operator marks it ready-for-review, so we
-    // must block on it.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 99, "head": { "ref": "agent/99-draft-fix" }, "draft": true }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let prs = list_open_agent_prs(&client, "marad2001", "test-repo")
-        .await
-        .expect("call should succeed");
-    assert_eq!(prs, vec![99]);
-}
-
-#[tokio::test]
-async fn list_open_agent_prs_returns_empty_when_no_open_prs() {
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let prs = list_open_agent_prs(&client, "marad2001", "test-repo")
-        .await
-        .expect("call should succeed");
-    assert!(prs.is_empty(), "expected empty, got {:?}", prs);
-}
-
-#[tokio::test]
-async fn list_open_agent_prs_returns_empty_when_only_non_agent_prs_open() {
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "number": 100, "head": { "ref": "feature/x" }, "draft": false },
-            { "number": 101, "head": { "ref": "dependabot/cargo/foo-1.2.3" }, "draft": false }
-        ])))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let prs = list_open_agent_prs(&client, "marad2001", "test-repo")
-        .await
-        .expect("call should succeed");
-    assert!(prs.is_empty(), "expected empty, got {:?}", prs);
-}
-
-#[tokio::test]
-async fn list_open_agent_prs_surfaces_github_errors() {
-    // Brief: "When the list-PRs API call fails for any reason, bellows
-    // treats it as blocked (fail-closed)." The fail-closed routing lives
-    // in `run_once`; this lower-level function must surface errors so
-    // run_once can detect them rather than silently returning empty.
-    let mock = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/pulls"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("server exploded"))
-        .mount(&mock)
-        .await;
-
-    let client = octocrab_pointed_at(mock.uri());
-    let result = list_open_agent_prs(&client, "marad2001", "test-repo").await;
-    assert!(result.is_err(), "expected Err, got {:?}", result.map(|_| "Ok"));
-}
+// Issue #126 / ADR-0009 slice 4: the `list_open_agent_prs` tests have
+// been removed alongside the function itself. The pre-claim PR-open
+// gate (issue #42) has been replaced with a global container-presence
+// probe, and the function had no other callers.
 
 #[tokio::test]
 async fn list_needs_triage_issues_filters_to_open_issues_with_needs_triage_label_oldest_first() {
