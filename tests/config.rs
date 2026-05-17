@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use bellows::config::{AuthMethod, Config};
+use bellows::config::{AuthMethod, Config, PostingMode};
 
 const MINIMAL_CONFIG: &str = r#"
 [repo]
@@ -337,6 +337,81 @@ pat_env_var = "GITHUB_TOKEN"
     assert!(
         result.is_err(),
         "config with no repos must be rejected at parse time, got {:?}",
+        result.as_ref().map(|_| "Ok"),
+    );
+}
+
+// ---- Issue #125 / ADR-0009: `[phases.merge].posting` toggle controls
+//      whether the phase-8 merger's prose is posted as a "Merge verdict"
+//      PR comment after the run. Default `post-always` per audit-trail-
+//      by-default; alternative `post-on-hold-only` for operators who
+//      find the comment-on-every-MERGE noisy. ----
+
+#[test]
+fn phases_merge_posting_defaults_to_post_always_when_omitted() {
+    // AC1: default `post-always` when the toggle is omitted. Existing
+    // operator configs that have no `[phases.merge]` table at all must
+    // see the audit-trail-by-default behaviour described in ADR-0009.
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert_eq!(config.phases.merge.posting, PostingMode::PostAlways);
+}
+
+#[test]
+fn phases_merge_posting_parses_post_always_token() {
+    // AC1: `post-always` is a valid value for the toggle.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+posting = "post-always"
+"#;
+    let config = Config::from_str(config_text).expect("post-always should parse");
+    assert_eq!(config.phases.merge.posting, PostingMode::PostAlways);
+}
+
+#[test]
+fn phases_merge_posting_parses_post_on_hold_only_token() {
+    // AC1: `post-on-hold-only` is the alternative value — MERGE
+    // verdicts auto-merge silently; HOLD-NOTED and HOLD-DRAFT verdicts
+    // still post a comment.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+posting = "post-on-hold-only"
+"#;
+    let config = Config::from_str(config_text).expect("post-on-hold-only should parse");
+    assert_eq!(config.phases.merge.posting, PostingMode::PostOnHoldOnly);
+}
+
+#[test]
+fn phases_merge_posting_rejects_any_other_value_at_parse_time() {
+    // AC1: parse error on any other value. We surface this at config
+    // load so an operator typo (`"post-on-hold"`, `"always"`, etc.)
+    // surfaces immediately rather than silently mis-routing surfacing
+    // behaviour at run time.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+posting = "post-on-hold"
+"#;
+    let result = Config::from_str(config_text);
+    assert!(
+        result.is_err(),
+        "posting = \"post-on-hold\" must be rejected at parse time, got {:?}",
         result.as_ref().map(|_| "Ok"),
     );
 }
