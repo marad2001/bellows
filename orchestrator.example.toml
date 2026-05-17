@@ -158,6 +158,29 @@ api_key_env_file = "~/.config/bellows/opencode.env"
 #
 # [phases.merge]
 # cli_chain = ["claude:claude-opus-4-7"]
+#
+# Surfacing the merger's prose review as a "Merge verdict" PR comment
+# (issue #125 / ADR-0009 slice 3). After phase 8 completes and the
+# verdict has been parsed, bellows posts the merger's full prose body
+# (including the trailing `VERDICT: <token>` line) as a comment on
+# the PR. The comment is posted before the label transition
+# completes so the operator opening the PR sees the verdict alongside
+# the agent-done / agent-noted / agent-failed state.
+#
+# Two modes:
+#   - `post-always` (default): every parseable verdict posts a
+#     "Merge verdict" comment, including clean MERGE runs. Full
+#     audit trail, recommended.
+#   - `post-on-hold-only`: only HOLD-NOTED and HOLD-DRAFT verdicts
+#     post the comment; MERGE runs auto-merge silently with no
+#     comment. Choose this when comment-on-every-MERGE feels noisy.
+#
+# A `None` merger verdict (slice-1 fallback, e.g. unparseable
+# output, merger crash, rate-limit skip) does NOT post a comment
+# regardless of this toggle — the audit trail belongs to the
+# merger, not to the fallback classifier.
+#
+# posting = "post-always"
 
 [agent]
 # Per-issue wall-clock budget. Bellows tracks elapsed time across all
