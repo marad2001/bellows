@@ -14,8 +14,8 @@
 //!    and gate-failed precedences still beat the merger verdict.
 
 use bellows::policy::{
-    classify_exit, CheckResult, ExitReason, GateOutcome, ImplementOutcome, MergerVerdict,
-    NotesShape, PhaseOutcomes,
+    classify_exit, BellowsSynthCause, CheckResult, ExitReason, GateOutcome, ImplementOutcome,
+    MergerVerdict, NotesShape, PhaseOutcomes,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -196,6 +196,86 @@ fn classify_exit_none_verdict_falls_back_informational_only_to_success_with_note
         ExitReason::SuccessWithNotes,
         "None verdict + informational notes must fall through to \
          the pre-slice SuccessWithNotes routing",
+    );
+}
+
+// -----------------------------------------------------------------
+// AC4 — (β) synth-provenance hard override. A recorded
+// `BellowsSynthCause` of `WeakTestGuard` / `ParserBackstop` /
+// `ImplementCrash` is out-of-band evidence that Bellows itself
+// authored an `## Unaddressed finding:` span. The merger cannot
+// vote past that: a `Merge` verdict over any of these synth
+// causes must route to `AgentSelfReportedFailure`.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_synth_weak_test_guard_overrides_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.synth_causes = vec![BellowsSynthCause::WeakTestGuard];
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "WeakTestGuard synth-provenance must override merger Merge — \
+         the guard's purpose is to fail runs where tests are weak, \
+         and the merger cannot vote past that",
+    );
+}
+
+#[test]
+fn classify_exit_synth_parser_backstop_overrides_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.synth_causes = vec![BellowsSynthCause::ParserBackstop];
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "ParserBackstop synth-provenance must override merger Merge — \
+         the backstop detected an unaddressed/unexplained finding the \
+         agent silently skipped",
+    );
+}
+
+#[test]
+fn classify_exit_synth_implement_crash_overrides_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.synth_causes = vec![BellowsSynthCause::ImplementCrash];
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "ImplementCrash synth-provenance must override merger Merge — \
+         the implement phase crashed and the synth is recovery scaffolding, \
+         not an agent-authored mergeable diff",
+    );
+}
+
+#[test]
+fn classify_exit_no_synth_causes_lets_merge_verdict_win() {
+    // Control: empty synth_causes leaves the Merge verdict intact.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert!(
+        outcomes.synth_causes.is_empty(),
+        "default PhaseOutcomes must have no recorded synth causes",
+    );
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::Success,
+        "with no synth-provenance recorded, the merger Merge verdict \
+         drives routing per AC1",
     );
 }
 
