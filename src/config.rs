@@ -585,13 +585,37 @@ fn default_test_flags() -> String {
 /// defaults to `["claude"]` when the phase's `[phases.X]` table is
 /// omitted, so existing v1 single-engine operator configs see no
 /// behaviour change.
-#[derive(Debug, Clone, Default)]
+///
+/// Issue #123 / ADR-0009 slice 1: the merger phase (`merge`) has a
+/// model-pinned default (`["claude:claude-opus-4-7"]`) rather than the
+/// bare-engine default — opus is the first-look-judgement role in
+/// ADR-0009 and the default has to encode that, not just an engine
+/// name. The phase itself is hard-required; operators can swap the
+/// engine but not disable the phase via config (the empty-chain
+/// rejection is shared with the other phases via `RawPhaseChain`).
+#[derive(Debug, Clone)]
 pub struct PhasesConfig {
     pub implement: PhaseChain,
     pub review: PhaseChain,
     pub review_fix: PhaseChain,
     pub security_review: PhaseChain,
     pub security_fix: PhaseChain,
+    /// Issue #123 / ADR-0009 slice 1: the phase-8 merger. Default
+    /// `["claude:claude-opus-4-7"]` per ADR-0009.
+    pub merge: PhaseChain,
+}
+
+impl Default for PhasesConfig {
+    fn default() -> Self {
+        Self {
+            implement: PhaseChain::default(),
+            review: PhaseChain::default(),
+            review_fix: PhaseChain::default(),
+            security_review: PhaseChain::default(),
+            security_fix: PhaseChain::default(),
+            merge: PhaseChain::merge_default(),
+        }
+    }
 }
 
 /// One phase's chain. The default chain is `[ClaimChainEntry::claude]`
@@ -624,6 +648,22 @@ impl PhaseChain {
             .first()
             .expect("cli_chain non-empty by config-load invariant")
     }
+
+    /// Issue #123 / ADR-0009 slice 1: default for the merger phase
+    /// (`[phases.merge]`). Pins opus-4-7 (the first-look-judgement
+    /// role in ADR-0009; cross-family independence from codex which
+    /// originates most agent-authored unaddressed-finding headings in
+    /// phase 4). Distinct from `Default::default()` because the
+    /// merger's default carries a model pin, not just an engine
+    /// choice.
+    pub fn merge_default() -> Self {
+        Self {
+            cli_chain: vec![ChainEntry {
+                engine: Engine::Claude,
+                model: Some("claude-opus-4-7".to_string()),
+            }],
+        }
+    }
 }
 
 /// Wire shape for `[phases.X]` tables. Bare strings parse via
@@ -638,8 +678,22 @@ struct RawPhaseChain {
 
 impl RawPhaseChain {
     fn normalise(self, phase: &'static str) -> Result<PhaseChain, ConfigError> {
+        self.normalise_with_default(phase, PhaseChain::default)
+    }
+
+    /// Parse `cli_chain` from the wire, falling back to a phase-
+    /// specific default when the `[phases.X]` table is omitted entirely.
+    /// Most phases use `PhaseChain::default` (bare `["claude"]`); the
+    /// merger phase passes `PhaseChain::merge_default` to get the
+    /// model-pinned ADR-0009 default. Empty-chain rejection is shared
+    /// across all phases.
+    fn normalise_with_default(
+        self,
+        phase: &'static str,
+        fallback: impl FnOnce() -> PhaseChain,
+    ) -> Result<PhaseChain, ConfigError> {
         let Some(raw) = self.cli_chain else {
-            return Ok(PhaseChain::default());
+            return Ok(fallback());
         };
         if raw.is_empty() {
             return Err(ConfigError::EmptyCliChain { phase });
@@ -671,6 +725,9 @@ struct RawPhasesConfig {
     security_review: RawPhaseChain,
     #[serde(default)]
     security_fix: RawPhaseChain,
+    /// Issue #123 / ADR-0009 slice 1: phase-8 merger.
+    #[serde(default)]
+    merge: RawPhaseChain,
 }
 
 impl RawPhasesConfig {
@@ -681,6 +738,9 @@ impl RawPhasesConfig {
             review_fix: self.review_fix.normalise("review_fix")?,
             security_review: self.security_review.normalise("security_review")?,
             security_fix: self.security_fix.normalise("security_fix")?,
+            merge: self
+                .merge
+                .normalise_with_default("merge", PhaseChain::merge_default)?,
         })
     }
 }
