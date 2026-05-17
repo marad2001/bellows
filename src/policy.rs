@@ -466,6 +466,14 @@ pub fn classify_exit(
         {
             return ExitReason::AgentSelfReportedFailure;
         }
+        // (γ) parser-as-backstop hard override: even if the runner
+        // did not project the violations into `synth_causes`,
+        // non-empty `backstop_violations` is direct evidence the
+        // agent silently skipped a blocker/important finding.
+        // Defence-in-depth against drift between the two surfaces.
+        if !outcomes.backstop_violations.is_empty() {
+            return ExitReason::AgentSelfReportedFailure;
+        }
         return match verdict {
             MergerVerdict::Merge => ExitReason::Success,
             MergerVerdict::HoldNoted => ExitReason::SuccessWithNotes,
