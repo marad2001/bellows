@@ -620,58 +620,58 @@ impl MergerVerdict {
 
 /// Phase 8 merger verdict parser (issue #123 / ADR-0009 slice 1).
 ///
-/// Scans `agent_output` for `VERDICT: <TOKEN>` lines (matching exactly
-/// one of `MERGE`, `HOLD-NOTED`, `HOLD-DRAFT`) and returns the parsed
-/// `MergerVerdict`. Returns `None` for:
+/// Requires exactly one standalone `VERDICT: <TOKEN>` line (matching
+/// exactly one of `MERGE`, `HOLD-NOTED`, `HOLD-DRAFT`), and that line
+/// must be the last non-empty line in `agent_output`. Returns `None`
+/// for:
 ///
 /// - missing — no verdict line at all,
 /// - off-vocabulary — verdict line carries a token outside the closed
 ///   set (e.g. `LGTM`, `merge`, `OK`),
-/// - ambiguous — two or more verdict lines carry DIFFERENT tokens;
-///   duplicate lines with the SAME token are fine (the agent may have
-///   quoted itself in the prose),
+/// - ambiguous / off-contract — any additional standalone `VERDICT:`
+///   line appears before the trailing verdict line,
+/// - non-trailing — prose or any other non-empty line appears after
+///   the only standalone `VERDICT:` line,
 /// - empty input.
 ///
 /// Tolerates trailing whitespace (spaces / tabs) on the verdict line
 /// and CRLF line endings — both are common when the agent's harness
 /// rewraps prose.
 pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
-    let mut found: Option<MergerVerdict> = None;
+    let mut verdict_line_count = 0;
+    let mut last_non_empty_line = None;
+
     for raw_line in agent_output.lines() {
         // Strip a trailing `\r` (handles CRLF) and trailing whitespace.
         let line = raw_line.trim_end_matches('\r').trim_end();
-        // Require the line to start with `VERDICT: ` (after any leading
-        // whitespace). Anchoring on the line start prevents matching
-        // mid-prose appearances of the substring `VERDICT:`.
-        let Some(rest) = line.trim_start().strip_prefix("VERDICT: ") else {
+
+        if line.trim().is_empty() {
             continue;
-        };
-        // The token must be exactly one of the three canonical values,
-        // with NO trailing content (everything after the token must be
-        // whitespace — already stripped by `trim_end` above, so an
-        // empty remainder is the contract).
-        let token = rest.trim_end();
-        let candidate = match token {
-            "MERGE" => MergerVerdict::Merge,
-            "HOLD-NOTED" => MergerVerdict::HoldNoted,
-            "HOLD-DRAFT" => MergerVerdict::HoldDraft,
-            _ => continue,
-        };
-        match found {
-            None => found = Some(candidate),
-            Some(prev) if prev == candidate => {
-                // Duplicate verdict with the same token — not
-                // ambiguous, keep going.
-            }
-            Some(_) => {
-                // Two verdict lines with DIFFERENT canonical tokens.
-                // Refuse to pick one arbitrarily — the brief says
-                // ambiguous returns None.
-                return None;
-            }
         }
+
+        // Count every standalone verdict-looking line, including
+        // off-vocabulary tokens. If the agent emitted more than one,
+        // the output is off-contract regardless of whether the final
+        // token is otherwise parseable.
+        if line.trim_start().starts_with("VERDICT:") {
+            verdict_line_count += 1;
+        }
+
+        last_non_empty_line = Some(line);
     }
-    found
+
+    if verdict_line_count != 1 {
+        return None;
+    }
+
+    let line = last_non_empty_line?;
+    let token = line.strip_prefix("VERDICT: ")?;
+    match token {
+        "MERGE" => Some(MergerVerdict::Merge),
+        "HOLD-NOTED" => Some(MergerVerdict::HoldNoted),
+        "HOLD-DRAFT" => Some(MergerVerdict::HoldDraft),
+        _ => None,
+    }
 }
 
 /// Phase-8 merger prompt (issue #123 / ADR-0009 slice 1).
