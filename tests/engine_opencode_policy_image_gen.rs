@@ -37,7 +37,7 @@ fn opencode_sha256_is_pinned_to_the_canonical_upstream_digest() {
     // binary.
     assert_eq!(
         OPENCODE_SHA256,
-        "f8ae8678c9bccdbaf99777f36ff2d5efe689d473384f2e94b84d6cda256d2540",
+        "be282c09f6d4fe2889b2566b48f0507c52151528490c2a67efeccbe57a7fe317",
     );
 }
 
