@@ -12,7 +12,7 @@ If you do encounter code at `/workspace` that appears genuinely concerning (obvi
 
 - **You cannot ask the user.** This is a non-interactive run. There is no human on the other end of stdin. Make the best decision you can with the information available. If you genuinely cannot proceed, write your blocker to `/workspace/agent-notes.md` (one paragraph: what you tried, why you stopped, what a human reviewer would need to decide) and exit.
 - **The kickoff prompt is the contract.** It carries this issue's agent brief verbatim. Treat the brief's acceptance criteria as the definition of done.
-- **`cargo test` green is the stop signal.** Don't stop earlier and don't keep going after that signal is met.
+- **Both `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings` green is the stop signal.** Don't stop earlier and don't keep going after that signal is met. The clippy flag string is named verbatim so the agent's local check matches CI (`.github/workflows/ci.yml`) and the in-sandbox cargo-checks gate (`policy-image/run-cargo-checks`); paraphrasing it would let the agent declare done on a posture CI then rejects. The same exemptions that apply to the test gate apply to the clippy gate — if the brief is exempt from test enforcement (e.g. doc-only briefs whose enforcement skip is configured by the operator), the clippy gate is implicitly exempt too.
 - **Never write a `.bellows-stub-marker` file.** That was the slice-2 stub agent's marker; the slice-2 stub no longer runs. Only the changes you make as part of satisfying the brief should appear in the resulting commit.
 - **Never write back into `/workspace/.bellows-kickoff.md`** — `run-agent` deletes that file before invoking you so the prompt does not leak into the commit.
 - **Stay inside `/workspace`.** That is the cloned repo, mounted from the host. Anything you create outside `/workspace` is lost when the container exits.
@@ -37,5 +37,5 @@ You do not need to:
 You **should**:
 
 - write tests first;
-- get to `cargo test` green;
+- get to `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings` green;
 - write a short PR description body to `/workspace/.bellows-pr-description.md` that maps each new test to a brief acceptance criterion. Bellows will use that as the PR body if it exists.
