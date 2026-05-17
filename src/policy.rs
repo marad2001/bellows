@@ -339,42 +339,58 @@ pub struct PhaseOutcomes {
     /// wire routing). Stored here so the runner can carry it across
     /// the gap from phase-8 dispatch to the PR/log build sites.
     pub merger_verdict: Option<MergerVerdict>,
+    /// Issue #124 / ADR-0009 slice 2: out-of-band provenance for any
+    /// Bellows-authored `## Unaddressed finding:` spans appended to
+    /// `agent-notes.md` during this run. The runner populates this
+    /// from the `BellowsSynthSpan`s recorded by
+    /// `append_bellows_synth_entry`. `classify_exit` treats these as
+    /// a hard override: when any of `WeakTestGuard`,
+    /// `ParserBackstop`, or `ImplementCrash` is present the merger
+    /// verdict cannot upgrade routing past `AgentSelfReportedFailure`
+    /// — the synth-provenance is evidence Bellows itself decided the
+    /// run was not mergeable, and the agent-authored merger vote
+    /// cannot overrule that.
+    pub synth_causes: Vec<BellowsSynthCause>,
 }
 
 /// Decide how a finished agent run should be classified.
 ///
-/// Precedence (ADR-0006 / issue #95):
+/// Precedence (ADR-0006 / issue #95, refined by ADR-0009 / issue #124
+/// slice 2 — the phase-8 merger verdict now drives the (α) agent-
+/// authored routing branch):
 ///
-/// 1. `NotesShape::HasUnaddressedFinding` → `AgentSelfReportedFailure`.
-///    The structured escalation channel: an `## Unaddressed finding:`
-///    section (agent-authored or bellows-synthesised by the weak-test
-///    guard or parser-as-backstop) always wins over tooling signals,
-///    because the agent's structured voice is the most actionable
-///    self-report we have.
-/// 2. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
+/// 1. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
 ///    at the budget boundary.
-/// 3. Non-zero implement exit + rate-limit stderr signature →
+/// 2. Non-zero implement exit + rate-limit stderr signature →
 ///    `RateLimited`. More specific than the generic Crash so the
 ///    operator gets the right follow-up signal.
-/// 4. Non-zero implement exit → `Crash`. The agent process died.
-/// 5. Failing cargo gate (clippy or test, post-implement or
+/// 3. Non-zero implement exit → `Crash`. The agent process died.
+/// 4. Failing cargo gate (clippy or test, post-implement or
 ///    end-pipeline) → `FinalTestsRed`.
-/// 6. `NotesShape::InformationalOnly` → `SuccessWithNotes`. The new
-///    ADR-0006 informational channel: an otherwise-clean run with
-///    freeform agent-authored prose (no escalation heading). Should
-///    stop silent auto-merge but should NOT route to
-///    AgentSelfReportedFailure.
-/// 7. Otherwise → `Success`.
+/// 5. Merger verdict (when `Some` and no (β)/(γ) hard override fires,
+///    see runner-side construction of `outcomes`):
+///    `Merge` → `Success`, `HoldNoted` → `SuccessWithNotes`,
+///    `HoldDraft` → `AgentSelfReportedFailure`. Replaces the
+///    pre-slice-2 (α) auto-fatal `NotesShape::HasUnaddressedFinding`
+///    branch.
+/// 6. Q4-Option-A fallback (merger verdict is `None` — phase didn't
+///    run, output was unparseable, rate-limit skip): behaves exactly
+///    as the pre-slice-2 classifier. `HasUnaddressedFinding` →
+///    `AgentSelfReportedFailure`, `InformationalOnly` →
+///    `SuccessWithNotes`, otherwise → `Success`. Strictly additive on
+///    throughput: a working merger raises it; a failing merger is
+///    neutral.
 ///
 /// The issue-#49 `synth_suppresses_notes` shim is gone: synth-only
 /// agent-notes files map to `NotesShape::Absent` when the runner passes
 /// the recorded implement-crash synth span to note classification, so
 /// they route on their actual failure mode (Crash) without a per-call
 /// special case here.
-pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason {
-    if matches!(notes, NotesShape::HasUnaddressedFinding) {
-        return ExitReason::AgentSelfReportedFailure;
-    }
+pub fn classify_exit(
+    notes: NotesShape,
+    outcomes: &PhaseOutcomes,
+    merger_verdict: Option<MergerVerdict>,
+) -> ExitReason {
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
     }
@@ -416,6 +432,58 @@ pub fn classify_exit(notes: NotesShape, outcomes: &PhaseOutcomes) -> ExitReason 
         && gate_failed(end_gate)
     {
         return ExitReason::FinalTestsRed;
+    }
+    // ADR-0009 slice 2 / issue #124 (α) replacement: when the merger
+    // produced a parseable verdict, it drives routing on the
+    // agent-authored channel. The merger has already screened against
+    // the run's full context (diff, ACs, agent-notes, CI status); if
+    // it voted `Merge` the substantive code is good and the heading
+    // shape that would otherwise auto-fatal the run is overridden.
+    //
+    // Q4-Option-A fallback (per ADR-0009): if the verdict is `None`
+    // (merger phase didn't run, agent output was unparseable, or the
+    // merger hit a rate-limit and was skipped), fall through to the
+    // pre-slice classifier below. Strictly additive on throughput: a
+    // working merger raises it; a failing merger is neutral.
+    if let Some(verdict) = merger_verdict {
+        // (β) synth-provenance hard override: any recorded
+        // `WeakTestGuard` / `ParserBackstop` / `ImplementCrash`
+        // is out-of-band evidence Bellows itself authored an
+        // `## Unaddressed finding:` span. The merger cannot vote
+        // past these — the run routes to AgentSelfReportedFailure
+        // regardless of the verdict token.
+        if outcomes
+            .synth_causes
+            .iter()
+            .any(|cause| {
+                matches!(
+                    cause,
+                    BellowsSynthCause::WeakTestGuard
+                        | BellowsSynthCause::ParserBackstop
+                        | BellowsSynthCause::ImplementCrash
+                )
+            })
+        {
+            return ExitReason::AgentSelfReportedFailure;
+        }
+        // (γ) parser-as-backstop hard override: even if the runner
+        // did not project the violations into `synth_causes`,
+        // non-empty `backstop_violations` is direct evidence the
+        // agent silently skipped a blocker/important finding.
+        // Defence-in-depth against drift between the two surfaces.
+        if !outcomes.backstop_violations.is_empty() {
+            return ExitReason::AgentSelfReportedFailure;
+        }
+        return match verdict {
+            MergerVerdict::Merge => ExitReason::Success,
+            MergerVerdict::HoldNoted => ExitReason::SuccessWithNotes,
+            MergerVerdict::HoldDraft => ExitReason::AgentSelfReportedFailure,
+        };
+    }
+    // Q4-Option-A fallback path. Pre-slice-2 behaviour preserved
+    // exactly so a missing merger verdict is a no-op on routing.
+    if matches!(notes, NotesShape::HasUnaddressedFinding) {
+        return ExitReason::AgentSelfReportedFailure;
     }
     if matches!(notes, NotesShape::InformationalOnly) {
         return ExitReason::SuccessWithNotes;
@@ -698,6 +766,8 @@ const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bell
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta this run produced against master. Read this as the primary anchor.
 - The agent brief (with its verbatim `## Acceptance criteria` list) is appended to this kickoff under `## Bellows-supplied run inputs`. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
 - `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
+
+  **Synth-provenance markers are a hard signal: do NOT vote `MERGE` when any `<!-- bellows parser-as-backstop ... -->`, `<!-- bellows weak-test guard ... -->`, or `<!-- bellows implement-crash recovery ... -->` HTML comment is present in agent-notes.md.** These markers are Bellows' own out-of-band evidence that the run is not mergeable: the parser-as-backstop detected a finding the agent silently skipped, the weak-test guard fired, or the implement phase crashed. The marker text itself appears verbatim in the file; you cannot strip it. The correct verdict in their presence is `HOLD-DRAFT` (or `HOLD-NOTED` if the markers are stale relative to the current diff and a human reviewer should still glance at the gap before merge — but never `MERGE`). Bellows' classify_exit will reject a `MERGE` vote over any of these markers anyway, but emitting the right verdict in the first place produces a sharper PR-body summary and avoids the agent-self-reported-failure label looking like a classifier override.
 - The end-pipeline cargo-checks gate status is appended to this kickoff under `## Bellows-supplied run inputs`. Treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
 
 ## What this phase does NOT do

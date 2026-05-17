@@ -2125,17 +2125,34 @@ pub async fn run_once(
         // the merger phase above when it ran; `None` when phase 8 was
         // halted or its output was unparseable.
         merger_verdict,
+        // Issue #124 / ADR-0009 slice 2: project the recorded
+        // out-of-band synth spans down to their causes. The
+        // (β) hard-override branch in classify_exit consumes this so
+        // a `Merge` vote over WeakTestGuard/ParserBackstop/
+        // ImplementCrash provenance cannot upgrade routing past
+        // AgentSelfReportedFailure.
+        synth_causes: agent_note_synth_spans
+            .iter()
+            .map(|span| span.cause)
+            .collect(),
     };
     // ADR-0006 / issue #95: feed agent-notes content plus the
     // out-of-band Bellows synth spans through note classification.
     // HTML comments in the workspace file are human-readable only;
     // routing strips only spans recorded at Bellows append sites.
+    //
+    // ADR-0009 slice 2 / issue #124: thread the phase-8 merger
+    // verdict captured above (None if phase 8 didn't run or its
+    // output was unparseable) into the classifier so it can drive
+    // the (α) agent-authored routing branch. Q4-Option-A: None
+    // falls back to the pre-slice classifier behaviour.
     let pipeline_reason = policy::classify_exit(
         policy::classify_agent_notes_with_synth_spans(
             agent_notes.as_deref(),
             &agent_note_synth_spans,
         ),
         &outcomes,
+        outcomes.merger_verdict,
     );
 
     // PR #33 review finding #2: detect external cancellation BEFORE
@@ -3198,6 +3215,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            synth_causes: Vec::new(),
             security: None,
             security_fix: None,
         }
@@ -3352,6 +3370,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
@@ -3388,6 +3407,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -3427,6 +3447,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed, 42, started, finished, "agent/42-x", &outcomes,
@@ -3463,6 +3484,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -3543,6 +3565,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Crash, 42, started, finished, "agent/42-x", &outcomes,
@@ -3578,6 +3601,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -3620,6 +3644,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::RateLimited,
@@ -3664,6 +3689,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Crash,
@@ -3716,6 +3742,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success,
@@ -3757,6 +3784,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::WallClockExceeded,
@@ -3814,6 +3842,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::AgentSelfReportedFailure,
@@ -3860,6 +3889,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success, 42, started, finished, "agent/42-x", &outcomes,
@@ -3926,6 +3956,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let notes_shape =
             policy::classify_agent_notes_with_synth_spans(Some(&synth_note), &[synth_span]);
@@ -3935,7 +3966,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             "synth-only notes must classify to Absent so the routing falls through \
              to Crash on the non-zero implement exit",
         );
-        let reason = policy::classify_exit(notes_shape, &outcomes);
+        let reason = policy::classify_exit(notes_shape, &outcomes, None);
         assert_eq!(
             reason,
             ExitReason::Crash,
@@ -4095,6 +4126,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            synth_causes: Vec::new(),
             security,
             security_fix,
         }
@@ -4318,6 +4350,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 exit_code: 0,
             }),
             security_fix: Some(FixOutcome { exit_code: 0 }),
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::Success,
@@ -4378,6 +4411,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             merger_verdict: None,
             security: None,
             security_fix: None,
+            synth_causes: Vec::new(),
         };
         let body = build_log_body(
             &ExitReason::FinalTestsRed,
