@@ -701,17 +701,17 @@ const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bell
 
 ## What this phase does NOT do
 
-You are read-only. Do NOT edit any files. Do NOT create commits. Do NOT push. Your output is the prose review and the trailing verdict line — that is the entire job.
+You are read-only with respect to the repo contents: do NOT edit any tracked files, do NOT create commits, do NOT push. The single exception is writing your output file `/workspace/.bellows-merger-output.md` (untracked; Bellows reads and removes it after your run). Your output is the prose review and the trailing verdict line — that is the entire job.
 
 ## Output
 
-Write a natural-language prose review covering:
+Write your natural-language prose review to `/workspace/.bellows-merger-output.md`. Cover:
 
 1. Whether each acceptance criterion in the brief is satisfied by the diff. Reference the diff (file paths, function names) for each AC you confirm or flag.
 2. Whether `agent-notes.md` raises any concern the diff has not addressed. Remember: notes are reasoning, not evidence. A note that says "I deviated from strict test-first on AC4" is fine; a note that says "I couldn't satisfy AC2" is a hold signal.
 3. Whether the cargo-checks gate's outcome is consistent with the diff (e.g. green gate over a diff that touches Rust source is the expected shape; green gate over a no-Rust-source diff is also fine).
 
-End your output with a SINGLE trailing line of the EXACT form:
+End the file's contents with a SINGLE trailing line of the EXACT form:
 
 ```
 VERDICT: <TOKEN>
@@ -723,7 +723,7 @@ where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctu
 - `HOLD-NOTED` — the diff broadly satisfies the ACs but `agent-notes.md` flags a gap a human reviewer should see before merge.
 - `HOLD-DRAFT` — the diff does NOT satisfy the brief's ACs; a draft PR is the right shape so a human can take over.
 
-The trailing verdict line is load-bearing — Bellows greps for it after your run. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
+The trailing verdict line is load-bearing — Bellows greps `/workspace/.bellows-merger-output.md` for it after your run. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
 
 ## When you cannot complete
 
@@ -735,6 +735,13 @@ If the diff is malformed, missing, or you genuinely cannot judge it, emit a `VER
 /// generates this on the host (via `git diff`) and removes it after
 /// the review-fix phase completes.
 pub const REVIEW_DIFF_FILE: &str = ".bellows-review-diff.patch";
+
+/// Workspace-relative path of the merger output file the phase-8
+/// prompt writes (issue #123 / ADR-0009 slice 1). Bellows reads this
+/// after the merger agent run, parses the trailing `VERDICT: <token>`
+/// line with `parse_merger_verdict`, and removes the file before the
+/// final commit so it never lands in the PR diff.
+pub const MERGER_OUTPUT_FILE: &str = ".bellows-merger-output.md";
 
 /// Workspace-relative path of the findings file the review prompt
 /// writes. The runner reads it after the review run and posts the
