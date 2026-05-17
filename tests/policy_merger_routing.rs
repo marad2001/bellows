@@ -14,10 +14,8 @@
 //!    and gate-failed precedences still beat the merger verdict.
 
 use bellows::policy::{
-    append_bellows_synth_entry, classify_agent_notes_with_synth_spans, classify_exit,
-    synthesize_implement_crash_entry, synthesize_no_new_tests_entry,
-    synthesize_unaddressed_entries, BellowsSynthCause, CheckResult, ExitReason, GateOutcome,
-    ImplementOutcome, MergerVerdict, NotesShape, ParsedFinding, PhaseOutcomes, Severity,
+    classify_exit, CheckResult, ExitReason, GateOutcome, ImplementOutcome, MergerVerdict,
+    NotesShape, PhaseOutcomes,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -58,6 +56,15 @@ fn clean_outcomes_with_agent_authored_heading() -> PhaseOutcomes {
     }
 }
 
+/// Same baseline as above but framed for the informational-notes
+/// scenario (ADR-0006's `<!-- bellows: informational -->` channel).
+/// The `PhaseOutcomes` value itself is identical — `classify_exit`
+/// takes `NotesShape` as a separate argument, so the helper just
+/// documents which test case the fixture is supporting.
+fn clean_outcomes_with_informational_notes() -> PhaseOutcomes {
+    clean_outcomes_with_agent_authored_heading()
+}
+
 // -----------------------------------------------------------------
 // AC1 + AC2-Merge tracer bullet: the signature gains
 // `Option<MergerVerdict>`, and `Some(Merge)` over an agent-authored
@@ -80,3 +87,79 @@ fn classify_exit_routes_merge_verdict_over_agent_authored_heading_to_success() {
          heading branch (ADR-0009 / issue #124)",
     );
 }
+
+// -----------------------------------------------------------------
+// AC2 — pin the brief-mandated mapping for each non-Merge verdict.
+// -----------------------------------------------------------------
+
+#[test]
+fn classify_exit_routes_hold_noted_verdict_to_success_with_notes() {
+    // Brief: 'MergerVerdict::HoldNoted → ExitReason::SuccessWithNotes
+    // (non-draft + agent-noted label)'. The diff broadly satisfies
+    // the ACs but a gap flagged in agent-notes.md should be visible
+    // to a human reviewer — non-draft PR labelled agent-noted.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::HoldNoted),
+        ),
+        ExitReason::SuccessWithNotes,
+        "merger HoldNoted must route to SuccessWithNotes regardless of \
+         the agent-authored heading shape (ADR-0009 / issue #124)",
+    );
+}
+
+#[test]
+fn classify_exit_routes_hold_draft_verdict_to_agent_self_reported_failure() {
+    // Brief: 'MergerVerdict::HoldDraft → ExitReason::AgentSelfReportedFailure
+    // (draft + agent-failed label)'. The merger judged the diff does
+    // NOT satisfy the brief; open a draft PR so a human can take over.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::HoldDraft),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "merger HoldDraft must route to AgentSelfReportedFailure so the \
+         runner opens a draft PR labelled agent-failed (ADR-0009 / issue #124)",
+    );
+}
+
+#[test]
+fn classify_exit_routes_merge_verdict_over_informational_notes_to_success() {
+    // A merger Merge over the informational channel routes to plain
+    // Success, replacing the pre-slice-2 SuccessWithNotes shape that
+    // InformationalOnly notes alone would have produced.
+    let outcomes = clean_outcomes_with_informational_notes();
+    assert_eq!(
+        classify_exit(
+            NotesShape::InformationalOnly,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::Success,
+        "merger Merge over informational notes must route to Success — \
+         the merger explicitly judged the run mergeable",
+    );
+}
+
+#[test]
+fn classify_exit_routes_hold_noted_verdict_over_informational_notes_to_success_with_notes() {
+    // HoldNoted is the merger's own assessment of "diff broadly OK
+    // but flag for human review" and is independent of the
+    // NotesShape-derived classification.
+    let outcomes = clean_outcomes_with_informational_notes();
+    assert_eq!(
+        classify_exit(
+            NotesShape::InformationalOnly,
+            &outcomes,
+            Some(MergerVerdict::HoldNoted),
+        ),
+        ExitReason::SuccessWithNotes,
+    );
+}
+
