@@ -15,7 +15,7 @@
 
 use bellows::policy::{
     classify_exit, BellowsSynthCause, CheckResult, ExitReason, GateOutcome, ImplementOutcome,
-    MergerVerdict, NotesShape, PhaseOutcomes,
+    MergerVerdict, NotesShape, ParsedFinding, PhaseOutcomes, Severity,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -277,6 +277,82 @@ fn classify_exit_no_synth_causes_lets_merge_verdict_win() {
         ExitReason::Success,
         "with no synth-provenance recorded, the merger Merge verdict \
          drives routing per AC1",
+    );
+}
+
+// -----------------------------------------------------------------
+// AC5 — (γ) parser-as-backstop hard override. The parser detected
+// one or more blocker/important findings the agent silently
+// skipped (neither addressed-in-code nor explained via an
+// `## Unaddressed finding:` section). The `backstop_violations`
+// field on PhaseOutcomes carries these directly; the merger
+// cannot vote past them, independent of whether the runner
+// already projected the corresponding `ParserBackstop` synth into
+// `synth_causes`. Defence-in-depth against a future drift where
+// the runner forgets to project the backstop into the synth-cause
+// list.
+// -----------------------------------------------------------------
+
+fn blocker_finding(title: &str) -> ParsedFinding {
+    ParsedFinding {
+        title: title.to_string(),
+        severity: Severity::Blocker,
+        body: String::new(),
+    }
+}
+
+#[test]
+fn classify_exit_backstop_violations_override_merge_verdict() {
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.backstop_violations = vec![blocker_finding("unhandled error path")];
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "non-empty backstop_violations must override merger Merge — \
+         the parser-as-backstop detected a blocker the agent silently \
+         skipped, and the merger cannot vote past that",
+    );
+}
+
+#[test]
+fn classify_exit_backstop_violations_override_hold_noted_verdict() {
+    // Coverage-backstop is a hard override across every verdict, not
+    // just Merge. HoldNoted would normally upgrade to SuccessWithNotes
+    // but the silent-skip detection holds the line.
+    let mut outcomes = clean_outcomes_with_agent_authored_heading();
+    outcomes.backstop_violations = vec![blocker_finding("missing test coverage")];
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::HoldNoted),
+        ),
+        ExitReason::AgentSelfReportedFailure,
+        "non-empty backstop_violations must override HoldNoted too",
+    );
+}
+
+#[test]
+fn classify_exit_empty_backstop_violations_lets_merge_verdict_win() {
+    // Control: the default empty Vec leaves the Merge verdict intact.
+    let outcomes = clean_outcomes_with_agent_authored_heading();
+    assert!(
+        outcomes.backstop_violations.is_empty(),
+        "default PhaseOutcomes must have no recorded backstop violations",
+    );
+    assert_eq!(
+        classify_exit(
+            NotesShape::HasUnaddressedFinding,
+            &outcomes,
+            Some(MergerVerdict::Merge),
+        ),
+        ExitReason::Success,
+        "with no backstop violations, the merger Merge verdict drives \
+         routing per AC1",
     );
 }
 
