@@ -14,7 +14,8 @@ use bellows::policy::{
 
 // -----------------------------------------------------------------
 // AC: parse_merger_verdict for the three valid tokens, garbage,
-// missing-line, ambiguous, and whitespace / CRLF edge cases.
+// missing-line, non-trailing / duplicate verdict lines, and whitespace /
+// CRLF edge cases.
 // -----------------------------------------------------------------
 
 #[test]
@@ -48,6 +49,13 @@ fn parse_merger_verdict_returns_none_when_verdict_line_missing() {
 }
 
 #[test]
+fn parse_merger_verdict_returns_none_when_verdict_line_is_not_trailing() {
+    let agent_output =
+        "Initial judgement.\n\nVERDICT: MERGE\n\nLater prose means this was not the final line.\n";
+    assert_eq!(parse_merger_verdict(agent_output), None);
+}
+
+#[test]
 fn parse_merger_verdict_returns_none_for_garbage_token() {
     // Off-vocabulary tokens (e.g. `LGTM`, `OK`, `merge`, lowercase
     // variants) must NOT be coerced into a valid verdict.
@@ -67,15 +75,12 @@ fn parse_merger_verdict_returns_none_when_ambiguous() {
 }
 
 #[test]
-fn parse_merger_verdict_accepts_duplicate_verdict_lines_with_same_token() {
-    // Two verdict lines with the SAME token is not ambiguous — the
-    // agent's verdict is still unambiguous, and a strict "any
-    // duplicate" check would over-reject (an agent that quoted
-    // itself in the prose would trip it). Brief says "ambiguous"
-    // explicitly, which the doc-comment clarifies to mean
-    // "different tokens".
+fn parse_merger_verdict_returns_none_for_duplicate_verdict_lines_with_same_token() {
+    // The merger prompt requires a single trailing verdict line.
+    // Earlier standalone verdict lines are stale / off-contract even
+    // when they carry the same token as the final line.
     let agent_output = "I'll say it twice.\n\nVERDICT: MERGE\n\nAgain:\n\nVERDICT: MERGE\n";
-    assert_eq!(parse_merger_verdict(agent_output), Some(MergerVerdict::Merge));
+    assert_eq!(parse_merger_verdict(agent_output), None);
 }
 
 #[test]
