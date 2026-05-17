@@ -16,7 +16,8 @@ use std::str::FromStr;
 use bellows::config::Config;
 use bellows::runner::{
     capture_and_remove_agent_notes, post_agent_notes_comment_if_present, run_once,
-    AgentContainerProbe, BlockReason, NoAgentContainer, RunError, RunOutcome,
+    AgentContainerProbe, AgentContainerProbeError, BlockReason,
+    LocalDockerAgentContainerProbe, NoAgentContainer, RunError, RunOutcome,
     RunningAgentContainer,
 };
 use bellows::workspace;
@@ -184,6 +185,50 @@ async fn run_once_returns_blocked_when_a_bellows_agent_container_is_running() {
             "expected Blocked(AgentContainerRunning {{ container_id: \"abc123def456\", .. }}), got {other:?}",
         ),
     }
+}
+
+#[tokio::test]
+async fn run_once_fails_closed_when_the_reconnecting_probe_cannot_build_a_docker_client() {
+    // Regression for the review finding: Docker client construction
+    // failure must remain inside the run_once probe path. If the
+    // polling loop swaps in NoAgentContainer after a startup connect
+    // failure, this tick would proceed to the GitHub issue lookup and
+    // could claim work without checking the daemon.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let probe = LocalDockerAgentContainerProbe::with_connector(|| {
+        Err(AgentContainerProbeError(anyhow::anyhow!(
+            "docker socket unavailable"
+        )))
+    });
+    let mut log = Cursor::new(Vec::new());
+
+    let outcome = run_once(&client, &config, &mut log, None, &probe)
+        .await
+        .expect("probe setup failures should be mapped to a blocked tick, not Err");
+
+    match outcome {
+        RunOutcome::Blocked {
+            reason: BlockReason::AgentContainerRunning { container_id, .. },
+        } => assert!(
+            container_id.is_empty(),
+            "unknown probe state should use an empty synthetic container id"
+        ),
+        other => panic!("expected fail-closed Blocked(AgentContainerRunning), got {other:?}"),
+    }
+    let log_text = String::from_utf8(log.into_inner()).expect("log is utf8");
+    assert!(
+        log_text.contains("docker socket unavailable"),
+        "operator log should include the Docker setup failure: {log_text}"
+    );
 }
 
 #[tokio::test]

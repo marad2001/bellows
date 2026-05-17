@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use bellows::auth::{Auth, CLAUDE_HOME_IN_CONTAINER};
 use bellows::config::{AuthMethod, Config};
-use bellows::runner::{self, BollardAgentContainerProbe, NoAgentContainer, RunOutcome};
+use bellows::runner::{self, LocalDockerAgentContainerProbe, RunOutcome};
 use bellows::sandbox;
 use bellows::status::{self, KillPrecheck, OutcomeTransition, StatusContext};
 use bellows::tracker;
@@ -1901,43 +1901,20 @@ async fn run(config_path: &PathBuf) -> Result<()> {
     let mut transition = OutcomeTransition::new();
 
     // Issue #126: the pre-claim gate is now a container-presence
-    // check against the local Docker daemon. Connect once at startup
-    // and pass a borrow into each `run_once` tick. A daemon-connect
-    // failure here is logged and we fall back to `NoAgentContainer`
-    // so a bellows install without a reachable Docker (or before the
-    // daemon is up) still polls — the sandbox-spawn step downstream
-    // will surface the real error per-claim if the daemon is needed.
-    let docker_for_probe = match bollard::Docker::connect_with_local_defaults() {
-        Ok(d) => Some(d),
-        Err(e) => {
-            log(
-                &mut log_file,
-                &format!(
-                    "bellows: could not connect to Docker for pre-claim container-presence probe (falling back to no-probe; sandbox spawn would still error if Docker is needed): {}",
-                    format_error_chain(&e),
-                ),
-            );
-            None
-        }
-    };
+    // check against the local Docker daemon. The probe connects on
+    // every tick so a startup-time Docker outage remains a fail-closed
+    // probe error instead of permanently disabling the gate.
+    let container_probe = LocalDockerAgentContainerProbe::new();
 
     loop {
-        let outcome = match &docker_for_probe {
-            Some(d) => {
-                let probe = BollardAgentContainerProbe { docker: d };
-                runner::run_once(&client, &config, &mut log_file, status_ctx.as_ref(), &probe).await
-            }
-            None => {
-                runner::run_once(
-                    &client,
-                    &config,
-                    &mut log_file,
-                    status_ctx.as_ref(),
-                    &NoAgentContainer,
-                )
-                .await
-            }
-        };
+        let outcome = runner::run_once(
+            &client,
+            &config,
+            &mut log_file,
+            status_ctx.as_ref(),
+            &container_probe,
+        )
+        .await;
         match outcome {
             Ok(RunOutcome::Blocked { reason }) => {
                 if let Some(line) = transition.observe_blocked(&reason) {

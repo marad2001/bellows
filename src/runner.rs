@@ -329,6 +329,59 @@ impl<'a> AgentContainerProbe for BollardAgentContainerProbe<'a> {
     }
 }
 
+fn connect_local_docker() -> Result<bollard::Docker, AgentContainerProbeError> {
+    bollard::Docker::connect_with_local_defaults()
+        .map_err(|e| AgentContainerProbeError(anyhow::Error::from(e)))
+}
+
+/// Production polling-loop probe. Unlike `BollardAgentContainerProbe`,
+/// this owns the Docker connection step and performs it on every tick,
+/// so a startup-time Docker outage remains a fail-closed probe error
+/// instead of permanently disabling the pre-claim concurrency gate.
+pub struct LocalDockerAgentContainerProbe<
+    C = fn() -> Result<bollard::Docker, AgentContainerProbeError>,
+> {
+    connect: C,
+}
+
+impl LocalDockerAgentContainerProbe {
+    pub fn new() -> Self {
+        Self {
+            connect: connect_local_docker
+                as fn() -> Result<bollard::Docker, AgentContainerProbeError>,
+        }
+    }
+}
+
+impl Default for LocalDockerAgentContainerProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> LocalDockerAgentContainerProbe<C>
+where
+    C: Fn() -> Result<bollard::Docker, AgentContainerProbeError> + Send + Sync,
+{
+    pub fn with_connector(connect: C) -> Self {
+        Self { connect }
+    }
+}
+
+impl<C> AgentContainerProbe for LocalDockerAgentContainerProbe<C>
+where
+    C: Fn() -> Result<bollard::Docker, AgentContainerProbeError> + Send + Sync,
+{
+    async fn find_running_agent_container(
+        &self,
+    ) -> Result<Option<RunningAgentContainer>, AgentContainerProbeError> {
+        let docker = (self.connect)()?;
+        BollardAgentContainerProbe { docker: &docker }
+            .find_running_agent_container()
+            .await
+    }
+}
+
 /// Per-repo claim candidate the multi-repo polling tick (#35)
 /// collects across configured repos before picking the
 /// globally-lowest-number issue. Holds the parsed `(owner, repo)`
