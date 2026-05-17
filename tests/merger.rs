@@ -4,6 +4,9 @@
 //! before the source-side change lands, so the TDD shape is visible in
 //! the commit log.
 
+use std::str::FromStr;
+
+use bellows::config::{Config, Engine};
 use bellows::policy::{parse_merger_verdict, render_merger_prompt, MergerVerdict};
 
 // -----------------------------------------------------------------
@@ -181,5 +184,83 @@ fn render_merger_prompt_identifies_phase_as_merger() {
     assert!(
         head.to_lowercase().contains("merger"),
         "merger prompt must identify the phase: {head}",
+    );
+}
+
+// -----------------------------------------------------------------
+// AC: `[phases.merge]` schema entry parses with a `cli_chain` field;
+// default `["claude:claude-opus-4-7"]` when omitted.
+// -----------------------------------------------------------------
+
+#[test]
+fn config_phases_merge_defaults_to_claude_opus_when_section_omitted() {
+    // Brief: 'Default `claude:claude-opus-4-7` per ADR-0009 (opus is
+    // the first-look-judgement role; cross-family independence from
+    // codex which originates most agent-authored unaddressed-finding
+    // headings in phase 4).' A minimal config (with no `[phases.merge]`
+    // table) must produce a single-entry chain with that engine + model.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+"#;
+    let config = Config::from_str(config_text).expect("minimal config must parse");
+    let merge = &config.phases.merge.cli_chain;
+    assert_eq!(merge.len(), 1, "merger default chain must be one entry");
+    assert_eq!(merge[0].engine, Engine::Claude);
+    assert_eq!(
+        merge[0].model.as_deref(),
+        Some("claude-opus-4-7"),
+        "merger default must pin claude-opus-4-7 per ADR-0009"
+    );
+}
+
+#[test]
+fn config_phases_merge_accepts_operator_supplied_cli_chain() {
+    // Brief: 'Engine selection is per-phase configurable via
+    // `[phases.merge] cli_chain = [...]` in `orchestrator.toml`,
+    // matching the existing per-phase pattern.' Operators can swap
+    // the engine but cannot disable the phase via config — the
+    // empty-chain rejection lives in the per-phase normaliser and is
+    // already shared with the other phases.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+cli_chain = ["codex:gpt-5.5", "claude:claude-opus-4-7"]
+"#;
+    let config = Config::from_str(config_text).expect("merge override config must parse");
+    let merge = &config.phases.merge.cli_chain;
+    assert_eq!(merge.len(), 2);
+    assert_eq!(merge[0].engine, Engine::Codex);
+    assert_eq!(merge[0].model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(merge[1].engine, Engine::Claude);
+    assert_eq!(merge[1].model.as_deref(), Some("claude-opus-4-7"));
+}
+
+#[test]
+fn config_phases_merge_rejects_empty_cli_chain() {
+    // Same shape as the other phases: explicit `cli_chain = []` is
+    // rejected at config-load time so an operator can't silently end
+    // up with a phase that has nothing to dispatch.
+    let config_text = r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[phases.merge]
+cli_chain = []
+"#;
+    assert!(
+        Config::from_str(config_text).is_err(),
+        "empty merge cli_chain must be rejected at config-load time"
     );
 }
