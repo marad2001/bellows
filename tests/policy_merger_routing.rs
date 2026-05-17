@@ -51,6 +51,7 @@ fn clean_outcomes_with_agent_authored_heading() -> PhaseOutcomes {
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,
         merger_verdict: None,
+        merger_prose: None,
         synth_causes: Vec::new(),
         security: None,
         security_fix: None,
@@ -376,6 +377,7 @@ fn classify_exit_reads_verdict_from_phase_outcomes_field_in_runner_call_pattern(
     // integration-level harness.
     let outcomes = PhaseOutcomes {
         merger_verdict: Some(MergerVerdict::Merge),
+        merger_prose: None,
         ..clean_outcomes_with_agent_authored_heading()
     };
     let reason = classify_exit(

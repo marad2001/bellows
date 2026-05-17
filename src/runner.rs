@@ -7,7 +7,7 @@ use crate::chain_walker::{
     pick_engine_for_phase, PickError, PickReason, PickedEntry, RateLimitDisposition, StateFile,
 };
 use crate::config::{
-    AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride, RuntimeLabelsConfig,
+    AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride, PostingMode, RuntimeLabelsConfig,
 };
 use crate::policy::{
     self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
@@ -1260,6 +1260,12 @@ pub async fn run_once(
     // in PhaseOutcomes for the PR/log build sites; does NOT yet feed
     // classify_exit (slice 2 / #124 wires routing).
     let mut merger_verdict: Option<policy::MergerVerdict> = None;
+    // Issue #125 / ADR-0009 slice 3: retain the merger's full prose
+    // body so we can post it as a `## Merge verdict` PR comment after
+    // PR-open (see `post_merge_verdict_comment_if_present`). Mirrors
+    // `merger_verdict`: populated only when phase 8 ran and wrote its
+    // output file; `None` on any halt-before-phase-8 path.
+    let mut merger_prose: Option<String> = None;
     // Slice 9.6: parser-as-backstop violations. Populated after the
     // per-finding/nit-batch review-fix invocations complete and the
     // parser cross-references findings against agent-notes sections.
@@ -2061,6 +2067,9 @@ pub async fn run_once(
                 merger_verdict = merger_output_text
                     .as_deref()
                     .and_then(policy::parse_merger_verdict);
+                // Issue #125 / ADR-0009 slice 3: stash the prose so
+                // it survives down to the post-PR-open comment site.
+                merger_prose = merger_output_text;
                 match merger_verdict {
                     Some(v) => announce(
                         log_writer,
@@ -2125,6 +2134,11 @@ pub async fn run_once(
         // the merger phase above when it ran; `None` when phase 8 was
         // halted or its output was unparseable.
         merger_verdict,
+        // Issue #125 / ADR-0009 slice 3: phase-8 merger's full prose
+        // body, plumbed to the post-PR-open `## Merge verdict`
+        // comment site. `None` whenever the merger didn't run or
+        // didn't write its output file.
+        merger_prose,
         // Issue #124 / ADR-0009 slice 2: project the recorded
         // out-of-band synth spans down to their causes. The
         // (β) hard-override branch in classify_exit consumes this so
@@ -2320,6 +2334,26 @@ pub async fn run_once(
         let comment_body = format!("## Security findings\n\n{security_findings}");
         tracker::post_pr_comment(client, &owner, &repo, pr.number, &comment_body).await?;
     }
+
+    // Issue #125 / ADR-0009 slice 3: post the phase-8 merger's full
+    // prose review as a `## Merge verdict` PR comment, gated by the
+    // operator's `[phases.merge].posting` toggle. Internally
+    // no-ops on every suppression branch (verdict=None, no prose,
+    // PostOnHoldOnly+Merge); on post-failure it logs a warning and
+    // returns `Ok(())` so the run still completes (AC7).
+    post_merge_verdict_comment_if_present(
+        client,
+        &owner,
+        &repo,
+        pr.number,
+        MergeVerdictPost::from_parts(
+            outcomes.merger_verdict,
+            outcomes.merger_prose.as_deref(),
+        ),
+        config.phases.merge.posting,
+        log_writer,
+    )
+    .await?;
 
     let finished = chrono::Utc::now();
     let log_body = build_log_body(
@@ -3031,6 +3065,145 @@ pub async fn post_agent_notes_comment_if_present(
     tracker::post_pr_comment(client, owner, repo, pr_number, &body).await
 }
 
+/// Phase-8 merger output bundled for the `## Merge verdict` PR-comment
+/// post site. Both fields come from the same merger invocation: either
+/// the phase ran, parsed a verdict, and retained its prose (both
+/// present), or the run took the fallback classifier path and neither
+/// is available (see AC6). Grouping them at the type level makes the
+/// correlation explicit and keeps
+/// [`post_merge_verdict_comment_if_present`]'s argument count below
+/// clippy's `too_many_arguments` threshold.
+pub struct MergeVerdictPost<'a> {
+    pub verdict: crate::policy::MergerVerdict,
+    pub prose: &'a str,
+}
+
+impl<'a> MergeVerdictPost<'a> {
+    /// Construct from the `(merger_verdict, merger_prose)` pair the
+    /// runner threads through `PhaseOutcomes`. Returns `None` when
+    /// either component is missing — matching the pre-refactor
+    /// semantics that treated a missing verdict OR a missing prose as
+    /// "nothing to surface."
+    pub fn from_parts(
+        verdict: Option<crate::policy::MergerVerdict>,
+        prose: Option<&'a str>,
+    ) -> Option<Self> {
+        match (verdict, prose) {
+            (Some(verdict), Some(prose)) => Some(Self { verdict, prose }),
+            _ => None,
+        }
+    }
+}
+
+/// Issue #125 / ADR-0009 slice 3: post the phase-8 merger's full prose
+/// review as a "Merge verdict" PR comment.
+///
+/// The comment is the operator's audit trail of *why* the merger voted
+/// the way it did — squash-merged into `master` along with the rest of
+/// the PR's conversation. The comment is titled `## Merge verdict` to
+/// distinguish it at a glance from the existing `## Agent notes`,
+/// `## Review findings`, and `## Security findings` per-phase comment
+/// posts in [`run_once`].
+///
+/// Surfacing depends on the operator's `[phases.merge].posting`
+/// toggle:
+///
+/// - `PostAlways` (default): every parseable verdict surfaces a
+///   comment, including clean `MERGE` runs. Full audit trail.
+/// - `PostOnHoldOnly`: only `HoldNoted` and `HoldDraft` verdicts
+///   surface a comment; `Merge` verdicts auto-merge silently with no
+///   comment.
+///
+/// Regardless of the toggle:
+///
+/// - A `None` `post` argument (slice-1 fallback path — unparseable
+///   output, merger crash, rate-limit skip, or the merger never wrote
+///   its output file) does NOT post a comment. The audit trail
+///   belongs to the merger, not to the fallback classifier.
+/// - If `prose` exceeds GitHub's 64 KiB comment limit, the body is
+///   truncated with a `[truncated — full prose in bellows.log]`
+///   marker (precedent: issue #87 run-log truncation).
+/// - If the POST fails (network blip, permission denied, 5xx), the
+///   error is logged as a warning on `log_writer` and the function
+///   returns `Ok(())` — consistent with the existing run-log
+///   comment-post behaviour (issue #87). The run continues.
+pub async fn post_merge_verdict_comment_if_present<W: Write + ?Sized>(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    post: Option<MergeVerdictPost<'_>>,
+    posting: PostingMode,
+    log_writer: &mut W,
+) -> Result<(), octocrab::Error> {
+    // post=None: phase 8 didn't emit a parsed verdict, or its prose
+    // was absent (the AC6 fallback path). Audit trail belongs to the
+    // merger, not the fallback classifier — skip silently.
+    let Some(MergeVerdictPost { verdict, prose }) = post else {
+        return Ok(());
+    };
+    if prose.trim().is_empty() {
+        return Ok(());
+    }
+    // Posting-mode gate (AC4 / AC5): silent auto-merge for clean
+    // MERGE under post-on-hold-only.
+    let should_post = match (posting, verdict) {
+        (PostingMode::PostAlways, _) => true,
+        (PostingMode::PostOnHoldOnly, crate::policy::MergerVerdict::Merge) => false,
+        (PostingMode::PostOnHoldOnly, _) => true,
+    };
+    if !should_post {
+        return Ok(());
+    }
+    let body = build_merge_verdict_comment_body(prose);
+    if let Err(e) = tracker::post_pr_comment(client, owner, repo, pr_number, &body).await {
+        // AC7: posting failures are operator-visible warnings, not
+        // run-failing errors. Mirrors the issue-#87 run-log
+        // comment-post failure handling.
+        let line = format!(
+            "bellows: posting the Merge verdict comment on PR #{} failed (continuing): {}",
+            pr_number, e,
+        );
+        println!("{line}");
+        let _ = writeln!(log_writer, "{line}");
+    }
+    Ok(())
+}
+
+/// Build the body of the "Merge verdict" PR comment, truncating if
+/// the merger's prose exceeds GitHub's 64 KiB comment limit (AC8).
+///
+/// The marker `[truncated — full prose in bellows.log]` matches the
+/// issue-#87 run-log truncation precedent so the operator's muscle
+/// memory carries over.
+fn build_merge_verdict_comment_body(prose: &str) -> String {
+    /// GitHub hard-caps issue/PR comment bodies at 65,536 bytes.
+    const GITHUB_COMMENT_MAX_BYTES: usize = 65_536;
+    /// Reserved headroom so the `## Merge verdict` heading plus the
+    /// truncation marker plus the closing code-fence definitely fit
+    /// under the cap. 4 KiB is generous; the actual fixed overhead
+    /// is well under 200 bytes.
+    const HEADROOM_BYTES: usize = 4_096;
+
+    let heading = "## Merge verdict\n\n";
+    let truncation_marker = "\n\n[truncated — full prose in bellows.log]\n";
+    let max_prose_bytes = GITHUB_COMMENT_MAX_BYTES
+        .saturating_sub(heading.len() + truncation_marker.len() + HEADROOM_BYTES);
+
+    if prose.len() <= max_prose_bytes {
+        return format!("{heading}{prose}");
+    }
+    // Truncate at a char boundary so we don't slice through a UTF-8
+    // multi-byte sequence (the merger's prose is natural-language
+    // English in practice; defensive belt anyway).
+    let mut cut = max_prose_bytes;
+    while cut > 0 && !prose.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let truncated = &prose[..cut];
+    format!("{heading}{truncated}{truncation_marker}")
+}
+
 /// Remove the slice-X1 + X2 phase handoff files from the workspace.
 /// The review diff (input to the review prompt), the review findings
 /// file (output of review, input of review-fix), the review commit
@@ -3215,6 +3388,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             synth_causes: Vec::new(),
             security: None,
             security_fix: None,
@@ -3368,6 +3542,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3405,6 +3580,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3445,6 +3621,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3482,6 +3659,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3563,6 +3741,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3599,6 +3778,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3642,6 +3822,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3687,6 +3868,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3740,6 +3922,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3782,6 +3965,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3840,6 +4024,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             ],
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3887,6 +4072,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -3954,6 +4140,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),
@@ -4126,6 +4313,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             synth_causes: Vec::new(),
             security,
             security_fix,
@@ -4342,6 +4530,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: Some(crate::policy::AnalysisOutcome {
                 findings_text: Some(
                     "## Findings\n\n### 1. command injection in shell call — blocker\n\nbody"
@@ -4409,6 +4598,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
             merger_verdict: None,
+            merger_prose: None,
             security: None,
             security_fix: None,
             synth_causes: Vec::new(),

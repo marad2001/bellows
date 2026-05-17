@@ -363,6 +363,7 @@ fn phase_outcomes_merger_verdict_round_trips_all_three_variants() {
     ] {
         let outcomes = PhaseOutcomes {
             merger_verdict: Some(verdict),
+            merger_prose: None,
             ..PhaseOutcomes::default()
         };
         assert_eq!(outcomes.merger_verdict, Some(verdict));

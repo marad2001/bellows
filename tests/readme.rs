@@ -535,6 +535,31 @@ fn orchestrator_example_documents_ssh_keys_volume_and_deploy_keys() {
 }
 
 #[test]
+fn orchestrator_example_documents_phases_merge_posting_toggle() {
+    // Issue #125 / ADR-0009 AC2: orchestrator.example.toml documents
+    // the `[phases.merge].posting` field, with both the default
+    // (`post-always`) and the alternative (`post-on-hold-only`)
+    // values visible to an operator skimming the file. Pin the
+    // load-bearing tokens (the field name, both enum values, and the
+    // commented-default convention) rather than verbatim prose so
+    // the comment block can evolve without breaking the test.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("orchestrator.example.toml");
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("orchestrator.example.toml must exist: {}", e));
+    for needle in [
+        "posting",
+        "post-always",
+        "post-on-hold-only",
+        "Merge verdict",
+    ] {
+        assert!(
+            body.contains(needle),
+            "orchestrator.example.toml must mention `{needle}` for issue #125: {body}"
+        );
+    }
+}
+
+#[test]
 fn orchestrator_example_documents_gates_table_and_fallback_flags() {
     // ADR-0004 acceptance: orchestrator.example.toml documents the
     // new `[gates]` table with explanatory comments. The defaults

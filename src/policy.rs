@@ -339,6 +339,16 @@ pub struct PhaseOutcomes {
     /// wire routing). Stored here so the runner can carry it across
     /// the gap from phase-8 dispatch to the PR/log build sites.
     pub merger_verdict: Option<MergerVerdict>,
+    /// Issue #125 / ADR-0009 slice 3: the phase-8 merger's full
+    /// prose output (everything in `MERGER_OUTPUT_FILE`, including
+    /// the trailing `VERDICT: <token>` line). `None` mirrors the
+    /// same conditions as `merger_verdict` — phase didn't run or
+    /// the merger never wrote its output file. The runner uses this
+    /// to post the `## Merge verdict` PR comment via
+    /// `post_merge_verdict_comment_if_present`; the field exists on
+    /// `PhaseOutcomes` purely to plumb the prose from the phase-8
+    /// dispatch site to the post-PR-open comment site.
+    pub merger_prose: Option<String>,
     /// Issue #124 / ADR-0009 slice 2: out-of-band provenance for any
     /// Bellows-authored `## Unaddressed finding:` spans appended to
     /// `agent-notes.md` during this run. The runner populates this
