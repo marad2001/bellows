@@ -8,8 +8,8 @@ use std::str::FromStr;
 
 use bellows::config::{Config, Engine};
 use bellows::policy::{
-    classify_exit, parse_merger_verdict, render_merger_prompt, ExitReason, ImplementOutcome,
-    MergerVerdict, NotesShape, PhaseOutcomes,
+    classify_exit, parse_merger_verdict, render_merger_prompt, MergerVerdict, NotesShape,
+    PhaseOutcomes,
 };
 
 // -----------------------------------------------------------------
