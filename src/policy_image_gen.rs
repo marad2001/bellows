@@ -20,7 +20,7 @@ pub const OPENCODE_VERSION: &str = "1.15.3";
 /// `npm pack opencode-ai@<version> && sha256sum opencode-ai-*.tgz`
 /// when bumping the version.
 pub const OPENCODE_SHA256: &str =
-    "f8ae8678c9bccdbaf99777f36ff2d5efe689d473384f2e94b84d6cda256d2540";
+    "be282c09f6d4fe2889b2566b48f0507c52151528490c2a67efeccbe57a7fe317";
 
 /// Render the canonical Dockerfile `RUN` snippet that installs
 /// opencode and verifies its tarball against the pinned sha256. AC14's

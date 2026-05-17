@@ -83,7 +83,7 @@ RUN set -eux; \
 # sha256sum opencode-ai-*.tgz`; the two ARGs must move
 # together.
 ARG OPENCODE_VERSION=1.15.3
-ARG OPENCODE_SHA256=f8ae8678c9bccdbaf99777f36ff2d5efe689d473384f2e94b84d6cda256d2540
+ARG OPENCODE_SHA256=be282c09f6d4fe2889b2566b48f0507c52151528490c2a67efeccbe57a7fe317
 RUN set -eux; \
     npm pack opencode-ai@${OPENCODE_VERSION} --pack-destination /tmp; \
     echo "${OPENCODE_SHA256}  /tmp/opencode-ai-${OPENCODE_VERSION}.tgz" | sha256sum -c -; \

@@ -2,6 +2,7 @@
 name = "bellows"
 version = "0.1.0"
 edition = "2024"
+default-run = "bellows"
 
 [dependencies]
 anyhow = "1.0.102"
