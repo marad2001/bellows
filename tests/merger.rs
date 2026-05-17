@@ -194,6 +194,46 @@ fn render_merger_prompt_identifies_phase_as_merger() {
     );
 }
 
+#[test]
+fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_markers_present() {
+    // AC8 of issue #124 / ADR-0009 slice 2: the merger reads
+    // agent-notes.md but the in-band content may contain
+    // Bellows-authored synth-provenance markers
+    // (`<!-- bellows parser-as-backstop ... -->`,
+    //  `<!-- bellows weak-test guard ... -->`,
+    //  `<!-- bellows implement-crash recovery ... -->`).
+    //
+    // The policy-side (β) hard override in classify_exit blocks a
+    // Merge verdict over these markers, but the merger should
+    // recognise them and not vote MERGE in the first place — the
+    // override is a defence-in-depth, not the primary instruction.
+    // Pin the prompt's instruction so a future edit can't quietly
+    // drop the synth-provenance guidance.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        lowered.contains("synth")
+            || lowered.contains("bellows-authored")
+            || lowered.contains("<!-- bellows"),
+        "merger prompt must mention bellows-authored synth-provenance markers \
+         so the merger knows to look for them: {prompt}",
+    );
+    // The instruction must specifically tell the agent NOT to vote
+    // MERGE in their presence — `HOLD-DRAFT` (or any non-MERGE
+    // verdict) is the correct shape when the synth markers indicate
+    // Bellows itself decided the run was not mergeable.
+    assert!(
+        lowered.contains("do not vote merge")
+            || lowered.contains("do not vote `merge`")
+            || lowered.contains("must not vote merge")
+            || lowered.contains("never vote merge")
+            || lowered.contains("never vote `merge`")
+            || lowered.contains("not vote `merge`"),
+        "merger prompt must instruct the agent NOT to vote MERGE when \
+         synth-provenance markers are present in agent-notes.md: {prompt}",
+    );
+}
+
 // -----------------------------------------------------------------
 // AC: `[phases.merge]` schema entry parses with a `cli_chain` field;
 // default `["claude:claude-opus-4-7"]` when omitted.
