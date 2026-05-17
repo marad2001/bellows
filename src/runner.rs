@@ -2014,9 +2014,10 @@ pub async fn run_once(
             let merger_auth = auth_for(&merger_chain_entry);
             if rate_limited_phase.is_none() {
                 workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-                let merger_kickoff = policy::wrap_phase_prompt_for_engine(
+                let merger_kickoff = render_merger_kickoff_for_engine(
                     merger_chain_entry.engine,
-                    &policy::render_merger_prompt(),
+                    &brief,
+                    &end_pipeline_gate,
                 );
                 tokio::fs::write(
                     workspace.path().join(".bellows-kickoff.md"),
@@ -2663,6 +2664,64 @@ fn gate_summary_line(gate: &GateOutcome) -> String {
         part("clippy", &gate.cargo_clippy),
         part("tests", &gate.cargo_test),
     )
+}
+
+fn render_merger_kickoff_for_engine(
+    engine: Engine,
+    brief: &str,
+    end_pipeline_gate: &Option<GateOutcome>,
+) -> String {
+    let mut body = policy::render_merger_prompt();
+    body.push_str("\n\n## Bellows-supplied run inputs\n\n");
+    body.push_str(
+        "The runner injects these values directly into the kickoff because the merger \
+         sandbox only has `/workspace` mounted and cannot read the host run log.\n\n",
+    );
+    body.push_str("### Agent brief\n\n");
+    body.push_str("```markdown\n");
+    body.push_str(brief.trim_end());
+    body.push_str("\n```\n\n");
+    body.push_str("### End-pipeline cargo-checks gate\n\n");
+    body.push_str("```text\n");
+    body.push_str(&merger_gate_summary(end_pipeline_gate));
+    body.push_str("```\n");
+    policy::wrap_phase_prompt_for_engine(engine, &body)
+}
+
+fn merger_gate_summary(end_pipeline_gate: &Option<GateOutcome>) -> String {
+    let mut out = String::new();
+    out.push_str("end_pipeline_gate:\n");
+    match end_pipeline_gate {
+        Some(gate) => {
+            out.push_str("  status: ran\n");
+            push_merger_check_summary(&mut out, "cargo_clippy", &gate.cargo_clippy);
+            push_merger_check_summary(&mut out, "cargo_test", &gate.cargo_test);
+        }
+        None => {
+            out.push_str("  status: did-not-run\n");
+            push_merger_check_summary(&mut out, "cargo_clippy", &None);
+            push_merger_check_summary(&mut out, "cargo_test", &None);
+        }
+    }
+    out
+}
+
+fn push_merger_check_summary(out: &mut String, name: &str, check: &Option<CheckResult>) {
+    out.push_str(&format!("  {name}:\n"));
+    match check {
+        Some(result) if result.exit_code == 0 => {
+            out.push_str("    status: passed\n");
+            out.push_str(&format!("    exit_code: {}\n", result.exit_code));
+        }
+        Some(result) => {
+            out.push_str("    status: failed\n");
+            out.push_str(&format!("    exit_code: {}\n", result.exit_code));
+        }
+        None => {
+            out.push_str("    status: did-not-run\n");
+            out.push_str("    exit_code: n/a\n");
+        }
+    }
 }
 
 fn review_summary(review: &Option<ReviewOutcome>) -> String {
@@ -3412,6 +3471,53 @@ api_key_env_file = "~/bellows-test-opencode.env"
         assert!(body.contains("Review:"));
         assert!(body.contains("Cargo checks (post-implement)"));
         assert!(body.contains("Cargo checks (end-pipeline)"));
+    }
+
+    #[test]
+    fn render_merger_kickoff_includes_brief_and_end_pipeline_gate_status() {
+        let brief = r#"## Agent Brief
+
+**Acceptance criteria:**
+- [ ] Behaviour test: preserve the frobnicator output.
+"#;
+        let end_pipeline_gate = Some(GateOutcome {
+            cargo_clippy: Some(CheckResult {
+                exit_code: 0,
+                output: "clippy ok".to_string(),
+            }),
+            cargo_test: Some(CheckResult {
+                exit_code: 101,
+                output: "one regression failed".to_string(),
+            }),
+        });
+
+        let kickoff =
+            render_merger_kickoff_for_engine(Engine::Claude, brief, &end_pipeline_gate);
+
+        assert!(
+            kickoff.contains("preserve the frobnicator output"),
+            "merger kickoff must embed the fetched agent brief: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("end_pipeline_gate:"),
+            "merger kickoff must embed a structured gate summary: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("status: ran"),
+            "merger kickoff must say the end-pipeline gate ran: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("cargo_clippy:")
+                && kickoff.contains("status: passed")
+                && kickoff.contains("exit_code: 0"),
+            "merger kickoff must include clippy status and exit code: {kickoff}",
+        );
+        assert!(
+            kickoff.contains("cargo_test:")
+                && kickoff.contains("status: failed")
+                && kickoff.contains("exit_code: 101"),
+            "merger kickoff must include test status and exit code: {kickoff}",
+        );
     }
 
     #[test]

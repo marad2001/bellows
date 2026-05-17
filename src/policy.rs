@@ -680,10 +680,11 @@ pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
 /// shape but is read-only and emits a natural-language prose review
 /// ending in a `VERDICT: <token>` line carrying exactly one of
 /// `MERGE`, `HOLD-NOTED`, or `HOLD-DRAFT`. The merger reads the diff
-/// vs master, the brief's verbatim ACs (passed via the kickoff
-/// prompt), the final `agent-notes.md` content (with synth-provenance
-/// markers), and CI / cargo-checks status — then judges whether the
-/// diff satisfies the ACs. Notes are treated as agent-stated
+/// vs master, the brief's verbatim ACs (appended by the runner to the
+/// kickoff prompt), the final `agent-notes.md` content (with synth-
+/// provenance markers), and end-pipeline cargo-checks status (also
+/// appended by the runner) — then judges whether the diff satisfies
+/// the ACs. Notes are treated as agent-stated
 /// reasoning, NOT evidence the code is correct; the diff and ACs are
 /// the anchor.
 pub fn render_merger_prompt() -> String {
@@ -695,9 +696,9 @@ const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bell
 ## Inputs
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta this run produced against master. Read this as the primary anchor.
-- The agent brief (with its verbatim `## Acceptance criteria` list) is in the kickoff context. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
+- The agent brief (with its verbatim `## Acceptance criteria` list) is appended to this kickoff under `## Bellows-supplied run inputs`. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
 - `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
-- The cargo-checks gate (clippy + test) ran at end-of-pipeline. CI status is captured in the run-log; treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
+- The end-pipeline cargo-checks gate status is appended to this kickoff under `## Bellows-supplied run inputs`. Treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
 
 ## What this phase does NOT do
 
