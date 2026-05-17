@@ -7,7 +7,7 @@ use crate::chain_walker::{
     pick_engine_for_phase, PickError, PickReason, PickedEntry, RateLimitDisposition, StateFile,
 };
 use crate::config::{
-    AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride, RuntimeLabelsConfig,
+    AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride, PostingMode, RuntimeLabelsConfig,
 };
 use crate::policy::{
     self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
@@ -3029,6 +3029,120 @@ pub async fn post_agent_notes_comment_if_present(
     }
     let body = format!("## Agent notes\n\n```\n{notes}\n```");
     tracker::post_pr_comment(client, owner, repo, pr_number, &body).await
+}
+
+/// Issue #125 / ADR-0009 slice 3: post the phase-8 merger's full prose
+/// review as a "Merge verdict" PR comment.
+///
+/// The comment is the operator's audit trail of *why* the merger voted
+/// the way it did — squash-merged into `master` along with the rest of
+/// the PR's conversation. The comment is titled `## Merge verdict` to
+/// distinguish it at a glance from the existing `## Agent notes`,
+/// `## Review findings`, and `## Security findings` per-phase comment
+/// posts in [`run_once`].
+///
+/// Surfacing depends on the operator's `[phases.merge].posting`
+/// toggle:
+/// - `PostAlways` (default): every parseable verdict surfaces a
+///   comment, including clean `MERGE` runs. Full audit trail.
+/// - `PostOnHoldOnly`: only `HoldNoted` and `HoldDraft` verdicts
+///   surface a comment; `Merge` verdicts auto-merge silently with no
+///   comment.
+///
+/// Regardless of the toggle:
+/// - A `None` `verdict` (slice-1 fallback path — unparseable output,
+///   merger crash, rate-limit skip) does NOT post a comment. The
+///   audit trail belongs to the merger, not to the fallback
+///   classifier.
+/// - A `None` `prose` (the merger never wrote its output file) does
+///   not post a comment either; we have no body to surface.
+/// - If `prose` exceeds GitHub's 64 KiB comment limit, the body is
+///   truncated with a `[truncated — full prose in bellows.log]`
+///   marker (precedent: issue #87 run-log truncation).
+/// - If the POST fails (network blip, permission denied, 5xx), the
+///   error is logged as a warning on `log_writer` and the function
+///   returns `Ok(())` — consistent with the existing run-log
+///   comment-post behaviour (issue #87). The run continues.
+pub async fn post_merge_verdict_comment_if_present<W: Write>(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    verdict: Option<crate::policy::MergerVerdict>,
+    prose: Option<&str>,
+    posting: PostingMode,
+    log_writer: &mut W,
+) -> Result<(), octocrab::Error> {
+    // Verdict=None: audit trail belongs to the merger, not to the
+    // fallback classifier (AC6). Skip silently.
+    let Some(verdict) = verdict else {
+        return Ok(());
+    };
+    // No prose to surface — nothing to post. (The verdict alone is
+    // logged on `bellows.log` by the runner regardless.)
+    let Some(prose) = prose else {
+        return Ok(());
+    };
+    if prose.trim().is_empty() {
+        return Ok(());
+    }
+    // Posting-mode gate (AC4 / AC5): silent auto-merge for clean
+    // MERGE under post-on-hold-only.
+    let should_post = match (posting, verdict) {
+        (PostingMode::PostAlways, _) => true,
+        (PostingMode::PostOnHoldOnly, crate::policy::MergerVerdict::Merge) => false,
+        (PostingMode::PostOnHoldOnly, _) => true,
+    };
+    if !should_post {
+        return Ok(());
+    }
+    let body = build_merge_verdict_comment_body(prose);
+    if let Err(e) = tracker::post_pr_comment(client, owner, repo, pr_number, &body).await {
+        // AC7: posting failures are operator-visible warnings, not
+        // run-failing errors. Mirrors the issue-#87 run-log
+        // comment-post failure handling.
+        let line = format!(
+            "bellows: posting the Merge verdict comment on PR #{} failed (continuing): {}",
+            pr_number, e,
+        );
+        println!("{line}");
+        let _ = writeln!(log_writer, "{line}");
+    }
+    Ok(())
+}
+
+/// Build the body of the "Merge verdict" PR comment, truncating if
+/// the merger's prose exceeds GitHub's 64 KiB comment limit (AC8).
+///
+/// The marker `[truncated — full prose in bellows.log]` matches the
+/// issue-#87 run-log truncation precedent so the operator's muscle
+/// memory carries over.
+fn build_merge_verdict_comment_body(prose: &str) -> String {
+    /// GitHub hard-caps issue/PR comment bodies at 65,536 bytes.
+    const GITHUB_COMMENT_MAX_BYTES: usize = 65_536;
+    /// Reserved headroom so the `## Merge verdict` heading plus the
+    /// truncation marker plus the closing code-fence definitely fit
+    /// under the cap. 4 KiB is generous; the actual fixed overhead
+    /// is well under 200 bytes.
+    const HEADROOM_BYTES: usize = 4_096;
+
+    let heading = "## Merge verdict\n\n";
+    let truncation_marker = "\n\n[truncated — full prose in bellows.log]\n";
+    let max_prose_bytes = GITHUB_COMMENT_MAX_BYTES
+        .saturating_sub(heading.len() + truncation_marker.len() + HEADROOM_BYTES);
+
+    if prose.len() <= max_prose_bytes {
+        return format!("{heading}{prose}");
+    }
+    // Truncate at a char boundary so we don't slice through a UTF-8
+    // multi-byte sequence (the merger's prose is natural-language
+    // English in practice; defensive belt anyway).
+    let mut cut = max_prose_bytes;
+    while cut > 0 && !prose.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let truncated = &prose[..cut];
+    format!("{heading}{truncated}{truncation_marker}")
 }
 
 /// Remove the slice-X1 + X2 phase handoff files from the workspace.
