@@ -33,7 +33,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the polling loop in the foreground.
-    Run,
+    Run {
+        /// Restrict the polling loop to a single configured `[[repo]]`,
+        /// addressed as `<owner>/<name>`. Useful when `orchestrator.toml`
+        /// lists multiple repos but the operator wants this `bellows
+        /// run` invocation to attend to only one of them. The slug must
+        /// match exactly one configured `[[repo]]` URL; an unknown slug
+        /// is a startup error.
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: Option<String>,
+    },
     /// First-time auth setup — run once per new install to seed the
     /// credentials volume with an OAuth session via an interactive
     /// `claude login` (or `codex login`) flow.
@@ -196,8 +205,8 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("orchestrator.toml"));
 
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run(&config_path).await,
+    match cli.command.unwrap_or(Command::Run { repo: None }) {
+        Command::Run { repo } => run(&config_path, repo.as_deref()).await,
         // `refresh-auth` is a sibling subcommand to `setup-auth` for
         // operator readability — they describe two different
         // situations (first-time install vs token expired) but share
@@ -1145,6 +1154,38 @@ fn parse_owner_repo(url: &str) -> Result<(String, String)> {
     runner::parse_owner_repo(url).map_err(|e| anyhow!("{e}"))
 }
 
+/// Resolve `bellows run --repo <owner>/<name>` to the index of the
+/// matching `[[repo]]` entry. Pure function (no IO) so the slug
+/// validation is unit-testable without booting the polling loop.
+/// Errors carry the list of configured slugs so an operator typo
+/// surfaces the legal values inline. Mirrors the validation shape of
+/// `resolve_kill_target` / `resolve_triage_filter`.
+fn resolve_run_repo_filter(
+    slug: &str,
+    repos: &[bellows::config::RepoConfig],
+) -> Result<usize> {
+    for (i, r) in repos.iter().enumerate() {
+        if let Ok((o, n)) = parse_owner_repo(&r.url)
+            && format!("{o}/{n}") == slug
+        {
+            return Ok(i);
+        }
+    }
+    let configured: Vec<String> = repos
+        .iter()
+        .filter_map(|r| {
+            parse_owner_repo(&r.url)
+                .ok()
+                .map(|(o, n)| format!("{o}/{n}"))
+        })
+        .collect();
+    anyhow::bail!(
+        "bellows run: no such configured repo `{}`. Configured: {:?}",
+        slug,
+        configured,
+    )
+}
+
 async fn status_cmd() -> Result<()> {
     let path = status::default_status_path().context("resolve status file path")?;
     let parsed = status::read(&path).await;
@@ -1759,11 +1800,22 @@ async fn setup_auth_opencode(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run(config_path: &PathBuf) -> Result<()> {
+async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config at {}", config_path.display()))?;
-    let config = Config::from_str(&config_text)
+    let mut config = Config::from_str(&config_text)
         .with_context(|| format!("parse config at {}", config_path.display()))?;
+
+    // `--repo <owner>/<name>`: narrow `config.repos` to the single
+    // matching `[[repo]]` entry before any further validation runs.
+    // Done here (pre-deploy-keys-validation) so a `--repo` invocation
+    // that targets a fully-configured repo isn't blocked by an
+    // unrelated repo whose deploy keys haven't been seeded yet.
+    if let Some(slug) = repo_filter {
+        let idx = resolve_run_repo_filter(slug, &config.repos)?;
+        let kept = config.repos.swap_remove(idx);
+        config.repos = vec![kept];
+    }
 
     // Issue #69 (ADR-0002) AC9: refuse to start when any [[repo]]
     // deploy_keys references a key name that's not present in the
@@ -3668,5 +3720,66 @@ pat_env_var = "X"
             resolved.explicit_issues.is_empty(),
             "no positional or --issue means drain mode: explicit_issues must be empty"
         );
+    }
+
+    // ---- `bellows run --repo <owner>/<name>` slug filter ----
+
+    #[test]
+    fn cli_parses_run_with_repo_flag() {
+        let cli = Cli::try_parse_from(["bellows", "run", "--repo", "marad2001/bellows"])
+            .expect("bellows run --repo <slug> must parse");
+        match cli.command {
+            Some(Command::Run { repo }) => assert_eq!(repo.as_deref(), Some("marad2001/bellows")),
+            _ => panic!("expected Run {{ repo: Some(...) }}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_bare_run_for_back_compat() {
+        let cli = Cli::try_parse_from(["bellows", "run"])
+            .expect("bare `bellows run` must still parse");
+        match cli.command {
+            Some(Command::Run { repo }) => assert!(repo.is_none()),
+            _ => panic!("expected Run {{ repo: None }}"),
+        }
+    }
+
+    #[test]
+    fn resolve_run_repo_filter_picks_matching_entry() {
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+            "https://github.com/marad2001/repo-c",
+        ]);
+        let idx = resolve_run_repo_filter("marad2001/repo-b", &repos)
+            .expect("known slug must resolve");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_run_repo_filter_errors_on_unknown_slug() {
+        let repos = multi_repo(&[
+            "https://github.com/marad2001/repo-a",
+            "https://github.com/marad2001/repo-b",
+        ]);
+        let err = resolve_run_repo_filter("marad2001/nope", &repos)
+            .expect_err("unknown slug must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no such configured repo `marad2001/nope`"),
+            "error must name the bad slug: {msg}"
+        );
+        assert!(
+            msg.contains("marad2001/repo-a") && msg.contains("marad2001/repo-b"),
+            "error must list configured slugs so operator can fix the typo: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_repo_filter_accepts_single_repo_config() {
+        let repos = single_repo("https://github.com/marad2001/bellows");
+        let idx = resolve_run_repo_filter("marad2001/bellows", &repos)
+            .expect("single-repo + matching slug must resolve");
+        assert_eq!(idx, 0);
     }
 }
