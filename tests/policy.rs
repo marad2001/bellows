@@ -215,6 +215,47 @@ fn is_rate_limit_signature_does_not_false_positive_on_unrelated_rate_mention() {
 }
 
 #[test]
+fn is_rate_limit_signature_matches_codex_subscription_usage_limit_message() {
+    // Issue #142: codex's subscription-tier rate-limit stderr uses the
+    // phrase "You've hit your usage limit", not the
+    // `codex-rs/codex-api/src/error.rs`-sourced `quota exceeded` /
+    // `rate limit:` patterns ADR-0005 documents. Observed verbatim on
+    // a real run: bellows.log captured the line below from the codex
+    // review-phase container on workboard-financial-advice PR #118.
+    // Without this match, the run silently misclassified as a generic
+    // crash and bellows' chain advancement / `bellows-state.json`
+    // cool-down never fired.
+    let codex_stderr =
+        "ERROR: You've hit your usage limit. To get more access now, send a request to your admin or try again at 8:15 PM.";
+    assert!(is_rate_limit_signature(codex_stderr));
+}
+
+#[test]
+fn is_rate_limit_signature_matches_codex_usage_limit_case_insensitively() {
+    // The signature set is matched against a lowercased input, so
+    // upper-case variants of the same phrase must also match. Pins
+    // the case-insensitivity contract for the new signature so a
+    // future refactor that strips the lowercase normalisation
+    // doesn't silently regress codex detection.
+    assert!(is_rate_limit_signature(
+        "YOU'VE HIT YOUR USAGE LIMIT. Try again later."
+    ));
+}
+
+#[test]
+fn is_rate_limit_signature_does_not_false_positive_on_loose_usage_word_collocation() {
+    // The substring match keys on the apostrophe-bearing phrase
+    // "you've hit your usage limit" as a whole — loose collocation
+    // of the constituent words in unrelated prose must NOT trigger.
+    // Specificity matters here: a benign mention of usage limits in
+    // an agent-fetched doc page, a test fixture, or a comment must
+    // not promote a generic crash to RateLimited.
+    let benign_stderr =
+        "the agent reasoned about the user's hit rate on the API limit page; usage was within bounds.";
+    assert!(!is_rate_limit_signature(benign_stderr));
+}
+
+#[test]
 fn is_auth_error_signature_matches_anthropic_refresh_token_expired_response() {
     // Anthropic-style auth-error stderr after a refresh token expires.
     // The canonical shape is a 401 with an underscore-style identifier;
