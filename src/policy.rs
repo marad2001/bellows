@@ -1871,6 +1871,10 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          \n\
          {brief}\n\
          \n\
+         ## Headless mode\n\
+         \n\
+         You are running headlessly via `claude -p`. There is no interactive user to approve plan exits — do NOT use the `ExitPlanMode` tool. If you call it, the exit is auto-rejected, you will read that as user pushback, and the session will end with no commits made. Implement directly: read the brief, write the failing tests, write the implementation, commit. If the brief is too large to hold in one pass, write a short outline into `agent-notes.md` (informational channel — no `## Unaddressed finding:` heading) and proceed with the first slice.\n\
+         \n\
          ## How to work\n\
          \n\
          Use the `tdd` skill: write failing tests first, then implement to green, then refactor.\n\

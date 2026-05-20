@@ -48,6 +48,33 @@ fn rendered_kickoff_includes_stop_conditions_and_tooling_hints() {
 }
 
 #[test]
+fn rendered_kickoff_forbids_exit_plan_mode_tool_for_headless_invocation() {
+    // The implement-phase agent runs as `claude -p` with no
+    // interactive UI. ExitPlanMode tool calls auto-reject in
+    // headless mode and the model reads the rejection as user
+    // pushback — it exits cleanly with no commits, the empty diff
+    // misclassifies as Success, and the PR creation 422s on the
+    // unpushed agent/* branch. Observed verbatim on issue #18,
+    // claim attempt 2026-05-20. The kickoff MUST therefore name
+    // the ExitPlanMode tool to forbid it explicitly, and explain
+    // the headless context so the agent does not re-enter the
+    // same deadlock on the next dense brief.
+    let prompt = render_kickoff(
+        "any brief",
+        "https://github.com/owner/repo",
+        "agent/42-x",
+    );
+    assert!(
+        prompt.contains("ExitPlanMode"),
+        "kickoff must name the ExitPlanMode tool to forbid it: {prompt}"
+    );
+    assert!(
+        prompt.to_lowercase().contains("headless"),
+        "kickoff must explain why (headless mode context): {prompt}"
+    );
+}
+
+#[test]
 fn classify_exit_returns_success_when_all_phases_clean() {
     // Tracer bullet for slice X1: every phase produced a clean exit and
     // every cargo gate's clippy + test passed. No findings, so review-fix
