@@ -578,6 +578,40 @@ pub async fn run_once(
 
     for (repo_order, repo_cfg) in config.repos.iter().enumerate() {
         let (owner, repo) = parse_owner_repo(&repo_cfg.url)?;
+
+        // Pre-claim PR-open gate (post-ADR-0009 amendment): skip
+        // this repo for the current tick if it has open non-draft
+        // agent/* PRs waiting to merge. Avoids cutting the next
+        // agent's branch from a stale `main` while an outstanding
+        // successful PR is about to advance the tip. Drafts are
+        // deliberately NOT skipped — they need human triage and
+        // would halt the queue overnight (the failure mode
+        // ADR-0009 was solving). On API failure, log and proceed:
+        // a transient hiccup must not pause per-repo throughput.
+        match tracker::list_open_non_draft_agent_pr_numbers(client, &owner, &repo).await {
+            Ok(prs) if !prs.is_empty() => {
+                let nums = prs
+                    .iter()
+                    .map(|n| format!("#{}", n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: skipping repo {}/{} this tick: waiting on open non-draft agent/* PR(s): {}",
+                    owner, repo, nums,
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = writeln!(
+                    log_writer,
+                    "bellows: pre-claim PR-open probe failed for {}/{} (proceeding this tick): {}",
+                    owner, repo, e,
+                );
+            }
+        }
+
         let next = tracker::find_next_issue(
             client,
             &owner,
