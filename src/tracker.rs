@@ -298,6 +298,75 @@ pub async fn list_needs_triage_issues(
     Ok(issues)
 }
 
+/// Minimal PR-summary shape for the pre-claim PR-open gate. Only
+/// the fields needed to decide "is this PR on an `agent/*` branch
+/// and non-draft" are deserialised; everything else (labels,
+/// merge_commit_sha, etc.) is dropped.
+#[derive(Debug, Deserialize)]
+struct OpenPrSummary {
+    number: u64,
+    draft: Option<bool>,
+    head: PrHead,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrHead {
+    #[serde(rename = "ref")]
+    ref_field: String,
+}
+
+#[derive(serde::Serialize)]
+struct ListPullsParams {
+    state: &'static str,
+    sort: &'static str,
+    direction: &'static str,
+    per_page: u8,
+}
+
+/// Pre-claim PR-open gate (post-ADR-0009 amendment): list open
+/// **non-draft** PRs in `owner/repo` whose head branch starts with
+/// `agent/`. Used by `run_once` to skip a repo for the current tick
+/// when an outstanding successful agent PR is waiting to merge,
+/// avoiding stale-base conflicts where the next agent's branch
+/// would otherwise be cut from a `main` an outstanding PR is about
+/// to advance.
+///
+/// Draft PRs are deliberately excluded. Bellows opens draft PRs
+/// for HOLD-DRAFT / `agent-failed` verdicts where the next step is
+/// human triage; that can sit indefinitely. Blocking on drafts
+/// would recreate the overnight queue-halt ADR-0009 was solving.
+/// Non-draft PRs (Success → auto-merge on green CI, or
+/// `agent-noted` → human read) merge within a bounded window, so
+/// holding the next claim is the trade-off operators opt into.
+pub async fn list_open_non_draft_agent_pr_numbers(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<u64>, octocrab::Error> {
+    let params = ListPullsParams {
+        state: "open",
+        sort: "created",
+        direction: "asc",
+        per_page: 100,
+    };
+    let route = format!("/repos/{owner}/{repo}/pulls");
+    let mut page: octocrab::Page<OpenPrSummary> = client.get(&route, Some(&params)).await?;
+    let mut items = page.take_items();
+    let mut next = page.next.clone();
+    while let Some(mut next_page) = client.get_page::<OpenPrSummary>(&next).await? {
+        items.append(&mut next_page.take_items());
+        next = next_page.next.clone();
+    }
+    let mut nums: Vec<u64> = items
+        .into_iter()
+        .filter(|pr| !pr.draft.unwrap_or(false))
+        .filter(|pr| pr.head.ref_field.starts_with("agent/"))
+        .map(|pr| pr.number)
+        .collect();
+    nums.sort_unstable();
+    Ok(nums)
+}
+
 async fn list_all_open_issues_with_labels(
     client: &octocrab::Octocrab,
     owner: &str,
