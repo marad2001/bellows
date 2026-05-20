@@ -515,17 +515,26 @@ pub fn classify_exit(
 ///     `codex-rs/codex-api/src/error.rs`): `quota exceeded`
 ///     (subscription users, primary path) and `rate limit:`
 ///     (Platform-API users, secondary path).
+///   - Codex (issue #142, observed verbatim on workboard-financial-
+///     advice PR #118): `you've hit your usage limit` — the
+///     subscription-tier user-facing stderr line ChatGPT-backed
+///     codex emits when the per-account quota is reached. Distinct
+///     from the API-error strings above; matching both keeps the
+///     detector working regardless of which surface codex used.
 ///
 /// Bare HTTP `429` is deliberately NOT matched — too false-positive-
 /// prone (port numbers, test fixtures, JSON byte counts, etc.).
 pub fn is_rate_limit_signature(text: &str) -> bool {
-    const SIGNATURES: [&str; 4] = [
+    const SIGNATURES: [&str; 5] = [
         // Claude Code / Anthropic API signatures.
         "rate_limit_error",
         "rate_limited",
         // Codex signatures (issue #79 / ADR-0005 spike findings).
         "quota exceeded",
         "rate limit:",
+        // Codex subscription-tier signature (issue #142, observed
+        // verbatim on workboard-financial-advice PR #118).
+        "you've hit your usage limit",
     ];
     let lower = text.to_lowercase();
     if SIGNATURES.iter().any(|sig| lower.contains(sig)) {
