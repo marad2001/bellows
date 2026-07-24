@@ -3411,8 +3411,8 @@ api_key_env_file = "~/bellows-test-opencode.env"
     fn success_routes_ready_for_review_with_agent_done_label() {
         // ADR-0011: a clean mechanical run auto-merges. Success opens a
         // non-draft PR labelled `agent-done`. `pr_routing_for_reason`
-        // takes no auto-merge-filter argument anymore — the
-        // SuccessWithNotes / agent-noted lane that read it is gone.
+        // takes no auto-merge-filter argument anymore — the advisory-note
+        // human-merge lane that read it is gone.
         let labels = crate::config::RuntimeLabelsConfig::default();
         let routing = pr_routing_for_reason(&ExitReason::Success, &labels);
 

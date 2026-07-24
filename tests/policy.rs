@@ -2398,7 +2398,7 @@ fn classify_exit_informational_notes_no_longer_gate_a_clean_run() {
     // ADR-0011: an informational agent note no longer stops auto-merge.
     // A clean run auto-merges and the note surfaces as an advisory PR
     // comment. Supersedes the pre-ADR-0011 InformationalOnly →
-    // SuccessWithNotes human-merge lane.
+    // human-merge lane (now removed).
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
@@ -2428,10 +2428,10 @@ fn classify_exit_informational_notes_no_longer_gate_a_clean_run() {
 }
 
 #[test]
-fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_failed() {
-    // Acceptance criterion (brief): "classify_exit prefers FinalTestsRed
-    // over SuccessWithNotes when a gate failed AND informational content
-    // present (test failure is the more actionable headline)."
+fn classify_exit_prefers_final_tests_red_over_success_when_gate_failed() {
+    // classify_exit prefers FinalTestsRed over Success when a gate
+    // failed AND informational content present (test failure is the
+    // more actionable headline).
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
@@ -2459,10 +2459,9 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
 }
 
 #[test]
-fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_zero() {
-    // Acceptance criterion (brief): "classify_exit prefers Crash over
-    // SuccessWithNotes when implement exit is non-zero AND informational
-    // content present."
+fn classify_exit_prefers_crash_over_success_when_implement_exit_non_zero() {
+    // classify_exit prefers Crash over Success when implement exit is
+    // non-zero AND informational content present.
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 1, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome::default(),
@@ -2488,8 +2487,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
 #[test]
 fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
     // ADR-0006: Absent maps to Success when phases are clean — the
-    // baseline routing path. Pins the AC that Absent does NOT trigger
-    // SuccessWithNotes (only InformationalOnly does).
+    // baseline routing path.
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {

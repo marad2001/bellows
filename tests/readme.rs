@@ -111,9 +111,11 @@ fn readme_link_targets_exist_on_disk() {
 fn readme_enumerates_all_canonical_labels() {
     let body = read_readme();
     // Brief acceptance criteria: all five triage labels + the two
-    // category labels + all six runtime labels appear by name. The
+    // category labels + the runtime labels appear by name. The
     // acceptance criteria explicitly call this out twice; pin both
     // sets in one test so the README cannot drop one silently.
+    // ADR-0011 removed the `agent-noted` runtime label along with the
+    // SuccessWithNotes human-merge lane, so it is no longer enumerated.
     let triage = [
         "`needs-triage`",
         "`needs-info`",
@@ -125,7 +127,6 @@ fn readme_enumerates_all_canonical_labels() {
     let runtime = [
         "`agent-in-progress`",
         "`agent-done`",
-        "`agent-noted`",
         "`agent-failed`",
         "`agent-rate-limited`",
         "`agent-cancelled`",

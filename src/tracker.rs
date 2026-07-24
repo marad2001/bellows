@@ -335,9 +335,9 @@ struct ListPullsParams {
 /// for HOLD-DRAFT / `agent-failed` verdicts where the next step is
 /// human triage; that can sit indefinitely. Blocking on drafts
 /// would recreate the overnight queue-halt ADR-0009 was solving.
-/// Non-draft PRs (Success → auto-merge on green CI, or
-/// `agent-noted` → human read) merge within a bounded window, so
-/// holding the next claim is the trade-off operators opt into.
+/// Non-draft PRs (Success → auto-merge on green CI) merge within a
+/// bounded window, so holding the next claim is the trade-off
+/// operators opt into.
 pub async fn list_open_non_draft_agent_pr_numbers(
     client: &octocrab::Octocrab,
     owner: &str,
@@ -997,9 +997,8 @@ pub async fn post_pr_comment(
 }
 
 /// Add labels to an issue or PR without replacing its existing label set.
-/// Pull requests share GitHub's issue-labels API; the runner uses this
-/// for ADR-0006 `agent-noted` PR labels so the auto-merge workflow can
-/// observe the note gate on the PR object itself.
+/// Pull requests share GitHub's issue-labels API, so this posts to the
+/// issue-labels endpoint using the PR number.
 pub async fn add_issue_labels(
     client: &octocrab::Octocrab,
     owner: &str,
