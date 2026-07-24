@@ -203,10 +203,12 @@ fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_marker
     //  `<!-- bellows weak-test guard ... -->`,
     //  `<!-- bellows implement-crash recovery ... -->`).
     //
-    // The policy-side (β) hard override in classify_exit blocks a
-    // Merge verdict over these markers, but the merger should
-    // recognise them and not vote MERGE in the first place — the
-    // override is a defence-in-depth, not the primary instruction.
+    // Per ADR-0011 the merger verdict is advisory: classify_exit no
+    // longer consumes the token and the (β) synth-provenance hard
+    // override was removed. The synth markers therefore inform the
+    // merger's advisory opinion and operator-facing comment — the
+    // merger recognises them and does not vote MERGE in the first
+    // place — but nothing in classify_exit enforces that verdict.
     // Pin the prompt's instruction so a future edit can't quietly
     // drop the synth-provenance guidance.
     let prompt = render_merger_prompt();
