@@ -61,8 +61,8 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # (`gh api repos/openai/codex/releases/tags/<tag>` exposes a
 # `digest: sha256:...` field per asset) or from a freshly downloaded
 # tarball; the two ARGs must move together.
-ARG CODEX_VERSION=rust-v0.130.0
-ARG CODEX_SHA256=16779e7b7857508a768a36d7d4e084eec336ec23946ed70a9b09489b8f861190
+ARG CODEX_VERSION=rust-v0.145.0
+ARG CODEX_SHA256=bfaf13c9ba34f2ad764e4a916c49cf7177aeba329cf0f719e2227566fc8d662a
 RUN set -eux; \
     curl -fsSL -o /tmp/codex.tar.gz \
         "https://github.com/openai/codex/releases/download/${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz"; \
