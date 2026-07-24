@@ -385,7 +385,11 @@ pub struct PhaseOutcomes {
 /// 4. Non-zero implement exit → `Crash`.
 /// 5. Failing cargo gate (post-implement or end-pipeline) →
 ///    `FinalTestsRed`.
-/// 6. Otherwise → `Success`.
+/// 6. Non-zero exit in a review / review-fix / security-review /
+///    security-fix phase → `Crash` (the advisory merger is excluded).
+///    A rate-limit crash in one of these phases is re-routed to
+///    `RateLimited` by the runner's `rate_limited_phase` override.
+/// 7. Otherwise → `Success`.
 ///
 /// The phase-8 merger still runs and still posts its `## Merge verdict`
 /// PR comment, but its verdict is advisory: `classify_exit` no longer
@@ -433,6 +437,27 @@ pub fn classify_exit(outcomes: &PhaseOutcomes) -> ExitReason {
         && gate_failed(end_gate)
     {
         return ExitReason::FinalTestsRed;
+    }
+    // ADR-0011 amendment: a review / review-fix / security-review /
+    // security-fix agent that CRASHED (non-zero exit) is a mechanical
+    // failure — that phase's work did not run to completion, so the run
+    // drafts rather than silently auto-merging with a review or fix
+    // skipped (e.g. a mis-typed codex model pin crashes the review
+    // agent). Same objective-failure principle as the implement-crash
+    // check above, extended across the pipeline.
+    //
+    // A rate-limit crash in one of these phases is re-routed to
+    // RateLimited by the runner's `rate_limited_phase` override, which
+    // takes precedence over the `Crash` returned here. The phase-8
+    // merger is deliberately excluded — it is advisory (ADR-0011), so
+    // its failure never gates a merge (its exit is not carried on
+    // PhaseOutcomes at all).
+    if outcomes.review.as_ref().is_some_and(|r| r.exit_code != 0)
+        || outcomes.review_fix.as_ref().is_some_and(|f| f.exit_code != 0)
+        || outcomes.security.as_ref().is_some_and(|s| s.exit_code != 0)
+        || outcomes.security_fix.as_ref().is_some_and(|f| f.exit_code != 0)
+    {
+        return ExitReason::Crash;
     }
     // ADR-0011: mechanical-only gating. Everything past the objective
     // failure checks above auto-merges. Leftover review / security
