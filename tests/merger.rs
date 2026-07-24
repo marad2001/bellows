@@ -235,6 +235,132 @@ fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_marker
 }
 
 // -----------------------------------------------------------------
+// AC (issue #146 / ADR-0011): the merger verdict is ADVISORY. The
+// prompt must reframe the three tokens as opinions for the operator's
+// review, not routing / gating instructions. `classify_exit` no
+// longer consumes the verdict; Bellows still parses the `VERDICT:`
+// line for the `## Merge verdict` PR comment and the
+// `[phases.merge].posting` toggle.
+// -----------------------------------------------------------------
+
+#[test]
+fn render_merger_prompt_frames_verdict_as_advisory_not_routing() {
+    // AC1: the prompt must no longer assert the verdict gates or
+    // routes the run. It has to state, in plain terms, that the
+    // verdict is advisory — an opinion for the operator's review.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        lowered.contains("advisory"),
+        "merger prompt must describe the verdict as advisory: {prompt}",
+    );
+    assert!(
+        lowered.contains("does not gate")
+            || lowered.contains("does not route")
+            || lowered.contains("not gate")
+            || lowered.contains("not route")
+            || lowered.contains("does not affect whether"),
+        "merger prompt must state the verdict does not gate / route the run: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_no_longer_claims_verdict_routes_or_gates_the_run() {
+    // AC1 / AC4 (negative): the old ADR-0009 framing said MERGE means
+    // "the run should land as a normal (non-draft) PR", HOLD-DRAFT
+    // means "a draft PR", and that classify_exit rejects a MERGE
+    // vote. None of those routing claims may survive the reframe.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        !lowered.contains("should land as a normal (non-draft) pr"),
+        "merger prompt must not claim MERGE routes the run to a non-draft PR: {prompt}",
+    );
+    assert!(
+        !lowered.contains("classify_exit will reject a `merge` vote")
+            && !lowered.contains("classify_exit will reject a merge vote"),
+        "merger prompt must not claim classify_exit rejects a MERGE vote: {prompt}",
+    );
+    assert!(
+        !lowered.contains("a draft pr is the right shape"),
+        "merger prompt must not claim HOLD-DRAFT routes the run to a draft PR: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_describes_tokens_as_opinions() {
+    // AC3: the three tokens must be framed as the merger's opinion —
+    // ship-ready / ship-but-worth-a-look / would-hold-if-it-could —
+    // rather than as routing instructions.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        lowered.contains("ship-ready") || lowered.contains("ship ready"),
+        "merger prompt must frame MERGE as the ship-ready opinion: {prompt}",
+    );
+    assert!(
+        lowered.contains("worth-a-look") || lowered.contains("worth a look"),
+        "merger prompt must frame HOLD-NOTED as ship-but-worth-a-look: {prompt}",
+    );
+    assert!(
+        lowered.contains("would-hold-if-it-could") || lowered.contains("would hold if it could"),
+        "merger prompt must frame HOLD-DRAFT as would-hold-if-it-could: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_mentions_posting_toggle_consumes_the_token() {
+    // AC4: the prompt must explain the `VERDICT:` line is still parsed
+    // by Bellows for the `## Merge verdict` PR comment and the
+    // `[phases.merge].posting` toggle (e.g. `post-on-hold-only`), even
+    // though it no longer routes the run.
+    let prompt = render_merger_prompt();
+    assert!(
+        prompt.contains("[phases.merge].posting") || prompt.contains("phases.merge].posting"),
+        "merger prompt must reference the [phases.merge].posting toggle: {prompt}",
+    );
+    assert!(
+        prompt.contains("post-on-hold-only"),
+        "merger prompt must name the post-on-hold-only toggle value: {prompt}",
+    );
+    assert!(
+        prompt.contains("## Merge verdict"),
+        "merger prompt must reference the `## Merge verdict` PR comment: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_still_demands_trailing_advisory_verdict_line() {
+    // AC2: the `VERDICT: <token>` contract is preserved — exactly one
+    // of MERGE / HOLD-NOTED / HOLD-DRAFT, on a trailing line,
+    // case-sensitive, still parsed by Bellows. The reframe to advisory
+    // must not weaken the mechanical contract the parser keys on.
+    let prompt = render_merger_prompt();
+    assert!(
+        prompt.contains("VERDICT:"),
+        "merger prompt must still instruct the agent to emit a VERDICT: line: {prompt}",
+    );
+    for token in ["MERGE", "HOLD-NOTED", "HOLD-DRAFT"] {
+        assert!(
+            prompt.contains(token),
+            "merger prompt must still name the token `{token}`: {prompt}",
+        );
+    }
+    let lowered = prompt.to_lowercase();
+    assert!(
+        lowered.contains("single trailing line")
+            || lowered.contains("single, trailing")
+            || lowered.contains("trailing line")
+            || lowered.contains("trailing verdict line"),
+        "merger prompt must still require a single trailing verdict line: {prompt}",
+    );
+    assert!(
+        lowered.contains("case-sensitive") || lowered.contains("case sensitive"),
+        "merger prompt must still require the token be case-sensitive: {prompt}",
+    );
+}
+
+// -----------------------------------------------------------------
 // AC: `[phases.merge]` schema entry parses with a `cli_chain` field;
 // default `["claude:claude-opus-4-7"]` when omitted.
 // -----------------------------------------------------------------
