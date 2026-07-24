@@ -28,7 +28,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
     Success,
-    SuccessWithNotes,
     AgentSelfReportedFailure,
     Crash,
     FinalTestsRed,
