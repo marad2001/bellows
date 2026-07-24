@@ -28,7 +28,12 @@ Only **mechanical, objective** failures gate a merge:
   CI gate per ADR-0001),
 - either bellows cargo-checks gate red (`post_implement_gate` or
   `end_pipeline_gate`),
-- container crash (non-zero implement exit),
+- an agent crash (non-zero exit) in any pipeline phase whose work
+  affects the shipped code — implement, review, review-fix,
+  security-review, or security-fix. A crashed reviewer (for example a
+  mis-typed codex model pin) therefore drafts the PR rather than
+  auto-merging with the review silently skipped. The phase-8 merger is
+  excluded: it is advisory, so its own failure never gates.
 - wall-clock budget exceeded,
 - subscription rate-limit / auth error.
 

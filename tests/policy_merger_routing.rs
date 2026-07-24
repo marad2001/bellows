@@ -16,8 +16,9 @@
 //!    their objective `ExitReason`, beating any advisory signal.
 
 use bellows::policy::{
-    classify_exit, BellowsSynthCause, CheckResult, ExitReason, GateOutcome, ImplementOutcome,
-    MergerVerdict, ParsedFinding, PhaseOutcomes, Severity,
+    classify_exit, AnalysisOutcome, BellowsSynthCause, CheckResult, ExitReason, FixOutcome,
+    GateOutcome, ImplementOutcome, MergerVerdict, ParsedFinding, PhaseOutcomes, ReviewOutcome,
+    Severity,
 };
 
 fn check(exit: i64) -> CheckResult {
@@ -185,4 +186,70 @@ fn failing_end_pipeline_gate_still_gates() {
         cargo_test: Some(check(0)),
     });
     assert_eq!(classify_exit(&outcomes), ExitReason::FinalTestsRed);
+}
+
+// -----------------------------------------------------------------
+// ADR-0011 amendment: a non-rate-limit CRASH in a review / fix /
+// security phase is a mechanical failure and drafts the PR — it must
+// NOT silently auto-merge with that phase's work skipped (e.g. a
+// mis-typed codex model pin crashes the review agent). The advisory
+// phase-8 merger is excluded (its exit is not carried on
+// PhaseOutcomes).
+// -----------------------------------------------------------------
+
+#[test]
+fn review_phase_crash_gates_to_draft() {
+    let mut outcomes = clean_outcomes();
+    outcomes.review = Some(ReviewOutcome {
+        findings_text: None,
+        exit_code: 1,
+    });
+    assert_eq!(
+        classify_exit(&outcomes),
+        ExitReason::Crash,
+        "a crashed review agent must draft, not auto-merge with review skipped",
+    );
+}
+
+#[test]
+fn review_fix_phase_crash_gates_to_draft() {
+    let mut outcomes = clean_outcomes();
+    outcomes.review_fix = Some(FixOutcome { exit_code: 137 });
+    assert_eq!(classify_exit(&outcomes), ExitReason::Crash);
+}
+
+#[test]
+fn security_review_phase_crash_gates_to_draft() {
+    let mut outcomes = clean_outcomes();
+    outcomes.security = Some(AnalysisOutcome {
+        findings_text: None,
+        exit_code: 1,
+    });
+    assert_eq!(classify_exit(&outcomes), ExitReason::Crash);
+}
+
+#[test]
+fn security_fix_phase_crash_gates_to_draft() {
+    let mut outcomes = clean_outcomes();
+    outcomes.security_fix = Some(FixOutcome { exit_code: 1 });
+    assert_eq!(classify_exit(&outcomes), ExitReason::Crash);
+}
+
+#[test]
+fn phases_that_ran_and_exited_zero_do_not_gate() {
+    // Regression: phases that completed (exit 0) never gate, even with
+    // findings present — only a non-zero exit (crash) does. This is the
+    // normal happy path with a reviewer that flagged nits.
+    let mut outcomes = clean_outcomes();
+    outcomes.review = Some(ReviewOutcome {
+        findings_text: Some("### 1. minor naming — nit".to_string()),
+        exit_code: 0,
+    });
+    outcomes.review_fix = Some(FixOutcome { exit_code: 0 });
+    outcomes.security = Some(AnalysisOutcome {
+        findings_text: None,
+        exit_code: 0,
+    });
+    outcomes.security_fix = Some(FixOutcome { exit_code: 0 });
+    assert_eq!(classify_exit(&outcomes), ExitReason::Success);
 }
