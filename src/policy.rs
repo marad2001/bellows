@@ -1863,7 +1863,7 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          \n\
          `agent-notes.md` has exactly two channels, and the classifier routes the PR based on which one you used. Pick deliberately:\n\
          \n\
-         - **Informational channel** — the file exists but has *no* `## Unaddressed finding:` heading. Use this for freeform observations you want a human reviewer to see (e.g. \"I deviated from strict test-first on AC4 because it was a pure-prompt-text change with no observable behaviour\"). The classifier returns `SuccessWithNotes`, Bellows opens a normal (non-draft) PR labelled `agent-noted`, and the run still counts as a green stop.\n\
+         - **Informational channel** — the file exists but has *no* `## Unaddressed finding:` heading. Use this for freeform observations you want a human reviewer to see (e.g. \"I deviated from strict test-first on AC4 because it was a pure-prompt-text change with no observable behaviour\"). The classifier returns `Success`; per ADR-0011 the note is *advisory* — Bellows opens a normal (non-draft) PR that auto-merges on green CI and surfaces the note as a separate `## Agent notes` PR comment, so the run still counts as a green stop.\n\
          - **Escalation channel** — the file contains a `## Unaddressed finding: <AC title>` heading naming the unsatisfied acceptance criterion, with body text describing what you tried and why you stopped. The classifier returns `AgentSelfReportedFailure`, Bellows opens a *draft* PR labelled `agent-failed`, and a human is expected to take over.\n\
          \n\
          The TDD exceptions explicitly fit the **informational** channel, not the escalation one:\n\
