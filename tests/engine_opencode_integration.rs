@@ -28,7 +28,7 @@ use bellows::main_helpers::write_opencode_env_file;
 use bellows::policy::{
     classify_exit, is_auth_error_signature, is_opencode_auth_error_signature,
     is_opencode_rate_limit_signature, is_rate_limit_signature, render_kickoff_for_engine,
-    ExitReason, ImplementOutcome, NotesShape, PhaseOutcomes,
+    ExitReason, ImplementOutcome, PhaseOutcomes,
 };
 use bellows::runner::pr_body_for_auth_error;
 
@@ -125,7 +125,7 @@ fn opencode_dispatch_classifies_401_as_auth_error_and_names_opencode_in_pr_body(
         },
         ..PhaseOutcomes::default()
     };
-    let reason = classify_exit(NotesShape::Absent, &outcomes, None);
+    let reason = classify_exit(&outcomes);
     assert!(
         matches!(reason, ExitReason::AuthError),
         "opencode 401 must classify as AuthError even on exit 0: {reason:?}",
@@ -161,7 +161,7 @@ fn opencode_dispatch_classifies_429_as_rate_limited() {
         },
         ..PhaseOutcomes::default()
     };
-    let reason = classify_exit(NotesShape::Absent, &outcomes, None);
+    let reason = classify_exit(&outcomes);
     assert!(
         matches!(reason, ExitReason::RateLimited),
         "opencode 429 must classify as RateLimited even on exit 0: {reason:?}",

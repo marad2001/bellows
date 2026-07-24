@@ -107,7 +107,7 @@ fn classify_exit_returns_success_when_all_phases_clean() {
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
+    assert_eq!(classify_exit(&outcomes), ExitReason::Success);
 }
 
 /// Helper for migrated tests: an `Outcomes` shape representing the
@@ -141,7 +141,7 @@ fn slice5_shaped(implement_exit: i64, cargo_test: Option<i64>) -> PhaseOutcomes 
 #[test]
 fn classify_exit_returns_success_for_clean_run_with_tests_green() {
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(0)), None),
+        classify_exit(&slice5_shaped(0, Some(0))),
         ExitReason::Success
     );
 }
@@ -151,21 +151,20 @@ fn classify_exit_returns_success_when_cargo_test_gate_was_skipped() {
     // None means the workspace had no Cargo.toml at root; the runner
     // skipped the cargo test gate. Non-Rust briefs are a valid use case.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, None), None),
+        classify_exit(&slice5_shaped(0, None)),
         ExitReason::Success
     );
 }
 
 #[test]
-fn classify_exit_returns_self_reported_failure_when_agent_notes_present() {
-    // ADR-0006 escalation channel: a `## Unaddressed finding:` heading
-    // wins over exit code 0 AND green tests — the agent's structured
-    // voice trumps everything. Call-site migrated from bool to NotesShape
-    // per issue #95: HasUnaddressedFinding is the post-ADR-0006 form
-    // of "agent-notes present and signalling failure."
+fn classify_exit_ignores_agent_notes_under_mechanical_only_gating() {
+    // ADR-0011: agent-notes no longer gate. A clean run (exit 0, green
+    // gate) that produced an `## Unaddressed finding:` heading now
+    // auto-merges — the note surfaces as an advisory PR comment, not a
+    // draft. `classify_exit` reads only mechanical phase signals.
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &slice5_shaped(0, Some(0)), None),
-        ExitReason::AgentSelfReportedFailure
+        classify_exit(&slice5_shaped(0, Some(0))),
+        ExitReason::Success
     );
 }
 
@@ -174,11 +173,11 @@ fn classify_exit_returns_crash_when_agent_exits_non_zero_without_notes() {
     // Agent process died (claude itself errored, OOM, etc.). No notes
     // file means the agent didn't get to write a structured report.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(1, None), None),
+        classify_exit(&slice5_shaped(1, None)),
         ExitReason::Crash
     );
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(137, Some(0)), None),
+        classify_exit(&slice5_shaped(137, Some(0))),
         ExitReason::Crash
     );
 }
@@ -207,7 +206,7 @@ fn classify_exit_returns_wall_clock_exceeded_when_flag_is_set() {
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::WallClockExceeded);
+    assert_eq!(classify_exit(&outcomes), ExitReason::WallClockExceeded);
 }
 
 #[test]
@@ -341,7 +340,7 @@ fn classify_exit_returns_rate_limited_when_stderr_matches_signature_and_implemen
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::RateLimited);
+    assert_eq!(classify_exit(&outcomes), ExitReason::RateLimited);
 }
 
 #[test]
@@ -373,7 +372,7 @@ fn classify_exit_does_not_return_rate_limited_when_signature_present_but_exit_wa
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
+    assert_eq!(classify_exit(&outcomes), ExitReason::Success);
 }
 
 #[test]
@@ -414,7 +413,7 @@ fn classify_exit_wall_clock_exceeded_wins_over_self_reported_failure() {
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::WallClockExceeded,
         "wall-clock-exceeded must beat the agent-authored HasUnaddressedFinding \
          branch under the slice-2 precedence ladder",
@@ -443,7 +442,7 @@ fn classify_exit_returns_final_tests_red_when_post_implement_gate_clippy_failed(
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
+    assert_eq!(classify_exit(&outcomes), ExitReason::FinalTestsRed);
 }
 
 #[test]
@@ -472,7 +471,7 @@ fn classify_exit_returns_final_tests_red_when_end_pipeline_gate_failed() {
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::FinalTestsRed);
+    assert_eq!(classify_exit(&outcomes), ExitReason::FinalTestsRed);
 }
 
 #[test]
@@ -480,11 +479,11 @@ fn classify_exit_returns_final_tests_red_when_cargo_test_failed() {
     // Agent thought it was done (exit 0, no notes), but the cargo test
     // gate caught failing tests.
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(1)), None),
+        classify_exit(&slice5_shaped(0, Some(1))),
         ExitReason::FinalTestsRed
     );
     assert_eq!(
-        classify_exit(NotesShape::Absent, &slice5_shaped(0, Some(101)), None),
+        classify_exit(&slice5_shaped(0, Some(101))),
         ExitReason::FinalTestsRed
     );
 }
@@ -1578,7 +1577,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
          `synth_suppresses_notes` shim",
     );
     assert_eq!(
-        classify_exit(notes_shape, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::Crash,
         "implement-crash synth must classify as Crash, not AgentSelfReportedFailure \
          (the notes are bellows-synthesised, not agent-authored)",
@@ -1586,19 +1585,13 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
 }
 
 #[test]
-fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escalation_notes() {
-    // Post-ADR-0006 migration: the `implement_crash_synthesised` flag
-    // is no longer consumed by `classify_exit`; the bellows/agent
-    // partition is resolved upstream by note classification using
-    // out-of-band synth provenance. This test pins the new behaviour:
-    // with HasUnaddressedFinding (the structured-escalation
-    // NotesShape that agent-authored notes produce), the routing is
-    // AgentSelfReportedFailure regardless of the synth flag.
-    //
-    // Replaces the pre-ADR-0006 defensive guard which asserted that
-    // the shim only suppressed notes-precedence when implement exit
-    // was non-zero. The shim is gone; this test now documents the
-    // simpler "shape wins, flag is ignored" model.
+fn classify_exit_synth_flag_and_agent_notes_do_not_gate_clean_run() {
+    // ADR-0011: neither the `implement_crash_synthesised` flag nor an
+    // agent-authored `## Unaddressed finding:` note gates a run whose
+    // mechanical signals are clean (exit 0, green gate). classify_exit
+    // reads only mechanical signals, so this auto-merges; the note is
+    // surfaced as an advisory PR comment. (An actual implement crash
+    // still drafts — but via the non-zero-exit check, not the flag.)
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
             exit_code: 0,
@@ -1611,7 +1604,7 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         end_pipeline_gate: None,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
-        // Synth flag set defensively; classify_exit ignores it.
+        // Flag set defensively; classify_exit ignores it under ADR-0011.
         implement_crash_synthesised: true,
         merger_verdict: None,
         merger_prose: None,
@@ -1620,46 +1613,9 @@ fn classify_exit_implement_crash_synth_flag_no_longer_affects_routing_with_escal
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
-        ExitReason::AgentSelfReportedFailure,
-        "HasUnaddressedFinding always routes to AgentSelfReportedFailure; the \
-         synth flag is no longer consulted by classify_exit",
-    );
-}
-
-#[test]
-fn classify_exit_implement_crash_synth_does_not_regress_clean_self_reported_failure_path() {
-    // Regression guard (post-ADR-0006): a run where the agent
-    // voluntarily wrote a HasUnaddressedFinding section AND implement
-    // exited zero (the canonical AgentSelfReportedFailure path) must
-    // continue to route to AgentSelfReportedFailure. After the
-    // ADR-0006 migration the bellows/agent partition lives in
-    // `classify_agent_notes_with_synth_spans`; bellows-synthesised
-    // crash content strips to NotesShape::Absent, while genuine agent-authored
-    // escalation (`## Unaddressed finding:`) yields
-    // NotesShape::HasUnaddressedFinding and wins here.
-    let outcomes = PhaseOutcomes {
-        implement: ImplementOutcome {
-            exit_code: 0,
-            stderr_tail: String::new(),
-            engine: None,
-        },
-        post_implement_gate: GateOutcome::default(),
-        review: None,
-        review_fix: None,
-        end_pipeline_gate: None,
-        wall_clock_exceeded: false,
-        backstop_violations: Vec::new(),
-        implement_crash_synthesised: false,
-        merger_verdict: None,
-        merger_prose: None,
-        security: None,
-        security_fix: None,
-        synth_causes: Vec::new(),
-    };
-    assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
-        ExitReason::AgentSelfReportedFailure,
+        classify_exit(&outcomes),
+        ExitReason::Success,
+        "ADR-0011: a mechanical-clean run auto-merges regardless of notes/flag",
     );
 }
 
@@ -2047,7 +2003,7 @@ fn classify_exit_returns_success_for_clean_security_review_and_fix() {
         security_fix: Some(FixOutcome { exit_code: 0 }),
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
+    assert_eq!(classify_exit(&outcomes), ExitReason::Success);
 }
 
 #[test]
@@ -2076,7 +2032,7 @@ fn classify_exit_security_review_clean_with_no_findings_is_success() {
         security_fix: None,
         synth_causes: Vec::new(),
     };
-    assert_eq!(classify_exit(NotesShape::Absent, &outcomes, None), ExitReason::Success);
+    assert_eq!(classify_exit(&outcomes), ExitReason::Success);
 }
 
 // ---- diff_contains_rs_files: weak-test guard doc-only short-circuit ----
@@ -2407,12 +2363,11 @@ fn classify_agent_notes_strips_recorded_synth_span_without_searching_marker_text
 }
 
 #[test]
-fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardless_of_phases() {
-    // Acceptance criterion (brief): "classify_exit routes
-    // HasUnaddressedFinding → AgentSelfReportedFailure regardless of
-    // phase outcomes (structured escalation wins)." Even with a clean
-    // implement exit AND a green gate, an `## Unaddressed finding:`
-    // section forces the AgentSelfReportedFailure outcome.
+fn classify_exit_unaddressed_finding_no_longer_gates_a_clean_run() {
+    // ADR-0011: an `## Unaddressed finding:` section no longer forces a
+    // draft. With a clean implement exit and a green gate, the run
+    // auto-merges and the finding surfaces as an advisory PR comment.
+    // Supersedes the pre-ADR-0011 "escalation wins over green phases".
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
@@ -2432,19 +2387,18 @@ fn classify_exit_routes_has_unaddressed_finding_to_self_reported_failure_regardl
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::HasUnaddressedFinding, &outcomes, None),
-        ExitReason::AgentSelfReportedFailure,
-        "HasUnaddressedFinding must beat green-phase signals (escalation wins)",
+        classify_exit(&outcomes),
+        ExitReason::Success,
+        "ADR-0011: an unaddressed finding is advisory now; a mechanical-clean run auto-merges",
     );
 }
 
 #[test]
-fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_notes() {
-    // Acceptance criterion (brief): "classify_exit routes InformationalOnly
-    // + all phases clean → SuccessWithNotes." The new ADR-0006
-    // informational channel: the agent left a freeform note that should
-    // stop silent auto-merge but should NOT route to
-    // AgentSelfReportedFailure.
+fn classify_exit_informational_notes_no_longer_gate_a_clean_run() {
+    // ADR-0011: an informational agent note no longer stops auto-merge.
+    // A clean run auto-merges and the note surfaces as an advisory PR
+    // comment. Supersedes the pre-ADR-0011 InformationalOnly →
+    // SuccessWithNotes human-merge lane.
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome { exit_code: 0, stderr_tail: String::new(), engine: None },
         post_implement_gate: GateOutcome {
@@ -2467,8 +2421,9 @@ fn classify_exit_routes_informational_only_plus_clean_phases_to_success_with_not
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
-        ExitReason::SuccessWithNotes,
+        classify_exit(&outcomes),
+        ExitReason::Success,
+        "ADR-0011: informational notes are advisory; a mechanical-clean run auto-merges",
     );
 }
 
@@ -2496,7 +2451,7 @@ fn classify_exit_prefers_final_tests_red_over_success_with_notes_when_gate_faile
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::FinalTestsRed,
         "a failing gate must beat an informational note — broken tests are the \
          more actionable headline for an operator",
@@ -2524,7 +2479,7 @@ fn classify_exit_prefers_crash_over_success_with_notes_when_implement_exit_non_z
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::InformationalOnly, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::Crash,
         "a non-zero implement exit must beat an informational note",
     );
@@ -2557,7 +2512,7 @@ fn classify_exit_returns_success_for_absent_notes_with_clean_phases() {
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(NotesShape::Absent, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::Success,
     );
 }
@@ -2613,7 +2568,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
         synth_causes: Vec::new(),
     };
     assert_eq!(
-        classify_exit(shape, &outcomes, None),
+        classify_exit(&outcomes),
         ExitReason::Crash,
         "synth-only notes + non-zero implement exit must route to Crash without \
          the per-call synth_suppresses_notes shim",
