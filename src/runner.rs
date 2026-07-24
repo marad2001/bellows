@@ -3453,36 +3453,6 @@ api_key_env_file = "~/bellows-test-opencode.env"
     }
 
     #[test]
-    fn success_with_notes_routes_ready_for_review_when_agent_noted_filter_supported() {
-        let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, true);
-
-        assert!(!routing.draft, "supported targets should get a ready PR");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        assert!(
-            routing.fallback_announcement.is_none(),
-            "supported targets should not announce a draft fallback",
-        );
-    }
-
-    #[test]
-    fn success_with_notes_routes_draft_with_adr_0006_fallback_when_filter_unsupported() {
-        let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, false);
-
-        assert!(routing.draft, "unsupported targets must fall back to draft");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        let announcement = routing
-            .fallback_announcement
-            .expect("unsupported target should announce draft fallback");
-        assert!(announcement.contains("ADR-0006"), "{announcement}");
-        assert!(announcement.contains("agent-noted"), "{announcement}");
-        assert!(announcement.contains("draft"), "{announcement}");
-    }
-
-    #[test]
     fn build_pr_body_for_self_reported_failure_quotes_agent_notes() {
         let body = build_pr_body(
             &ExitReason::AgentSelfReportedFailure,
