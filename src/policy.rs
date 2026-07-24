@@ -365,42 +365,33 @@ pub struct PhaseOutcomes {
 
 /// Decide how a finished agent run should be classified.
 ///
-/// Precedence (ADR-0006 / issue #95, refined by ADR-0009 / issue #124
-/// slice 2 — the phase-8 merger verdict now drives the (α) agent-
-/// authored routing branch):
+/// ADR-0011: merge gating is **mechanical-only**. A run drafts solely on
+/// objective failure — wall-clock exceeded, container crash (non-zero
+/// implement exit), rate-limit / auth signature, or a failing cargo gate
+/// (post-implement or end-pipeline). Every subjective or heuristic
+/// outcome — leftover review / security findings, weak-test-guard and
+/// parser-as-backstop synth headings, informational agent notes, and the
+/// phase-8 merger's HOLD verdicts — no longer gates. Those signals now
+/// surface only as advisory PR comments; the run routes to `Success` and
+/// auto-merges on green CI.
 ///
-/// 1. `wall_clock_exceeded` → `WallClockExceeded`. Pipeline was killed
-///    at the budget boundary.
-/// 2. Non-zero implement exit + rate-limit stderr signature →
-///    `RateLimited`. More specific than the generic Crash so the
-///    operator gets the right follow-up signal.
-/// 3. Non-zero implement exit → `Crash`. The agent process died.
-/// 4. Failing cargo gate (clippy or test, post-implement or
-///    end-pipeline) → `FinalTestsRed`.
-/// 5. Merger verdict (when `Some` and no (β)/(γ) hard override fires,
-///    see runner-side construction of `outcomes`):
-///    `Merge` → `Success`, `HoldNoted` → `SuccessWithNotes`,
-///    `HoldDraft` → `AgentSelfReportedFailure`. Replaces the
-///    pre-slice-2 (α) auto-fatal `NotesShape::HasUnaddressedFinding`
-///    branch.
-/// 6. Q4-Option-A fallback (merger verdict is `None` — phase didn't
-///    run, output was unparseable, rate-limit skip): behaves exactly
-///    as the pre-slice-2 classifier. `HasUnaddressedFinding` →
-///    `AgentSelfReportedFailure`, `InformationalOnly` →
-///    `SuccessWithNotes`, otherwise → `Success`. Strictly additive on
-///    throughput: a working merger raises it; a failing merger is
-///    neutral.
+/// Precedence (first match wins):
 ///
-/// The issue-#49 `synth_suppresses_notes` shim is gone: synth-only
-/// agent-notes files map to `NotesShape::Absent` when the runner passes
-/// the recorded implement-crash synth span to note classification, so
-/// they route on their actual failure mode (Crash) without a per-call
-/// special case here.
-pub fn classify_exit(
-    notes: NotesShape,
-    outcomes: &PhaseOutcomes,
-    merger_verdict: Option<MergerVerdict>,
-) -> ExitReason {
+/// 1. `wall_clock_exceeded` → `WallClockExceeded`.
+/// 2. opencode auth / rate-limit stderr signature → `AuthError` /
+///    `RateLimited` (the opencode CLI exits 0 on these, so the signature
+///    is authoritative regardless of exit code).
+/// 3. Non-zero implement exit + rate-limit signature → `RateLimited`.
+/// 4. Non-zero implement exit → `Crash`.
+/// 5. Failing cargo gate (post-implement or end-pipeline) →
+///    `FinalTestsRed`.
+/// 6. Otherwise → `Success`.
+///
+/// The phase-8 merger still runs and still posts its `## Merge verdict`
+/// PR comment, but its verdict is advisory: `classify_exit` no longer
+/// reads it, nor the `notes` shape, nor the (β)/(γ) synth-provenance
+/// overrides. See ADR-0011.
+pub fn classify_exit(outcomes: &PhaseOutcomes) -> ExitReason {
     if outcomes.wall_clock_exceeded {
         return ExitReason::WallClockExceeded;
     }
@@ -443,61 +434,16 @@ pub fn classify_exit(
     {
         return ExitReason::FinalTestsRed;
     }
-    // ADR-0009 slice 2 / issue #124 (α) replacement: when the merger
-    // produced a parseable verdict, it drives routing on the
-    // agent-authored channel. The merger has already screened against
-    // the run's full context (diff, ACs, agent-notes, CI status); if
-    // it voted `Merge` the substantive code is good and the heading
-    // shape that would otherwise auto-fatal the run is overridden.
-    //
-    // Q4-Option-A fallback (per ADR-0009): if the verdict is `None`
-    // (merger phase didn't run, agent output was unparseable, or the
-    // merger hit a rate-limit and was skipped), fall through to the
-    // pre-slice classifier below. Strictly additive on throughput: a
-    // working merger raises it; a failing merger is neutral.
-    if let Some(verdict) = merger_verdict {
-        // (β) synth-provenance hard override: any recorded
-        // `WeakTestGuard` / `ParserBackstop` / `ImplementCrash`
-        // is out-of-band evidence Bellows itself authored an
-        // `## Unaddressed finding:` span. The merger cannot vote
-        // past these — the run routes to AgentSelfReportedFailure
-        // regardless of the verdict token.
-        if outcomes
-            .synth_causes
-            .iter()
-            .any(|cause| {
-                matches!(
-                    cause,
-                    BellowsSynthCause::WeakTestGuard
-                        | BellowsSynthCause::ParserBackstop
-                        | BellowsSynthCause::ImplementCrash
-                )
-            })
-        {
-            return ExitReason::AgentSelfReportedFailure;
-        }
-        // (γ) parser-as-backstop hard override: even if the runner
-        // did not project the violations into `synth_causes`,
-        // non-empty `backstop_violations` is direct evidence the
-        // agent silently skipped a blocker/important finding.
-        // Defence-in-depth against drift between the two surfaces.
-        if !outcomes.backstop_violations.is_empty() {
-            return ExitReason::AgentSelfReportedFailure;
-        }
-        return match verdict {
-            MergerVerdict::Merge => ExitReason::Success,
-            MergerVerdict::HoldNoted => ExitReason::SuccessWithNotes,
-            MergerVerdict::HoldDraft => ExitReason::AgentSelfReportedFailure,
-        };
-    }
-    // Q4-Option-A fallback path. Pre-slice-2 behaviour preserved
-    // exactly so a missing merger verdict is a no-op on routing.
-    if matches!(notes, NotesShape::HasUnaddressedFinding) {
-        return ExitReason::AgentSelfReportedFailure;
-    }
-    if matches!(notes, NotesShape::InformationalOnly) {
-        return ExitReason::SuccessWithNotes;
-    }
+    // ADR-0011: mechanical-only gating. Everything past the objective
+    // failure checks above auto-merges. Leftover review / security
+    // findings, weak-test-guard and parser-as-backstop synth headings,
+    // informational notes, and the phase-8 merger's HOLD verdicts are
+    // all advisory now — they surface as PR comments (agent-notes and
+    // the `## Merge verdict` comment) but do not route the run to a
+    // draft. The merger still runs; `classify_exit` simply no longer
+    // reads its verdict, the `notes` shape, or the (β)/(γ)
+    // synth-provenance overrides. See ADR-0011 for why the trust
+    // boundary moved from the merge gate to up-front design guidance.
     ExitReason::Success
 }
 

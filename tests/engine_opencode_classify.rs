@@ -13,7 +13,7 @@
 //! refresh).
 
 use bellows::config::Engine;
-use bellows::policy::{classify_exit, ExitReason, ImplementOutcome, NotesShape, PhaseOutcomes};
+use bellows::policy::{classify_exit, ExitReason, ImplementOutcome, PhaseOutcomes};
 
 #[test]
 fn classify_exit_opencode_exit_zero_rate_limit_stderr_is_rate_limited() {
@@ -25,7 +25,7 @@ fn classify_exit_opencode_exit_zero_rate_limit_stderr_is_rate_limited() {
         },
         ..PhaseOutcomes::default()
     };
-    let r = classify_exit(NotesShape::Absent, &outcomes, None);
+    let r = classify_exit(&outcomes);
     assert_eq!(
         r,
         ExitReason::RateLimited,
@@ -43,7 +43,7 @@ fn classify_exit_opencode_exit_zero_auth_error_stderr_is_auth_error() {
         },
         ..PhaseOutcomes::default()
     };
-    let r = classify_exit(NotesShape::Absent, &outcomes, None);
+    let r = classify_exit(&outcomes);
     assert_eq!(
         r,
         ExitReason::AuthError,
@@ -62,7 +62,7 @@ fn classify_exit_opencode_clean_exit_zero_is_success() {
         },
         ..PhaseOutcomes::default()
     };
-    let r = classify_exit(NotesShape::Absent, &outcomes, None);
+    let r = classify_exit(&outcomes);
     assert_eq!(r, ExitReason::Success);
 }
 
@@ -81,7 +81,7 @@ fn classify_exit_claude_exit_zero_with_rate_limit_signature_still_success() {
         },
         ..PhaseOutcomes::default()
     };
-    let r = classify_exit(NotesShape::Absent, &outcomes, None);
+    let r = classify_exit(&outcomes);
     assert_eq!(
         r,
         ExitReason::Success,
