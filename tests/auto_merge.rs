@@ -222,25 +222,19 @@ fn auto_merge_workflow_filters_fork_prs_by_head_repo_equality() {
 }
 
 #[test]
-fn auto_merge_workflow_filters_prs_labelled_agent_noted_per_adr_0006() {
+fn auto_merge_workflow_has_no_agent_noted_filter_after_adr_0011() {
     let body = read_workflow();
-    // ADR-0006 acceptance criterion: a PR carrying the canonical
-    // `agent-noted` label MUST NOT auto-merge — the operator has been
-    // asked to read the agent's informational note before merging.
-    // The workflow's filter block sits alongside the existing draft /
-    // head.ref / fork-repo / state / base-branch filters and inspects
-    // `pr.labels` for the literal `agent-noted` string before the
-    // merge call. The block's comment must cite ADR-0006 so a future
-    // reader knows why the filter exists.
-    //
-    // Pin both the load-bearing literals (`labels`, `agent-noted`) and
-    // the ADR-0006 citation. A future drive-by edit that drops the
-    // filter — or the citation that explains why the filter exists —
-    // flips this test red.
-    assert_contains_all(
-        &body,
-        &["labels", "agent-noted", "ADR-0006"],
-        "filter / agent-noted label per ADR-0006",
+    // ADR-0011 supersedes ADR-0006's gating half: the
+    // `SuccessWithNotes` / `agent-noted` human-merge lane is removed, so
+    // the auto-merge workflow no longer carries an `agent-noted` skip
+    // filter. Informational notes are advisory now — they surface as PR
+    // comments but never hold a merge. A future re-introduction of the
+    // filter (or the label string it keyed on) flips this test red.
+    assert!(
+        !body.contains("agent-noted"),
+        "auto-merge workflow must NOT reference the removed `agent-noted` \
+         label after ADR-0011; informational notes are advisory and do \
+         not gate auto-merge",
     );
 }
 
