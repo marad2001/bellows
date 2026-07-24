@@ -42,3 +42,32 @@ The natural test surface for these ACs is string assertions over
   named in the prompt.
 - `cargo test --all-targets --all-features` and
   `cargo clippy --all-targets --all-features -- -D warnings` both green.
+
+## Unaddressed finding: single commit mixes merger prompt tests and implementation
+
+**What would be required to address it.** The finding asks that the branch
+history be rewritten so the failing-test commit precedes the make-it-pass
+implementation commit (a red commit touching `tests/merger.rs`, then a green
+commit touching `src/policy.rs`), preserving each red/green pair in order. That
+means an interactive rebase / history rewrite of commit
+`1aebd3b73167be618c993067ef9d5a6ee5a529ea`, splitting it into two commits, and
+a force-update of the already-pushed agent branch.
+
+**Why I cannot address it in this run.** The mega-commit is a *structural
+property of the Bellows orchestrator*, not a code root cause an agent can fix
+with a scoped commit. The single squashed commit `1aebd3b` is authored by
+Bellows ("Bellows agent run"), created by `commit_all` in `src/workspace.rs:259`
+*after* the sandbox exits: it does one `git add -A` and produces a single commit
+by design (`src/workspace.rs:252-254`, `src/runner.rs:342` — "land in a single
+commit so the post-condition is a single new commit"). An agent phase therefore
+cannot emit two commits for one phase; the red→green transition happened locally
+(documented above under "Test-first shape / deviation") but the orchestrator
+collapses it. Splitting the history would require rewriting and force-pushing an
+already-pushed, Bellows-authored commit, which (a) violates my hard constraint
+against destructive git operations on pushed history, and (b) conflicts with
+Bellows owning the commit/push step (agents add new scoped commits, they do not
+rewrite existing ones). The genuine fix lives at the pipeline level — either
+teaching `commit_all` to preserve per-behaviour commits, or exempting Bellows
+single-commit squashes from the mega-commit review heuristic in
+`src/policy.rs:855` — which is an architectural decision requiring human
+judgement, out of scope for a single-finding review-fix invocation.
