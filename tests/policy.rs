@@ -2624,16 +2624,25 @@ fn rendered_kickoff_teaches_informational_vs_escalation_agent_notes_channels() {
     );
 
     // Labels: the escalation channel maps to `agent-failed` and a
-    // draft PR; the informational channel opens a noted PR labelled
-    // `agent-noted`. The agent needs to know that to write a useful
-    // note in the right shape.
+    // draft PR. The informational channel, post-ADR-0011, no longer has
+    // a distinct label / human-merge lane: the run classifies as
+    // Success and auto-merges on green CI, with the note surfaced as an
+    // advisory PR comment. The kickoff must name `agent-failed` as the
+    // escalation outcome and must NOT reference the removed
+    // `agent-noted` label.
     assert!(
         prompt.contains("agent-failed"),
         "kickoff must name the `agent-failed` label as the escalation outcome: {prompt}",
     );
     assert!(
-        prompt.contains("agent-noted"),
-        "kickoff must name the `agent-noted` label as the informational outcome: {prompt}",
+        !prompt.contains("agent-noted"),
+        "kickoff must NOT reference the removed `agent-noted` label; the \
+         informational channel auto-merges (advisory comment) after ADR-0011: {prompt}",
+    );
+    assert!(
+        prompt.contains("advisory"),
+        "kickoff must describe the informational channel's note as advisory \
+         (surfaced as a PR comment, does not gate the merge): {prompt}",
     );
 }
 
