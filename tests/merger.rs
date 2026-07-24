@@ -235,6 +235,89 @@ fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_marker
 }
 
 // -----------------------------------------------------------------
+// AC (issue #146 / ADR-0011): the merger verdict is ADVISORY. The
+// prompt must not assert the verdict gates or routes the run, and
+// must frame the three tokens as opinions the operator reviews.
+// -----------------------------------------------------------------
+
+#[test]
+fn render_merger_prompt_does_not_claim_verdict_gates_or_routes_the_run() {
+    // ADR-0011 demoted the merger to advisory: its verdict no longer
+    // feeds classify_exit and does not decide whether the PR lands as
+    // draft or non-draft. The pre-ADR-0011 prompt claimed the token
+    // routed the run ("the run should land as a normal (non-draft)
+    // PR"), that a MERGE vote would be rejected by classify_exit, and
+    // that a HOLD-DRAFT verdict makes "a draft PR the right shape".
+    // Those routing/gating claims must be gone.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        !lowered.contains("classify_exit will reject"),
+        "advisory prompt must not claim classify_exit rejects a MERGE vote: {prompt}",
+    );
+    assert!(
+        !lowered.contains("the run should land as a normal (non-draft) pr"),
+        "advisory prompt must not claim the verdict routes the run to a non-draft PR: {prompt}",
+    );
+    assert!(
+        !lowered.contains("a draft pr is the right shape"),
+        "advisory prompt must not claim a HOLD-DRAFT verdict routes the run to a draft PR: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_frames_tokens_as_advisory_opinions() {
+    // AC (issue #146 / ADR-0011): the three tokens are the merger's
+    // OPINION, not routing instructions: MERGE = ship-ready,
+    // HOLD-NOTED = ship-but-worth-a-look, HOLD-DRAFT =
+    // would-hold-if-it-could. Pin that framing.
+    let prompt = render_merger_prompt();
+    let lowered = prompt.to_lowercase();
+    assert!(
+        lowered.contains("advisory"),
+        "prompt must describe the verdict as advisory: {prompt}",
+    );
+    assert!(
+        lowered.contains("ship-ready"),
+        "prompt must frame MERGE as the ship-ready opinion: {prompt}",
+    );
+    assert!(
+        lowered.contains("worth-a-look") || lowered.contains("worth a look"),
+        "prompt must frame HOLD-NOTED as the ship-but-worth-a-look opinion: {prompt}",
+    );
+    assert!(
+        lowered.contains("would-hold") || lowered.contains("would hold"),
+        "prompt must frame HOLD-DRAFT as the would-hold-if-it-could opinion: {prompt}",
+    );
+    assert!(
+        lowered.contains("opinion"),
+        "prompt must frame the tokens as opinions for the operator's review: {prompt}",
+    );
+}
+
+#[test]
+fn render_merger_prompt_mentions_posting_toggle_consumes_the_token() {
+    // AC (issue #146 / ADR-0011): although advisory, the token is
+    // still parsed by Bellows to drive the `[phases.merge].posting`
+    // toggle (e.g. `post-on-hold-only`) and the `## Merge verdict`
+    // PR comment. The prompt must say so, so the merger knows the
+    // token still has a consumer even without routing authority.
+    let prompt = render_merger_prompt();
+    assert!(
+        prompt.contains("[phases.merge].posting") || prompt.contains("phases.merge].posting"),
+        "prompt must mention the [phases.merge].posting toggle: {prompt}",
+    );
+    assert!(
+        prompt.contains("post-on-hold-only"),
+        "prompt must name the post-on-hold-only posting mode as a token consumer: {prompt}",
+    );
+    assert!(
+        prompt.contains("## Merge verdict") || prompt.contains("Merge verdict"),
+        "prompt must mention the ## Merge verdict PR comment as a token consumer: {prompt}",
+    );
+}
+
+// -----------------------------------------------------------------
 // AC: `[phases.merge]` schema entry parses with a `cli_chain` field;
 // default `["claude:claude-opus-4-7"]` when omitted.
 // -----------------------------------------------------------------

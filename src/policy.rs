@@ -744,6 +744,11 @@ pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
 /// the ACs. Notes are treated as agent-stated
 /// reasoning, NOT evidence the code is correct; the diff and ACs are
 /// the anchor.
+///
+/// Per ADR-0011 the verdict is **advisory**: it surfaces as the
+/// `## Merge verdict` PR comment and drives the `[phases.merge].posting`
+/// toggle, but it no longer routes the run or feeds `classify_exit`.
+/// Only mechanical failures gate a merge.
 pub fn render_merger_prompt() -> String {
     MERGER_PROMPT.to_string()
 }
@@ -756,7 +761,7 @@ const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bell
 - The agent brief (with its verbatim `## Acceptance criteria` list) is appended to this kickoff under `## Bellows-supplied run inputs`. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
 - `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
 
-  **Synth-provenance markers are a hard signal: do NOT vote `MERGE` when any `<!-- bellows parser-as-backstop ... -->`, `<!-- bellows weak-test guard ... -->`, or `<!-- bellows implement-crash recovery ... -->` HTML comment is present in agent-notes.md.** These markers are Bellows' own out-of-band evidence that the run is not mergeable: the parser-as-backstop detected a finding the agent silently skipped, the weak-test guard fired, or the implement phase crashed. The marker text itself appears verbatim in the file; you cannot strip it. The correct verdict in their presence is `HOLD-DRAFT` (or `HOLD-NOTED` if the markers are stale relative to the current diff and a human reviewer should still glance at the gap before merge — but never `MERGE`). Bellows' classify_exit will reject a `MERGE` vote over any of these markers anyway, but emitting the right verdict in the first place produces a sharper PR-body summary and avoids the agent-self-reported-failure label looking like a classifier override.
+  **Synth-provenance markers are a hard signal: do NOT vote `MERGE` when any `<!-- bellows parser-as-backstop ... -->`, `<!-- bellows weak-test guard ... -->`, or `<!-- bellows implement-crash recovery ... -->` HTML comment is present in agent-notes.md.** These markers are Bellows' own out-of-band evidence that the run is not mergeable: the parser-as-backstop detected a finding the agent silently skipped, the weak-test guard fired, or the implement phase crashed. The marker text itself appears verbatim in the file; you cannot strip it. The correct verdict in their presence is `HOLD-DRAFT` (or `HOLD-NOTED` if the markers are stale relative to the current diff and a human reviewer should still glance at the gap before merge — but never `MERGE`). Your verdict is advisory and does not gate the run, but emitting the right verdict here produces a sharper `## Merge verdict` PR comment that accurately flags, for the operator's review, that Bellows' own out-of-band signals judged the run not mergeable.
 - The end-pipeline cargo-checks gate status is appended to this kickoff under `## Bellows-supplied run inputs`. Treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
 
 ## What this phase does NOT do
@@ -777,17 +782,17 @@ End the file's contents with a SINGLE trailing line of the EXACT form:
 VERDICT: <TOKEN>
 ```
 
-where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctuation):
+where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctuation). Per ADR-0011 your verdict is **advisory** — it is your opinion for the operator's morning review, NOT a gate on the run. It does not route the run, does not decide whether the PR lands as draft or non-draft, and does not feed `classify_exit` (only mechanical, objective failures — red CI, a red cargo-checks gate, an agent crash, a budget/rate-limit stop — gate a merge). Pick the token that best captures your opinion of the shipped diff:
 
-- `MERGE` — the diff satisfies the brief's ACs and the run should land as a normal (non-draft) PR.
-- `HOLD-NOTED` — the diff broadly satisfies the ACs but `agent-notes.md` flags a gap a human reviewer should see before merge.
-- `HOLD-DRAFT` — the diff does NOT satisfy the brief's ACs; a draft PR is the right shape so a human can take over.
+- `MERGE` — ship-ready: the diff satisfies the brief's ACs and you would happily see it land as-is.
+- `HOLD-NOTED` — ship-but-worth-a-look: the diff broadly satisfies the ACs but `agent-notes.md` or the diff flags a gap the operator should glance at before or after the merge.
+- `HOLD-DRAFT` — would-hold-if-it-could: the diff does NOT satisfy the brief's ACs, and if the verdict still gated the run you would hold it for a human. It no longer does, but the token records that opinion clearly.
 
-The trailing verdict line is load-bearing — Bellows greps `/workspace/.bellows-merger-output.md` for it after your run. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
+The trailing verdict line is still parsed — Bellows greps `/workspace/.bellows-merger-output.md` for it after your run to build the `## Merge verdict` PR comment and to drive the `[phases.merge].posting` toggle (e.g. `post-on-hold-only`, which posts the comment only for `HOLD-NOTED` / `HOLD-DRAFT`). Emitting the right token therefore still matters for what the operator sees, even though it no longer affects whether the PR is draft or merged. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
 
 ## When you cannot complete
 
-If the diff is malformed, missing, or you genuinely cannot judge it, emit a `VERDICT: HOLD-DRAFT` line (so the run lands as a draft for a human) and explain what stopped you in the prose above the verdict line. Do NOT emit a different token, and do NOT omit the verdict line — a missing verdict produces an ambiguous run-log entry.
+If the diff is malformed, missing, or you genuinely cannot judge it, emit a `VERDICT: HOLD-DRAFT` line and explain what stopped you in the prose above the verdict line. This records your inability-to-judge as an advisory opinion for the operator; it does not itself draft the PR (only the mechanical checks do that). Do NOT emit a different token, and do NOT omit the verdict line — a missing verdict produces an ambiguous run-log entry.
 "#;
 
 /// Workspace-relative path of the diff file the runner writes before
