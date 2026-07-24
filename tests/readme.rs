@@ -122,10 +122,12 @@ fn readme_enumerates_all_canonical_labels() {
         "`wontfix`",
     ];
     let categories = ["`bug`", "`enhancement`"];
+    // ADR-0011 removed the `agent-noted` runtime label along with the
+    // SuccessWithNotes human-merge lane, so the runtime label set is now
+    // five, not six.
     let runtime = [
         "`agent-in-progress`",
         "`agent-done`",
-        "`agent-noted`",
         "`agent-failed`",
         "`agent-rate-limited`",
         "`agent-cancelled`",
@@ -133,6 +135,12 @@ fn readme_enumerates_all_canonical_labels() {
     assert_contains_all(&body, &triage, "labels / triage");
     assert_contains_all(&body, &categories, "labels / category");
     assert_contains_all(&body, &runtime, "labels / runtime");
+    // The removed `agent-noted` label must not reappear in the README.
+    assert!(
+        !body.contains("agent-noted"),
+        "README must not reference the removed `agent-noted` runtime label \
+         after ADR-0011",
+    );
 }
 
 #[test]

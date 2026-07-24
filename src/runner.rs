@@ -122,36 +122,17 @@ pub enum RunOutcome {
 struct PrRouting<'a> {
     draft: bool,
     outcome_label: &'a str,
-    pr_label: Option<&'a str>,
-    fallback_announcement: Option<&'static str>,
 }
-
-const ADR_0006_DRAFT_FALLBACK_ANNOUNCEMENT: &str =
-    "bellows: ADR-0006 fallback — target auto-merge workflow does not advertise \
-     an `agent-noted` filter; opening SuccessWithNotes PR as draft so the \
-     agent note cannot auto-merge unread";
 
 fn pr_routing_for_reason<'a>(
     reason: &ExitReason,
     labels: &'a RuntimeLabelsConfig,
-    auto_merge_workflow_supports_agent_noted_filter: bool,
 ) -> PrRouting<'a> {
     match reason {
         ExitReason::Success => PrRouting {
             draft: false,
             outcome_label: &labels.agent_done,
-            pr_label: None,
-            fallback_announcement: None,
         },
-        ExitReason::SuccessWithNotes => {
-            let draft = !auto_merge_workflow_supports_agent_noted_filter;
-            PrRouting {
-                draft,
-                outcome_label: &labels.agent_noted,
-                pr_label: Some(&labels.agent_noted),
-                fallback_announcement: draft.then_some(ADR_0006_DRAFT_FALLBACK_ANNOUNCEMENT),
-            }
-        }
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
         | ExitReason::FinalTestsRed
@@ -159,20 +140,14 @@ fn pr_routing_for_reason<'a>(
         | ExitReason::AuthError => PrRouting {
             draft: true,
             outcome_label: &labels.agent_failed,
-            pr_label: None,
-            fallback_announcement: None,
         },
         ExitReason::RateLimited => PrRouting {
             draft: true,
             outcome_label: &labels.agent_rate_limited,
-            pr_label: None,
-            fallback_announcement: None,
         },
         ExitReason::Cancelled => PrRouting {
             draft: true,
             outcome_label: &labels.agent_cancelled,
-            pr_label: None,
-            fallback_announcement: None,
         },
     }
 }
@@ -2256,16 +2231,9 @@ pub async fn run_once(
         pipeline_reason
     };
 
-    let routing = pr_routing_for_reason(
-        &reason,
-        &config.runtime_labels,
-        workspace.auto_merge_workflow_supports_agent_noted_filter(),
-    );
+    let routing = pr_routing_for_reason(&reason, &config.runtime_labels);
     let draft = routing.draft;
     let outcome_label = routing.outcome_label;
-    if let Some(line) = routing.fallback_announcement {
-        announce(log_writer, line);
-    }
 
     announce(
         log_writer,
@@ -2322,9 +2290,6 @@ pub async fn run_once(
         },
     )
     .await?;
-    if let Some(pr_label) = routing.pr_label {
-        tracker::add_issue_labels(client, &owner, &repo, pr.number, &[pr_label]).await?;
-    }
     announce(
         log_writer,
         &format!("bellows: opened PR #{} — finalising labels + log comment", pr.number),
@@ -2532,16 +2497,6 @@ fn build_pr_body(
                 "_(Run produced by Bellows v1; the agent did not write a PR description.)_"
                     .to_string()
             }),
-        ExitReason::SuccessWithNotes => {
-            let generated = claude_pr_body.unwrap_or(
-                "_(Run produced by Bellows v1; the agent did not write a PR description.)_",
-            );
-            format!(
-                "## Agent completed with notes\n\n\
-                 The agent completed successfully and wrote an informational `agent-notes.md` note. The file itself is ephemeral to the run (issue #85); its content is posted as a separate `## Agent notes` PR comment for the operator to read before merging.\n\n\
-                 {generated}"
-            )
-        }
         ExitReason::AgentSelfReportedFailure => format!(
             "## Agent self-reported failure\n\n\
              The agent wrote `agent-notes.md` rather than complete the brief. The file itself is ephemeral to the run (issue #85) and does not appear in this PR's diff; its content is posted as a separate `## Agent notes` PR comment for visibility and quoted below for convenience.\n\n\
@@ -2709,7 +2664,7 @@ fn build_log_body(
     // string for the empty list, so the common case is a no-op.
     body.push_str(&workflow_files_changed_callout(workflow_files_changed));
 
-    if !matches!(reason, ExitReason::Success | ExitReason::SuccessWithNotes) {
+    if !matches!(reason, ExitReason::Success) {
         // When SIGKILL fires before any agent output flushes (typical for
         // wall-clock kill mid-startup), `stderr_tail` is empty; emitting
         // the section anyway produces an empty markdown code fence in the
@@ -3450,36 +3405,6 @@ api_key_env_file = "~/bellows-test-opencode.env"
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
         let body = build_pr_body(&ExitReason::Success, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("the agent did not write a PR description"));
-    }
-
-    #[test]
-    fn success_with_notes_routes_ready_for_review_when_agent_noted_filter_supported() {
-        let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, true);
-
-        assert!(!routing.draft, "supported targets should get a ready PR");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        assert!(
-            routing.fallback_announcement.is_none(),
-            "supported targets should not announce a draft fallback",
-        );
-    }
-
-    #[test]
-    fn success_with_notes_routes_draft_with_adr_0006_fallback_when_filter_unsupported() {
-        let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, false);
-
-        assert!(routing.draft, "unsupported targets must fall back to draft");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        let announcement = routing
-            .fallback_announcement
-            .expect("unsupported target should announce draft fallback");
-        assert!(announcement.contains("ADR-0006"), "{announcement}");
-        assert!(announcement.contains("agent-noted"), "{announcement}");
-        assert!(announcement.contains("draft"), "{announcement}");
     }
 
     #[test]

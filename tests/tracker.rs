@@ -406,14 +406,14 @@ async fn finalise_applies_failure_label_when_outcome_is_agent_failed() {
 }
 
 #[tokio::test]
-async fn add_issue_labels_posts_agent_noted_label_to_pr_issue_endpoint() {
+async fn add_issue_labels_posts_label_to_pr_issue_endpoint() {
     let mock = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/repos/marad2001/test-repo/issues/99/labels"))
-        .and(body_json(json!({ "labels": ["agent-noted"] })))
+        .and(body_json(json!({ "labels": ["agent-done"] })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            { "name": "agent-noted" }
+            { "name": "agent-done" }
         ])))
         .expect(1)
         .mount(&mock)
@@ -425,13 +425,13 @@ async fn add_issue_labels_posts_agent_noted_label_to_pr_issue_endpoint() {
         "marad2001",
         "test-repo",
         99,
-        &["agent-noted"],
+        &["agent-done"],
     )
     .await
     .expect("add_issue_labels should succeed");
 
     let label_names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
-    assert_eq!(label_names, vec!["agent-noted"]);
+    assert_eq!(label_names, vec!["agent-done"]);
 }
 
 #[tokio::test]

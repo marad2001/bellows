@@ -61,7 +61,6 @@ pickup_label = "ready-for-agent"
 # Strings Bellows applies during a run. Defaults match these names verbatim.
 agent_in_progress = "agent-in-progress"
 agent_done        = "agent-done"
-agent_noted       = "agent-noted"
 agent_failed      = "agent-failed"
 agent_rate_limited = "agent-rate-limited"
 agent_cancelled   = "agent-cancelled"
@@ -165,7 +164,7 @@ api_key_env_file = "~/.config/bellows/opencode.env"
 # (including the trailing `VERDICT: <token>` line) as a comment on
 # the PR. The comment is posted before the label transition
 # completes so the operator opening the PR sees the verdict alongside
-# the agent-done / agent-noted / agent-failed state.
+# the agent-done / agent-failed state.
 #
 # Two modes:
 #   - `post-always` (default): every parseable verdict posts a
