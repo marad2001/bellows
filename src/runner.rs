@@ -3453,33 +3453,36 @@ api_key_env_file = "~/bellows-test-opencode.env"
     }
 
     #[test]
-    fn success_with_notes_routes_ready_for_review_when_agent_noted_filter_supported() {
+    fn success_routes_ready_for_review_with_agent_done_label() {
+        // ADR-0011: a clean mechanical run auto-merges. Success opens a
+        // non-draft PR labelled `agent-done`. `pr_routing_for_reason`
+        // takes no auto-merge-filter argument anymore — the
+        // SuccessWithNotes / agent-noted lane that read it is gone.
         let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, true);
+        let routing = pr_routing_for_reason(&ExitReason::Success, &labels);
 
-        assert!(!routing.draft, "supported targets should get a ready PR");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        assert!(
-            routing.fallback_announcement.is_none(),
-            "supported targets should not announce a draft fallback",
-        );
+        assert!(!routing.draft, "Success must open a non-draft PR");
+        assert_eq!(routing.outcome_label, "agent-done");
     }
 
     #[test]
-    fn success_with_notes_routes_draft_with_adr_0006_fallback_when_filter_unsupported() {
+    fn mechanical_failures_route_draft() {
+        // ADR-0011: only mechanical failures draft. Each objective
+        // failure reason opens a draft PR so a human triages before the
+        // auto-merge workflow can touch it.
         let labels = crate::config::RuntimeLabelsConfig::default();
-        let routing = pr_routing_for_reason(&ExitReason::SuccessWithNotes, &labels, false);
-
-        assert!(routing.draft, "unsupported targets must fall back to draft");
-        assert_eq!(routing.outcome_label, "agent-noted");
-        assert_eq!(routing.pr_label, Some("agent-noted"));
-        let announcement = routing
-            .fallback_announcement
-            .expect("unsupported target should announce draft fallback");
-        assert!(announcement.contains("ADR-0006"), "{announcement}");
-        assert!(announcement.contains("agent-noted"), "{announcement}");
-        assert!(announcement.contains("draft"), "{announcement}");
+        for reason in [
+            ExitReason::AgentSelfReportedFailure,
+            ExitReason::Crash,
+            ExitReason::FinalTestsRed,
+            ExitReason::WallClockExceeded,
+            ExitReason::AuthError,
+            ExitReason::RateLimited,
+            ExitReason::Cancelled,
+        ] {
+            let routing = pr_routing_for_reason(&reason, &labels);
+            assert!(routing.draft, "{reason:?} must open a draft PR");
+        }
     }
 
     #[test]
