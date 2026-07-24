@@ -374,8 +374,9 @@ fn phase_outcomes_merger_verdict_round_trips_all_three_variants() {
 // Note: the slice-1 `classify_exit_is_invariant_under_merger_verdict_in_slice_1`
 // test that previously lived here is gone. Slice 2 (issue #124 /
 // ADR-0009) wires the merger verdict into routing, so the slice-1
-// invariance no longer holds: `Some(Merge)` is now a Success
-// signal, `Some(HoldNoted)` is `SuccessWithNotes`, and
+// invariance no longer holds: `Some(Merge)` and `Some(HoldNoted)`
+// are both Success signals (per ADR-0011 the merger is advisory —
+// its verdict surfaces as a PR comment, not a gate), and
 // `Some(HoldDraft)` is `AgentSelfReportedFailure`. The slice-2
 // precedence-table tests live in `tests/policy_merger_routing.rs`.
 // -----------------------------------------------------------------

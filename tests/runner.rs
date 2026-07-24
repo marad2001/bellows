@@ -708,8 +708,8 @@ async fn merge_verdict_post_on_hold_only_skips_comment_for_merge_verdict() {
 async fn merge_verdict_post_on_hold_only_posts_comment_for_hold_noted() {
     // AC5 (first half): When `posting = post-on-hold-only` and the
     // verdict is `HoldNoted`, the comment IS posted — the operator
-    // needs the merger's rationale when manually merging an
-    // agent-noted PR.
+    // needs the merger's rationale when reviewing a PR the merger
+    // flagged for a closer look.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/repos/marad2001/test-repo/issues/125/comments"))
