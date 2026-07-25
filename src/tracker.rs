@@ -287,8 +287,21 @@ pub async fn list_needs_triage_issues(
     repo: &str,
     needs_triage_label: &str,
 ) -> Result<Vec<Issue>, octocrab::Error> {
+    list_open_issues_with_label(client, owner, repo, needs_triage_label).await
+}
+
+/// List open issues in `owner/repo` carrying `label`, oldest-first.
+/// Generic backbone of `list_needs_triage_issues`; also used by the
+/// startup reconciliation (issue #158) to find issues a prior aborted
+/// run stranded at `agent-in-progress`.
+pub async fn list_open_issues_with_label(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    label: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
     let params = ListNeedsTriageParams {
-        labels: needs_triage_label,
+        labels: label,
         state: "open",
         sort: "created",
         direction: "asc",
@@ -509,6 +522,34 @@ pub async fn strip_issue_label(
         .map(|l| l.name.clone())
         .filter(|n| n != label)
         .collect();
+    new_labels.sort();
+    let body = serde_json::json!({ "labels": new_labels });
+    let updated: Issue = client.patch(&route, Some(&body)).await?;
+    Ok(updated)
+}
+
+/// Reverse of [`claim`] (issue #158 startup reconciliation): swap
+/// `in_progress_label` back to `pickup_label` on an issue stranded by a
+/// prior aborted run, so the next polling tick re-claims it. One GET +
+/// one PATCH, mirroring `claim`. `pickup_label` is not duplicated if it
+/// is somehow already present, and any other labels are preserved.
+pub async fn reset_in_progress_to_pickup(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    in_progress_label: &str,
+    pickup_label: &str,
+) -> Result<Issue, octocrab::Error> {
+    let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
+    let current: Issue = client.get(&route, None::<&()>).await?;
+    let mut new_labels: Vec<String> = current
+        .labels
+        .iter()
+        .map(|l| l.name.clone())
+        .filter(|n| n != in_progress_label && n != pickup_label)
+        .collect();
+    new_labels.push(pickup_label.to_string());
     new_labels.sort();
     let body = serde_json::json!({ "labels": new_labels });
     let updated: Issue = client.patch(&route, Some(&body)).await?;

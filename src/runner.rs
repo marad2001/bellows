@@ -494,6 +494,78 @@ async fn sweep_one_dependent(
     }
 }
 
+/// Issue #158: on runner startup, reclaim issues stranded at
+/// `in_progress_label` by a prior aborted / timed-out run. The
+/// orphan-container sweep (in `main::run`) kills leftover containers;
+/// this reconciles the GitHub side so the AFK contract survives a
+/// process abort (laptop sleep, `Ctrl-C`, network abort mid-run)
+/// without the operator having to re-label by hand.
+///
+/// Safe because of the concurrency=1 invariant: at startup no agent run
+/// is in flight, so any issue still carrying `in_progress_label` was
+/// stranded by the prior process. Each reclaimed issue's stale
+/// `agent/<N>-*` branch (if any) is swept by the existing pre-claim
+/// stale-branch deletion (ADR-0003) when it is re-claimed on a later
+/// tick.
+///
+/// Best-effort per issue: a failed list or reset is logged and skipped
+/// so a transient GitHub hiccup never blocks startup. Returns the number
+/// of issues reclaimed for the caller's summary line.
+pub async fn reconcile_stranded_in_progress(
+    client: &octocrab::Octocrab,
+    repos: &[(String, String)],
+    in_progress_label: &str,
+    pickup_label: &str,
+    log_writer: &mut dyn Write,
+) -> usize {
+    let mut reclaimed = 0usize;
+    for (owner, repo) in repos {
+        let stranded =
+            match tracker::list_open_issues_with_label(client, owner, repo, in_progress_label)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: startup reconcile: listing {}/{} `{}` issues failed (skipping repo): {}",
+                        owner, repo, in_progress_label, e,
+                    );
+                    continue;
+                }
+            };
+        for issue in stranded {
+            match tracker::reset_in_progress_to_pickup(
+                client,
+                owner,
+                repo,
+                issue.number,
+                in_progress_label,
+                pickup_label,
+            )
+            .await
+            {
+                Ok(_) => {
+                    reclaimed += 1;
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: startup reconcile: reclaimed stranded issue #{} ({}/{}) — `{}` -> `{}`",
+                        issue.number, owner, repo, in_progress_label, pickup_label,
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: startup reconcile: reset failed for issue #{} ({}/{}) (leaving for manual re-label): {}",
+                        issue.number, owner, repo, e,
+                    );
+                }
+            }
+        }
+    }
+    reclaimed
+}
+
 pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
@@ -2481,6 +2553,31 @@ pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
     )
 }
 
+/// Issue #157: a one-line disambiguation appended to the PR body so an
+/// operator can tell whether an `agent-failed` label reflects the CODE
+/// or just the RUN. Environmental / run failures (crash, wall-clock,
+/// rate-limit, cancel, auth) are NOT a verdict on the code — if a branch
+/// was pushed, this PR's own GitHub CI is the authoritative signal.
+/// `FinalTestsRed` gets the opposite note (Bellows mirrors the repo's CI
+/// per ADR-0004, so it IS the real code signal). `Success` and
+/// `AgentSelfReportedFailure` get nothing — the label already means
+/// exactly what it says.
+fn run_failure_disambiguation(reason: &ExitReason) -> &'static str {
+    match reason {
+        ExitReason::Crash
+        | ExitReason::WallClockExceeded
+        | ExitReason::RateLimited
+        | ExitReason::AuthError
+        | ExitReason::Cancelled => {
+            "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._"
+        }
+        ExitReason::FinalTestsRed => {
+            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._"
+        }
+        ExitReason::Success | ExitReason::AgentSelfReportedFailure => "",
+    }
+}
+
 fn build_pr_body(
     reason: &ExitReason,
     issue_number: u64,
@@ -2535,7 +2632,10 @@ fn build_pr_body(
     // agent's branch diff touched a file under `.github/workflows/`.
     // The helper returns an empty string for the empty list, so the
     // common case is a no-op and there is no whitespace noise.
-    header + &body + &workflow_files_changed_callout(workflow_files_changed)
+    header
+        + &body
+        + run_failure_disambiguation(reason)
+        + &workflow_files_changed_callout(workflow_files_changed)
 }
 
 fn build_log_body(
@@ -3426,6 +3526,47 @@ api_key_env_file = "~/bellows-test-opencode.env"
         let body = build_pr_body(&ExitReason::Crash, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("crashed"));
         assert!(body.contains("stderr tail"));
+    }
+
+    #[test]
+    fn build_pr_body_disambiguates_run_failure_from_code_verdict() {
+        // Issue #157: environmental / run failures point the operator at
+        // real CI (the label reflects the RUN, not the code); a
+        // code-check failure (FinalTestsRed) says it mirrors real CI;
+        // Success and the agent's own self-report get no disambiguation.
+        let crash =
+            build_pr_body(&ExitReason::Crash, 42, None, None, &[], &PhaseOutcomes::default());
+        assert!(
+            crash.contains("run** failure") && crash.contains("authoritative check"),
+            "crash body should flag a run failure and point at real CI: {crash}",
+        );
+        let rate =
+            build_pr_body(&ExitReason::RateLimited, 42, None, None, &[], &PhaseOutcomes::default());
+        assert!(rate.contains("run** failure"), "rate-limit is a run failure too: {rate}");
+
+        let red =
+            build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &PhaseOutcomes::default());
+        assert!(
+            red.contains("mirrors this repo's CI"),
+            "FinalTestsRed should say it is the same failure CI would report: {red}",
+        );
+        assert!(
+            !red.contains("run** failure"),
+            "FinalTestsRed is a code signal, not a run-failure note: {red}",
+        );
+
+        let ok = build_pr_body(
+            &ExitReason::Success,
+            42,
+            Some("body"),
+            None,
+            &[],
+            &PhaseOutcomes::default(),
+        );
+        assert!(
+            !ok.contains("run** failure") && !ok.contains("mirrors this repo's CI"),
+            "Success gets no failure disambiguation: {ok}",
+        );
     }
 
     #[test]
