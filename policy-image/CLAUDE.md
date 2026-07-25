@@ -23,6 +23,14 @@ Use the `tdd` skill that lives in your skills directory. The pattern is red → 
 
 When the brief mentions a skill, look for it under your skills directory and follow it.
 
+## Reading large files
+
+Real repos contain large source files (tens of thousands of tokens). The `Read` tool caps a single read at ~25k tokens and **errors** when you read a whole file bigger than that. In a headless run there is no one to recover the read for you, and a repeated `MaxFileReadTokenExceededError` can abort the pipeline mid-issue. So never read a large file whole:
+
+- Use `Grep` to locate the symbols, functions, or lines you need, then `Read` with `offset`/`limit` to pull only those ranges.
+- If a `Read` returns a max-token error, do **not** retry the same whole-file read — switch to `Grep` + ranged `Read`.
+- Only read a whole file when you already know it is small.
+
 ## What Bellows does after you exit
 
 Bellows runs `git add -A` and `git commit` against `/workspace`, pushes the resulting branch, opens a GitHub PR (closing this issue), posts a `<details>` log comment summarising the run, and transitions the issue's labels.

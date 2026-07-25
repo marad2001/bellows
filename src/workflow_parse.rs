@@ -134,18 +134,24 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
     ExtractedCommands::default()
 }
 
-/// Walk a parsed workflow's `jobs.*` map, pick the preferred job (a
-/// job running on a Linux runner that yields at least one cargo
-/// command; falling back to the first declared job when no Linux job
-/// extracts), then return the first `cargo clippy` and `cargo test`
-/// lines from that job's steps.
+/// Walk a parsed workflow's `jobs.*` map and extract the clippy and
+/// test commands CI runs. Accumulates the two commands *independently*
+/// across all Linux-runner jobs in declaration order — taking the first
+/// `cargo clippy` line found and the first `cargo test` line found, even
+/// when they live in separate jobs.
 ///
-/// Iterates *all* Linux jobs in declaration order rather than locking
-/// onto the first one, so a workflow that declares a non-cargo Linux
-/// job (e.g. `release:` running `cargo build`) before the real `ci:`
-/// job still extracts. Without this fallthrough the parser would
-/// report (None, None) for that shape even though a sibling Linux job
-/// carries clippy/test.
+/// A dedicated `clippy:` job alongside a `test:` job is an idiomatic CI
+/// shape. Stopping at the first job that yields *either* command (the
+/// pre-fix behaviour) grabbed `cargo test` from the `test:` job and
+/// returned before ever reading the `clippy:` job, so clippy fell back
+/// to the `[gates]` default `-D warnings` — over-strict relative to a
+/// repo whose CI scopes clippy to `-D clippy::correctness
+/// -D clippy::suspicious`, false-failing every PR. ADR-0004 requires the
+/// gate to mirror the target's *actual* clippy scope, so we must keep
+/// looking for each command across sibling jobs.
+///
+/// When no job runs on a Linux runner, falls back to the first declared
+/// job — the matrix-without-ubuntu shape.
 fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
     let Some(jobs) = doc["jobs"].as_hash() else {
         return (None, None);
@@ -160,24 +166,36 @@ fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
             linux_jobs.push(body);
         }
     }
+    // No Linux job at all — matrix-without-ubuntu shape: fall back to the
+    // first declared job so a workflow whose only runner is expressed via
+    // an unresolvable `runs-on` still extracts.
+    if linux_jobs.is_empty() {
+        return match first_job {
+            Some(job) => extract_from_job(job),
+            None => (None, None),
+        };
+    }
+    // Accumulate clippy and test INDEPENDENTLY across every Linux job in
+    // declaration order. Take the first clippy found and the first test
+    // found, wherever each lives — a repo may split them into separate
+    // `clippy:` / `test:` jobs, and returning at the first job to yield
+    // either command would drop the other and force a `-D warnings`
+    // fallback for it.
+    let mut clippy = None;
+    let mut test = None;
     for job in &linux_jobs {
-        let extracted = extract_from_job(job);
-        if extracted.0.is_some() || extracted.1.is_some() {
-            return extracted;
+        let (c, t) = extract_from_job(job);
+        if clippy.is_none() {
+            clippy = c;
+        }
+        if test.is_none() {
+            test = t;
+        }
+        if clippy.is_some() && test.is_some() {
+            break;
         }
     }
-    // No Linux job produced an extractable command. If at least one
-    // Linux job existed, return its (None, None) so the verdict is
-    // attributable to that job. Otherwise fall through to the first
-    // declared job — the matrix-without-ubuntu shape the brief calls
-    // out.
-    if let Some(job) = linux_jobs.first() {
-        return extract_from_job(job);
-    }
-    match first_job {
-        Some(job) => extract_from_job(job),
-        None => (None, None),
-    }
+    (clippy, test)
 }
 
 /// Whether a `jobs.<name>` body runs on a Linux runner. Accepts a
@@ -382,4 +400,92 @@ fn has_shell_control_operators(line: &str) -> bool {
     let double_quotes = line.bytes().filter(|&b| b == b'"').count();
     let single_quotes = line.bytes().filter(|&b| b == b'\'').count();
     double_quotes % 2 != 0 || single_quotes % 2 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(yaml: &str) -> Yaml {
+        YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn extracts_clippy_and_test_from_separate_linux_jobs() {
+        // Regression (ADR-0004): a repo with a dedicated `clippy:` job
+        // separate from the `test:` job. The parser must mirror BOTH
+        // commands. The pre-fix parser stopped at the first job to yield
+        // either command (test), returned early, and let clippy fall back
+        // to `-D warnings` — false-failing every PR against a repo whose
+        // CI scopes clippy to correctness+suspicious.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test --locked --workspace --all-features
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+",
+        );
+        let (clippy, test) = extract_from_workflow(&d);
+        assert_eq!(
+            clippy.as_deref(),
+            Some("cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious"),
+            "clippy must be mirrored from the separate `clippy:` job, not fall back to -D warnings",
+        );
+        assert_eq!(
+            test.as_deref(),
+            Some("cargo test --locked --workspace --all-features"),
+        );
+    }
+
+    #[test]
+    fn extracts_both_from_a_single_job_unchanged() {
+        // A workflow with clippy and test in one job still extracts both.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test --all-features
+      - run: cargo clippy --all-targets -- -D warnings
+",
+        );
+        let (clippy, test) = extract_from_workflow(&d);
+        assert_eq!(clippy.as_deref(), Some("cargo clippy --all-targets -- -D warnings"));
+        assert_eq!(test.as_deref(), Some("cargo test --all-features"));
+    }
+
+    #[test]
+    fn clippy_only_workflow_still_extracts_clippy() {
+        // A repo with only a `clippy:` job (no cargo test line anywhere)
+        // extracts clippy and leaves test None for config fallback.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --all-targets --all-features -- -D clippy::correctness
+",
+        );
+        let (clippy, test) = extract_from_workflow(&d);
+        assert_eq!(
+            clippy.as_deref(),
+            Some("cargo clippy --all-targets --all-features -- -D clippy::correctness"),
+        );
+        assert_eq!(test, None);
+    }
 }
