@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::process::Command;
 
@@ -515,20 +516,106 @@ pub async fn push_branch(workspace: &Workspace) -> Result<(), WorkspaceError> {
 /// `commit_landed` signal handles all three commit-shape outcomes
 /// (agent self-commit, bellows commit on behalf, no advancement).
 pub async fn head_sha(workspace: &Workspace) -> Result<String, WorkspaceError> {
+    head_sha_at(workspace.path()).await
+}
+
+/// [`head_sha`] against a bare path. Issue #164's workspace sampler
+/// holds the bind-mounted path rather than the `Workspace` itself, and
+/// needs the same reading to apply the at-base-SHA advance guard while
+/// the container is still running.
+pub async fn head_sha_at(repo: &Path) -> Result<String, WorkspaceError> {
+    let stdout = git_stdout(repo, &["rev-parse", "HEAD"]).await?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// Sample the state of the agent's work in `repo` and reduce it to one
+/// comparable hash (issue #164). The workspace is a host directory
+/// bind-mounted into the agent's container (`src/sandbox.rs` mounts it
+/// at `/workspace`), so bellows can run git against it from the host
+/// while the container writes.
+///
+/// The sample is of the *work product*, not the directory:
+///
+///   1. `git diff HEAD` — every tracked modification, staged or not.
+///   2. The sorted list of untracked-and-not-ignored paths from
+///      `git status --porcelain`.
+///
+/// Going through git rather than hashing the directory tree is what
+/// keeps `target/` out of the sample. Build artefacts churn on every
+/// `cargo` invocation; a naive recursive file hash would report change
+/// on every sample regardless of what the agent was doing, and no
+/// stall would ever be detectable.
+///
+/// Reads race against the container writing, so a torn read is
+/// possible. That is tolerable by construction: the classifier needs a
+/// hash to repeat three times before it reports **Oscillation**, so a
+/// spurious sample can at worst delay or skip a detection, never
+/// invent one.
+pub async fn sample_workspace_state(
+    repo: &Path,
+) -> Result<crate::policy::SampleHash, WorkspaceError> {
+    let diff = git_stdout(repo, &["diff", "HEAD"]).await?;
+    let status = git_stdout(repo, &["status", "--porcelain"]).await?;
+
+    // `git status --porcelain` marks untracked entries with `?? `, and
+    // already excludes anything .gitignore covers. Sorting makes the
+    // sample independent of git's enumeration order.
+    let status = String::from_utf8_lossy(&status).into_owned();
+    let mut untracked: Vec<&str> = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("?? "))
+        .map(str::trim_end)
+        .collect();
+    untracked.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&diff);
+    // Domain separator: without it a diff ending in a path-shaped line
+    // and an untracked path could hash identically to a different
+    // split of the same bytes.
+    hasher.update(b"\0untracked\0");
+    for path in untracked {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(crate::policy::SampleHash::new(hex))
+}
+
+/// Run `git <args>` in `repo` and return its stdout, mapping a
+/// non-zero exit to [`WorkspaceError::GitFailed`].
+async fn git_stdout(repo: &Path, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(workspace.path())
-        .args(["rev-parse", "HEAD"])
+        .arg(repo)
+        .args(args)
         .output()
         .await?;
     if !output.status.success() {
         return Err(WorkspaceError::GitFailed {
-            args: vec!["rev-parse".into(), "HEAD".into()],
+            args: args.iter().map(|a| (*a).to_string()).collect(),
             status: output.status,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout)
+}
+
+/// Discard every uncommitted change in the workspace, returning it to
+/// `HEAD` (issue #164). Used by the **Advance** path: an advance
+/// abandons the current engine's attempt and re-runs the phase from
+/// base under the next chain entry, so the abandoned engine's
+/// uncommitted edits must not leak into the fresh attempt.
+///
+/// `git clean -fd` (no `-x`) deliberately leaves ignored paths alone,
+/// so the `target/` build cache survives the advance — rebuilding it
+/// would cost the fresh engine minutes of the very budget the advance
+/// exists to preserve.
+pub async fn discard_uncommitted_changes(workspace: &Workspace) -> Result<(), WorkspaceError> {
+    git_stdout(workspace.path(), &["reset", "--hard", "HEAD"]).await?;
+    git_stdout(workspace.path(), &["clean", "-fd"]).await?;
+    Ok(())
 }
 
 /// Whether `path` is a GitHub Actions workflow file: a `.yml` or

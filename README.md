@@ -111,6 +111,25 @@ Sections of `orchestrator.toml`, all of which are read at startup:
   pipeline (implement + post-implement gate + review + review-fix +
   end-pipeline gate); when the budget is spent the run halts and
   routes to a draft PR with `agent-failed`.
+- **`[agent].oscillation_sample_seconds`** — how often bellows samples
+  the implement-phase workspace looking for a stall. Default 60. Each
+  sample hashes `git diff HEAD` plus the untracked-and-not-ignored
+  paths, so gitignored build output (`target/`) never registers as
+  change. A workspace that returns to a previously-seen state with a
+  different state in between is *oscillating* — an edit made, reverted,
+  and made again — and bellows abandons that engine's attempt and
+  advances to the next chain entry. A workspace that is merely
+  *unchanged* is idle, which is logged and never acted on: it looks
+  identical whether the engine is deep in thought or thirty seconds
+  from a clean exit.
+- **`[agent].advance_budget_floor_fraction`** — how much of
+  `wall_clock_minutes` must still remain for an oscillation to earn
+  that advance. Default 0.5. Below the floor the oscillation is logged
+  and the run continues to its existing terminal state, because handing
+  a fresh engine the tail end of a spent budget wastes it. The advance
+  allowance is shared with the rate-limit trigger and capped at one per
+  phase invocation, so a run that already advanced for either reason
+  does not advance again.
 
 ### 2. Export your GitHub PAT
 

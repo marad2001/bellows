@@ -471,6 +471,193 @@ pub fn classify_exit(outcomes: &PhaseOutcomes) -> ExitReason {
     ExitReason::Success
 }
 
+/// One sample of the agent's work product in the workspace, reduced to
+/// a comparable hash (issue #164). Produced by
+/// `workspace::sample_workspace_state`; consumed by
+/// [`classify_stall`], which only ever compares samples for equality —
+/// it never looks inside the string, which is what keeps the
+/// classifier testable with no container, no git, and no clock.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SampleHash(String);
+
+impl SampleHash {
+    pub fn new(hash: impl Into<String>) -> Self {
+        SampleHash(hash.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A run in which the engine is no longer making progress against the
+/// workspace (`CONTEXT.md` §Stall). The two shapes differ in whether
+/// the lack of progress is unambiguous, and therefore in what bellows
+/// is allowed to do about it:
+///
+/// - [`Stall::Oscillation`] — the workspace returns to a previously
+///   seen state with a different state in between. No healthy run does
+///   this, so it justifies an **Advance**.
+/// - [`Stall::Idleness`] — the workspace is unchanged for a prolonged
+///   stretch. Indistinguishable from an engine reasoning about a hard
+///   problem or one about to exit cleanly, so it is recorded for the
+///   operator and never acted on.
+///
+/// A stall is one or the other, never both at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stall {
+    Oscillation,
+    Idleness,
+}
+
+/// How many samples the oscillation scan needs to see. Issue #164:
+/// "take a bounded sequence of sample hashes (keep the last 10)".
+pub const STALL_SAMPLE_WINDOW: usize = 10;
+
+/// Default number of consecutive identical samples that constitutes
+/// **Idleness** — at the default 60-second interval, ~15 minutes of a
+/// motionless workspace.
+pub const DEFAULT_IDLENESS_SAMPLES: usize = 15;
+
+/// How many samples to retain for a given idleness threshold. The
+/// oscillation scan wants the last [`STALL_SAMPLE_WINDOW`]; idleness
+/// wants the last `idleness_samples`. Retaining the larger of the two
+/// is what lets a single retained sequence answer both questions — a
+/// bare 10-sample window could never witness a 15-sample idle run.
+pub fn stall_window_len(idleness_samples: usize) -> usize {
+    STALL_SAMPLE_WINDOW.max(idleness_samples)
+}
+
+/// Append `hash` to `samples`, dropping the oldest entries so at most
+/// `window` remain. Oldest first, so the last element is always the
+/// most recent sample.
+pub fn record_sample(samples: &mut Vec<SampleHash>, hash: SampleHash, window: usize) {
+    samples.push(hash);
+    if samples.len() > window {
+        let excess = samples.len() - window;
+        samples.drain(..excess);
+    }
+}
+
+/// Classify a bounded sequence of workspace samples (oldest first).
+///
+/// **Oscillation** — the same hash appears at least 3 times, with at
+/// least one different hash between two of those occurrences. The
+/// "different hash in between" clause is the whole distinction: a hash
+/// repeated consecutively is a still workspace, not a cycle.
+///
+/// **Idleness** — the last `idleness_samples` samples are all the same
+/// hash. At the default 60-second sampling interval the default
+/// threshold ([`DEFAULT_IDLENESS_SAMPLES`]) is roughly fifteen minutes
+/// of a motionless workspace.
+///
+/// Oscillation is tested first: the two shapes are mutually exclusive
+/// by `CONTEXT.md` ("a Stall is either an Oscillation or an Idleness,
+/// never both at once"), and Oscillation is the shape bellows can act
+/// on, so a window carrying both signals reports the actionable one.
+///
+/// Pure over `&[SampleHash]`: no container, no git, no clock.
+pub fn classify_stall(samples: &[SampleHash], idleness_samples: usize) -> Option<Stall> {
+    if has_oscillation(samples) {
+        return Some(Stall::Oscillation);
+    }
+    if is_idle(samples, idleness_samples) {
+        return Some(Stall::Idleness);
+    }
+    None
+}
+
+/// The sampling loop's bookkeeping around [`classify_stall`]: retains
+/// a bounded sample sequence and reports each **Stall** shape the
+/// first time it becomes visible.
+///
+/// Reporting once per shape matters because the sampler ticks for the
+/// whole length of the implement phase — a workspace that goes idle
+/// and stays idle would otherwise re-report **Idleness** on every
+/// remaining tick and bury the rest of the run log.
+///
+/// Holds no clock and no IO, so the loop's behaviour is testable with
+/// nothing but a list of hashes.
+#[derive(Debug)]
+pub struct StallTracker {
+    samples: Vec<SampleHash>,
+    idleness_samples: usize,
+    window: usize,
+    reported_oscillation: bool,
+    reported_idleness: bool,
+}
+
+impl StallTracker {
+    pub fn new(idleness_samples: usize) -> Self {
+        Self {
+            samples: Vec::new(),
+            idleness_samples,
+            window: stall_window_len(idleness_samples),
+            reported_oscillation: false,
+            reported_idleness: false,
+        }
+    }
+
+    /// Record one sample and return the stall shape that became
+    /// visible on this tick, or `None` when nothing new was learned.
+    pub fn observe(&mut self, hash: SampleHash) -> Option<Stall> {
+        record_sample(&mut self.samples, hash, self.window);
+        match classify_stall(&self.samples, self.idleness_samples) {
+            Some(Stall::Oscillation) if !self.reported_oscillation => {
+                self.reported_oscillation = true;
+                Some(Stall::Oscillation)
+            }
+            Some(Stall::Idleness) if !self.reported_idleness => {
+                self.reported_idleness = true;
+                Some(Stall::Idleness)
+            }
+            _ => None,
+        }
+    }
+
+    /// How many samples are currently retained. Bounded by
+    /// [`stall_window_len`] however long the phase runs.
+    pub fn retained(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// The configured idleness threshold, for the run-log line.
+    pub fn idleness_samples(&self) -> usize {
+        self.idleness_samples
+    }
+}
+
+/// Whether the trailing `threshold` samples are all identical. A
+/// `threshold` of 0 never reports idleness — a zero-length run says
+/// nothing about the workspace.
+fn is_idle(samples: &[SampleHash], threshold: usize) -> bool {
+    if threshold == 0 || samples.len() < threshold {
+        return false;
+    }
+    let tail = &samples[samples.len() - threshold..];
+    tail.iter().all(|h| h == &tail[0])
+}
+
+/// Whether any hash in `samples` occurs 3+ times with at least one
+/// different hash separating two of those occurrences.
+fn has_oscillation(samples: &[SampleHash]) -> bool {
+    samples.iter().enumerate().any(|(first_idx, hash)| {
+        // Only consider each distinct hash once — from its first
+        // occurrence — so the scan is O(n²) on a 10-to-15 element
+        // window rather than repeating work per duplicate.
+        if samples[..first_idx].contains(hash) {
+            return false;
+        }
+        let positions: Vec<usize> = samples
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| *h == hash)
+            .map(|(i, _)| i)
+            .collect();
+        positions.len() >= 3 && positions.windows(2).any(|w| w[1] - w[0] > 1)
+    })
+}
+
 /// Whether the given text contains a known rate-limit signature. Used
 /// by `classify_exit` to distinguish a rate-limit failure from a
 /// generic crash so the operator gets the right follow-up signal

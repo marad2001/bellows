@@ -17,7 +17,8 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::auth::Auth;
-use crate::policy::{CheckResult, GateOutcome};
+use crate::chain_walker::format_idleness_log;
+use crate::policy::{CheckResult, GateOutcome, Stall, StallTracker};
 use crate::workspace::{GateCommands, Workspace};
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
@@ -83,6 +84,43 @@ pub struct AgentRun {
     pub exit_code: i64,
     pub stderr_tail: String,
     pub killed_by_deadline: bool,
+    /// Issue #164: the **Stall** shape observed while this container
+    /// ran, if any. `Some(Stall::Oscillation)` means the workspace
+    /// returned to a previously-seen state — the runner consults
+    /// `chain_walker::decide_oscillation_advance_action` to decide
+    /// whether that earns an **Advance**. `Some(Stall::Idleness)` is
+    /// recorded for the operator and never acted on. `None` when the
+    /// run was not sampled (every phase but implement) or nothing was
+    /// seen.
+    pub stall: Option<Stall>,
+}
+
+/// Issue #164: periodic sampling of the implement-phase workspace
+/// while the container runs, so a wedged engine is caught rather than
+/// burning the whole budget.
+///
+/// The workspace is a host directory bind-mounted into the container
+/// (see the `Mount` built in `run_agent`), which is what lets bellows
+/// run git against it from the host while the agent writes.
+#[derive(Debug, Clone)]
+pub struct StallWatch {
+    /// Host path of the bind-mounted workspace to sample.
+    pub workspace_path: PathBuf,
+    /// How often to sample (`[agent].oscillation_sample_seconds`).
+    pub interval: Duration,
+    /// Consecutive identical samples that constitute **Idleness**.
+    pub idleness_samples: usize,
+    /// The base SHA the phase started from. An **Advance** discards the
+    /// workspace, so the container is only ever interrupted while HEAD
+    /// is still here — if the agent self-committed mid-run there is
+    /// committed work to lose and the oscillation is recorded instead.
+    pub base_sha: String,
+    /// How long into this container's run an **Oscillation** may still
+    /// kill it. `None` means observe-and-log only: the run's advance
+    /// allowance is already spent, or too little budget remains for a
+    /// fresh engine to be worth handing to, so killing the container
+    /// would cost the run its remaining time for nothing.
+    pub kill_within: Option<Duration>,
 }
 
 /// Bounded byte buffer that retains the most-recent N bytes appended.
@@ -354,6 +392,66 @@ struct ContainerOutcome {
     /// this to set `PhaseOutcomes::wall_clock_exceeded` and short-
     /// circuit the rest of the pipeline.
     killed_by_deadline: bool,
+    /// Issue #164: the **Stall** shape observed by the workspace
+    /// sampler, when one was configured.
+    stall: Option<Stall>,
+}
+
+/// One tick of the issue-#164 stall sampler: sample the workspace,
+/// feed the hash to the tracker, and narrate whatever shape became
+/// visible. Returns the newly-observed **Stall** shape, or `None` when
+/// the tick learned nothing new.
+///
+/// A failed sample (a torn read while the container writes, or a
+/// transient git failure) is swallowed: the classifier needs a hash to
+/// recur three times before it reports **Oscillation**, so a missed
+/// sample can at worst delay or skip a detection, never invent one.
+async fn observe_stall(
+    watch: &StallWatch,
+    tracker: &mut StallTracker,
+    log_writer: &mut dyn Write,
+    within_kill_window: bool,
+) -> Option<StallObservation> {
+    let hash = crate::workspace::sample_workspace_state(&watch.workspace_path)
+        .await
+        .ok()?;
+    let shape = tracker.observe(hash)?;
+    // The at-base-SHA guard, applied here so the container is only ever
+    // interrupted when an advance is genuinely available. Checked only
+    // on the tick that reports an Oscillation, not on every sample.
+    // A failed read is read conservatively as "do not interrupt".
+    let kill = shape == Stall::Oscillation
+        && within_kill_window
+        && crate::workspace::head_sha_at(&watch.workspace_path)
+            .await
+            .is_ok_and(|head| head == watch.base_sha);
+    let line = match shape {
+        Stall::Idleness => {
+            format_idleness_log(tracker.idleness_samples(), watch.interval.as_secs())
+        }
+        Stall::Oscillation => format!(
+            "bellows: implement workspace oscillation detected (it returned to a \
+             previously-seen state){}",
+            if kill {
+                "; stopping the agent container so the phase can advance"
+            } else {
+                ""
+            },
+        ),
+    };
+    // Same shape as the runner's `announce`: the operator watching the
+    // console and the operator reading bellows.log see the same line.
+    println!("{line}");
+    let _ = writeln!(log_writer, "{line}");
+    let _ = log_writer.flush();
+    Some(StallObservation { shape, kill })
+}
+
+/// What one sampler tick learned: the **Stall** shape that became
+/// visible, and whether it earns interrupting the container.
+struct StallObservation {
+    shape: Stall,
+    kill: bool,
 }
 
 /// Run a container through its full lifecycle: create, start, stream
@@ -369,12 +467,19 @@ struct ContainerOutcome {
 /// container is killed (SIGKILL) and `killed_by_deadline` is set. When
 /// `None`, the container runs to natural completion regardless of
 /// elapsed time.
+///
+/// `stall_watch` (issue #164) opts this run into periodic **Stall**
+/// sampling of the bind-mounted workspace. It cooperates with the log
+/// stream rather than replacing it: sampling is a third branch of the
+/// same `select!`, so logs keep streaming while bellows watches for a
+/// wedged engine.
 async fn run_container(
     docker: &Docker,
     config: ContainerCreateBody,
     log_writer: &mut dyn Write,
     capture_mode: CaptureMode,
     deadline: Option<Duration>,
+    stall_watch: Option<StallWatch>,
 ) -> Result<ContainerOutcome, SandboxError> {
     let container = docker.create_container(None, config).await?;
     let id = container.id;
@@ -404,8 +509,66 @@ async fn run_container(
         let mut captured = Captured::new(capture_mode);
         let mut killed_by_deadline = false;
 
+        // Issue #164 stall sampling. The first tick fires one interval
+        // in, not immediately: a sample taken before the agent has had
+        // a chance to touch anything says nothing.
+        let started = std::time::Instant::now();
+        let mut tracker = stall_watch
+            .as_ref()
+            .map(|w| StallTracker::new(w.idleness_samples));
+        let mut sample_interval = stall_watch.as_ref().map(|w| {
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + w.interval, w.interval);
+            // A slow git sample must not cause a burst of catch-up
+            // ticks; delay the schedule instead.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+        let mut stall: Option<Stall> = None;
+
         loop {
             tokio::select! {
+                _ = async {
+                    match sample_interval.as_mut() {
+                        Some(interval) => { interval.tick().await; }
+                        // No watch configured — this branch never wins.
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let watch = stall_watch
+                        .as_ref()
+                        .expect("sample interval only exists alongside a stall watch");
+                    let tracker = tracker
+                        .as_mut()
+                        .expect("tracker only exists alongside a stall watch");
+                    // The budget floor, expressed against this
+                    // container's own clock: past it, too little of the
+                    // run's budget would be left for a fresh engine to
+                    // do anything with, so an oscillation is recorded
+                    // and the container left to finish.
+                    let within_kill_window = watch
+                        .kill_within
+                        .is_some_and(|window| started.elapsed() <= window);
+                    if let Some(observation) =
+                        observe_stall(watch, tracker, log_writer, within_kill_window).await
+                    {
+                        match observation.shape {
+                            Stall::Oscillation => stall = Some(Stall::Oscillation),
+                            // Never overwrites an Oscillation: the
+                            // actionable shape is the one the runner
+                            // needs to see.
+                            Stall::Idleness => {
+                                stall.get_or_insert(Stall::Idleness);
+                            }
+                        }
+                        if observation.kill {
+                            let _ = docker
+                                .kill_container(&id, None::<KillContainerOptions>)
+                                .await;
+                            break;
+                        }
+                    }
+                }
                 maybe_frame = log_stream.next() => {
                     match maybe_frame {
                         None => break, // log stream ended (container exited)
@@ -455,6 +618,7 @@ async fn run_container(
             exit_code,
             captured: captured.into_string(),
             killed_by_deadline,
+            stall,
         })
     }
     .await;
@@ -482,6 +646,7 @@ pub async fn run_agent(
     deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
+    stall_watch: Option<StallWatch>,
 ) -> Result<AgentRun, SandboxError> {
     let env = build_agent_env(issue_number, auth)?;
 
@@ -534,6 +699,7 @@ pub async fn run_agent(
         log_writer,
         CaptureMode::BoundedTail(OUTPUT_TAIL_CAP_BYTES),
         deadline,
+        stall_watch,
     )
     .await?;
 
@@ -541,6 +707,7 @@ pub async fn run_agent(
         exit_code: outcome.exit_code,
         stderr_tail: outcome.captured,
         killed_by_deadline: outcome.killed_by_deadline,
+        stall: outcome.stall,
     })
 }
 
@@ -655,7 +822,10 @@ pub async fn run_cargo_checks(
     // non-Rust workspace = Success. Use the container exit as a tripwire
     // for that scenario: non-zero container exit + no usable results
     // file ⇒ raise CargoChecksScriptCrashed instead of silently passing.
-    let outcome = run_container(&docker, config, log_writer, CaptureMode::Full, deadline).await?;
+    // The cargo-checks gate is bellows' own container, not an agent's
+    // — there is no engine to stall, so no sampling.
+    let outcome =
+        run_container(&docker, config, log_writer, CaptureMode::Full, deadline, None).await?;
 
     let workspace_path = workspace.path();
     let clippy_output = read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))

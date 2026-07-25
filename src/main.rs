@@ -543,6 +543,10 @@ async fn call_triage_one(
         &dispatch.deploy_keys,
         &mut log_writer,
         deadline,
+        // `bellows dispatch` runs a single ad-hoc agent invocation with
+        // no chain walker behind it, so there is no advance to trigger
+        // and nothing to sample for (issue #164).
+        None,
     )
     .await
     .map_err(|e| format!("sandbox::run_agent: {e}"))?;

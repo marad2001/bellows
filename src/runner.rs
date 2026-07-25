@@ -16,7 +16,7 @@ use crate::config::{
 };
 use crate::policy::{
     self, AnalysisOutcome, CheckResult, ExitReason, FixOutcome, GateOutcome, ImplementOutcome,
-    PhaseOutcomes, ReviewOutcome,
+    PhaseOutcomes, ReviewOutcome, Stall,
 };
 use crate::sandbox::{self, SandboxError};
 use crate::status::{CurrentRun, StatusContext};
@@ -965,6 +965,12 @@ pub async fn run_once(
     );
     let head_before_implement = workspace::head_sha(&workspace).await?;
     let mut implement_advances_used: u8 = 0;
+    // Issue #164: set when an **Oscillation** spent the shared advance
+    // allowance, naming the engine whose attempt was abandoned. The
+    // next loop iteration consumes it to log the advance (it can only
+    // name the engine being advanced *to* once the picker has run) and
+    // to label the phase-start line with the right trigger.
+    let mut oscillation_advance_from: Option<Engine> = None;
     let mut rate_limited_phase: Option<&'static str> = None;
     let (implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
         let now = chrono::Utc::now();
@@ -995,6 +1001,7 @@ pub async fn run_once(
                         exit_code: 0,
                         stderr_tail: "(implement skipped: all chain entries cooling)".to_string(),
                         killed_by_deadline: false,
+                        stall: None,
                     },
                     head_before_implement.clone(),
                     None,
@@ -1008,8 +1015,21 @@ pub async fn run_once(
         if implement_advances_used > 0 {
             picked = PickedEntry {
                 entry: picked.entry,
-                reason: PickReason::InPlaceAdvancementAfterRateLimit,
+                reason: if oscillation_advance_from.is_some() {
+                    PickReason::InPlaceAdvancementAfterOscillation
+                } else {
+                    PickReason::InPlaceAdvancementAfterRateLimit
+                },
             };
+        }
+        // Issue #164: the advance line names the trigger, the engine
+        // whose attempt was abandoned, and the engine the phase is
+        // being handed to — distinguishable from a rate-limit advance.
+        if let Some(abandoned) = oscillation_advance_from.take() {
+            announce(
+                log_writer,
+                &chain_walker::format_oscillation_advance_log(abandoned, picked.entry.engine),
+            );
         }
         if engine_label_override.is_some() {
             announce(
@@ -1039,6 +1059,7 @@ pub async fn run_once(
 
         let auth = auth_for(&picked.entry);
 
+        let phase_deadline = budget.deadline_or_halt();
         let agent_run = sandbox::run_agent(
             &workspace,
             &auth,
@@ -1048,7 +1069,15 @@ pub async fn run_once(
             &ssh_keys_volume,
             &deploy_keys,
             log_writer,
-            budget.deadline_or_halt(),
+            phase_deadline,
+            Some(implement_stall_watch(
+                &workspace,
+                config,
+                &head_before_implement,
+                phase_deadline,
+                implement_advances_used,
+                engine_label_override.is_some(),
+            )),
         )
         .await?;
         budget.mark_killed_if(agent_run.killed_by_deadline);
@@ -1064,6 +1093,46 @@ pub async fn run_once(
                 },
             ),
         );
+
+        // Issue #164: **Oscillation** as the second trigger for an
+        // **Advance**. Decided BEFORE the commit below, because an
+        // advance discards the abandoned engine's work — committing it
+        // first would both preserve what we mean to throw away and
+        // move HEAD off base SHA, which is itself an advance guard.
+        if agent_run.stall == Some(Stall::Oscillation) && !budget.exceeded {
+            let at_base_sha = workspace::head_sha(&workspace).await? == head_before_implement;
+            // A forced engine bypasses chain walking entirely, so there
+            // is no next entry to advance to (same shape the rate-limit
+            // path takes above).
+            let action = if engine_label_override.is_some() {
+                chain_walker::OscillationAdvanceAction::ContinueRun
+            } else {
+                chain_walker::decide_oscillation_advance_action(
+                    at_base_sha,
+                    implement_advances_used,
+                    budget.remaining(),
+                    budget.cap(),
+                    config.agent.advance_budget_floor_fraction,
+                )
+            };
+            if action.disposition() == Some(RateLimitDisposition::InPlaceAdvance) {
+                workspace::discard_uncommitted_changes(&workspace).await?;
+                implement_advances_used += 1;
+                oscillation_advance_from = Some(picked.entry.engine);
+                continue;
+            }
+            announce(
+                log_writer,
+                &chain_walker::format_oscillation_not_advanced_log(
+                    picked.entry.engine,
+                    oscillation_not_advanced_reason(
+                        engine_label_override.is_some(),
+                        at_base_sha,
+                        implement_advances_used,
+                    ),
+                ),
+            );
+        }
 
         // If the agent wrote a PR description file, capture + remove
         // it before committing so it does NOT appear in the diff.
@@ -3067,6 +3136,7 @@ where
         exit_code: 0,
         stderr_tail: String::new(),
         killed_by_deadline: false,
+        stall: None,
     };
     let chain_len = chain.len().max(1);
     let mut last_run = skipped();
@@ -3093,6 +3163,11 @@ where
             deploy_keys,
             log_writer,
             budget.deadline_or_halt(),
+            // Issue #164: no Stall sampling outside the implement
+            // phase. These phases run on top of committed implement
+            // work and cannot advance without discarding it, so there
+            // is no safe response to detect for.
+            None,
         )
         .await?;
         budget.mark_killed_if(run.killed_by_deadline);
@@ -3178,6 +3253,58 @@ fn pick_non_implement_engine(
     }
 }
 
+/// Build the implement phase's **Stall** watch (issue #164).
+///
+/// `kill_within` encodes the two guards knowable before the container
+/// starts — the shared advance allowance and the budget floor — so a
+/// run that could not advance anyway is never interrupted. The floor
+/// is a *remaining budget* threshold, so as an elapsed-time bound it is
+/// "everything up to `remaining_at_launch - floor`"; once that point
+/// passes, an oscillation is still recorded but the container is left
+/// to finish. The at-base-SHA guard is not knowable here (the agent may
+/// self-commit mid-run) and is applied by
+/// `decide_oscillation_advance_action` after the container exits.
+fn implement_stall_watch(
+    workspace: &workspace::Workspace,
+    config: &Config,
+    base_sha: &str,
+    phase_deadline: Option<Duration>,
+    advances_used: u8,
+    engine_forced: bool,
+) -> sandbox::StallWatch {
+    sandbox::StallWatch {
+        workspace_path: workspace.path().to_path_buf(),
+        interval: Duration::from_secs(config.agent.oscillation_sample_seconds.get()),
+        idleness_samples: policy::DEFAULT_IDLENESS_SAMPLES,
+        base_sha: base_sha.to_string(),
+        kill_within: chain_walker::oscillation_kill_window(
+            phase_deadline,
+            Duration::from_secs(config.agent.wall_clock_minutes.get() * 60),
+            config.agent.advance_budget_floor_fraction,
+            advances_used,
+            engine_forced,
+        ),
+    }
+}
+
+/// Why an observed **Oscillation** did not earn an **Advance**. Ordered
+/// so the operator gets the guard that actually stopped it.
+fn oscillation_not_advanced_reason(
+    engine_forced: bool,
+    at_base_sha: bool,
+    advances_used: u8,
+) -> &'static str {
+    if engine_forced {
+        "the engine is forced via label, so there is no chain entry to advance to"
+    } else if advances_used > 0 {
+        "this run's single advance allowance is already spent"
+    } else if !at_base_sha {
+        "the workspace is ahead of base SHA and an advance would discard committed work"
+    } else {
+        "less than the configured share of the wall-clock budget remains"
+    }
+}
+
 /// Tracks the per-issue wall-clock budget across the slice-X1
 /// multi-phase pipeline. Each phase that spawns a container asks for
 /// `deadline_or_halt()` to compute its own deadline, and reports back
@@ -3219,6 +3346,20 @@ impl WallClockBudget {
         if killed {
             self.exceeded = true;
         }
+    }
+
+    /// The configured cap. Issue #164's budget floor is expressed as a
+    /// fraction of it.
+    fn cap(&self) -> Duration {
+        self.cap
+    }
+
+    /// Budget left right now, saturating at zero. Unlike
+    /// `deadline_or_halt` this is a pure read — it never flips
+    /// `exceeded`, because the oscillation decision must not itself
+    /// halt the pipeline.
+    fn remaining(&self) -> Duration {
+        self.cap.saturating_sub(self.start.elapsed())
     }
 }
 
@@ -5025,6 +5166,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             exit_code,
             stderr_tail: stderr.to_string(),
             killed_by_deadline: false,
+            stall: None,
         }
     }
 
