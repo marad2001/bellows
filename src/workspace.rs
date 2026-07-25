@@ -5,6 +5,7 @@ use tempfile::TempDir;
 use tokio::process::Command;
 
 use crate::config::GatesConfig;
+use crate::large_files::{scan_large_files, LargeFile};
 use crate::workflow_parse::{parse_ci_workflow, ExtractedCommands, Provenance};
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +51,11 @@ pub struct Workspace {
     branch_name: String,
     default_branch: String,
     gate_commands: GateCommands,
+    /// Issue #161 large-file pre-scan, captured at `prepare` time for
+    /// the same reason as `gate_commands`: snapshotted once at clone
+    /// time so the list handed to the implement kickoff cannot drift
+    /// mid-run even if the agent edits or adds files.
+    large_files: Vec<LargeFile>,
 }
 
 /// ADR-0004 cargo-checks gate command snapshot, captured at
@@ -126,6 +132,32 @@ impl Workspace {
     pub fn gate_commands(&self) -> &GateCommands {
         &self.gate_commands
     }
+
+    /// The snapshotted large-file pre-scan (issue #161), sorted
+    /// descending by size with a lexicographic path tiebreak. Captured
+    /// at `prepare` time so the implement kickoff names exactly the
+    /// files that were over the `Read` cap in the clone, and the list
+    /// cannot shift mid-run even if the agent edits files.
+    pub fn large_files(&self) -> &[LargeFile] {
+        &self.large_files
+    }
+}
+
+/// The single operator-visible run-log line announcing what the
+/// large-file pre-scan (issue #161) found. In the spirit of
+/// [`GateCommands::announcement_lines`]: emitted by the runner at the
+/// start of the implement phase so an operator tailing the log can see,
+/// per-run, how many over-cap files were flagged into the kickoff (or
+/// that none were).
+pub fn large_files_announcement(files: &[LargeFile]) -> String {
+    if files.is_empty() {
+        "  large-file pre-scan: no files estimated over ~20k tokens".to_string()
+    } else {
+        format!(
+            "  large-file pre-scan: {} file(s) estimated over ~20k tokens, listed in the implement kickoff",
+            files.len(),
+        )
+    }
 }
 
 pub async fn prepare(repo_url: &str, branch_name: &str) -> Result<Workspace, WorkspaceError> {
@@ -187,11 +219,18 @@ pub async fn prepare_with_gates(
     let extracted = parse_ci_workflow(path);
     let gate_commands = materialise_gate_commands(extracted, gates);
 
+    // Issue #161 snapshot: walk the clone ONCE here and store the
+    // over-large-file list on the Workspace. The implement kickoff reads
+    // from this snapshot, so a mid-pipeline edit that adds or shrinks a
+    // file cannot shift what the agent was told at kickoff time.
+    let large_files = scan_large_files(path);
+
     Ok(Workspace {
         temp_dir,
         branch_name: branch_name.to_string(),
         default_branch,
         gate_commands,
+        large_files,
     })
 }
 
