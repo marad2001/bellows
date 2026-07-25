@@ -850,12 +850,14 @@ pub const SECURITY_FINDINGS_FILE: &str = ".bellows-security-findings.md";
 /// Workspace-relative path of the commit-log file the runner writes
 /// before the review phase. Read-only input to the review prompt
 /// alongside REVIEW_DIFF_FILE — the diff shows the squashed end-state,
-/// the commit log shows ordering. The reviewer-claude reads it to
-/// reason about test-first commit shape (one failing-test commit then
-/// one make-it-pass commit, per acceptance criterion); mega-commits
-/// and source-before-test orderings are visible from this file but
-/// not from the squashed diff. The runner removes the file after the
-/// review-fix phase completes so it never lands in the PR diff.
+/// the commit log shows ordering. It is *optional* ordering context
+/// for the reviewer: which files arrived in which commit, in what
+/// order. It is no longer read to enforce any commit-shape check —
+/// bellows commits once per phase (`workspace::commit_all`), so tests
+/// and implementation always land together and there is no test-first
+/// commit shape to verify (ADR-0012; issue #154). The runner removes
+/// the file after the review-fix phase completes so it never lands in
+/// the PR diff.
 pub const REVIEW_COMMIT_LOG_FILE: &str = ".bellows-review-commit-log.txt";
 
 /// Vendored review-phase prompt. Documents the input file path
@@ -864,24 +866,20 @@ pub const REVIEW_COMMIT_LOG_FILE: &str = ".bellows-review-commit-log.txt";
 /// nit` severity vocabulary, and the agent-notes append-not-overwrite
 /// contract. Bellows-specific (operates on a local diff instead of
 /// `gh pr diff`) so the container stays GitHub-credential-free.
+///
+/// Deliberately carries NO test-first commit-shape check (removed per
+/// ADR-0012 / issue #154): bellows commits once per phase, so every run
+/// structurally produces the "mega-commit" shape and the finding was
+/// unclearable by any in-run actor. The commit-log input is retained as
+/// optional ordering context only — do not reintroduce a commit-shape
+/// finding here.
 pub const REVIEW_PROMPT: &str = r#"You are running as the **review phase** of a Bellows agent pipeline. The implement phase has already produced changes on this branch; your job is to review the diff for correctness, maintainability, project conventions, and test coverage.
 
 ## Inputs
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta the implement phase produced. Read this file as the primary input. Do not browse the wider codebase except to disambiguate symbols referenced in the diff; the patch is the contract.
-- `/workspace/.bellows-review-commit-log.txt` contains `git log --name-status <base>...HEAD` — the commit-by-commit history of the agent branch since it diverged from the base. Use this to reason about commit *ordering* (which the squashed diff cannot show): which files arrived in which commit, in what order. Required for the test-first check below.
+- `/workspace/.bellows-review-commit-log.txt` contains `git log --name-status <base>...HEAD` — the commit-by-commit history of the agent branch since it diverged from the base. Optional ordering context: it can show which files arrived in which commit, which the squashed diff cannot. Do not derive any finding from commit *shape* — bellows commits once per phase, so tests and implementation always land in a single commit; that is the expected shape, not a defect.
 - `/workspace/bellows-agent-notes.md` may exist (the implement phase appended to it if it could not complete some part of the brief). Read it for context on deliberate gaps or known limitations.
-
-## Test-first commit-shape check
-
-The implement-phase kickoff mandates a test-first commit shape: one failing-test commit, then one make-it-pass commit, per acceptance criterion. Use `.bellows-review-commit-log.txt` to verify that shape. Flag a finding tagged ` — important` when you see either of these test-first violations:
-
-- **mega-commit**: a single commit on the agent branch touches BOTH test files (`tests/**`, files containing `#[test]` / `#[tokio::test]` attributes) AND non-trivial source files at the same time. The two should land in separate commits so the make-it-pass commit demonstrates the test transitioning from red to green.
-- **source-before-test**: a source-file commit lands earlier in the agent-branch history than the corresponding test commit. Tests added after the implementation are not test-first — they post-hoc rationalise whatever the implementation happens to do.
-
-If the entire branch is a single mega-commit, that one commit is the violation; if individual commits ordered source-before-test, name each offending pair. Use the existing finding format and the `important` severity tag so the run's per-finding review-fix loop can route the finding through unchanged: the agent will get one invocation to either rewrite history to be test-first OR append an `## Unaddressed finding: <verbatim title>` section to bellows-agent-notes.md.
-
-A diff with no test files at all is out of scope for this check — the slice-8 weak-test guard handles "no tests added" separately. Briefs that the operator labelled with the skip-label are also out of scope here; the bellows runner will already have skipped the weak-test guard for those, but the test-first check is a stylistic recommendation rather than a hard gate, so it is acceptable to skip flagging where the brief makes test-first ordering impractical (e.g. pure-docs PRs).
 
 ## Output
 
@@ -1774,7 +1772,7 @@ pub fn synthesize_implement_crash_entry(exit_code: i64, stderr_tail: &str) -> St
 /// kickoff prompt itself, because codex does not have an equivalent
 /// on-demand discovery mechanism. This wrapper preserves the v1
 /// `render_kickoff(brief, repo, branch)` signature (one source of
-/// truth for the failing-test commit-shape language), and delegates
+/// truth for the test-first authoring language), and delegates
 /// to the engine-aware function with `Engine::Claude` so the existing
 /// tests and call sites stay green.
 pub fn render_kickoff(brief: &str, repo_url: &str, branch_name: &str) -> String {
@@ -1865,6 +1863,12 @@ pub fn wrap_phase_prompt_for_engine(
 }
 
 fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
+    // The `## Commit shape (test-first)` section keeps test-first
+    // *authoring* discipline but no longer mandates a two-commit-per-AC
+    // shape or claims the review phase flags commit-shape violations.
+    // Bellows commits once per phase, so that mandate was unreachable and
+    // the matching review check was unclearable — both removed per
+    // ADR-0012 / issue #154.
     format!(
         "You are working on {repo_url} on branch `{branch_name}`.\n\
          \n\
@@ -1881,12 +1885,11 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          \n\
          ## Commit shape (test-first)\n\
          \n\
-         The TDD skill is not just a guideline here — it is a load-bearing requirement on the *commit shape* of this branch, because the review phase reads the commit log and flags violations as `important` findings:\n\
+         Write test-first: for each behaviour, write the failing test before the implementation that makes it pass, following the `tdd` skill. This is *authoring* discipline — the order in which you write test and source — not a constraint on how commits are shaped.\n\
          \n\
-         - For each acceptance criterion in the brief, produce TWO commits in order: first a **failing-test commit** that adds the test(s) and would fail against the unchanged source, then a **make-it-pass commit** that changes the source so those tests pass.\n\
-         - One failing-test commit then one make-it-pass commit, per acceptance criterion. Do NOT bundle tests and source into a single mega-commit. Do NOT land source-file changes before their corresponding tests.\n\
-         - It is fine to add small refactors as separate follow-up commits after the make-it-pass commit. The constraint is on test-vs-source ordering, not on commit count overall.\n\
-         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `bellows-agent-notes.md` per the channel rules below rather than silently bundling tests and source.\n\
+         Do NOT try to split your work into separate test and source commits. Bellows commits once per phase — after you exit it runs a single `git add -A` plus one commit, so your test and implementation edits land together in one commit no matter how you sequence your edits. That one-commit-per-phase shape is the expected and correct shape for a bellows run; the review phase does not inspect commit shape, so there is nothing to gain from splitting (ADR-0012 / issue #154).\n\
+         \n\
+         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `bellows-agent-notes.md` per the channel rules below rather than skipping the test.\n\
          \n\
          ## bellows-agent-notes.md channels (informational vs escalation)\n\
          \n\
