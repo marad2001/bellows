@@ -271,11 +271,27 @@ progresses; override the strings via `[runtime_labels]` in
 - `agent-cancelled` — an operator ran `bellows kill <issue>`; the
   container was stopped and a draft PR was opened.
 
+**Correction attribution labels** (applied by the operator when filing an
+issue that fixes something a prior run already shipped; see
+[`docs/agents/triage-labels.md`](docs/agents/triage-labels.md) for when
+to use each). Bellows does not read these — they exist so you can tell
+later whether the agents, the harness, or the briefs are the thing
+costing you:
+
+- `agent-fault` — the brief was clear and the harness behaved; the
+  shipped work still didn't do the job. The only one that says anything
+  about engine or model choice.
+- `harness-fault` — a Bellows prompt, gate, or policy misbehaved, and
+  would misbehave the same way under any engine.
+- `brief-fault` — the engine faithfully built what the brief asked for;
+  the asking was wrong.
+
 Quick way to create all of these with the `gh` CLI:
 
 ```bash
 for label in needs-triage needs-info ready-for-agent ready-for-human wontfix bug enhancement \
-             agent-in-progress agent-done agent-failed agent-rate-limited agent-cancelled; do
+             agent-in-progress agent-done agent-failed agent-rate-limited agent-cancelled \
+             agent-fault harness-fault brief-fault; do
   gh label create "$label" --force
 done
 ```

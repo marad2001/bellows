@@ -32,6 +32,28 @@ _Avoid_: Thrash, flapping, churn.
 The shape of **Stall** in which the workspace is unchanged for a prolonged stretch. Ambiguous by nature — indistinguishable from an **Engine** reasoning about a hard problem, or one that has finished and is about to exit. Recorded for the operator, never acted on.
 _Avoid_: Hang, freeze, timeout, inactivity.
 
+### Run quality
+
+**Correction**:
+An issue filed to fix something a prior run already shipped. Names the run it corrects and carries exactly one **Attribution**. Not every bug-fix issue is a Correction — only one that repairs merged agent work.
+_Avoid_: Revert, regression, follow-up, rework.
+
+**Attribution**:
+Which part of the system a **Correction** holds responsible — **Agent Fault**, **Harness Fault**, or **Brief Fault**. Assigned by the operator when the Correction is filed, because working out the answer is a by-product of writing the issue.
+_Avoid_: Cause, blame, root cause, category.
+
+**Agent Fault**:
+The **Attribution** meaning the brief was clear and the harness behaved, but the shipped work still did not do the job. Concerns the quality of what was produced, never a crash — crashes are mechanical and already gate the merge. The only Attribution that is evidence about ADR-0011's trade of subjective merge gates for occasional bad merges.
+_Avoid_: Model failure, bad run, engine failure (an **Engine** that crashed is a different thing entirely).
+
+**Harness Fault**:
+The **Attribution** meaning a Bellows prompt, gate, or policy misbehaved, and would misbehave identically under any **Engine**. Carries no information about engine or model choice.
+_Avoid_: Bellows bug, infrastructure failure, tooling issue.
+
+**Brief Fault**:
+The **Attribution** meaning the **Engine** faithfully built what the agent brief asked for, and the asking was wrong. Points at triage quality rather than at the run.
+_Avoid_: Spec bug, requirements failure, bad ticket.
+
 ### Issue dependencies
 
 **Blocker**:
@@ -54,6 +76,10 @@ _Avoid_: Resolved, completed, done.
 - A **Stall** is either an **Oscillation** or an **Idleness**, never both at once.
 - An **Oscillation** triggers an **Advance**; an **Idleness** never does.
 - An **Advance** has two independent triggers: a rate-limited **Engine**, and an **Oscillation**. Both mean the same thing — no progress is available from this engine — and both produce the same response.
+- A **Correction** corrects exactly one prior run; a run can attract many **Corrections**.
+- A **Correction** carries exactly one **Attribution**, which is one of **Agent Fault**, **Harness Fault**, or **Brief Fault**.
+- Only **Agent Fault** **Corrections** are evidence about the ADR-0011 trade. **Harness Fault** counts measure Bellows' own defect rate; **Brief Fault** counts measure triage quality.
+- A **Correction** is itself shipped by a run, so it can attract **Corrections** of its own.
 
 ## Example dialogue
 
@@ -69,6 +95,12 @@ _Avoid_: Resolved, completed, done.
 > **Operator:** "So an **Advance** means the engine did bad work and we're punishing it?"
 > **Bellows maintainer:** "No — an **Advance** is never a verdict on quality. It says only that no further progress is available from this engine on this issue. That's why the same response covers a rate limit and an **Oscillation**: in both cases the engine has nothing more to give, and the cheapest next move is to hand the issue to the next chain entry from a clean base. The work is discarded because it's unfinished, not because it's bad."
 
+> **Operator:** "The review prompt has been flagging a bogus finding on every run for weeks. That's a **Correction** against every one of those runs, right?"
+> **Bellows maintainer:** "It's one **Correction**, with a **Harness Fault** attribution, and it corrects the *prompt* — not the fifty runs that faithfully executed it. Attribution is about what has to change to stop it happening again. Nothing about those runs was wrong, and counting them as bad would make the engines look unreliable when the defect is ours. Only an **Agent Fault** says anything about the engine that ran."
+
+> **Operator:** "The agent built exactly what the brief said, but the brief asked for the wrong thing. Whose fault?"
+> **Bellows maintainer:** "**Brief Fault**. The run did its job. That count belongs against triage quality, and it's the number that tells you whether the brief-writing step needs tightening. If we filed it as an **Agent Fault** we'd be reading a spec problem as a model problem and reaching for the wrong lever — swapping engines when we should be sharpening acceptance criteria."
+
 ## Flagged ambiguities
 
-None yet.
+**"Agent" means three different things in this repo.** The AFK worker concept (as in "AFK agent", the `agent-in-progress` / `agent-done` labels, the `## Agent Brief`), the CLI binary that runs it (canonically **Engine**), and now the **Agent Fault** attribution. The label strings and the brief header are fixed contracts and are not being renamed. Resolution: **Engine** is always the CLI; **Agent Fault** always concerns the quality of shipped work and never a crash; bare "agent" in prose means the AFK worker. Prefer the precise term wherever the sentence would otherwise be ambiguous.
