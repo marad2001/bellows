@@ -7,8 +7,9 @@ use chrono::{DateTime, Utc};
 
 use crate::auth::Auth;
 use crate::chain_walker::{
-    self, format_phase_engine_log, handle_implement_rate_limit, handle_non_implement_rate_limit,
-    pick_engine_for_phase, PickError, PickReason, PickedEntry, RateLimitDisposition, StateFile,
+    self, decide_implement_rate_limit_action, format_phase_engine_log, handle_implement_rate_limit,
+    pick_engine_for_phase, ImplementRateLimitAction, PickError, PickReason, PickedEntry,
+    RateLimitDisposition, StateFile,
 };
 use crate::config::{
     AuthMethod, ChainEntry, Config, Engine, EngineLabelOverride, PostingMode, RuntimeLabelsConfig,
@@ -1070,53 +1071,80 @@ pub async fn run_once(
         let head_after =
             workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
 
-        // Rate-limit handling (issue #82). Forced engine bypasses
-        // chain walking: any rate-limit terminates without an
-        // in-place advance.
+        // Rate-limit / transient-outage handling (issue #82; extended
+        // to transient backend outages by #174). A credit/quota-
+        // exhaustion (rate-limit) OR a transient outage (503/500/504) at
+        // base SHA in-place-advances to the next hot chain entry; either
+        // signal after commits have landed terminates as RateLimited
+        // (retry-later). Forced engine bypasses chain walking: either
+        // signal terminates without an in-place advance.
+        let implement_rate_limited_sig = policy::is_rate_limit_signature(&agent_run.stderr_tail);
+        let implement_outage_sig = !implement_rate_limited_sig
+            && policy::is_service_unavailable_signature(&agent_run.stderr_tail);
         if agent_run.exit_code != 0
-            && policy::is_rate_limit_signature(&agent_run.stderr_tail)
+            && (implement_rate_limited_sig || implement_outage_sig)
             && !budget.exceeded
         {
             let at_base_sha = head_after == head_before_implement;
             let now = chrono::Utc::now();
-            if engine_label_override.is_some() {
+            // Record the appropriate cooling window for the engine: a
+            // rate-limit carries a parsed (or 5-minute fallback)
+            // cooldown; a transient outage gets a short 2-minute window.
+            if implement_rate_limited_sig {
                 let parsed = chain_walker::parse_cooling_until(
                     picked.entry.engine,
                     &agent_run.stderr_tail,
                     now,
                 );
-                state.record_rate_limit(picked.entry.engine, parsed.cooling_until);
                 if parsed.used_fallback {
                     announce(
                         log_writer,
                         "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
                     );
                 }
-                let _ = state.save(&state_path);
+                state.record_rate_limit(picked.entry.engine, parsed.cooling_until);
+            } else {
+                state.record_rate_limit(
+                    picked.entry.engine,
+                    now + chrono::Duration::minutes(2),
+                );
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: implement engine={} hit a transient backend outage (503/500/504); marking it cooling for 2 minutes (issue #174)",
+                        picked.entry.engine.as_name(),
+                    ),
+                );
+            }
+            let _ = state.save(&state_path);
+            if engine_label_override.is_some() {
                 rate_limited_phase = Some("implement");
                 break (picked.entry, agent_run, head_after, pr_body);
             }
-            // Record fallback flag for log visibility before
-            // delegating to the composed handler.
-            let parsed = chain_walker::parse_cooling_until(
-                picked.entry.engine,
-                &agent_run.stderr_tail,
-                now,
-            );
-            if parsed.used_fallback {
-                announce(
-                    log_writer,
-                    "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
-                );
-            }
-            let disposition = handle_implement_rate_limit(
-                &mut state,
-                picked.entry.engine,
-                &agent_run.stderr_tail,
-                now,
-                at_base_sha,
-                implement_advances_used,
-            );
+            // The in-place-advance-vs-terminate decision is identical
+            // for both signals (bounded to max-1 advance per phase
+            // invocation, only at base SHA). For a rate-limit we still
+            // route through `handle_implement_rate_limit` so its
+            // cooling bookkeeping stays the single source of truth;
+            // the transient-outage cooling was recorded above so we
+            // consult `decide_implement_rate_limit_action` directly.
+            let disposition = if implement_rate_limited_sig {
+                handle_implement_rate_limit(
+                    &mut state,
+                    picked.entry.engine,
+                    &agent_run.stderr_tail,
+                    now,
+                    at_base_sha,
+                    implement_advances_used,
+                )
+            } else {
+                match decide_implement_rate_limit_action(at_base_sha, implement_advances_used) {
+                    ImplementRateLimitAction::InPlaceAdvance => {
+                        RateLimitDisposition::InPlaceAdvance
+                    }
+                    ImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
+                }
+            };
             let _ = state.save(&state_path);
             match disposition {
                 RateLimitDisposition::InPlaceAdvance => {
@@ -1124,7 +1152,12 @@ pub async fn run_once(
                     announce(
                         log_writer,
                         &format!(
-                            "bellows: implement rate-limited at base SHA with engine={}; in-place-advancing to next hot chain entry (max 1 per phase invocation)",
+                            "bellows: implement {} at base SHA with engine={}; in-place-advancing to next hot chain entry (max 1 per phase invocation)",
+                            if implement_rate_limited_sig {
+                                "rate-limited"
+                            } else {
+                                "hit a transient outage (503/500/504)"
+                            },
                             picked.entry.engine.as_name(),
                         ),
                     );
@@ -1498,23 +1531,14 @@ pub async fn run_once(
                     nit_findings.len(),
                 ),
             );
-            let review_fix_picked_opt = pick_non_implement_engine(
-                &config.phases.review_fix.cli_chain,
-                &state,
-                implementer_cli,
-                engine_label_override,
-                "review-fix",
-                log_writer,
-            );
-            if review_fix_picked_opt.is_none() {
-                rate_limited_phase = Some("review-fix");
-            }
-            let review_fix_picked = review_fix_picked_opt.unwrap_or(PickedEntry {
-                entry: ChainEntry { engine: Engine::Claude, model: None },
-                reason: PickReason::ChainFirstHotEntry,
-            });
-            let review_fix_chain_entry = review_fix_picked.entry.clone();
-            let review_fix_auth = auth_for(&review_fix_chain_entry);
+            // The review-fix phase has its own `[phases.review_fix]
+            // cli_chain`. Each per-finding and nit-batch invocation
+            // picks the phase engine through `run_invocation_with_fallback`
+            // (issue #174): a transient outage or credit/quota
+            // exhaustion on one engine falls back to the next hot chain
+            // entry mid-phase (a failed invocation commits nothing, so
+            // the retry is safe), and only a fully-exhausted chain sets
+            // `rate_limited_phase` to terminate as retry-later.
 
             // Per-finding loop: one container per blocker/important
             // finding. Each invocation respects the remaining wall-
@@ -1564,42 +1588,43 @@ pub async fn run_once(
                     ),
                 );
 
-                let kickoff = policy::wrap_phase_prompt_for_engine(
-                    review_fix_chain_entry.engine,
-                    &policy::per_finding_kickoff(
-                        finding,
-                        policy::REVIEW_DIFF_FILE,
-                        "bellows-agent-notes.md",
-                    ),
-                );
-                tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff)
-                    .await?;
                 // Capture HEAD BEFORE the agent runs so we can detect
                 // whether the agent self-committed during the
-                // invocation. See the four-corners comment below the
-                // run for the full contract.
+                // invocation. Failed in-phase fallback attempts leave
+                // HEAD untouched, so this stays valid across an engine
+                // fallback. See the four-corners comment below the run
+                // for the full contract.
                 let head_before = workspace::head_sha(&workspace).await?;
-                let per_finding_run = sandbox::run_agent(
+                let per_finding_invocation = run_invocation_with_fallback(
                     &workspace,
-                    &review_fix_auth,
+                    config,
+                    &config.phases.review_fix.cli_chain,
+                    &mut state,
+                    &state_path,
+                    implementer_cli,
+                    engine_label_override,
+                    "review-fix",
                     claimed.number,
                     &repo_label,
                     &repo_slug,
                     &ssh_keys_volume,
                     &deploy_keys,
+                    &mut budget,
                     log_writer,
-                    budget.deadline_or_halt(),
+                    |engine| {
+                        policy::wrap_phase_prompt_for_engine(
+                            engine,
+                            &policy::per_finding_kickoff(
+                                finding,
+                                policy::REVIEW_DIFF_FILE,
+                                "bellows-agent-notes.md",
+                            ),
+                        )
+                    },
                 )
                 .await?;
-                budget.mark_killed_if(per_finding_run.killed_by_deadline);
-                if process_non_implement_rate_limit(
-                    &mut state,
-                    &state_path,
-                    review_fix_chain_entry.engine,
-                    "review-fix",
-                    &per_finding_run,
-                    log_writer,
-                ) {
+                let per_finding_run = per_finding_invocation.run;
+                if per_finding_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("review-fix");
                 }
                 if review_fix_exit == 0 && per_finding_run.exit_code != 0 {
@@ -1683,44 +1708,38 @@ pub async fn run_once(
                         nit_findings.len(),
                     ),
                 );
-                let mut nit_kickoff = String::from("## Nit findings to consider\n\n");
+                let mut nit_kickoff_body = String::from("## Nit findings to consider\n\n");
                 for nit in &nit_findings {
-                    nit_kickoff.push_str(&format!(
+                    nit_kickoff_body.push_str(&format!(
                         "### {title} — nit\n\n{body}\n\n",
                         title = nit.title,
                         body = nit.body,
                     ));
                 }
-                nit_kickoff.push_str("\n---\n\n");
-                nit_kickoff.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
-                let nit_kickoff = policy::wrap_phase_prompt_for_engine(
-                    review_fix_chain_entry.engine,
-                    &nit_kickoff,
-                );
-                tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &nit_kickoff)
-                    .await?;
+                nit_kickoff_body.push_str("\n---\n\n");
+                nit_kickoff_body.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
                 let head_before = workspace::head_sha(&workspace).await?;
-                let nit_batch_run = sandbox::run_agent(
+                let nit_batch_invocation = run_invocation_with_fallback(
                     &workspace,
-                    &review_fix_auth,
+                    config,
+                    &config.phases.review_fix.cli_chain,
+                    &mut state,
+                    &state_path,
+                    implementer_cli,
+                    engine_label_override,
+                    "review-fix",
                     claimed.number,
                     &repo_label,
                     &repo_slug,
                     &ssh_keys_volume,
                     &deploy_keys,
+                    &mut budget,
                     log_writer,
-                    budget.deadline_or_halt(),
+                    |engine| policy::wrap_phase_prompt_for_engine(engine, &nit_kickoff_body),
                 )
                 .await?;
-                budget.mark_killed_if(nit_batch_run.killed_by_deadline);
-                if process_non_implement_rate_limit(
-                    &mut state,
-                    &state_path,
-                    review_fix_chain_entry.engine,
-                    "review-fix",
-                    &nit_batch_run,
-                    log_writer,
-                ) {
+                let nit_batch_run = nit_batch_invocation.run;
+                if nit_batch_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("review-fix");
                 }
                 if review_fix_exit == 0 && nit_batch_run.exit_code != 0 {
@@ -1889,73 +1908,46 @@ pub async fn run_once(
                     log_writer,
                     "bellows: phase 6/8 — security-fix (reads findings and addresses each)",
                 );
-                let security_fix_picked_opt = pick_non_implement_engine(
+                // Single batch invocation with in-phase engine fallback
+                // (issue #174): a transient outage or credit/quota
+                // exhaustion falls back to the next hot chain entry
+                // rather than terminating outright. The security-fix
+                // phase has its own `[phases.security_fix] cli_chain`.
+                let head_before = workspace::head_sha(&workspace).await?;
+                let security_fix_invocation = run_invocation_with_fallback(
+                    &workspace,
+                    config,
                     &config.phases.security_fix.cli_chain,
-                    &state,
+                    &mut state,
+                    &state_path,
                     implementer_cli,
                     engine_label_override,
                     "security-fix",
+                    claimed.number,
+                    &repo_label,
+                    &repo_slug,
+                    &ssh_keys_volume,
+                    &deploy_keys,
+                    &mut budget,
                     log_writer,
-                );
-                if security_fix_picked_opt.is_none() {
+                    |engine| {
+                        policy::wrap_phase_prompt_for_engine(engine, policy::SECURITY_FIX_PROMPT)
+                    },
+                )
+                .await?;
+                let security_fix_run = security_fix_invocation.run;
+                if security_fix_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("security-fix");
                 }
-                let security_fix_picked = security_fix_picked_opt.unwrap_or(PickedEntry {
-                    entry: ChainEntry { engine: Engine::Claude, model: None },
-                    reason: PickReason::ChainFirstHotEntry,
-                });
-                let security_fix_chain_entry = security_fix_picked.entry.clone();
-                let security_fix_auth = auth_for(&security_fix_chain_entry);
-                let security_fix_run = if rate_limited_phase.is_some() {
-                    sandbox::AgentRun {
-                        exit_code: 0,
-                        stderr_tail: String::new(),
-                        killed_by_deadline: false,
-                    }
-                } else {
-                    let security_fix_kickoff = policy::wrap_phase_prompt_for_engine(
-                        security_fix_chain_entry.engine,
-                        policy::SECURITY_FIX_PROMPT,
-                    );
-                    tokio::fs::write(
-                        workspace.path().join(".bellows-kickoff.md"),
-                        security_fix_kickoff,
-                    )
-                    .await?;
-                    let head_before = workspace::head_sha(&workspace).await?;
-                    let run = sandbox::run_agent(
-                        &workspace,
-                        &security_fix_auth,
-                        claimed.number,
-                        &repo_label,
-                        &repo_slug,
-                        &ssh_keys_volume,
-                        &deploy_keys,
-                        log_writer,
-                        budget.deadline_or_halt(),
-                    )
-                    .await?;
-                    budget.mark_killed_if(run.killed_by_deadline);
-                    if process_non_implement_rate_limit(
-                        &mut state,
-                        &state_path,
-                        security_fix_chain_entry.engine,
-                        "security-fix",
-                        &run,
-                        log_writer,
-                    ) {
-                        rate_limited_phase = Some("security-fix");
-                    }
-                    // Same agent-self-commit-tolerant push plumbing as
-                    // the per-finding/nit-batch sites. If the agent
-                    // self-committed each fix, bellows's commit_all
-                    // sees nothing to stage (NoChangesToCommit) but
-                    // HEAD has advanced — commit_all_and_push_if_advanced
-                    // pushes either shape.
-                    let _ =
-                        workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
-                    run
-                };
+                // Same agent-self-commit-tolerant push plumbing as the
+                // per-finding/nit-batch sites. If the agent self-
+                // committed each fix, bellows's commit_all sees nothing
+                // to stage (NoChangesToCommit) but HEAD has advanced —
+                // commit_all_and_push_if_advanced pushes either shape. A
+                // fully-exhausted chain leaves HEAD at base, so this is a
+                // no-op push.
+                let _ =
+                    workspace::commit_all_and_push_if_advanced(&workspace, &head_before).await?;
                 let security_fix_exit = security_fix_run.exit_code;
                 security_fix_outcome = Some(FixOutcome {
                     exit_code: security_fix_exit,
@@ -2032,59 +2024,36 @@ pub async fn run_once(
                 log_writer,
                 "bellows: phase 8/8 — merger (read-only end-of-pipeline verdict on the diff vs ACs)",
             );
-            let merger_picked_opt = pick_non_implement_engine(
+            // Read-only single-shot with in-phase engine fallback
+            // (issue #174). The diff is generated once — no commits land
+            // between fallback attempts — then the helper picks the
+            // merge-phase engine, renders its kickoff, and walks to the
+            // next hot chain entry on a transient outage or credit/quota
+            // exhaustion.
+            workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+            let merger_invocation = run_invocation_with_fallback(
+                &workspace,
+                config,
                 &config.phases.merge.cli_chain,
-                &state,
+                &mut state,
+                &state_path,
                 implementer_cli,
                 engine_label_override,
                 "merger",
+                claimed.number,
+                &repo_label,
+                &repo_slug,
+                &ssh_keys_volume,
+                &deploy_keys,
+                &mut budget,
                 log_writer,
-            );
-            if merger_picked_opt.is_none() {
+                |engine| render_merger_kickoff_for_engine(engine, &brief, &end_pipeline_gate),
+            )
+            .await?;
+            if merger_invocation.terminate_as_rate_limited {
                 rate_limited_phase = Some("merger");
             }
-            let merger_picked = merger_picked_opt.unwrap_or(PickedEntry {
-                entry: ChainEntry { engine: Engine::Claude, model: None },
-                reason: PickReason::ChainFirstHotEntry,
-            });
-            let merger_chain_entry = merger_picked.entry.clone();
-            let merger_auth = auth_for(&merger_chain_entry);
-            if rate_limited_phase.is_none() {
-                workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-                let merger_kickoff = render_merger_kickoff_for_engine(
-                    merger_chain_entry.engine,
-                    &brief,
-                    &end_pipeline_gate,
-                );
-                tokio::fs::write(
-                    workspace.path().join(".bellows-kickoff.md"),
-                    merger_kickoff,
-                )
-                .await?;
-                let run = sandbox::run_agent(
-                    &workspace,
-                    &merger_auth,
-                    claimed.number,
-                    &repo_label,
-                    &repo_slug,
-                    &ssh_keys_volume,
-                    &deploy_keys,
-                    log_writer,
-                    budget.deadline_or_halt(),
-                )
-                .await?;
-                budget.mark_killed_if(run.killed_by_deadline);
-                if process_non_implement_rate_limit(
-                    &mut state,
-                    &state_path,
-                    merger_chain_entry.engine,
-                    "merger",
-                    &run,
-                    log_writer,
-                ) {
-                    rate_limited_phase = Some("merger");
-                }
-
+            if !merger_invocation.terminate_as_rate_limited {
                 // Parse the verdict from the merger's output file.
                 // Missing file / unrecognised / ambiguous → None,
                 // logged and stored (does NOT yet feed classify_exit).
@@ -2888,36 +2857,104 @@ pub fn state_file_path_alongside_log(log_path: &std::path::Path) -> std::path::P
         .unwrap_or_else(|| std::path::PathBuf::from("bellows-state.json"))
 }
 
-/// Pick the engine for a non-implement phase and emit the run-log
-/// line. Returns `Some(PickedEntry)` on success, `None` when every
-/// chain entry is cooling (caller short-circuits to RateLimited).
-/// Surfaces the diversity-collapse warning when pass-2 of the picker
-/// fired so the operator can see why the implementer-CLI ran review.
-/// Issue #170: a transient backend outage (503/500/504 / high demand) on
-/// one engine marks it cooling for a short 2-minute window so the
-/// chain-walk falls back to the next hot entry — distinct from a
-/// rate-limit's longer cooldown. Reuses the `cooling_until` mechanism so
-/// `pick_non_implement_engine` skips the engine on the re-pick.
-fn mark_transient_outage(
+/// In-phase fallback decision for one completed agent run (issue #174).
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackDecision {
+    /// The run succeeded, or failed for a non-fallback reason (a real
+    /// crash, or the wall-clock deadline). The caller keeps this run as
+    /// the phase result.
+    Keep,
+    /// A fallback-worthy failure (transient backend outage OR a
+    /// credit/quota-exhaustion signal) with another hot chain entry
+    /// available. Cooling for the failed engine has already been
+    /// recorded; the caller re-picks and retries on the next engine.
+    Fallback,
+    /// A fallback-worthy failure with the chain exhausted (this was the
+    /// last attempt). The caller terminates the run as RateLimited
+    /// (retry-later), never Crash.
+    Exhausted,
+}
+
+/// Classify a completed agent run for in-phase engine fallback and
+/// record the appropriate cooling as a side effect (issue #174,
+/// generalising #170). Two signals warrant falling back to the next
+/// chain engine within the same run:
+///
+///   - a transient backend outage (503/500/504 / high demand) — short
+///     2-minute cooling window;
+///   - a credit/quota-exhaustion / rate-limit signal — the parsed (or
+///     5-minute fallback) cooldown, so the exhausted engine is also
+///     skipped on the next claim.
+///
+/// A rate-limit no longer terminates outright: credits can run out
+/// mid-run at any phase, and the next chain engine may still be hot, so
+/// we walk to it in-run and only terminate as RateLimited when EVERY
+/// entry is exhausted. Because a failed invocation commits nothing,
+/// re-running on the next engine is safe in every phase, mutating or
+/// not.
+#[allow(clippy::too_many_arguments)]
+fn classify_and_record_fallback(
     state: &mut StateFile,
     state_path: &std::path::Path,
     engine: Engine,
     phase_name: &str,
+    run: &sandbox::AgentRun,
+    budget: &WallClockBudget,
+    attempt: usize,
+    chain_len: usize,
     log_writer: &mut dyn Write,
-) {
+) -> FallbackDecision {
+    if run.exit_code == 0 || budget.exceeded {
+        return FallbackDecision::Keep;
+    }
+    let rate_limited = policy::is_rate_limit_signature(&run.stderr_tail);
+    // A rate-limit shape wins over an incidental 503 substring so the
+    // longer, parsed cooldown is recorded rather than the 2-minute one.
+    let outage = !rate_limited && policy::is_service_unavailable_signature(&run.stderr_tail);
+    if !rate_limited && !outage {
+        return FallbackDecision::Keep;
+    }
     let now = chrono::Utc::now();
-    state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+    let signal = if rate_limited {
+        let parsed = chain_walker::parse_cooling_until(engine, &run.stderr_tail, now);
+        if parsed.used_fallback {
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown for engine={}",
+                    engine.as_name(),
+                ),
+            );
+        }
+        state.record_rate_limit(engine, parsed.cooling_until);
+        "credit/quota exhaustion"
+    } else {
+        state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+        "a transient backend outage (503/500/504)"
+    };
     let _ = state.save(state_path);
-    announce(
-        log_writer,
-        &format!(
-            "bellows: phase `{phase_name}` engine={} hit a transient backend outage (503/500/504); marking it cooling and falling back to the next chain entry (issue #170)",
-            engine.as_name(),
-        ),
-    );
+    if attempt + 1 < chain_len {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: phase `{phase_name}` engine={} hit {signal}; marking it cooling and falling back to the next chain entry (issue #174)",
+                engine.as_name(),
+            ),
+        );
+        FallbackDecision::Fallback
+    } else {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: phase `{phase_name}` exhausted every chain entry (last: engine={} on {signal}); terminating run as RateLimited (retry-later)",
+                engine.as_name(),
+            ),
+        );
+        FallbackDecision::Exhausted
+    }
 }
 
-/// Outcome of an analysis-phase agent run with in-phase engine fallback.
+/// Outcome of an agent phase run with in-phase engine fallback.
 struct AnalysisRun {
     run: sandbox::AgentRun,
     /// `true` when the phase could not complete on any chain engine —
@@ -2928,15 +2965,15 @@ struct AnalysisRun {
     terminate_as_rate_limited: bool,
 }
 
-/// Issue #170: run a read-only analysis phase (review / security-review)
-/// with in-phase chain fallback on a transient backend outage. Picks the
-/// phase's engine, renders the kickoff, runs the agent; on a
-/// service-unavailable signature it marks the engine cooling and retries
-/// with the next hot chain entry, bounded by the chain length. A
-/// rate-limit still terminates (existing behaviour); a fully-exhausted
-/// chain terminates as RateLimited (retry-later, not Crash). Read-only
-/// only — the failed invocation commits nothing, so re-running on a
-/// different engine cannot lose work.
+/// Run a read-only analysis phase (review / security-review) with
+/// in-phase chain fallback (issue #170, generalised by #174). Generates
+/// the diff (and, for review, the commit log) once — no commits land
+/// between fallback attempts, so a single generation stays valid — then
+/// delegates to `run_invocation_with_fallback`, which picks the phase
+/// engine, renders the kickoff, runs the agent, and walks to the next
+/// hot chain entry on a transient outage OR a credit/quota-exhaustion
+/// signal. A fully-exhausted chain terminates as RateLimited
+/// (retry-later, not Crash).
 #[allow(clippy::too_many_arguments)]
 async fn run_analysis_agent_with_fallback(
     workspace: &workspace::Workspace,
@@ -2957,12 +2994,73 @@ async fn run_analysis_agent_with_fallback(
     budget: &mut WallClockBudget,
     log_writer: &mut dyn Write,
 ) -> Result<AnalysisRun, RunError> {
+    workspace::generate_diff(workspace, policy::REVIEW_DIFF_FILE).await?;
+    if generate_commit_log {
+        workspace::generate_commit_log(workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
+    }
+    run_invocation_with_fallback(
+        workspace,
+        config,
+        chain,
+        state,
+        state_path,
+        implementer,
+        forced,
+        phase_name,
+        issue_number,
+        repo_label,
+        repo_slug,
+        ssh_keys_volume,
+        deploy_keys,
+        budget,
+        log_writer,
+        |engine| policy::wrap_phase_prompt_for_engine(engine, prompt),
+    )
+    .await
+}
+
+/// One logical agent invocation with in-phase chain fallback, for every
+/// phase (issue #174). Picks the phase engine, renders its kickoff via
+/// `render_kickoff`, runs the agent; on a transient backend outage OR a
+/// credit/quota-exhaustion signal it marks the engine cooling and
+/// retries on the next hot chain entry, bounded by the chain length.
+/// Because a failed invocation commits nothing, re-running on a
+/// different engine cannot lose work — safe for the mutating fix phases
+/// as well as the read-only analysis/merger phases. Returns the run the
+/// caller should treat as the phase result plus a
+/// `terminate_as_rate_limited` flag set only when every chain entry is
+/// exhausted/cooling. The caller owns any commit/push that follows —
+/// capturing HEAD before this call stays valid because failed attempts
+/// leave HEAD untouched.
+#[allow(clippy::too_many_arguments)]
+async fn run_invocation_with_fallback<F>(
+    workspace: &workspace::Workspace,
+    config: &Config,
+    chain: &[ChainEntry],
+    state: &mut StateFile,
+    state_path: &std::path::Path,
+    implementer: Option<Engine>,
+    forced: Option<Engine>,
+    phase_name: &'static str,
+    issue_number: u64,
+    repo_label: &str,
+    repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
+    budget: &mut WallClockBudget,
+    log_writer: &mut dyn Write,
+    render_kickoff: F,
+) -> Result<AnalysisRun, RunError>
+where
+    F: Fn(Engine) -> String,
+{
     let skipped = || sandbox::AgentRun {
         exit_code: 0,
         stderr_tail: String::new(),
         killed_by_deadline: false,
     };
     let chain_len = chain.len().max(1);
+    let mut last_run = skipped();
     for attempt in 0..chain_len {
         let Some(picked) =
             pick_non_implement_engine(chain, state, implementer, forced, phase_name, log_writer)
@@ -2974,11 +3072,7 @@ async fn run_analysis_agent_with_fallback(
         };
         let entry = picked.entry.clone();
         let auth = auth_for_chain_entry(config, &entry);
-        workspace::generate_diff(workspace, policy::REVIEW_DIFF_FILE).await?;
-        if generate_commit_log {
-            workspace::generate_commit_log(workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
-        }
-        let kickoff = policy::wrap_phase_prompt_for_engine(entry.engine, prompt);
+        let kickoff = render_kickoff(entry.engine);
         tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), kickoff).await?;
         let run = sandbox::run_agent(
             workspace,
@@ -2993,40 +3087,39 @@ async fn run_analysis_agent_with_fallback(
         )
         .await?;
         budget.mark_killed_if(run.killed_by_deadline);
-        if process_non_implement_rate_limit(
+        match classify_and_record_fallback(
             state,
             state_path,
             entry.engine,
             phase_name,
             &run,
+            budget,
+            attempt,
+            chain_len,
             log_writer,
         ) {
-            return Ok(AnalysisRun {
-                run,
-                terminate_as_rate_limited: true,
-            });
-        }
-        if run.exit_code != 0
-            && !budget.exceeded
-            && policy::is_service_unavailable_signature(&run.stderr_tail)
-        {
-            mark_transient_outage(state, state_path, entry.engine, phase_name, log_writer);
-            if attempt + 1 < chain_len {
+            FallbackDecision::Keep => {
+                return Ok(AnalysisRun {
+                    run,
+                    terminate_as_rate_limited: false,
+                });
+            }
+            FallbackDecision::Fallback => {
+                last_run = run;
                 continue;
             }
-            // Every chain entry hit the outage → retry-later, not Crash.
-            return Ok(AnalysisRun {
-                run,
-                terminate_as_rate_limited: true,
-            });
+            FallbackDecision::Exhausted => {
+                return Ok(AnalysisRun {
+                    run,
+                    terminate_as_rate_limited: true,
+                });
+            }
         }
-        return Ok(AnalysisRun {
-            run,
-            terminate_as_rate_limited: false,
-        });
     }
+    // The `Exhausted` arm returns on the final attempt, so this is only
+    // reached defensively; treat it as retry-later.
     Ok(AnalysisRun {
-        run: skipped(),
+        run: last_run,
         terminate_as_rate_limited: true,
     })
 }
@@ -3074,60 +3167,6 @@ fn pick_non_implement_engine(
             None
         }
     }
-}
-
-/// Record a non-implement-phase rate-limit signature in the state
-/// file. Returns `true` when the agent run matched a rate-limit
-/// signature (caller halts the rest of the pipeline). The composed
-/// helper from `chain_walker` does the state-update + decide; this
-/// runner-side wrapper adds the log lines.
-fn process_non_implement_rate_limit(
-    state: &mut StateFile,
-    state_path: &std::path::Path,
-    engine: Engine,
-    phase_name: &'static str,
-    agent_run: &sandbox::AgentRun,
-    log_writer: &mut dyn Write,
-) -> bool {
-    if agent_run.exit_code == 0 || !policy::is_rate_limit_signature(&agent_run.stderr_tail) {
-        return false;
-    }
-    let now = chrono::Utc::now();
-    let parsed = chain_walker::parse_cooling_until(engine, &agent_run.stderr_tail, now);
-    if parsed.used_fallback {
-        announce(
-            log_writer,
-            &format!(
-                "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown for engine={}",
-                engine.as_name(),
-            ),
-        );
-    }
-    let disposition =
-        handle_non_implement_rate_limit(state, engine, phase_name, &agent_run.stderr_tail, now);
-    let _ = state.save(state_path);
-    match disposition {
-        RateLimitDisposition::Terminate => {
-            announce(
-                log_writer,
-                &format!(
-                    "bellows: phase `{phase_name}` rate-limited on engine={}; terminating run as RateLimited",
-                    engine.as_name(),
-                ),
-            );
-        }
-        RateLimitDisposition::InPlaceAdvance => {
-            // Non-implement phases never in-place-advance; defensive.
-            announce(
-                log_writer,
-                &format!(
-                    "bellows: phase `{phase_name}` rate-limited on engine={}; terminating run as RateLimited",
-                    engine.as_name(),
-                ),
-            );
-        }
-    }
-    true
 }
 
 /// Tracks the per-issue wall-clock budget across the slice-X1
@@ -4963,5 +5002,129 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 "{surface}: must name release.yaml; got:\n{body}",
             );
         }
+    }
+
+    // ---- Issue #174: in-phase engine fallback classification ----
+
+    fn fallback_test_budget() -> WallClockBudget {
+        // A wide cap so `deadline_or_halt` never flips `exceeded`.
+        WallClockBudget::new(Duration::from_secs(3600))
+    }
+
+    fn agent_run_with(exit_code: i64, stderr: &str) -> sandbox::AgentRun {
+        sandbox::AgentRun {
+            exit_code,
+            stderr_tail: stderr.to_string(),
+            killed_by_deadline: false,
+        }
+    }
+
+    fn classify_for_test(
+        state: &mut StateFile,
+        run: &sandbox::AgentRun,
+        budget: &WallClockBudget,
+        attempt: usize,
+        chain_len: usize,
+    ) -> FallbackDecision {
+        let state_path = std::env::temp_dir().join("bellows-test-174-state.json");
+        let mut sink = Vec::<u8>::new();
+        classify_and_record_fallback(
+            state,
+            &state_path,
+            Engine::Codex,
+            "review",
+            run,
+            budget,
+            attempt,
+            chain_len,
+            &mut sink,
+        )
+    }
+
+    #[test]
+    fn classify_fallback_keeps_a_clean_exit() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(0, "");
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 0, 2);
+        assert_eq!(decision, FallbackDecision::Keep);
+        assert!(
+            state.engines.is_empty(),
+            "a clean exit must not record any cooling",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_keeps_a_plain_crash_without_recording_cooling() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, "thread 'main' panicked at src/lib.rs:1:1");
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 0, 2);
+        assert_eq!(
+            decision,
+            FallbackDecision::Keep,
+            "a non-outage, non-rate-limit crash is a real crash, not a fallback",
+        );
+        assert!(state.engines.is_empty());
+    }
+
+    #[test]
+    fn classify_fallback_falls_back_on_credit_exhaustion_with_chain_remaining() {
+        // Issue #174 gap 2: a credit/quota-exhaustion signal now falls
+        // back to the next engine rather than terminating outright.
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, "stream error: you've hit your usage limit");
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 0, 2);
+        assert_eq!(decision, FallbackDecision::Fallback);
+        assert!(
+            state.engines.contains_key(Engine::Codex.as_name()),
+            "the exhausted engine must be recorded cooling so the re-pick skips it",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_exhausts_on_credit_exhaustion_at_last_chain_entry() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, "quota exceeded");
+        // attempt 1 of a 2-entry chain (0-indexed) → last entry.
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 1, 2);
+        assert_eq!(
+            decision,
+            FallbackDecision::Exhausted,
+            "a rate-limit on the final chain entry terminates as retry-later",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_falls_back_on_transient_outage_with_chain_remaining() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, "Error: 503 Service Unavailable");
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 0, 3);
+        assert_eq!(decision, FallbackDecision::Fallback);
+        assert!(state.engines.contains_key(Engine::Codex.as_name()));
+    }
+
+    #[test]
+    fn classify_fallback_exhausts_on_transient_outage_at_last_chain_entry() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, "experiencing high demand");
+        let decision = classify_for_test(&mut state, &run, &fallback_test_budget(), 0, 1);
+        assert_eq!(
+            decision,
+            FallbackDecision::Exhausted,
+            "a single-engine chain has nothing to fall back to → retry-later",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_keeps_run_when_wall_clock_budget_is_spent() {
+        // A deadline kill is not a fallback signal even if the stderr
+        // happens to carry an outage substring — the run is done.
+        let mut state = StateFile::default();
+        let mut budget = WallClockBudget::new(Duration::from_secs(0));
+        // Force `exceeded` to flip.
+        assert!(budget.deadline_or_halt().is_none());
+        let run = agent_run_with(1, "503 Service Unavailable");
+        let decision = classify_for_test(&mut state, &run, &budget, 0, 2);
+        assert_eq!(decision, FallbackDecision::Keep);
+        assert!(state.engines.is_empty());
     }
 }
