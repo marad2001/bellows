@@ -153,6 +153,38 @@ fn pr_routing_for_reason<'a>(
     }
 }
 
+/// The authoritative terminal classification for a finished run, as the
+/// `runs.jsonl` record must report it.
+///
+/// `run_once` computes its exit reason before opening the PR, but
+/// `tracker::finalise`'s GET is the last word on cancellation: an
+/// operator can `bellows kill <N>` in the narrow window between the
+/// pre-PR check and finalisation. In that case finalise skips the label
+/// PATCH (the operator's `agent-cancelled` is already on the issue) and
+/// `run_once` returns `RunOutcome::Cancelled` — so the metrics record
+/// has to say `Cancelled` too, otherwise `runs.jsonl` permanently
+/// reports the stale pipeline `Success` / `agent-done` for a cancelled
+/// run and the failure distribution the file exists for is wrong.
+///
+/// Returns the effective reason and the outcome label the issue landed
+/// on. `draft` is deliberately NOT re-derived from the effective reason:
+/// the PR was opened before finalise ran, so the record reports the
+/// state the run actually landed on rather than the state a `Cancelled`
+/// routing would have chosen.
+pub fn effective_terminal_outcome<'a>(
+    pipeline_reason: &ExitReason,
+    finalise_externally_cancelled: bool,
+    labels: &'a RuntimeLabelsConfig,
+) -> (ExitReason, &'a str) {
+    let reason = if finalise_externally_cancelled {
+        ExitReason::Cancelled
+    } else {
+        pipeline_reason.clone()
+    };
+    let outcome_label = pr_routing_for_reason(&reason, labels).outcome_label;
+    (reason, outcome_label)
+}
+
 /// Why a `RunOutcome::Blocked` tick refused to claim. Split into one
 /// variant per block source so the status file's on-disk schema, the
 /// polling-loop log line, and `bellows status`'s human-readable
@@ -976,6 +1008,18 @@ pub async fn run_once(
     // *to* once the picker has run.
     let mut oscillation_advance_from: Option<Engine> = None;
     let mut rate_limited_phase: Option<&'static str> = None;
+    // Issue #168: the per-phase rows of this run's `runs.jsonl` record,
+    // accumulated as the pipeline progresses. A phase the run never
+    // reaches is never pushed, which is exactly the record's
+    // omit-phases-that-did-not-run contract.
+    let mut phase_timeline = policy::PhaseTimeline::new();
+    // The chain entry that actually served implement, set once a
+    // container has genuinely been dispatched. Stays `None` on the
+    // all-entries-cooling path, whose synthesised `ChainEntry` below is
+    // a placeholder for the PhaseOutcomes shape rather than an engine
+    // that ran.
+    let mut implement_served_by: Option<ChainEntry> = None;
+    let implement_started_at = std::time::Instant::now();
     let (implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
         let now = chrono::Utc::now();
         let pick_result = chain_walker::pick_engine_for_phase_excluding(
@@ -1086,6 +1130,11 @@ pub async fn run_once(
         )
         .await?;
         budget.mark_killed_if(agent_run.killed_by_deadline);
+        // Issue #168: a container has now genuinely run for implement.
+        // On an in-place advance the later engine overwrites the earlier
+        // one — the record names the engine whose attempt the run
+        // actually kept.
+        implement_served_by = Some(picked.entry.clone());
         announce(
             log_writer,
             &format!(
@@ -1273,6 +1322,12 @@ pub async fn run_once(
         implementer_cli = Some(picked.entry.engine);
         break (picked.entry, agent_run, head_after, pr_body);
     };
+    phase_timeline.record_engine_phase(
+        "implement",
+        implement_served_by.as_ref(),
+        implement_started_at.elapsed().as_secs(),
+        implement_agent_run.exit_code,
+    );
 
     // Issue #49: implement-crash recovery. When the implement-phase
     // agent exited non-zero AND produced no commits, the legacy path
@@ -1355,6 +1410,7 @@ pub async fn run_once(
         for line in workspace.gate_commands().announcement_lines() {
             announce(log_writer, &line);
         }
+        let gate_started_at = std::time::Instant::now();
         let run = sandbox::run_cargo_checks(
             &workspace,
             claimed.number,
@@ -1367,7 +1423,15 @@ pub async fn run_once(
         )
         .await?;
         budget.mark_killed_if(run.killed_by_deadline);
-        run.gate
+        let gate = run.gate;
+        // Issue #168: a gate spawns a container but no agent, so it is
+        // recorded with null engine/model.
+        phase_timeline.record_gate_phase(
+            "post_implement_gate",
+            gate_started_at.elapsed().as_secs(),
+            policy::gate_exit_code(&gate),
+        );
+        gate
     } else {
         GateOutcome::default()
     };
@@ -1508,6 +1572,7 @@ pub async fn run_once(
         // transient backend outage (503/500/504). A rate-limit or a
         // fully-exhausted chain terminates as RateLimited (retry-later),
         // not Crash.
+        let review_started_at = std::time::Instant::now();
         let review_analysis = run_analysis_agent_with_fallback(
             &workspace,
             config,
@@ -1531,7 +1596,14 @@ pub async fn run_once(
         if review_analysis.terminate_as_rate_limited {
             rate_limited_phase = Some("review");
         }
+        let review_served_by = review_analysis.served_by;
         let review_agent_run = review_analysis.run;
+        phase_timeline.record_engine_phase(
+            "review",
+            review_served_by.as_ref(),
+            review_started_at.elapsed().as_secs(),
+            review_agent_run.exit_code,
+        );
 
         // Read the findings file. Don't remove it yet — review-fix may
         // need to read it. If review-fix runs successfully it removes
@@ -1642,6 +1714,15 @@ pub async fn run_once(
             // without halting subsequent ones.
             let mut coverage: Vec<policy::FindingCoverage> = Vec::new();
             let mut review_fix_exit: i64 = 0;
+            // Issue #168: review-fix is the one phase that spans several
+            // container invocations (one per blocker/important finding
+            // plus the nit batch). The record carries a single
+            // `review_fix` row whose `seconds` sums those invocations
+            // and whose engine is the last one that served any of them —
+            // the same collapse `PhaseOutcomes::review_fix` already
+            // makes for the exit code.
+            let mut review_fix_elapsed = Duration::ZERO;
+            let mut review_fix_served_by: Option<ChainEntry> = None;
             for (idx, finding) in urgent_findings.iter().enumerate() {
                 if rate_limited_phase.is_some() {
                     // Earlier per-finding invocation rate-limited; skip
@@ -1691,6 +1772,7 @@ pub async fn run_once(
                 // fallback. See the four-corners comment below the run
                 // for the full contract.
                 let head_before = workspace::head_sha(&workspace).await?;
+                let per_finding_started_at = std::time::Instant::now();
                 let per_finding_invocation = run_invocation_with_fallback(
                     &workspace,
                     config,
@@ -1719,6 +1801,10 @@ pub async fn run_once(
                     },
                 )
                 .await?;
+                review_fix_elapsed += per_finding_started_at.elapsed();
+                if let Some(entry) = per_finding_invocation.served_by.clone() {
+                    review_fix_served_by = Some(entry);
+                }
                 let per_finding_run = per_finding_invocation.run;
                 if per_finding_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("review-fix");
@@ -1815,6 +1901,7 @@ pub async fn run_once(
                 nit_kickoff_body.push_str("\n---\n\n");
                 nit_kickoff_body.push_str(policy::BATCH_REVIEW_FIX_NIT_PROMPT);
                 let head_before = workspace::head_sha(&workspace).await?;
+                let nit_batch_started_at = std::time::Instant::now();
                 let nit_batch_invocation = run_invocation_with_fallback(
                     &workspace,
                     config,
@@ -1834,6 +1921,10 @@ pub async fn run_once(
                     |engine| policy::wrap_phase_prompt_for_engine(engine, &nit_kickoff_body),
                 )
                 .await?;
+                review_fix_elapsed += nit_batch_started_at.elapsed();
+                if let Some(entry) = nit_batch_invocation.served_by.clone() {
+                    review_fix_served_by = Some(entry);
+                }
                 let nit_batch_run = nit_batch_invocation.run;
                 if nit_batch_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("review-fix");
@@ -1848,6 +1939,12 @@ pub async fn run_once(
             review_fix_outcome = Some(FixOutcome {
                 exit_code: review_fix_exit,
             });
+            phase_timeline.record_engine_phase(
+                "review_fix",
+                review_fix_served_by.as_ref(),
+                review_fix_elapsed.as_secs(),
+                review_fix_exit,
+            );
             halt_after_fix = review_fix_exit != 0;
 
             // Parser-as-backstop: independently parse bellows-agent-notes.md
@@ -1928,6 +2025,7 @@ pub async fn run_once(
             // Issue #170: pick + run with in-phase engine fallback on a
             // transient backend outage; rate-limit / exhausted chain
             // terminates as RateLimited (retry-later), not Crash.
+            let security_started_at = std::time::Instant::now();
             let security_analysis = run_analysis_agent_with_fallback(
                 &workspace,
                 config,
@@ -1951,7 +2049,14 @@ pub async fn run_once(
             if security_analysis.terminate_as_rate_limited {
                 rate_limited_phase = Some("security-review");
             }
+            let security_served_by = security_analysis.served_by;
             let security_agent_run = security_analysis.run;
+            phase_timeline.record_engine_phase(
+                "security_review",
+                security_served_by.as_ref(),
+                security_started_at.elapsed().as_secs(),
+                security_agent_run.exit_code,
+            );
 
             // Read the security findings file. Don't remove it yet —
             // security-fix may need to read it. The security-fix phase
@@ -2010,6 +2115,7 @@ pub async fn run_once(
                 // rather than terminating outright. The security-fix
                 // phase has its own `[phases.security_fix] cli_chain`.
                 let head_before = workspace::head_sha(&workspace).await?;
+                let security_fix_started_at = std::time::Instant::now();
                 let security_fix_invocation = run_invocation_with_fallback(
                     &workspace,
                     config,
@@ -2031,6 +2137,8 @@ pub async fn run_once(
                     },
                 )
                 .await?;
+                let security_fix_elapsed = security_fix_started_at.elapsed();
+                let security_fix_served_by = security_fix_invocation.served_by.clone();
                 let security_fix_run = security_fix_invocation.run;
                 if security_fix_invocation.terminate_as_rate_limited {
                     rate_limited_phase = Some("security-fix");
@@ -2048,6 +2156,12 @@ pub async fn run_once(
                 security_fix_outcome = Some(FixOutcome {
                     exit_code: security_fix_exit,
                 });
+                phase_timeline.record_engine_phase(
+                    "security_fix",
+                    security_fix_served_by.as_ref(),
+                    security_fix_elapsed.as_secs(),
+                    security_fix_exit,
+                );
                 halt_after_security_fix = security_fix_exit != 0;
                 announce(
                     log_writer,
@@ -2078,6 +2192,7 @@ pub async fn run_once(
             for line in workspace.gate_commands().announcement_lines() {
                 announce(log_writer, &line);
             }
+            let end_gate_started_at = std::time::Instant::now();
             let run = sandbox::run_cargo_checks(
                 &workspace,
                 claimed.number,
@@ -2090,6 +2205,11 @@ pub async fn run_once(
             )
             .await?;
             budget.mark_killed_if(run.killed_by_deadline);
+            phase_timeline.record_gate_phase(
+                "end_pipeline_gate",
+                end_gate_started_at.elapsed().as_secs(),
+                policy::gate_exit_code(&run.gate),
+            );
             end_pipeline_gate = Some(run.gate);
         }
 
@@ -2127,6 +2247,7 @@ pub async fn run_once(
             // next hot chain entry on a transient outage or credit/quota
             // exhaustion.
             workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
+            let merger_started_at = std::time::Instant::now();
             let merger_invocation = run_invocation_with_fallback(
                 &workspace,
                 config,
@@ -2149,6 +2270,12 @@ pub async fn run_once(
             if merger_invocation.terminate_as_rate_limited {
                 rate_limited_phase = Some("merger");
             }
+            phase_timeline.record_engine_phase(
+                "merge",
+                merger_invocation.served_by.as_ref(),
+                merger_started_at.elapsed().as_secs(),
+                merger_invocation.run.exit_code,
+            );
             if !merger_invocation.terminate_as_rate_limited {
                 // Parse the verdict from the merger's output file.
                 // Missing file / unrecognised / ambiguous → None,
@@ -2430,7 +2557,12 @@ pub async fn run_once(
     )
     .await?;
 
+    // The run-log comment's own clock. It has to be read before
+    // `finalise` because `finalise` posts the body; the metrics record
+    // takes its own reading afterwards (see below) so the documented
+    // whole-run wall clock includes the finalisation request.
     let finished = chrono::Utc::now();
+
     let log_body = build_log_body(
         &reason,
         claimed.number,
@@ -2470,6 +2602,43 @@ pub async fn run_once(
         let _ = writeln!(log_writer, "{line}");
     }
 
+    // Issue #168: append this run's structured record to `runs.jsonl`.
+    // Every terminal outcome gets a line — success, failure, rate-limit,
+    // cancellation — because the failure distribution is the point of
+    // the file.
+    //
+    // Placed AFTER `finalise` on purpose. `finalise`'s GET is the last
+    // word on cancellation: it can discover an operator `bellows kill`
+    // that landed after our pre-PR check, and the return path below
+    // treats that as `RunOutcome::Cancelled`. Recording before that
+    // point would leave a permanent `Success` / `agent-done` line for a
+    // cancelled run. `effective_terminal_outcome` folds finalise's
+    // verdict in; `draft` stays as opened, because the PR predates
+    // finalise and a late cancellation cannot retroactively draft it.
+    // Still best-effort: `append_run_metrics` has no error channel, so
+    // nothing here can change how the run finalises.
+    let (effective_reason, effective_outcome_label) = effective_terminal_outcome(
+        &reason,
+        finalise_outcome.externally_cancelled,
+        &config.runtime_labels,
+    );
+    append_run_metrics(
+        &config.logging.metrics_path,
+        &policy::build_run_metrics(policy::RunMetricsInput {
+            issue: claimed.number,
+            repo: &repo_label,
+            pr: pr.number,
+            started_at: started,
+            finished_at: chrono::Utc::now(),
+            exit_reason: &effective_reason,
+            merger_verdict: outcomes.merger_verdict,
+            draft,
+            outcome_label: effective_outcome_label,
+            phases: &phase_timeline,
+        }),
+        log_writer,
+    );
+
     // Slice 9: announce we're back to idle. Best-effort —
     // halt paths still reach finalise above, so a single
     // write here covers all exit-reason variants.
@@ -2492,8 +2661,10 @@ pub async fn run_once(
     //     finalise's GET. PR was opened with whatever the pipeline
     //     reason was; finalise then skipped the label PATCH.
     // Both routes return RunOutcome::Cancelled so the polling loop
-    // logs the right line.
-    if matches!(reason, ExitReason::Cancelled) || finalise_outcome.externally_cancelled {
+    // logs the right line. `effective_terminal_outcome` above already
+    // folded both signals into one reason, so the polling loop and the
+    // `runs.jsonl` record cannot disagree about how the run ended.
+    if matches!(effective_reason, ExitReason::Cancelled) {
         Ok(RunOutcome::Cancelled {
             issue_number: claimed.number,
             pr_number: pr.number,
@@ -2502,7 +2673,7 @@ pub async fn run_once(
         Ok(RunOutcome::Finalised {
             issue_number: claimed.number,
             pr_number: pr.number,
-            reason,
+            reason: effective_reason,
         })
     }
 }
@@ -3059,6 +3230,13 @@ struct AnalysisRun {
     /// terminates as RateLimited (leave the PR open for re-run) rather
     /// than Crash.
     terminate_as_rate_limited: bool,
+    /// Issue #168: the chain entry that actually served this
+    /// invocation — which may be a later one than the picker first
+    /// chose, since a transient outage falls back along the chain
+    /// mid-phase. `None` only when no container was ever dispatched
+    /// (every chain entry was cooling), which is what lets the metrics
+    /// record omit a phase that did not really run.
+    served_by: Option<ChainEntry>,
 }
 
 /// Run a read-only analysis phase (review / security-review) with
@@ -3158,6 +3336,7 @@ where
     };
     let chain_len = chain.len().max(1);
     let mut last_run = skipped();
+    let mut last_served_by: Option<ChainEntry> = None;
     for attempt in 0..chain_len {
         let Some(picked) =
             pick_non_implement_engine(chain, state, implementer, forced, phase_name, log_writer)
@@ -3165,6 +3344,10 @@ where
             return Ok(AnalysisRun {
                 run: skipped(),
                 terminate_as_rate_limited: true,
+                // No container was dispatched, so no engine served the
+                // phase (issue #168: it is omitted from the metrics
+                // record rather than recorded with a placeholder).
+                served_by: None,
             });
         };
         let entry = picked.entry.clone();
@@ -3204,16 +3387,19 @@ where
                 return Ok(AnalysisRun {
                     run,
                     terminate_as_rate_limited: false,
+                    served_by: Some(entry),
                 });
             }
             FallbackDecision::Fallback => {
                 last_run = run;
+                last_served_by = Some(entry);
                 continue;
             }
             FallbackDecision::Exhausted => {
                 return Ok(AnalysisRun {
                     run,
                     terminate_as_rate_limited: true,
+                    served_by: Some(entry),
                 });
             }
         }
@@ -3223,6 +3409,7 @@ where
     Ok(AnalysisRun {
         run: last_run,
         terminate_as_rate_limited: true,
+        served_by: last_served_by,
     })
 }
 
@@ -3381,6 +3568,57 @@ impl WallClockBudget {
     /// halt the pipeline.
     fn remaining(&self) -> Duration {
         self.cap.saturating_sub(self.start.elapsed())
+    }
+}
+
+/// Issue #168: append one [`policy::RunMetrics`] record, as a single
+/// JSON line, to the file at `path`. The file is append-only and never
+/// rewritten, so prior runs' lines are untouched; it is created on the
+/// first run.
+///
+/// **Best-effort by construction.** The signature has no error channel
+/// at all, so no caller can accidentally gate the run on it: a
+/// permissions failure, a full disk, or a path that names a directory
+/// produces an operator-visible warning on the run log and nothing else.
+/// Nothing downstream reads this file, so a missing line costs the
+/// operator one row of analysis and never a run.
+pub fn append_run_metrics(
+    path: &std::path::Path,
+    metrics: &policy::RunMetrics,
+    log_writer: &mut dyn Write,
+) {
+    let warn = |log_writer: &mut dyn Write, e: &dyn std::fmt::Display| {
+        let _ = writeln!(
+            log_writer,
+            "bellows: could not append the run metrics record to {} (continuing; \
+             the run's outcome is unaffected): {}",
+            path.display(),
+            e,
+        );
+    };
+    let line = match metrics.to_jsonl_line() {
+        Ok(line) => line,
+        Err(e) => {
+            warn(log_writer, &e);
+            return;
+        }
+    };
+    // Synchronous IO on purpose: one small append, and a sync helper is
+    // testable without a tokio runtime. `append(true)` is what makes
+    // concurrent-safe single-line writes possible at all — bellows runs
+    // at concurrency 1, but an operator tailing or rotating the file
+    // externally still cannot lose a prior line to a truncating open.
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+    match opened {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(line.as_bytes()) {
+                warn(log_writer, &e);
+            }
+        }
+        Err(e) => warn(log_writer, &e),
     }
 }
 

@@ -48,6 +48,39 @@ fn runtime_labels_section_defaults_apply_when_omitted() {
 fn logging_section_defaults_apply_when_omitted() {
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
     assert_eq!(config.logging.path, std::path::PathBuf::from("bellows.log"));
+    // Issue #168: the per-run metrics record (`runs.jsonl`) sits
+    // alongside the rolling prose log. An operator whose
+    // `orchestrator.toml` predates the key gets the default rather than
+    // a parse error.
+    assert_eq!(
+        config.logging.metrics_path,
+        std::path::PathBuf::from("runs.jsonl"),
+    );
+}
+
+#[test]
+fn logging_metrics_path_can_be_overridden() {
+    // Issue #168: an operator who wants the metrics file somewhere
+    // else (e.g. a directory their dashboards already tail) sets the
+    // key explicitly; the sibling `path` key keeps its default.
+    let config = Config::from_str(
+        r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[logging]
+metrics_path = "/var/log/bellows/runs.jsonl"
+"#,
+    )
+    .expect("config with only metrics_path in [logging] should parse");
+    assert_eq!(
+        config.logging.metrics_path,
+        std::path::PathBuf::from("/var/log/bellows/runs.jsonl"),
+    );
+    assert_eq!(config.logging.path, std::path::PathBuf::from("bellows.log"));
 }
 
 #[test]
