@@ -596,10 +596,13 @@ pub async fn generate_diff(
 
 /// Capture `git log --name-status <default_branch>...HEAD` and write
 /// it to `dest_filename` (a workspace-relative path). Sibling of
-/// `generate_diff` for the test-first review backstop: the reviewer
-/// reads this file alongside the squashed diff to reason about commit
-/// *ordering* (which the diff cannot show), so mega-commit and
-/// source-before-test violations become flaggable.
+/// `generate_diff`: the reviewer reads this file alongside the squashed
+/// diff as *optional* ordering context (which files arrived in which
+/// commit — something the diff cannot show). It no longer feeds any
+/// commit-shape check; that test-first review backstop was removed
+/// because bellows commits once per phase, making the shape it demanded
+/// unreachable (ADR-0012 / issue #154). The artefact is retained
+/// deliberately as reviewer context.
 ///
 /// Uses three dots (`<base>...HEAD`) so the range matches what the PR
 /// would show — only commits unique to this branch since divergence.

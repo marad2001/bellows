@@ -100,10 +100,13 @@ fn auth_error_attributes_claude_signature_correctly() {
 #[test]
 fn render_kickoff_for_engine_claude_is_unchanged_from_v1_shape() {
     // The v1 single-engine `render_kickoff` shape is the source of
-    // truth for the failing-test commit-shape language; the engine-
-    // aware variant must preserve it for Claude. We pin a couple of
+    // truth for the test-first authoring language; the engine-aware
+    // variant must preserve it for Claude. We pin a couple of
     // load-bearing substrings rather than the whole body so prose
-    // can flex without breaking the test.
+    // can flex without breaking the test. (The kickoff no longer names
+    // a "failing-test commit" shape — the commit-shape mandate was
+    // removed per ADR-0012 / issue #154 — so pin the retained test-first
+    // authoring language instead.)
     let prompt = render_kickoff_for_engine(
         Engine::Claude,
         "## Agent Brief\n\n**Summary:** Do the thing.",
@@ -112,7 +115,7 @@ fn render_kickoff_for_engine_claude_is_unchanged_from_v1_shape() {
     );
     assert!(prompt.contains("agent/42-do-thing"));
     assert!(prompt.contains("## Agent Brief"));
-    assert!(prompt.contains("failing-test commit"));
+    assert!(prompt.contains("failing test"));
     // Claude reads CLAUDE.md and skills on-demand — they should NOT
     // be inlined into the kickoff.
     assert!(

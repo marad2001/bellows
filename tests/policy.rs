@@ -1656,62 +1656,61 @@ fn classify_exit_synth_flag_and_agent_notes_do_not_gate_clean_run() {
 // ---- Issue #40: Tier-2 test-first backstop ----
 
 #[test]
-fn rendered_kickoff_includes_concrete_test_first_commit_shape_instructions() {
-    // Acceptance criterion (brief): "render_kickoff output contains
-    // concrete test-first commit-shape instructions (one failing-test
-    // commit then one make-it-pass commit, per acceptance criterion)."
-    // Concrete commit-shape language, not just "use TDD" — the prior
-    // prompt's high-level skill mention was ignorable. The kickoff must
-    // literally describe the two-commit shape per AC so the implement
-    // agent has no room to interpret "use TDD" as "write code and tests
-    // in one commit".
+fn rendered_kickoff_directs_test_first_authoring_without_commit_shape_mandate() {
+    // Issue #154 / ADR-0012: bellows commits once per phase, so a
+    // two-commit-per-AC shape is structurally unreachable and the old
+    // review-phase commit-shape check was unclearable. The kickoff must
+    // still direct test-first *authoring* (write the failing test before
+    // the implementation, via the `tdd` skill) but MUST NOT mandate a
+    // two-commit-per-acceptance-criterion shape, and MUST NOT claim the
+    // review phase flags commit-shape violations (it no longer does).
     let prompt = render_kickoff(
         "any brief",
         "https://github.com/owner/repo",
-        "agent/40-test-first",
+        "agent/154-test-first",
     );
     let lower = prompt.to_lowercase();
+    // Still directs test-first authoring via the `tdd` skill.
     assert!(
-        lower.contains("failing-test commit") || lower.contains("failing test commit"),
-        "render_kickoff must explicitly name the failing-test commit: {prompt}"
+        lower.contains("tdd"),
+        "render_kickoff must still direct test-first authoring via the tdd skill: {prompt}"
     );
     assert!(
-        lower.contains("make-it-pass commit") || lower.contains("make it pass commit"),
-        "render_kickoff must explicitly name the make-it-pass commit: {prompt}"
+        lower.contains("failing test") || lower.contains("failing-test"),
+        "render_kickoff must still tell the agent to write the failing test first: {prompt}"
+    );
+    // No two-commit-per-AC commit-shape mandate.
+    assert!(
+        !lower.contains("make-it-pass commit") && !lower.contains("make it pass commit"),
+        "render_kickoff must not mandate a make-it-pass commit shape: {prompt}"
     );
     assert!(
-        lower.contains("per acceptance criterion")
-            || lower.contains("per acceptance criteria")
-            || lower.contains("each acceptance criterion"),
-        "render_kickoff must scope the two-commit shape to each acceptance criterion: {prompt}"
+        !lower.contains("two commits") && !lower.contains("two-commit"),
+        "render_kickoff must not mandate a two-commit-per-AC shape: {prompt}"
+    );
+    // No claim that the review phase flags commit-shape violations.
+    assert!(
+        !lower.contains("mega-commit") && !lower.contains("mega commit"),
+        "render_kickoff must not reference the removed mega-commit check: {prompt}"
     );
 }
 
 #[test]
-fn review_prompt_describes_test_first_violations_tagged_important() {
-    // Acceptance criterion (brief): "REVIEW_PROMPT contains a check
-    // item describing test-first violations (mega-commit, source-before-
-    // test ordering) and tags them with `important`." Both violation
-    // shapes must be named so the reviewer-claude has explicit
-    // categories to flag against, and the severity tag must be the
-    // existing `important` so the per-finding enact loop carries the
-    // finding through with no new plumbing.
+fn review_prompt_omits_commit_shape_check() {
+    // Issue #154 / ADR-0012: the review phase must no longer emit any
+    // finding about commit shape. Every bellows run structurally produces
+    // the mega-commit shape (one commit per phase), so the old check
+    // manufactured a state no in-run actor could clear. Pin the absence
+    // of both violation shapes so the check cannot be silently
+    // reintroduced.
     let lower = REVIEW_PROMPT.to_lowercase();
     assert!(
-        lower.contains("mega-commit") || lower.contains("mega commit"),
-        "REVIEW_PROMPT must name the mega-commit violation shape: {REVIEW_PROMPT}"
+        !lower.contains("mega-commit") && !lower.contains("mega commit"),
+        "REVIEW_PROMPT must not reference the removed mega-commit check: {REVIEW_PROMPT}"
     );
     assert!(
-        lower.contains("source-before-test") || lower.contains("source before test"),
-        "REVIEW_PROMPT must name the source-before-test violation shape: {REVIEW_PROMPT}"
-    );
-    assert!(
-        lower.contains("test-first") || lower.contains("test first"),
-        "REVIEW_PROMPT must frame the violations as test-first violations: {REVIEW_PROMPT}"
-    );
-    assert!(
-        REVIEW_PROMPT.contains("important"),
-        "REVIEW_PROMPT must tag test-first violations with the `important` severity: {REVIEW_PROMPT}"
+        !lower.contains("source-before-test") && !lower.contains("source before test"),
+        "REVIEW_PROMPT must not reference the removed source-before-test check: {REVIEW_PROMPT}"
     );
 }
 
