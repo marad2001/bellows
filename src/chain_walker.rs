@@ -268,6 +268,71 @@ pub fn pick_engine(
     implementer: Option<Engine>,
     now: DateTime<Utc>,
 ) -> Result<PickedEntry, PickError> {
+    pick_from_chain(chain, state, implementer, now)
+}
+
+/// [`pick_engine`] with one engine struck out of the chain before the
+/// walk begins (issue #164).
+///
+/// An **Oscillation**-triggered **Advance** has no state-file trace to
+/// steer the next pick: unlike a rate-limit it records no
+/// `cooling_until`, because `CONTEXT.md` is explicit that an advance is
+/// "never a verdict on quality" and the engine is not out of quota — it
+/// wedged on *this* issue. Without an exclusion the re-pick would see an
+/// unchanged `StateFile` and hand the phase straight back to the engine
+/// that just oscillated. So the runner names the abandoned engine here
+/// instead, for exactly the one retry iteration.
+///
+/// The exclusion is **engine-level**, matching the rate-limit path's
+/// engine-level `cooling_until`: `CONTEXT.md` defines an advance as
+/// meaning "no further progress is available from this engine", so a
+/// model-pinned sibling entry (`claude:opus` after `claude:sonnet`
+/// wedged) is struck out too.
+///
+/// `excluded` of `None` is exactly [`pick_engine`].
+pub fn pick_engine_excluding(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    excluded: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
+    let Some(excluded) = excluded else {
+        return pick_from_chain(chain, state, implementer, now);
+    };
+    let retained: Vec<ChainEntry> = chain
+        .iter()
+        .filter(|e| e.engine != excluded)
+        .cloned()
+        .collect();
+    pick_from_chain(&retained, state, implementer, now)
+}
+
+/// Whether an **Advance** away from `abandoned` has anywhere to go: at
+/// least one chain entry that is both hot and on a different engine
+/// (issue #164). The runner consults this *before* discarding the
+/// workspace — an advance with no target would throw the attempt away
+/// and then re-run the same engine, or fail the re-pick outright.
+pub fn has_advance_target(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    abandoned: Engine,
+    now: DateTime<Utc>,
+) -> bool {
+    chain
+        .iter()
+        .any(|e| e.engine != abandoned && state.is_hot(e.engine, now))
+}
+
+/// The two-pass walk itself. Private so the exclusion is applied by
+/// filtering the chain the walk sees, keeping one implementation of the
+/// pass-1/pass-2 rules.
+fn pick_from_chain(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
     // First hot entry overall — we'll need this in two places: the
     // "no implementer" path's pick, and the pass-2 fallback. Compute
     // once for clarity.
@@ -373,6 +438,26 @@ pub fn pick_engine_for_phase(
     forced_engine: Option<Engine>,
     now: DateTime<Utc>,
 ) -> Result<PickedEntry, PickError> {
+    pick_engine_for_phase_excluding(chain, state, implementer, forced_engine, None, now)
+}
+
+/// [`pick_engine_for_phase`] with an engine struck out of the chain
+/// walk (issue #164) — see [`pick_engine_excluding`] for why an
+/// **Oscillation**-triggered advance needs one.
+///
+/// `forced_engine` still wins: a forced engine bypasses chain walking
+/// entirely, and the runner never advances on an oscillation under a
+/// forced engine, so the two are never both set in practice. Keeping
+/// the forced branch first preserves ADR-0005's "the labeled engine is
+/// used for every phase" promise regardless.
+pub fn pick_engine_for_phase_excluding(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    forced_engine: Option<Engine>,
+    excluded: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
     if let Some(engine) = forced_engine {
         let entry = chain
             .iter()
@@ -387,7 +472,7 @@ pub fn pick_engine_for_phase(
             reason: PickReason::ForcedViaLabel,
         });
     }
-    pick_engine(chain, state, implementer, now)
+    pick_engine_excluding(chain, state, implementer, excluded, now)
 }
 
 /// Implement-phase response to a rate-limit signature. Pure decision
@@ -498,7 +583,7 @@ impl OscillationAdvanceAction {
 /// during the implement phase. Pure function so the runner-level
 /// contract is testable without docker, git, or a clock.
 ///
-/// Three guards, all of which must pass:
+/// Four guards, all of which must pass:
 ///
 /// 1. **At base SHA** — the pre-existing advance guard, unchanged. An
 ///    advance discards the workspace, so past base SHA there is
@@ -510,14 +595,19 @@ impl OscillationAdvanceAction {
 /// 3. **Budget floor** — at least `floor_fraction` of the configured
 ///    wall clock still remains. Handing a fresh engine the last ten
 ///    minutes of an hour wastes them.
+/// 4. **Somewhere to advance to** — `next_entry_available`, from
+///    [`has_advance_target`]. An advance that re-picked the engine that
+///    just oscillated would discard the workspace to repeat the wedge;
+///    with no other hot entry the honest answer is to log and continue.
 pub fn decide_oscillation_advance_action(
     at_base_sha: bool,
     advances_used: u8,
     remaining: std::time::Duration,
     cap: std::time::Duration,
     floor_fraction: f64,
+    next_entry_available: bool,
 ) -> OscillationAdvanceAction {
-    if !at_base_sha || advances_used > 0 {
+    if !at_base_sha || advances_used > 0 || !next_entry_available {
         return OscillationAdvanceAction::ContinueRun;
     }
     if !budget_above_floor(remaining, cap, floor_fraction) {

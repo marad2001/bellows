@@ -229,6 +229,7 @@ fn oscillation_at_base_sha_with_an_unspent_allowance_advances() {
         Duration::from_secs(45 * 60),
         CAP,
         DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        true,
     );
     assert_eq!(action, OscillationAdvanceAction::InPlaceAdvance);
     assert_eq!(
@@ -249,6 +250,7 @@ fn oscillation_does_not_advance_when_the_shared_allowance_is_spent() {
         Duration::from_secs(45 * 60),
         CAP,
         DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        true,
     );
     assert_eq!(action, OscillationAdvanceAction::ContinueRun);
     assert_eq!(action.disposition(), None);
@@ -265,6 +267,7 @@ fn oscillation_does_not_advance_below_the_budget_floor() {
         Duration::from_secs(10 * 60),
         CAP,
         DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        true,
     );
     assert_eq!(action, OscillationAdvanceAction::ContinueRun);
 }
@@ -278,6 +281,7 @@ fn oscillation_advances_exactly_at_the_budget_floor() {
         Duration::from_secs(30 * 60),
         CAP,
         DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        true,
     );
     assert_eq!(action, OscillationAdvanceAction::InPlaceAdvance);
 }
@@ -292,8 +296,27 @@ fn oscillation_does_not_advance_when_the_workspace_is_ahead_of_base_sha() {
         Duration::from_secs(45 * 60),
         CAP,
         DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        true,
     );
     assert_eq!(action, OscillationAdvanceAction::ContinueRun);
+}
+
+#[test]
+fn oscillation_does_not_advance_when_there_is_no_other_hot_chain_entry() {
+    // Issue #164 review: an advance discards the workspace and re-picks
+    // from the chain. With no other hot entry the re-pick would land
+    // back on the engine that just wedged, so the run would lose its
+    // attempt to repeat the wedge. Log it and continue instead.
+    let action = decide_oscillation_advance_action(
+        true,
+        0,
+        Duration::from_secs(45 * 60),
+        CAP,
+        DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
+        false,
+    );
+    assert_eq!(action, OscillationAdvanceAction::ContinueRun);
+    assert_eq!(action.disposition(), None);
 }
 
 #[test]

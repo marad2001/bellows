@@ -967,18 +967,23 @@ pub async fn run_once(
     let mut implement_advances_used: u8 = 0;
     // Issue #164: set when an **Oscillation** spent the shared advance
     // allowance, naming the engine whose attempt was abandoned. The
-    // next loop iteration consumes it to log the advance (it can only
-    // name the engine being advanced *to* once the picker has run) and
-    // to label the phase-start line with the right trigger.
+    // next loop iteration consumes it three ways: it is struck out of
+    // the chain walk (an oscillation records no `cooling_until`, so
+    // without this exclusion the re-pick would hand the phase straight
+    // back to the engine that just wedged), it labels the phase-start
+    // line with the right trigger, and it names the abandoned engine in
+    // the advance line — which can only name the engine being advanced
+    // *to* once the picker has run.
     let mut oscillation_advance_from: Option<Engine> = None;
     let mut rate_limited_phase: Option<&'static str> = None;
     let (implement_chain_entry, implement_agent_run, head_after_implement, claude_pr_body) = loop {
         let now = chrono::Utc::now();
-        let pick_result = pick_engine_for_phase(
+        let pick_result = chain_walker::pick_engine_for_phase_excluding(
             &config.phases.implement.cli_chain,
             &state,
             None,
             engine_label_override,
+            oscillation_advance_from,
             now,
         );
         let mut picked = match pick_result {
@@ -1104,6 +1109,17 @@ pub async fn run_once(
             // A forced engine bypasses chain walking entirely, so there
             // is no next entry to advance to (same shape the rate-limit
             // path takes above).
+            // Is there anywhere to advance *to*? An oscillation records
+            // no cooling, so the only thing steering the re-pick away
+            // from the wedged engine is the exclusion the next
+            // iteration applies — and if the chain holds no other hot
+            // entry, that exclusion leaves nothing to pick.
+            let next_entry_available = chain_walker::has_advance_target(
+                &config.phases.implement.cli_chain,
+                &state,
+                picked.entry.engine,
+                chrono::Utc::now(),
+            );
             let action = if engine_label_override.is_some() {
                 chain_walker::OscillationAdvanceAction::ContinueRun
             } else {
@@ -1113,6 +1129,7 @@ pub async fn run_once(
                     budget.remaining(),
                     budget.cap(),
                     config.agent.advance_budget_floor_fraction,
+                    next_entry_available,
                 )
             };
             if action.disposition() == Some(RateLimitDisposition::InPlaceAdvance) {
@@ -1129,6 +1146,7 @@ pub async fn run_once(
                         engine_label_override.is_some(),
                         at_base_sha,
                         implement_advances_used,
+                        next_entry_available,
                     ),
                 ),
             );
@@ -3293,9 +3311,12 @@ fn oscillation_not_advanced_reason(
     engine_forced: bool,
     at_base_sha: bool,
     advances_used: u8,
+    next_entry_available: bool,
 ) -> &'static str {
     if engine_forced {
         "the engine is forced via label, so there is no chain entry to advance to"
+    } else if !next_entry_available {
+        "no other chain entry is hot, so there is no engine to advance to"
     } else if advances_used > 0 {
         "this run's single advance allowance is already spent"
     } else if !at_base_sha {
