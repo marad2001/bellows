@@ -876,11 +876,46 @@ fn build_cargo_checks_entrypoint() -> Vec<String> {
 /// container so `run-cargo-checks` evaluates the snapshotted clippy
 /// and test commands verbatim. Pulled out into a pure function so
 /// the env shape is unit-testable without spinning up Docker.
+///
+/// Issue #180: each command is prefixed with the build-relevant env its
+/// CI step ran under, as a POSIX `VAR=value cmd` assignment prefix. The
+/// prefix rides inside the existing `BELLOWS_*_CMD` string rather than
+/// arriving as separate container env because the two commands can carry
+/// *different* env (sibling `clippy:` / `test:` jobs), and container-wide
+/// env cannot express that. It also means the policy image's
+/// `run-cargo-checks` script needs no change — it already `sh -c`'s each
+/// command, and `sh` applies assignment prefixes natively.
 fn build_cargo_checks_env(gate_commands: &GateCommands) -> Vec<String> {
     vec![
-        format!("BELLOWS_CLIPPY_CMD={}", gate_commands.clippy),
-        format!("BELLOWS_TEST_CMD={}", gate_commands.test),
+        format!(
+            "BELLOWS_CLIPPY_CMD={}",
+            with_env_prefix(&gate_commands.clippy_env, &gate_commands.clippy),
+        ),
+        format!(
+            "BELLOWS_TEST_CMD={}",
+            with_env_prefix(&gate_commands.test_env, &gate_commands.test),
+        ),
     ]
+}
+
+/// Render `KEY='value' ... <cmd>`. Values are single-quoted, which is
+/// airtight for `sh` because `workflow_parse::env_value_is_safe` has
+/// already rejected any value containing a single quote. An empty env
+/// list returns the command untouched, so repos whose CI declares no
+/// build env see byte-identical behaviour to before #180.
+fn with_env_prefix(env: &[(String, String)], cmd: &str) -> String {
+    if env.is_empty() {
+        return cmd.to_string();
+    }
+    let mut out = String::new();
+    for (key, value) in env {
+        out.push_str(key);
+        out.push_str("='");
+        out.push_str(value);
+        out.push_str("' ");
+    }
+    out.push_str(cmd);
+    out
 }
 
 fn labelled_volume_mount(target: &str, source: &str, labels: HashMap<String, String>) -> Mount {
@@ -1927,8 +1962,10 @@ mod tests {
         let gc = crate::workspace::GateCommands {
             clippy: "cargo clippy --all-targets -- -D clippy::correctness".to_string(),
             clippy_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+            clippy_env: Vec::new(),
             test: "cargo test --features in-memory".to_string(),
             test_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+            test_env: Vec::new(),
         };
         let env = build_cargo_checks_env(&gc);
         assert!(
@@ -1940,6 +1977,46 @@ mod tests {
             env.iter()
                 .any(|e| e == "BELLOWS_TEST_CMD=cargo test --features in-memory"),
             "test command must be set on BELLOWS_TEST_CMD: {env:?}",
+        );
+    }
+
+    #[test]
+    fn build_cargo_checks_env_prefixes_each_command_with_its_mirrored_ci_env() {
+        // Issue #180: the FA shape. The test step's linker-OOM guard
+        // must reach the gate as a POSIX assignment prefix, and each
+        // command carries only its OWN env (sibling clippy:/test: jobs).
+        let gc = crate::workspace::GateCommands {
+            clippy: "cargo clippy --all-targets -- -D clippy::correctness".to_string(),
+            clippy_source: crate::workflow_parse::Provenance::ParsedFromWorkflow(
+                std::path::PathBuf::from(".github/workflows/ci.yml"),
+            ),
+            clippy_env: vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())],
+            test: "cargo test --locked --workspace --lib --bins --tests --all-features".to_string(),
+            test_source: crate::workflow_parse::Provenance::ParsedFromWorkflow(
+                std::path::PathBuf::from(".github/workflows/ci.yml"),
+            ),
+            test_env: vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
+        };
+        let env = build_cargo_checks_env(&gc);
+        assert!(
+            env.iter().any(|e| e
+                == "BELLOWS_TEST_CMD=CARGO_PROFILE_TEST_DEBUG='0' cargo test --locked --workspace --lib --bins --tests --all-features"),
+            "test command must carry its mirrored env prefix: {env:?}",
+        );
+        assert!(
+            env.iter().any(|e| e
+                == "BELLOWS_CLIPPY_CMD=CARGO_INCREMENTAL='0' cargo clippy --all-targets -- -D clippy::correctness"),
+            "clippy must carry only its own env, not the test step's: {env:?}",
+        );
+    }
+
+    #[test]
+    fn with_env_prefix_leaves_command_untouched_when_ci_declares_no_env() {
+        // Issue #180 no-regression: repos whose CI sets no build env
+        // (e.g. bellows itself) must see a byte-identical command.
+        assert_eq!(
+            with_env_prefix(&[], "cargo test --all-features"),
+            "cargo test --all-features",
         );
     }
 

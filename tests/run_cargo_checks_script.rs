@@ -113,6 +113,67 @@ fn script_runs_clippy_command_from_env_and_test_command_after_clippy_passes() {
 }
 
 #[test]
+fn script_applies_the_mirrored_ci_env_prefix_to_each_command() {
+    // Issue #180: bellows mirrors the target repo's CI *environment*, not
+    // just its command, by prefixing each gate command with POSIX
+    // `VAR=value` assignments (see `sandbox::with_env_prefix`). This pins
+    // that the SHIPPED script honours that shape unchanged — the reason
+    // the fix needs no policy-image rebuild — and that each command sees
+    // only its own env, since a repo can split clippy and test into
+    // sibling jobs with different env blocks.
+    //
+    // Regression anchor: workboard-financial-advice sets
+    // `CARGO_PROFILE_TEST_DEBUG: "0"` as a documented linker-OOM guard.
+    // Without it the gate's test link was OOM-killed (`ld terminated with
+    // signal 9`) and reported a false FinalTestsRed (#46/#280).
+    let tmp_workspace = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // Stub cargo reports the env it actually received, per subcommand.
+    stub_cargo(
+        bin_dir.path(),
+        "#!/bin/sh\necho \"$1 saw debug=[${CARGO_PROFILE_TEST_DEBUG-unset}] flags=[${RUSTFLAGS-unset}]\"\nexit 0\n",
+    );
+
+    let output = run_script(
+        tmp_workspace.path(),
+        bin_dir.path(),
+        "CARGO_PROFILE_TEST_DEBUG='0' cargo clippy --all-targets",
+        "CARGO_PROFILE_TEST_DEBUG='0' RUSTFLAGS='-C debuginfo=0 -C x' cargo test --workspace",
+    );
+    assert!(
+        output.status.success(),
+        "script must exit 0 when both checks pass; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let clippy_out =
+        std::fs::read_to_string(tmp_workspace.path().join(".bellows-cargo-clippy-output")).unwrap();
+    let test_out =
+        std::fs::read_to_string(tmp_workspace.path().join(".bellows-cargo-test-output")).unwrap();
+
+    assert!(
+        clippy_out.contains("debug=[0]"),
+        "clippy must run under the mirrored CI env: {clippy_out:?}",
+    );
+    assert!(
+        test_out.contains("debug=[0]"),
+        "the OOM guard must reach the test command: {test_out:?}",
+    );
+    // Multi-word values survive the single-quoting intact.
+    assert!(
+        test_out.contains("flags=[-C debuginfo=0 -C x]"),
+        "a multi-word env value must arrive as one value: {test_out:?}",
+    );
+    // Per-command isolation: clippy's step declared no RUSTFLAGS, so it
+    // must not inherit the test step's.
+    assert!(
+        clippy_out.contains("flags=[unset]"),
+        "clippy must not inherit the test command's env: {clippy_out:?}",
+    );
+}
+
+#[test]
 fn script_short_circuits_test_when_clippy_fails() {
     // The existing slice X1 contract is preserved: if clippy fails
     // the test step is skipped and `test_exit` is recorded as empty.
