@@ -1864,9 +1864,10 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
 
     // Slice 7: clean up any orphan containers from a prior bellows
     // process that didn't shut down cleanly. Best-effort — a flaky
-    // Docker daemon shouldn't prevent bellows from running. Note that
-    // GitHub issues stuck at agent-in-progress from the killed run
-    // are NOT auto-reclaimed; the operator re-labels manually.
+    // Docker daemon shouldn't prevent bellows from running. The GitHub
+    // issues those killed runs stranded at agent-in-progress are
+    // reclaimed by the startup reconciliation immediately after this
+    // (issue #158).
     //
     // Per-orphan lines are routed through `log()` so the operator
     // running bellows interactively sees *which* container was cleaned
@@ -1885,7 +1886,7 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
                     log(
                         &mut log_file,
                         &format!(
-                            "bellows: cleaned up {} orphan containers from prior runs (any GitHub issues stuck at agent-in-progress need manual re-labelling to retry)",
+                            "bellows: cleaned up {} orphan containers from prior runs",
                             lines.len(),
                         ),
                     );
@@ -1906,6 +1907,35 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
                 format_error_chain(&e),
             ),
         ),
+    }
+
+    // Issue #158: reclaim issues a prior aborted / timed-out run
+    // stranded at agent-in-progress so the AFK contract survives a
+    // process abort without manual re-labelling. Runs after the
+    // orphan-container sweep; safe under concurrency=1 (no agent run is
+    // in flight at startup). Per-issue detail goes to the log file; the
+    // summary below hits the console too.
+    let reconcile_repos: Vec<(String, String)> = config
+        .repos
+        .iter()
+        .filter_map(|r| runner::parse_owner_repo(&r.url).ok())
+        .collect();
+    let reclaimed = runner::reconcile_stranded_in_progress(
+        &client,
+        &reconcile_repos,
+        &config.runtime_labels.agent_in_progress,
+        &config.polling.pickup_label,
+        &mut log_file,
+    )
+    .await;
+    if reclaimed > 0 {
+        log(
+            &mut log_file,
+            &format!(
+                "bellows: startup reconcile: reclaimed {} stranded agent-in-progress issue(s) -> {}",
+                reclaimed, config.polling.pickup_label,
+            ),
+        );
     }
 
     // Slice 9: write an initial idle status so `bellows status` in

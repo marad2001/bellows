@@ -186,6 +186,68 @@ pat_env_var = "BELLOWS_TEST_PAT"
     }
 }
 
+// ---- Issue #158: startup reconciliation reclaims issues stranded at
+//      agent-in-progress by a prior aborted run. ----
+
+#[tokio::test]
+async fn reconcile_stranded_in_progress_reclaims_to_pickup_label() {
+    // An issue left at agent-in-progress by an aborted prior run is
+    // swapped back to ready-for-agent on startup so the next poll re-runs
+    // it — no manual re-labelling. Drives the real function against
+    // wiremock: list agent-in-progress → GET current → PATCH swapped set.
+    let mock = MockServer::start().await;
+
+    // list_open_issues_with_label(agent-in-progress) → one stranded #42.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "agent-in-progress"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "number": 42, "title": "stranded", "labels": [{ "name": "agent-in-progress" }] }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // reset_in_progress_to_pickup GETs the current issue...
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            { "number": 42, "title": "stranded", "labels": [{ "name": "agent-in-progress" }] }
+        )))
+        .mount(&mock)
+        .await;
+
+    // ...then PATCHes the swapped set. The new labels must add
+    // ready-for-agent (the pickup label). Asserted via the PATCH body.
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .and(body_string_contains("ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+            { "number": 42, "title": "stranded", "labels": [{ "name": "ready-for-agent" }] }
+        )))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let repos = vec![("marad2001".to_string(), "test-repo".to_string())];
+    let mut log = Cursor::new(Vec::new());
+    let reclaimed = bellows::runner::reconcile_stranded_in_progress(
+        &client,
+        &repos,
+        "agent-in-progress",
+        "ready-for-agent",
+        &mut log,
+    )
+    .await;
+
+    assert_eq!(reclaimed, 1, "the one stranded issue should be reclaimed");
+    let log_str = String::from_utf8(log.into_inner()).unwrap();
+    assert!(
+        log_str.contains("reclaimed stranded issue #42"),
+        "log should name the reclaimed issue: {log_str}",
+    );
+}
+
 // Issue #126 / ADR-0009 slice 4: the original
 // `run_once_only_blocks_when_every_configured_repo_is_blocked` test
 // pinned the OLD per-repo PR-open gate's anti-regression invariant
