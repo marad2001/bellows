@@ -1723,7 +1723,7 @@ async fn prepare_snapshots_the_large_files_scan_on_the_workspace() {
 
     let large = workspace.large_files();
     assert!(
-        large.iter().any(|f| f.path == std::path::PathBuf::from("huge.rs")),
+        large.iter().any(|f| f.path == Path::new("huge.rs")),
         "clone-time scan must flag huge.rs: {large:?}"
     );
 }
