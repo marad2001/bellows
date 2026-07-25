@@ -541,10 +541,15 @@ pub fn record_sample(samples: &mut Vec<SampleHash>, hash: SampleHash, window: us
 
 /// Classify a bounded sequence of workspace samples (oldest first).
 ///
-/// **Oscillation** — the same hash appears at least 3 times, with at
-/// least one different hash between two of those occurrences. The
-/// "different hash in between" clause is the whole distinction: a hash
-/// repeated consecutively is a still workspace, not a cycle.
+/// **Oscillation** — within the trailing [`STALL_SAMPLE_WINDOW`]
+/// samples, the same hash appears at least 3 times with at least one
+/// different hash between two of those occurrences. The "different
+/// hash in between" clause is the whole distinction: a hash repeated
+/// consecutively is a still workspace, not a cycle. The scan is capped
+/// at the trailing window even when `samples` is longer (it is, at the
+/// default idleness threshold — see [`stall_window_len`]) so that a
+/// state the window has already scrolled past cannot combine with the
+/// newest one to manufacture a cycle.
 ///
 /// **Idleness** — the last `idleness_samples` samples are all the same
 /// hash. At the default 60-second sampling interval the default
@@ -558,7 +563,7 @@ pub fn record_sample(samples: &mut Vec<SampleHash>, hash: SampleHash, window: us
 ///
 /// Pure over `&[SampleHash]`: no container, no git, no clock.
 pub fn classify_stall(samples: &[SampleHash], idleness_samples: usize) -> Option<Stall> {
-    if has_oscillation(samples) {
+    if has_oscillation(trailing(samples, STALL_SAMPLE_WINDOW)) {
         return Some(Stall::Oscillation);
     }
     if is_idle(samples, idleness_samples) {
@@ -625,6 +630,12 @@ impl StallTracker {
     pub fn idleness_samples(&self) -> usize {
         self.idleness_samples
     }
+}
+
+/// The last `n` samples, or all of them when fewer than `n` have been
+/// recorded.
+fn trailing(samples: &[SampleHash], n: usize) -> &[SampleHash] {
+    &samples[samples.len().saturating_sub(n)..]
 }
 
 /// Whether the trailing `threshold` samples are all identical. A

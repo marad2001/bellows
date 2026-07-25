@@ -126,6 +126,31 @@ fn the_retained_window_is_bounded_and_keeps_the_most_recent_samples() {
 }
 
 #[test]
+fn occurrences_outside_the_trailing_ten_do_not_count_towards_oscillation() {
+    // The retained sequence is `max(10, idleness_samples)` long so
+    // Idleness has enough history, but the oscillation scan is still
+    // "the last 10" (issue #164). Here "a" sits at positions 1, 3 and
+    // 15 of a 15-sample sequence: three occurrences with gaps, but only
+    // *one* of them inside the trailing ten. Counting the stale two
+    // would advance a run on evidence the window has already dropped.
+    let mut seq = samples(&["a", "b", "a"]);
+    seq.extend(samples(&["c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"]));
+    seq.push(SampleHash::new("a"));
+    assert_eq!(seq.len(), stall_window_len(DEFAULT_IDLENESS_SAMPLES));
+    assert_eq!(classify_stall(&seq, DEFAULT_IDLENESS_SAMPLES), None);
+
+    // Pull the third occurrence inside the trailing ten and it is an
+    // Oscillation again — the limit is the window, not the shape.
+    let inside = samples(&[
+        "x", "y", "z", "w", "v", "a", "b", "a", "c", "d", "e", "f", "g", "h", "a",
+    ]);
+    assert_eq!(
+        classify_stall(&inside, DEFAULT_IDLENESS_SAMPLES),
+        Some(Stall::Oscillation),
+    );
+}
+
+#[test]
 fn an_empty_or_single_sample_sequence_is_not_a_stall() {
     // The first sample of a run must never look like a stall.
     assert_eq!(classify_stall(&[], 15), None);
