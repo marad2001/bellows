@@ -227,6 +227,56 @@ line (no per-prompt token cap below what we'd actually inline), and
 the cost of a longer kickoff is paid once per phase — well below
 the cost of drifting operating-context maintained in two places.
 
+### Amendment (issue #169): the skill inlining is phase-scoped
+
+The decision above stands — codex still gets the operating context
+inlined, from the one source of truth, at every phase. What changed
+is *which skills* ride along with it.
+
+The original implementation prepended all three baked skill bodies
+(`tdd`, `diagnose`, `triage`) to every prompt that went through
+`policy::wrap_phase_prompt_for_engine`, at all seven call sites. The
+"cost is paid once per phase" reasoning above turned out to
+understate it: review-fix invokes the agent *once per finding*, so a
+run with eight findings paid for the full skill corpus eight times,
+in front of prompts whose task is "address this one review comment"
+— out of the same `[agent].wall_clock_minutes` budget the run is
+trying to protect. And `triage` was inlined into all seven and
+relevant to none of them: `bellows triage` runs through its own
+subcommand path (`src/triage.rs`) that never calls this wrapper.
+
+`wrap_phase_prompt_for_engine` now takes a `policy::Phase` and
+inlines only the skills that phase can use:
+
+| Phase | Inlined skills |
+| --- | --- |
+| implement | `tdd`, `diagnose` |
+| review | none |
+| review-fix (per-finding and nit-batch) | `tdd` |
+| security-review | none |
+| security-fix | `tdd` |
+| merger | none |
+
+The two non-obvious rows: the fix phases keep `tdd` because
+addressing a finding often means adding or amending a test;
+`diagnose` is implement-only because implement is the phase that
+hits hard bugs and perf regressions with room in the budget to work
+them. `triage` is inlined nowhere, and its `CODEX_INLINED_SKILL_TRIAGE`
+constant was deleted rather than left defined-but-unused.
+
+`CODEX_INLINED_OPERATING_CONTEXT` is still prepended for **every**
+phase: it carries the headless/no-user constraint, the
+workspace-trust language and the large-file `Read` guidance, none of
+which are phase-specific. On a phase that inlines no skills the
+baked-skills section is omitted entirely, and the operating
+context's pointer at where skill bodies live is rewritten to say so
+rather than naming a section that is not there.
+
+The mapping is hard-coded. It is not a config surface until a real
+need for per-repo overrides appears. Claude and OpenCode are
+unaffected — both remain the identity function, for the reasons
+given above and in ADR-0008.
+
 ## Persisted rate-limit state
 
 Engine selection at phase-start consults a persisted state file
