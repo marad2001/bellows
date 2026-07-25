@@ -217,7 +217,9 @@ oscillation_sample_seconds = 60
 # minutes of an hour wastes them, so below this floor the oscillation
 # is logged and the run continues to its existing terminal state. The
 # advance allowance itself is shared with the rate-limit trigger and
-# capped at one per phase invocation. Default: 0.5 (half the budget).
+# capped at one per phase invocation. A fraction between 0.0 and 1.0
+# inclusive — anything else is rejected at config-load time.
+# Default: 0.5 (half the budget).
 advance_budget_floor_fraction = 0.5
 
 [gates]

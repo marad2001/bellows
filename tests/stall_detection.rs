@@ -444,6 +444,53 @@ oscillation_sample_seconds = 0
     );
 }
 
+fn config_with_budget_floor(literal: &str) -> String {
+    format!(
+        r#"
+[repo]
+url = "https://github.com/marad2001/bellows"
+
+[github]
+pat_env_var = "GITHUB_TOKEN"
+
+[agent]
+advance_budget_floor_fraction = {literal}
+"#
+    )
+}
+
+#[test]
+fn the_budget_floor_rejects_values_outside_zero_to_one() {
+    // The floor is a *fraction* of `wall_clock_minutes`. A negative
+    // one reaches `Duration::from_secs_f64` with a negative argument
+    // and panics the runner at the start of the implement phase; a
+    // value above 1 silently disables every actionable oscillation
+    // instead of doing what the operator asked. Both are config
+    // mistakes and belong at config-load time.
+    for literal in ["-0.1", "-1.0", "1.5", "2.0", "nan", "inf", "-inf"] {
+        let err = Config::from_str(&config_with_budget_floor(literal)).expect_err(
+            "advance_budget_floor_fraction must reject values outside 0.0..=1.0",
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("advance_budget_floor_fraction"),
+            "the error must name the offending key; got `{rendered}` for `{literal}`",
+        );
+    }
+}
+
+#[test]
+fn the_budget_floor_accepts_both_endpoints() {
+    // 0.0 (advance right up to the deadline) and 1.0 (never advance on
+    // an oscillation) are both coherent operator choices, so the range
+    // is inclusive at both ends.
+    for (literal, expected) in [("0.0", 0.0), ("1.0", 1.0)] {
+        let config = Config::from_str(&config_with_budget_floor(literal))
+            .unwrap_or_else(|e| panic!("`{literal}` must be accepted: {e}"));
+        assert_eq!(config.agent.advance_budget_floor_fraction, expected);
+    }
+}
+
 // ---------------------------------------------------------------
 // The sampling loop's bookkeeping, without a container.
 // ---------------------------------------------------------------

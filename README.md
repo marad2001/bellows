@@ -129,7 +129,9 @@ Sections of `orchestrator.toml`, all of which are read at startup:
   a fresh engine the tail end of a spent budget wastes it. The advance
   allowance is shared with the rate-limit trigger and capped at one per
   phase invocation, so a run that already advanced for either reason
-  does not advance again.
+  does not advance again. It is a fraction, so it must be between 0.0
+  and 1.0 inclusive; bellows rejects anything else when it loads the
+  config rather than at the start of an implement phase.
 
 ### 2. Export your GitHub PAT
 

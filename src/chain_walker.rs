@@ -647,6 +647,15 @@ fn budget_above_floor(
 ///
 /// `phase_deadline` is the budget remaining as the phase starts;
 /// `None` (budget already spent) yields no window.
+///
+/// `floor_fraction` is expected in `0.0..=1.0` —
+/// [`ConfigError::InvalidBudgetFloorFraction`](crate::config::ConfigError)
+/// rejects anything else at config-load time. Should one reach here
+/// anyway (this is a `pub` entry point), the floor is computed
+/// fallibly rather than with the panicking
+/// `Duration::from_secs_f64`, and an uncomputable floor yields `None`
+/// — the conservative answer, since `None` only ever costs an
+/// advance, never a run.
 pub fn oscillation_kill_window(
     phase_deadline: Option<std::time::Duration>,
     cap: std::time::Duration,
@@ -657,7 +666,7 @@ pub fn oscillation_kill_window(
     if advances_used > 0 || engine_forced {
         return None;
     }
-    let floor = std::time::Duration::from_secs_f64(cap.as_secs_f64() * floor_fraction);
+    let floor = std::time::Duration::try_from_secs_f64(cap.as_secs_f64() * floor_fraction).ok()?;
     phase_deadline?
         .checked_sub(floor)
         .filter(|window| !window.is_zero())
