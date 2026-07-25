@@ -1,10 +1,12 @@
 //! Pins the load-bearing phrases of the stop-signal bullet in the
-//! `## Hard constraints` section of `policy-image/CLAUDE.md`. Per
-//! issue #138, the stop signal must name BOTH `cargo test` AND
-//! `cargo clippy --all-targets --all-features -- -D warnings` green,
-//! with the clippy flag string appearing verbatim so it cannot drift
-//! from the canonical CI invocation (`.github/workflows/ci.yml`) or
-//! the in-sandbox cargo-checks gate (`policy-image/run-cargo-checks`).
+//! `## Hard constraints` section of `policy-image/CLAUDE.md`. The stop
+//! signal must name BOTH `cargo test` AND `cargo clippy` green — but the
+//! clippy scope is NOT hardcoded: the agent is directed to match the
+//! target repo's own CI clippy invocation, which bellows' cargo-checks
+//! gate mirrors (ADR-0004). Hardcoding a verbatim `-D warnings` here
+//! (the pre-fix contract from issue #138) made the agent chase a
+//! baseline of tolerated pedantic warnings on repos that scope clippy
+//! more narrowly (e.g. `-D clippy::correctness -D clippy::suspicious`).
 //!
 //! The existing "don't stop earlier and don't keep going after that
 //! signal is met" framing must be preserved, and the wording must
@@ -48,17 +50,25 @@ fn stop_signal_names_cargo_test_green() {
 }
 
 #[test]
-fn stop_signal_names_cargo_clippy_verbatim() {
-    // AC: the clippy flag string appears verbatim — not paraphrased,
-    // not abbreviated — so it cannot drift from the CI invocation
-    // (`.github/workflows/ci.yml`) and `policy-image/run-cargo-checks`.
+fn stop_signal_directs_agent_to_match_target_ci_clippy_scope() {
+    // AC (harness fix): the clippy stop-signal must NOT hardcode a fixed
+    // flag string. Repos scope clippy differently (e.g.
+    // `-D clippy::correctness -D clippy::suspicious`, tolerating a
+    // baseline of pedantic warnings); the agent must match the target
+    // repo's own CI invocation, which bellows' cargo-checks gate mirrors
+    // (ADR-0004). Pinning a verbatim `-D warnings` here made the agent
+    // chase warnings on repos that tolerate them.
     let body = read_policy_image_claude_md();
     let section = hard_constraints_section(&body);
+    let lower = section.to_lowercase();
     assert!(
-        section.contains("cargo clippy --all-targets --all-features -- -D warnings"),
-        "Stop-signal bullet must name the canonical clippy invocation verbatim \
-         (`cargo clippy --all-targets --all-features -- -D warnings`) so the agent's \
-         local check matches CI and the in-sandbox gate: {section}",
+        lower.contains("cargo clippy"),
+        "Stop-signal bullet must still name `cargo clippy` as a gate: {section}",
+    );
+    assert!(
+        lower.contains(".github/workflows") && lower.contains("target repo's ci"),
+        "Stop-signal bullet must direct the agent to match the TARGET repo's CI clippy \
+         scope (naming `.github/workflows`), not a hardcoded flag string: {section}",
     );
 }
 
