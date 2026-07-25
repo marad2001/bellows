@@ -14,7 +14,7 @@
 //! review-fix, security-review, security-fix).
 
 use bellows::config::Engine;
-use bellows::policy::{render_kickoff_for_engine, wrap_phase_prompt_for_engine};
+use bellows::policy::{render_kickoff_for_engine, wrap_phase_prompt_for_engine, Phase};
 
 #[test]
 fn render_kickoff_for_engine_opencode_matches_claude_body() {
@@ -33,10 +33,16 @@ fn render_kickoff_for_engine_opencode_matches_claude_body() {
 fn wrap_phase_prompt_for_engine_opencode_is_identity() {
     let phase_body =
         "## Phase prompt\n\nDo the thing. Then do the next thing. Then stop.\n";
-    let wrapped = wrap_phase_prompt_for_engine(Engine::Opencode, phase_body);
-    assert_eq!(
-        wrapped, phase_body,
-        "wrap_phase_prompt_for_engine(Opencode, body) must be the identity function \
-         (opencode auto-discovers AGENTS.md from disk, same as claude with CLAUDE.md)",
-    );
+    // Identity for every phase — the issue-#169 phase-scoped skill
+    // inlining is a codex-only change; opencode must not acquire a
+    // per-phase divergence on any branch of the table.
+    for phase in Phase::ALL {
+        let wrapped = wrap_phase_prompt_for_engine(Engine::Opencode, phase, phase_body);
+        assert_eq!(
+            wrapped, phase_body,
+            "wrap_phase_prompt_for_engine(Opencode, {phase:?}, body) must be the identity \
+             function (opencode auto-discovers AGENTS.md from disk, same as claude with \
+             CLAUDE.md)",
+        );
+    }
 }

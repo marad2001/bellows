@@ -1582,6 +1582,7 @@ pub async fn run_once(
             implementer_cli,
             engine_label_override,
             "review",
+            policy::Phase::Review,
             policy::REVIEW_PROMPT,
             true,
             claimed.number,
@@ -1792,6 +1793,7 @@ pub async fn run_once(
                     |engine| {
                         policy::wrap_phase_prompt_for_engine(
                             engine,
+                            policy::Phase::ReviewFix,
                             &policy::per_finding_kickoff(
                                 finding,
                                 policy::REVIEW_DIFF_FILE,
@@ -1918,7 +1920,13 @@ pub async fn run_once(
                     &deploy_keys,
                     &mut budget,
                     log_writer,
-                    |engine| policy::wrap_phase_prompt_for_engine(engine, &nit_kickoff_body),
+                    |engine| {
+                        policy::wrap_phase_prompt_for_engine(
+                            engine,
+                            policy::Phase::ReviewFix,
+                            &nit_kickoff_body,
+                        )
+                    },
                 )
                 .await?;
                 review_fix_elapsed += nit_batch_started_at.elapsed();
@@ -2035,6 +2043,7 @@ pub async fn run_once(
                 implementer_cli,
                 engine_label_override,
                 "security-review",
+                policy::Phase::SecurityReview,
                 policy::SECURITY_REVIEW_PROMPT,
                 false,
                 claimed.number,
@@ -2133,7 +2142,11 @@ pub async fn run_once(
                     &mut budget,
                     log_writer,
                     |engine| {
-                        policy::wrap_phase_prompt_for_engine(engine, policy::SECURITY_FIX_PROMPT)
+                        policy::wrap_phase_prompt_for_engine(
+                            engine,
+                            policy::Phase::SecurityFix,
+                            policy::SECURITY_FIX_PROMPT,
+                        )
                     },
                 )
                 .await?;
@@ -3000,7 +3013,7 @@ fn render_merger_kickoff_for_engine(
     body.push_str("```text\n");
     body.push_str(&merger_gate_summary(end_pipeline_gate));
     body.push_str("```\n");
-    policy::wrap_phase_prompt_for_engine(engine, &body)
+    policy::wrap_phase_prompt_for_engine(engine, policy::Phase::Merger, &body)
 }
 
 fn merger_gate_summary(end_pipeline_gate: &Option<GateOutcome>) -> String {
@@ -3258,6 +3271,7 @@ async fn run_analysis_agent_with_fallback(
     implementer: Option<Engine>,
     forced: Option<Engine>,
     phase_name: &'static str,
+    phase: policy::Phase,
     prompt: &str,
     generate_commit_log: bool,
     issue_number: u64,
@@ -3288,7 +3302,7 @@ async fn run_analysis_agent_with_fallback(
         deploy_keys,
         budget,
         log_writer,
-        |engine| policy::wrap_phase_prompt_for_engine(engine, prompt),
+        |engine| policy::wrap_phase_prompt_for_engine(engine, phase, prompt),
     )
     .await
 }

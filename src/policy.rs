@@ -2009,9 +2009,10 @@ pub fn render_kickoff(brief: &str, repo_url: &str, branch_name: &str) -> String 
 /// Engine-aware kickoff renderer (issue #81 / ADR-0005). For
 /// `Engine::Claude` produces the canonical body the v1 single-engine
 /// path always produced. For `Engine::Codex` prepends the operating-
-/// context body + the bodies of all baked skills (tdd, diagnose,
-/// triage) so codex sees the same operating instructions claude would
-/// auto-discover via `CLAUDE.md` + on-demand file reads.
+/// context body + the bodies of the baked skills the implement phase
+/// can use (`tdd` and `diagnose`, per [`Phase::codex_inlined_skills`])
+/// so codex sees the operating instructions claude would auto-discover
+/// via `CLAUDE.md` + on-demand file reads.
 pub fn render_kickoff_for_engine(
     engine: crate::config::Engine,
     brief: &str,
@@ -2112,26 +2113,104 @@ pub fn render_kickoff_for_engine_with_large_files(
 ) -> String {
     let mut body = base_kickoff_body(brief, repo_url, branch_name);
     body.push_str(&render_large_files_section(large_files));
-    wrap_phase_prompt_for_engine(engine, &body)
+    wrap_phase_prompt_for_engine(engine, Phase::Implement, &body)
+}
+
+/// Which pipeline phase a prompt is being rendered for (issue #169).
+///
+/// Bellows tracks phases as `&'static str` log labels elsewhere
+/// (`"implement"`, `"review-fix"`, …); those are display strings that
+/// several phases share — review-fix's per-finding and nit-batch
+/// invocations both log as `"review-fix"` — so they are not a usable
+/// discriminator. This enum is the typed one, and its only job today is
+/// to select which baked skills get inlined into a Codex prompt.
+///
+/// Deliberately *not* a config surface: the phase→skill mapping is
+/// hard-coded in [`Phase::codex_inlined_skills`] until a real need for
+/// per-repo overrides appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// The implement phase — writes the change, writes the tests.
+    Implement,
+    /// The read-only review phase.
+    Review,
+    /// The review-fix phase, both its per-finding and nit-batch
+    /// invocations.
+    ReviewFix,
+    /// The read-only security-review phase.
+    SecurityReview,
+    /// The security-fix phase.
+    SecurityFix,
+    /// The merger phase.
+    Merger,
+}
+
+impl Phase {
+    /// Every phase value, so tests can assert a contract across the
+    /// whole table rather than a hand-copied subset that drifts when a
+    /// phase is added.
+    pub const ALL: [Phase; 6] = [
+        Phase::Implement,
+        Phase::Review,
+        Phase::ReviewFix,
+        Phase::SecurityReview,
+        Phase::SecurityFix,
+        Phase::Merger,
+    ];
+
+    /// The baked skills inlined into this phase's Codex prompt, as
+    /// `(heading name, body)` pairs (issue #169).
+    ///
+    /// Before #169 this was a constant: all three baked skills went
+    /// into all seven call sites. That is phase-blind. The `tdd` skill
+    /// — whose `policy-image/skills/tdd/` directory also carries
+    /// `deep-modules.md`, `interface-design.md`, `mocking.md`,
+    /// `refactoring.md` and `tests.md` — was prepended to the
+    /// security-review prompt, the merger prompt, and every per-finding
+    /// review-fix invocation, none of which write tests; on a run with
+    /// eight findings that is eight copies of the skill corpus in front
+    /// of prompts whose task is "address this one review comment", paid
+    /// out of the same `[agent].wall_clock_minutes` budget the run is
+    /// trying to protect. The `triage` skill was on all seven and
+    /// relevant to none — `bellows triage` runs through `src/triage.rs`,
+    /// which never calls this wrapper — so it is inlined nowhere.
+    ///
+    /// The two non-obvious rows: review-fix and security-fix keep `tdd`
+    /// because addressing a finding often means adding or amending a
+    /// test; `diagnose` is implement-only because implement is the phase
+    /// that hits hard bugs and perf regressions with room in the budget
+    /// to work them.
+    fn codex_inlined_skills(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Phase::Implement => &[
+                ("tdd", CODEX_INLINED_SKILL_TDD),
+                ("diagnose", CODEX_INLINED_SKILL_DIAGNOSE),
+            ],
+            Phase::ReviewFix | Phase::SecurityFix => &[("tdd", CODEX_INLINED_SKILL_TDD)],
+            Phase::Review | Phase::SecurityReview | Phase::Merger => &[],
+        }
+    }
 }
 
 /// Wrap a phase-specific prompt body in engine-aware operating context.
 /// For `Engine::Claude` this is the identity function — Claude reads
 /// `CLAUDE.md` + the skills directory from disk so the runner doesn't
-/// need to repeat them in every kickoff. For `Engine::Codex` this
-/// prepends the operating-context body + baked skill bodies inline,
+/// need to repeat them in every kickoff. `Engine::Opencode` is the
+/// identity function for the same reason (ADR-0008). For `Engine::Codex`
+/// this prepends the operating-context body + baked skill bodies inline,
 /// because codex does not have an equivalent on-demand discovery
 /// mechanism (per ADR-0005: "the codex path in `policy::render_kickoff`
 /// inlines the operating-context body plus the bodies of all baked
 /// skills directly into the kickoff prompt").
 ///
-/// The same wrapper applies to all agent-invoking phases (implement,
-/// review, review-fix's per-finding + nit-batch invocations, security-
-/// review, security-fix) so codex sees the same operating instructions
-/// at every phase boundary — there is no per-phase divergence in what
-/// the operating context says.
+/// [`CODEX_INLINED_OPERATING_CONTEXT`] is prepended for **every** phase:
+/// it carries the headless/no-user constraint, the workspace-trust
+/// language and the large-file `Read` guidance, all of which every phase
+/// needs. The *skills* are phase-scoped (issue #169) — see
+/// [`Phase::codex_inlined_skills`] for the mapping and its rationale.
 pub fn wrap_phase_prompt_for_engine(
     engine: crate::config::Engine,
+    phase: Phase,
     body: &str,
 ) -> String {
     match engine {
@@ -2148,34 +2227,38 @@ pub fn wrap_phase_prompt_for_engine(
             body.to_string()
         }
         crate::config::Engine::Codex => {
-            // Inline the operating-context body + baked skill bodies.
-            // Claude-specific phrasing in those bodies ("Claude Code
-            // running headless...", "your skills directory") is
-            // neutralised via `neutralise_claude_phrasing_for_codex`
-            // so the codex agent does not receive a kickoff that
-            // calls it "Claude Code" or points it at a skills
-            // directory it does not have. The phase-specific `body`
-            // is *not* neutralised — it is written by bellows for
-            // the agent currently in hand, so any "Claude Code"
-            // reference there is intentional.
+            // Inline the operating-context body + this phase's baked
+            // skill bodies. Claude-specific phrasing in those bodies
+            // ("Claude Code running headless...", "your skills
+            // directory") is neutralised via
+            // `neutralise_claude_phrasing_for_codex` so the codex agent
+            // does not receive a kickoff that calls it "Claude Code" or
+            // points it at a skills directory it does not have. The
+            // phase-specific `body` is *not* neutralised — it is written
+            // by bellows for the agent currently in hand, so any "Claude
+            // Code" reference there is intentional.
+            let skills = phase.codex_inlined_skills();
             let mut prepended = String::new();
             prepended.push_str("# Operating context\n\n");
             prepended.push_str(CODEX_INLINED_OPERATING_CONTEXT);
-            prepended.push_str("\n\n# Baked skills\n\n");
-            prepended.push_str(
-                "The following skill bodies are inlined here because codex does \
-                 not auto-load them from a skills directory. Reach for them \
-                 whenever they apply.\n\n",
-            );
-            prepended.push_str("## Skill: tdd\n\n");
-            prepended.push_str(CODEX_INLINED_SKILL_TDD);
-            prepended.push_str("\n\n## Skill: diagnose\n\n");
-            prepended.push_str(CODEX_INLINED_SKILL_DIAGNOSE);
-            prepended.push_str("\n\n## Skill: triage\n\n");
-            prepended.push_str(CODEX_INLINED_SKILL_TRIAGE);
-            prepended.push_str("\n\n---\n\n");
+            if !skills.is_empty() {
+                prepended.push_str("\n\n# Baked skills\n\n");
+                prepended.push_str(
+                    "The following skill bodies are inlined here because codex does \
+                     not auto-load them from a skills directory. Reach for them \
+                     whenever they apply.\n\n",
+                );
+                for (name, skill_body) in skills {
+                    prepended.push_str(&format!("## Skill: {name}\n\n"));
+                    prepended.push_str(skill_body);
+                    prepended.push_str("\n\n");
+                }
+            } else {
+                prepended.push_str("\n\n");
+            }
+            prepended.push_str("---\n\n");
 
-            let mut out = neutralise_claude_phrasing_for_codex(&prepended);
+            let mut out = neutralise_claude_phrasing_for_codex(&prepended, skills);
             out.push_str(body);
             out
         }
@@ -2256,18 +2339,48 @@ pub const CODEX_INLINED_OPERATING_CONTEXT: &str = include_str!(
 /// rewritten so the codex agent gets a coherent kickoff. Applied to
 /// the operating-context body *and* the baked-skill bodies, since
 /// any of those may have been authored in claude's voice.
-fn neutralise_claude_phrasing_for_codex(claude_flavored: &str) -> String {
+///
+/// `skills` is the exact set this phase inlined (issue #169). The
+/// operating context's `## How to work` section names `tdd` and
+/// `diagnose` by hand and points at where their bodies live; on a
+/// phase that inlines a subset — or none — those sentences advertise
+/// instructions the codex agent does not have and cannot fetch, so
+/// they are rewritten to match the set actually present rather than
+/// merely re-pointed.
+fn neutralise_claude_phrasing_for_codex(
+    claude_flavored: &str,
+    skills: &[(&str, &str)],
+) -> String {
+    let has = |name: &str| skills.iter().any(|(n, _)| *n == name);
+    let (tdd, diagnose) = (has("tdd"), has("diagnose"));
+
+    // The canonical `## How to work` guidance, verbatim from
+    // `policy-image/CLAUDE.md`. Rewritten wholesale rather than
+    // phrase-patched because dropping a skill means dropping a whole
+    // sentence, not re-pointing one clause. If the canonical copy is
+    // reworded these replacements no-op — the rendered-text assertions
+    // in `tests/codex_phase_scoped_skills.rs` fail in that case rather
+    // than letting a stale advertisement ship.
+    let how_to_work = "Use the `tdd` skill that lives in your skills directory. The pattern is red → green → refactor, one behaviour at a time. The `diagnose` skill is also available if you hit a hard bug or perf regression.";
+    let brief_skills = "When the brief mentions a skill, look for it under your skills directory and follow it.";
+
+    let how_to_work_replacement = match (tdd, diagnose) {
+        (true, true) => "Use the `tdd` skill (its body is inlined in the baked-skills section above). The pattern is red → green → refactor, one behaviour at a time. The `diagnose` skill is also available if you hit a hard bug or perf regression — its body is inlined there too.".to_string(),
+        (true, false) => "Use the `tdd` skill (its body is inlined in the baked-skills section above). The pattern is red → green → refactor, one behaviour at a time.".to_string(),
+        (false, true) => "The `diagnose` skill is available if you hit a hard bug or perf regression — its body is inlined in the baked-skills section above.".to_string(),
+        (false, false) => "No skill bodies are inlined for this phase — it does not write code, so there is no test-first workflow to follow. Work from the phase-specific instructions below.".to_string(),
+    };
+    let brief_skills_replacement = if skills.is_empty() {
+        "No skill bodies are inlined for this phase, so a skill the brief names by name is not available to you — follow the phase-specific instructions below instead."
+    } else {
+        "When the brief mentions a skill, look for its body in the baked-skills section above and follow it."
+    };
+
     claude_flavored
         .replace("Claude Code agent", "the agent")
         .replace("Claude Code", "the agent")
-        .replace(
-            "that lives in your skills directory",
-            "(its body is inlined in the baked-skills section above)",
-        )
-        .replace(
-            "look for it under your skills directory",
-            "look for its body in the baked-skills section above",
-        )
+        .replace(how_to_work, &how_to_work_replacement)
+        .replace(brief_skills, brief_skills_replacement)
 }
 
 /// Inlined body of the `tdd` baked skill — per ADR-0005, codex's
@@ -2284,10 +2397,13 @@ pub const CODEX_INLINED_SKILL_DIAGNOSE: &str = include_str!(
     "../policy-image/skills/diagnose/SKILL.md"
 );
 
-/// Inlined body of the `triage` baked skill. Same rationale as above.
-pub const CODEX_INLINED_SKILL_TRIAGE: &str = include_str!(
-    "../policy-image/skills/triage/SKILL.md"
-);
+// There is deliberately no `CODEX_INLINED_SKILL_TRIAGE` (issue #169).
+// The `triage` skill used to be inlined into all seven pipeline call
+// sites and was relevant to none of them: `bellows triage` runs through
+// a separate subcommand path (`src/triage.rs`) that builds its own
+// kickoff and never calls `wrap_phase_prompt_for_engine`. The constant
+// and its `include_str!` were removed rather than left defined-but-
+// unused so the dead path does not linger.
 
 // ---------------------------------------------------------------------
 // Per-run metrics record (issue #168)

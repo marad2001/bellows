@@ -14,7 +14,7 @@ use bellows::auth::Auth;
 use bellows::config::{Config, Engine};
 use bellows::policy::{
     is_auth_error_signature, is_claude_auth_error_signature, is_codex_auth_error_signature,
-    is_rate_limit_signature, render_kickoff_for_engine, wrap_phase_prompt_for_engine,
+    is_rate_limit_signature, render_kickoff_for_engine, wrap_phase_prompt_for_engine, Phase,
 };
 
 // -----------------------------------------------------------------
@@ -161,9 +161,13 @@ fn render_kickoff_for_engine_codex_inlines_operating_context_and_skills() {
         prompt.contains("## Skill: diagnose"),
         "codex kickoff must inline the diagnose skill body",
     );
+    // Issue #169: the `triage` skill is no longer inlined anywhere —
+    // `bellows triage` runs through `src/triage.rs`, which builds its
+    // own kickoff and never calls this wrapper. The full phase→skill
+    // table is pinned in `tests/codex_phase_scoped_skills.rs`.
     assert!(
-        prompt.contains("## Skill: triage"),
-        "codex kickoff must inline the triage skill body",
+        !prompt.contains("## Skill: triage"),
+        "the implement kickoff must not inline the triage skill body",
     );
 }
 
@@ -174,14 +178,14 @@ fn wrap_phase_prompt_for_engine_claude_is_identity() {
     // claude path must be the identity function — claude already
     // reads operating context on-demand.
     let phase_body = "## Inputs\n\nfoo bar baz";
-    let wrapped = wrap_phase_prompt_for_engine(Engine::Claude, phase_body);
+    let wrapped = wrap_phase_prompt_for_engine(Engine::Claude, Phase::Review, phase_body);
     assert_eq!(wrapped, phase_body);
 }
 
 #[test]
 fn wrap_phase_prompt_for_engine_codex_prepends_operating_context() {
     let phase_body = "## Inputs\n\nfoo bar baz";
-    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, phase_body);
+    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, Phase::ReviewFix, phase_body);
     assert!(wrapped.ends_with(phase_body) || wrapped.contains(phase_body));
     assert!(wrapped.contains("# Operating context"));
     assert!(wrapped.contains("# Baked skills"));
@@ -202,7 +206,7 @@ fn wrap_phase_prompt_for_engine_codex_neutralises_claude_specific_phrasing() {
     // doc comment's "Claude-specific phrasing neutralised" promise
     // matches reality.
     let phase_body = "## Phase body\n\nirrelevant";
-    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, phase_body);
+    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, Phase::Implement, phase_body);
     assert!(
         !wrapped.contains("Claude Code"),
         "codex kickoff must not call the agent \"Claude Code\": {wrapped}",
