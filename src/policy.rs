@@ -741,6 +741,50 @@ pub fn is_service_unavailable_signature(text: &str) -> bool {
     SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
+/// Whether `text` carries the signature of a process killed by the
+/// kernel rather than one that ran and reported a verdict (issue #186).
+///
+/// The cargo-checks gate links the target repo's test binaries inside a
+/// container whose memory ceiling is far below a GitHub runner's. When a
+/// link exceeds it, the kernel SIGKILLs `ld` (or `rustc`) and cargo
+/// surfaces exit 101 — indistinguishable, to `gate_failed`, from a
+/// genuine failing test. Witnessed on `workboard-financial-advice`
+/// #46 / #280 / #314: three runs reported `FinalTestsRed` while the
+/// repo's own CI passed the same code (#314's agent measured 1314 lib
+/// tests green).
+///
+/// None of these shapes can be produced by a test that merely failed —
+/// a failing assertion exits non-zero *normally*. So a match means the
+/// gate never reached a verdict on the code, and the runner must retry
+/// with serialised linking rather than blame the diff.
+///
+/// `signal: 7, SIGBUS` is included because the workboard CI workflow
+/// documents `rust-lld` dying that way under the same memory pressure;
+/// like SIGKILL it is a death, not a test result.
+pub fn is_oom_kill_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 5] = [
+        "signal: 9, sigkill",
+        "terminated with signal 9",
+        "signal: 7, sigbus",
+        "terminated with signal 7",
+        "cannot allocate memory",
+    ];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
+/// Whether a *failing* gate failed because a process was killed rather
+/// than because a check reported a verdict (issue #186). Only consults
+/// the output of checks that actually exited non-zero, so an OOM string
+/// quoted in a passing check's output (e.g. a test that asserts on
+/// linker-error handling) cannot trip it.
+pub fn gate_oom_killed(gate: &GateOutcome) -> bool {
+    [&gate.cargo_clippy, &gate.cargo_test]
+        .into_iter()
+        .flatten()
+        .any(|r| r.exit_code != 0 && is_oom_kill_signature(&r.output))
+}
+
 /// Opencode-side rate-limit signature: composite match of
 /// `AI_APICallError` AND `"statusCode":429` on the ANSI-stripped form
 /// of the input (issue #120 / ADR-0008 AC4). Substrings come from the

@@ -1410,19 +1410,22 @@ pub async fn run_once(
         for line in workspace.gate_commands().announcement_lines() {
             announce(log_writer, &line);
         }
+        // Issue #186: the helper owns `budget.mark_killed_if` for both
+        // its attempts, so the timer deliberately spans the first
+        // attempt AND any serialised-link retry — the timeline should
+        // report the gate's true wall-clock cost, not just one attempt.
         let gate_started_at = std::time::Instant::now();
-        let run = sandbox::run_cargo_checks(
+        let run = run_cargo_checks_with_oom_retry(
             &workspace,
             claimed.number,
             &repo_label,
             &repo_slug,
             &ssh_keys_volume,
             &deploy_keys,
+            &mut budget,
             log_writer,
-            budget.deadline_or_halt(),
         )
         .await?;
-        budget.mark_killed_if(run.killed_by_deadline);
         let gate = run.gate;
         // Issue #168: a gate spawns a container but no agent, so it is
         // recorded with null engine/model.
@@ -2205,19 +2208,20 @@ pub async fn run_once(
             for line in workspace.gate_commands().announcement_lines() {
                 announce(log_writer, &line);
             }
+            // Issue #186: as at the post-implement gate, the helper owns
+            // `budget.mark_killed_if` and the timer spans any retry.
             let end_gate_started_at = std::time::Instant::now();
-            let run = sandbox::run_cargo_checks(
+            let run = run_cargo_checks_with_oom_retry(
                 &workspace,
                 claimed.number,
                 &repo_label,
                 &repo_slug,
                 &ssh_keys_volume,
                 &deploy_keys,
+                &mut budget,
                 log_writer,
-                budget.deadline_or_halt(),
             )
             .await?;
-            budget.mark_killed_if(run.killed_by_deadline);
             phase_timeline.record_gate_phase(
                 "end_pipeline_gate",
                 end_gate_started_at.elapsed().as_secs(),
@@ -2743,10 +2747,12 @@ pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
 /// rate-limit, cancel, auth) are NOT a verdict on the code — if a branch
 /// was pushed, this PR's own GitHub CI is the authoritative signal.
 /// `FinalTestsRed` gets the opposite note (Bellows mirrors the repo's CI
-/// per ADR-0004, so it IS the real code signal). `Success` and
-/// `AgentSelfReportedFailure` get nothing — the label already means
+/// per ADR-0004, so it IS the real code signal) — **unless** the gate was
+/// OOM-killed rather than judged (issue #186), in which case the
+/// ADR-0004 claim is false and saying it would actively mislead. `Success`
+/// and `AgentSelfReportedFailure` get nothing — the label already means
 /// exactly what it says.
-fn run_failure_disambiguation(reason: &ExitReason) -> &'static str {
+fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> &'static str {
     match reason {
         ExitReason::Crash
         | ExitReason::WallClockExceeded
@@ -2755,11 +2761,24 @@ fn run_failure_disambiguation(reason: &ExitReason) -> &'static str {
         | ExitReason::Cancelled => {
             "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._"
         }
+        ExitReason::FinalTestsRed if any_gate_oom_killed(outcomes) => {
+            "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._"
+        }
         ExitReason::FinalTestsRed => {
             "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._"
         }
         ExitReason::Success | ExitReason::AgentSelfReportedFailure => "",
     }
+}
+
+/// Whether either cargo-checks gate died to an OOM kill rather than
+/// producing a verdict (issue #186).
+fn any_gate_oom_killed(outcomes: &PhaseOutcomes) -> bool {
+    policy::gate_oom_killed(&outcomes.post_implement_gate)
+        || outcomes
+            .end_pipeline_gate
+            .as_ref()
+            .is_some_and(policy::gate_oom_killed)
 }
 
 fn build_pr_body(
@@ -2818,7 +2837,7 @@ fn build_pr_body(
     // common case is a no-op and there is no whitespace noise.
     header
         + &body
-        + run_failure_disambiguation(reason)
+        + run_failure_disambiguation(reason, outcomes)
         + &workflow_files_changed_callout(workflow_files_changed)
 }
 
@@ -3135,6 +3154,76 @@ pub fn state_file_path_alongside_log(log_path: &std::path::Path) -> std::path::P
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("bellows-state.json"))
         .unwrap_or_else(|| std::path::PathBuf::from("bellows-state.json"))
+}
+
+/// Issue #186: run the cargo-checks gate, retrying once with serialised
+/// linking if the first attempt was OOM-killed rather than judged.
+///
+/// The gate links the target's test binaries in a container whose memory
+/// ceiling is well below a GitHub runner's; when a link is SIGKILLed,
+/// cargo exits 101 and the gate is indistinguishable from a genuine
+/// failing test. `CARGO_BUILD_JOBS=1` serialises the links so the retry
+/// fits in memory and the gate reaches a real verdict — the difference
+/// between a lost run and a run that continues into review.
+///
+/// The retry's env wins over anything mirrored from the target's CI
+/// (#180), so a repo that sets its own `CARGO_BUILD_JOBS` cannot undo it.
+#[allow(clippy::too_many_arguments)]
+async fn run_cargo_checks_with_oom_retry(
+    workspace: &workspace::Workspace,
+    issue_number: u64,
+    repo_label: &str,
+    repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
+    budget: &mut WallClockBudget,
+    log_writer: &mut dyn Write,
+) -> Result<sandbox::CargoChecksRun, RunError> {
+    let run = sandbox::run_cargo_checks(
+        workspace,
+        issue_number,
+        repo_label,
+        repo_slug,
+        ssh_keys_volume,
+        deploy_keys,
+        log_writer,
+        budget.deadline_or_halt(),
+        &[],
+    )
+    .await?;
+    budget.mark_killed_if(run.killed_by_deadline);
+    if run.killed_by_deadline || budget.exceeded || !policy::gate_oom_killed(&run.gate) {
+        return Ok(run);
+    }
+    announce(
+        log_writer,
+        "bellows: cargo gate was OOM-killed while linking (not a test failure); retrying once with CARGO_BUILD_JOBS=1 to serialise the links (issue #186)",
+    );
+    let retry = sandbox::run_cargo_checks(
+        workspace,
+        issue_number,
+        repo_label,
+        repo_slug,
+        ssh_keys_volume,
+        deploy_keys,
+        log_writer,
+        budget.deadline_or_halt(),
+        &[("CARGO_BUILD_JOBS".to_string(), "1".to_string())],
+    )
+    .await?;
+    budget.mark_killed_if(retry.killed_by_deadline);
+    if policy::gate_oom_killed(&retry.gate) {
+        announce(
+            log_writer,
+            "bellows: cargo gate was OOM-killed again even with serialised linking; the code was never judged — treating as an infrastructure failure, not a verdict on the diff",
+        );
+    } else {
+        announce(
+            log_writer,
+            "bellows: serialised-link retry reached a real verdict; continuing on the retry's result",
+        );
+    }
+    Ok(retry)
 }
 
 /// In-phase fallback decision for one completed agent run (issue #174).
@@ -5425,6 +5514,81 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 "{surface}: must name release.yaml; got:\n{body}",
             );
         }
+    }
+
+    // ---- Issue #186: OOM-killed gate is not a code verdict ----
+
+    fn gate_with_test(exit_code: i64, output: &str) -> policy::GateOutcome {
+        policy::GateOutcome {
+            cargo_clippy: Some(policy::CheckResult {
+                exit_code: 0,
+                output: String::new(),
+            }),
+            cargo_test: Some(policy::CheckResult {
+                exit_code,
+                output: output.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn pr_body_does_not_claim_ci_agreement_when_the_gate_was_oom_killed() {
+        // The #186 bug: FA #314 / PR #650 shipped a body asserting
+        // "this is the same failure GitHub CI would report on the code"
+        // for a gate that was SIGKILLed while linking — CI passed the
+        // same diff (1314 tests green). The one line meant to tell an
+        // operator "this IS the code" must not lie precisely when the
+        // gate broke rather than the code.
+        let outcomes = PhaseOutcomes {
+            post_implement_gate: gate_with_test(
+                101,
+                "collect2: fatal error: ld terminated with signal 9 [Killed]",
+            ),
+            ..PhaseOutcomes::default()
+        };
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 314, None, None, &[], &outcomes);
+        assert!(
+            !body.contains("mirrors this repo's CI"),
+            "must not claim CI agreement for an OOM-killed gate: {body}",
+        );
+        assert!(
+            body.contains("not a code failure"),
+            "must say plainly it is not a code failure: {body}",
+        );
+        assert!(
+            body.contains("out of memory"),
+            "must name the actual cause: {body}",
+        );
+    }
+
+    #[test]
+    fn pr_body_keeps_the_adr_0004_claim_for_a_genuinely_failing_test() {
+        // No-regression: a real failing test still gets the original
+        // wording, because there the claim is true.
+        let outcomes = PhaseOutcomes {
+            post_implement_gate: gate_with_test(
+                101,
+                "test result: FAILED. 1 failed; 1313 passed",
+            ),
+            ..PhaseOutcomes::default()
+        };
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &outcomes);
+        assert!(
+            body.contains("mirrors this repo's CI"),
+            "a real test failure IS the code signal: {body}",
+        );
+        assert!(!body.contains("not a code failure"));
+    }
+
+    #[test]
+    fn oom_detection_also_covers_the_end_pipeline_gate() {
+        let outcomes = PhaseOutcomes {
+            end_pipeline_gate: Some(gate_with_test(101, "(signal: 9, SIGKILL: kill)")),
+            ..PhaseOutcomes::default()
+        };
+        assert!(any_gate_oom_killed(&outcomes));
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &outcomes);
+        assert!(!body.contains("mirrors this repo's CI"), "{body}");
     }
 
     // ---- Issue #174: in-phase engine fallback classification ----

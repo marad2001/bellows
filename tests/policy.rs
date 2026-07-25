@@ -2843,3 +2843,93 @@ fn malicious_large_file_paths_cannot_break_out_of_the_list_item() {
         "sanitised path must retain its visible text inertly: {bullet:?}"
     );
 }
+
+// ---- Issue #186: an OOM-killed gate is not a code verdict ----
+
+#[test]
+fn is_oom_kill_signature_matches_the_shapes_seen_on_workboard_financial_advice() {
+    // Verbatim from FA PR #650's gate output — rustc reporting its
+    // child SIGKILLed, and collect2 reporting the same for ld.
+    assert!(bellows::policy::is_oom_kill_signature(
+        "process didn't exit successfully: `rustc --crate-name x ...` (signal: 9, SIGKILL: kill)"
+    ));
+    assert!(bellows::policy::is_oom_kill_signature(
+        "= note: collect2: fatal error: ld terminated with signal 9 [Killed]"
+    ));
+    // The workboard CI workflow documents rust-lld dying with signal 7
+    // under the same memory pressure; also a death, not a test result.
+    assert!(bellows::policy::is_oom_kill_signature(
+        "rust-lld: error: (signal: 7, SIGBUS: access to undefined memory)"
+    ));
+    assert!(bellows::policy::is_oom_kill_signature(
+        "ld: fatal error: cannot allocate memory"
+    ));
+}
+
+#[test]
+fn is_oom_kill_signature_does_not_match_an_ordinary_failing_test() {
+    // A failing assertion exits non-zero NORMALLY. Misreading one of
+    // these as an OOM would make bellows retry (and then excuse) a
+    // genuine code failure — the inverse of the #186 bug.
+    assert!(!bellows::policy::is_oom_kill_signature(
+        "test tests::adds_both_variant ... FAILED\n\ntest result: FAILED. 1 failed; 1313 passed"
+    ));
+    assert!(!bellows::policy::is_oom_kill_signature(
+        "thread 'main' panicked at src/lib.rs:10: assertion `left == right` failed"
+    ));
+    assert!(!bellows::policy::is_oom_kill_signature(
+        "error[E0308]: mismatched types"
+    ));
+    // Prose mentioning a signal number must not trip it either.
+    assert!(!bellows::policy::is_oom_kill_signature(
+        "the handler ignores signal 9 by design; see docs/signals.md"
+    ));
+}
+
+#[test]
+fn gate_oom_killed_only_consults_checks_that_actually_failed() {
+    // A PASSING check whose output quotes an OOM string (e.g. a test
+    // asserting on linker-error handling) must not mark the gate as
+    // OOM-killed — otherwise a green gate could be excused as
+    // infrastructure.
+    let passing_but_quotes_oom = GateOutcome {
+        cargo_clippy: Some(CheckResult {
+            exit_code: 0,
+            output: "ld terminated with signal 9 [Killed]".to_string(),
+        }),
+        cargo_test: Some(CheckResult {
+            exit_code: 0,
+            output: "test result: ok. 1314 passed".to_string(),
+        }),
+    };
+    assert!(
+        !bellows::policy::gate_oom_killed(&passing_but_quotes_oom),
+        "a passing gate must never be classified as OOM-killed",
+    );
+
+    // The real FA shape: clippy passed, test exited 101 with the kill.
+    let fa_shape = GateOutcome {
+        cargo_clippy: Some(CheckResult {
+            exit_code: 0,
+            output: "no warnings".to_string(),
+        }),
+        cargo_test: Some(CheckResult {
+            exit_code: 101,
+            output: "collect2: fatal error: ld terminated with signal 9 [Killed]".to_string(),
+        }),
+    };
+    assert!(bellows::policy::gate_oom_killed(&fa_shape));
+
+    // A genuinely failing test is NOT an OOM.
+    let real_failure = GateOutcome {
+        cargo_clippy: Some(CheckResult {
+            exit_code: 0,
+            output: String::new(),
+        }),
+        cargo_test: Some(CheckResult {
+            exit_code: 101,
+            output: "test result: FAILED. 1 failed; 1313 passed".to_string(),
+        }),
+    };
+    assert!(!bellows::policy::gate_oom_killed(&real_failure));
+}
