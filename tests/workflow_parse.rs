@@ -494,4 +494,122 @@ fn extracted_commands_default_carries_fallback_provenance() {
     assert_eq!(extracted.clippy, None);
     assert_eq!(extracted.test, None);
     assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
+    assert!(extracted.clippy_env.is_empty());
+    assert!(extracted.test_env.is_empty());
+}
+
+#[test]
+fn mirrors_the_build_env_each_command_runs_under_in_ci() {
+    // Issue #180 end-to-end, reproducing the workflow shape that
+    // false-failed workboard-financial-advice #46/#280: sibling
+    // `test:` / `clippy:` jobs whose steps each set the documented
+    // linker-OOM guard. Mirroring the command but NOT this env made the
+    // gate link test binaries with full debuginfo, get OOM-killed
+    // (`ld terminated with signal 9`), and report FinalTestsRed on code
+    // the repo's own CI passes.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up SSH for private cargo git deps
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.WORKBOARD_CORE_DEPLOY_KEY }}
+      - name: cargo test
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: cargo test --locked --workspace --lib --bins --tests --all-features
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo clippy
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious
+"#,
+    );
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(
+        extracted.test.as_deref(),
+        Some("cargo test --locked --workspace --lib --bins --tests --all-features"),
+    );
+    assert_eq!(
+        extracted.test_env,
+        vec![
+            (
+                "CARGO_NET_GIT_FETCH_WITH_CLI".to_string(),
+                "true".to_string()
+            ),
+            ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
+        ],
+        "the test step's linker-OOM guard must be mirrored into the gate",
+    );
+    assert_eq!(
+        extracted.clippy_env,
+        vec![
+            (
+                "CARGO_NET_GIT_FETCH_WITH_CLI".to_string(),
+                "true".to_string()
+            ),
+            ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
+        ],
+        "clippy's own step env is mirrored independently of the test job's",
+    );
+}
+
+#[test]
+fn never_mirrors_secret_bearing_env_into_the_gate() {
+    // Security contract for #180: the gate reproduces CI's build
+    // posture, never its credentials. The env allowlist is the only
+    // reason a token cannot reach the sandbox, so pin it end-to-end.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+env:
+  GITHUB_TOKEN: hunter2
+  AWS_SECRET_ACCESS_KEY: hunter2
+  WORKBOARD_CORE_DEPLOY_KEY: hunter2
+  CARGO_PROFILE_TEST_DEBUG: "0"
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ${{ secrets.SNEAKY }}
+    steps:
+      - run: cargo test --all-features
+"#,
+    );
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(
+        extracted.test_env,
+        vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
+        "only allowlisted, resolvable build env may be mirrored; got {:?}",
+        extracted.test_env,
+    );
+    for (name, value) in &extracted.test_env {
+        assert!(
+            !value.contains("hunter2"),
+            "secret value leaked via {name}",
+        );
+        assert!(
+            !value.contains("${{"),
+            "unresolved GitHub expression leaked via {name}",
+        );
+    }
 }

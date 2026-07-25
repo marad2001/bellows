@@ -65,8 +65,17 @@ pub struct GateCommands {
     /// prefix. Bellows hands this to the sandbox container verbatim.
     pub clippy: String,
     pub clippy_source: Provenance,
+    /// Build-relevant env the target's CI ran clippy under, mirrored
+    /// into the gate (issue #180). Empty when the command came from the
+    /// `[gates]` fallback — an operator-declared flag set carries no CI
+    /// environment to mirror.
+    pub clippy_env: Vec<(String, String)>,
     pub test: String,
     pub test_source: Provenance,
+    /// Build-relevant env the target's CI ran tests under. See
+    /// `clippy_env`; kept per-command because a repo can split clippy
+    /// and test into sibling jobs with differing env blocks.
+    pub test_env: Vec<(String, String)>,
 }
 
 impl GateCommands {
@@ -81,8 +90,10 @@ impl GateCommands {
     ///   `  <check>: <command>  [<provenance>]`
     /// where `<provenance>` is either `parsed from <path>` or
     /// `fallback from [gates].<knob>` so the source is unambiguous.
+    /// Any mirrored env is announced on its own trailing line so the
+    /// first two lines keep their historical shape (issue #180).
     pub fn announcement_lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             format!(
                 "  clippy: {}  [{}]",
                 self.clippy,
@@ -93,7 +104,22 @@ impl GateCommands {
                 self.test,
                 format_provenance(&self.test_source, "[gates].test_flags"),
             ),
-        ]
+        ];
+        for (label, env) in [
+            ("clippy", &self.clippy_env),
+            ("test", &self.test_env),
+        ] {
+            if env.is_empty() {
+                continue;
+            }
+            let rendered = env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!("  {label} env: {rendered}  [mirrored from CI]"));
+        }
+        lines
     }
 }
 
@@ -200,26 +226,34 @@ pub async fn prepare_with_gates(
 /// back to `cargo <subcommand> <flags>` from `gates`. The provenance
 /// is reported per command so the run-log line attributes each gate
 /// invocation to its actual source.
+/// Issue #180: mirrored env travels with a *parsed* command only. A
+/// command that fell back to `[gates].*_flags` is bellows's own posture,
+/// not CI's, so pairing it with CI's environment would mirror half of
+/// each and could produce a build posture neither side ever ran.
 fn materialise_gate_commands(extracted: ExtractedCommands, gates: &GatesConfig) -> GateCommands {
-    let (clippy, clippy_source) = match extracted.clippy {
-        Some(cmd) => (cmd, extracted.source.clone()),
+    let (clippy, clippy_source, clippy_env) = match extracted.clippy {
+        Some(cmd) => (cmd, extracted.source.clone(), extracted.clippy_env),
         None => (
             format!("cargo clippy {}", gates.clippy_flags),
             Provenance::FallbackFromConfig,
+            Vec::new(),
         ),
     };
-    let (test, test_source) = match extracted.test {
-        Some(cmd) => (cmd, extracted.source),
+    let (test, test_source, test_env) = match extracted.test {
+        Some(cmd) => (cmd, extracted.source, extracted.test_env),
         None => (
             format!("cargo test {}", gates.test_flags),
             Provenance::FallbackFromConfig,
+            Vec::new(),
         ),
     };
     GateCommands {
         clippy,
         clippy_source,
+        clippy_env,
         test,
         test_source,
+        test_env,
     }
 }
 
