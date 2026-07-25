@@ -1791,7 +1791,70 @@ pub fn render_kickoff_for_engine(
     repo_url: &str,
     branch_name: &str,
 ) -> String {
-    let body = base_kickoff_body(brief, repo_url, branch_name);
+    render_kickoff_for_engine_with_large_files(engine, brief, repo_url, branch_name, &[])
+}
+
+/// Cap on the number of large files rendered inline in the kickoff
+/// section. When more than this many files match, the section lists the
+/// [`LARGE_FILES_SECTION_CAP`] largest and appends an explicit
+/// `… and N more files over ~20k tokens` line rather than silently
+/// truncating — the operator (and the agent) can see the listing was
+/// bounded.
+pub const LARGE_FILES_SECTION_CAP: usize = 40;
+
+/// Render the `## Large files in this repo` kickoff section for the
+/// given pre-scan result (issue #161). Returns an empty `String` for an
+/// empty slice, so a clone with no over-large files produces a kickoff
+/// byte-identical to today's output — no empty heading.
+///
+/// The `files` slice is expected pre-sorted by
+/// [`crate::large_files::scan_large_files`] (descending by size, ties
+/// broken by path); this renderer preserves that order and caps the
+/// listing at [`LARGE_FILES_SECTION_CAP`] entries.
+pub fn render_large_files_section(files: &[crate::large_files::LargeFile]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\n## Large files in this repo\n\n");
+    out.push_str(
+        "This specific clone contains files whose estimated token count exceeds ~20k, over the `Read` tool's cap. \
+         Do NOT read these whole — a headless whole-file `Read` of an over-cap file can crash the run or silently \
+         return only a partial view. For each, use `Grep` to locate the symbols or lines you need, then `Read` with \
+         `offset`/`limit` to pull only those ranges (see `## Reading large files` in the operating context):\n\n",
+    );
+    for file in files.iter().take(LARGE_FILES_SECTION_CAP) {
+        out.push_str(&format!(
+            "- `{}` — ~{} estimated tokens ({} bytes)\n",
+            file.path.display(),
+            file.estimated_tokens,
+            file.bytes,
+        ));
+    }
+    let remaining = files.len().saturating_sub(LARGE_FILES_SECTION_CAP);
+    if remaining > 0 {
+        out.push_str(&format!(
+            "- … and {remaining} more files over ~20k tokens\n"
+        ));
+    }
+    out
+}
+
+/// [`render_kickoff_for_engine`] plus the issue-#161 large-file pre-scan
+/// section. The section is appended to the phase body *before* the
+/// engine wrap, so codex's inlined operating context still precedes it.
+/// An empty `large_files` slice appends nothing, keeping the output
+/// byte-identical to [`render_kickoff_for_engine`] — the delegating
+/// wrapper above relies on exactly that.
+pub fn render_kickoff_for_engine_with_large_files(
+    engine: crate::config::Engine,
+    brief: &str,
+    repo_url: &str,
+    branch_name: &str,
+    large_files: &[crate::large_files::LargeFile],
+) -> String {
+    let mut body = base_kickoff_body(brief, repo_url, branch_name);
+    body.push_str(&render_large_files_section(large_files));
     wrap_phase_prompt_for_engine(engine, &body)
 }
 
