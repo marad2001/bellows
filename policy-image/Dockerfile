@@ -36,7 +36,7 @@ RUN apt-get update \
 # Claude Code CLI, pinned. Bumped deliberately as part of an image
 # rebuild rather than drifting under `@latest` between rebuilds (the
 # previous slice-3.5 TODO).
-ARG CLAUDE_CODE_VERSION=2.1.0
+ARG CLAUDE_CODE_VERSION=2.1.220
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Codex CLI, pinned (issue #79 spike). The Linux musl binary is
