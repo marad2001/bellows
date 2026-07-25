@@ -332,18 +332,31 @@ fn default_blocked_by() -> String {
 pub struct LoggingConfig {
     #[serde(default = "default_logging_path")]
     pub path: PathBuf,
+    /// Issue #168: where the append-only per-run metrics file
+    /// (`runs.jsonl`) lives. One JSON object per finished run, written
+    /// best-effort at finalisation; the rolling prose log at `path`
+    /// stays exactly as it was. Defaults alongside `path` so an
+    /// existing `orchestrator.toml` that predates the key keeps
+    /// parsing untouched.
+    #[serde(default = "default_metrics_path")]
+    pub metrics_path: PathBuf,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             path: default_logging_path(),
+            metrics_path: default_metrics_path(),
         }
     }
 }
 
 fn default_logging_path() -> PathBuf {
     PathBuf::from("bellows.log")
+}
+
+fn default_metrics_path() -> PathBuf {
+    PathBuf::from("runs.jsonl")
 }
 
 /// Top-level `[auth]` block. Per-engine credentials volumes live in

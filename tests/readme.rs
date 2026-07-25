@@ -568,6 +568,50 @@ fn orchestrator_example_documents_phases_merge_posting_toggle() {
 }
 
 #[test]
+fn orchestrator_example_documents_logging_metrics_path() {
+    // Issue #168: the sample config documents `[logging].metrics_path`
+    // in the same commented style as the sibling `path` key, so an
+    // operator skimming the file learns the metrics file exists and
+    // where it lands by default.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("orchestrator.example.toml");
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("orchestrator.example.toml must exist: {}", e));
+    for needle in ["metrics_path", "runs.jsonl", "one JSON object per"] {
+        assert!(
+            body.contains(needle),
+            "orchestrator.example.toml must mention `{needle}` for issue #168: {body}"
+        );
+    }
+}
+
+#[test]
+fn readme_documents_the_per_run_metrics_file_and_its_shape() {
+    // Issue #168: a short subsection under the logging / daily-use
+    // material tells the operator the file exists, that it is
+    // append-only JSON lines, where it defaults to, and which fields
+    // each record carries — the contract a reader (#167) will consume.
+    let body = read_readme();
+    assert_contains_all(
+        &body,
+        &[
+            "runs.jsonl",
+            "[logging].metrics_path",
+            "JSON",
+            "append-only",
+            "exit_reason",
+            "merger_verdict",
+            "wall_clock_seconds",
+            "phases",
+            "schema",
+            // Best-effort: an operator must not read a missing line as
+            // a failed run.
+            "best-effort",
+        ],
+        "per-run metrics file (issue #168)",
+    );
+}
+
+#[test]
 fn orchestrator_example_documents_gates_table_and_fallback_flags() {
     // ADR-0004 acceptance: orchestrator.example.toml documents the
     // new `[gates]` table with explanatory comments. The defaults

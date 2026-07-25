@@ -68,6 +68,13 @@ agent_cancelled   = "agent-cancelled"
 [logging]
 # Single log file path. Default: "bellows.log" in cwd.
 path = "bellows.log"
+# Append-only per-run metrics file: one JSON object per finished run,
+# on one line, appended at finalisation and never rewritten. Carries the
+# engine/model and duration of each phase that ran, the exit
+# classification, and the merger's verdict. Default: "runs.jsonl" in cwd.
+# Writing it is best-effort — a failure warns on the log and leaves the
+# run's outcome untouched.
+metrics_path = "runs.jsonl"
 
 [auth]
 # Auth method for the in-container agent. Only `"subscription"` is

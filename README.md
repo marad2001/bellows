@@ -103,6 +103,9 @@ Sections of `orchestrator.toml`, all of which are read at startup:
 - **`[logging].path`** — where bellows writes its single log file.
   Default `bellows.log` in the current working directory; `tail -f` is
   the intended UX.
+- **`[logging].metrics_path`** — where bellows appends the per-run
+  JSON-lines record. Default `runs.jsonl` alongside the log; see
+  [`runs.jsonl`](#runsjsonl--one-machine-readable-record-per-run).
 - **`[auth]`** — `method = "subscription"` (the only v1 variant) and
   `credentials_volume`, the name of the Docker volume holding the
   Claude Code OAuth session (default `bellows-claude-credentials`).
@@ -432,6 +435,54 @@ watch a long-running run unattended.
 Bellows is foreground by design in v1 — close the terminal and the
 loop stops. The standard pattern is to run it in `tmux` / `screen` /
 `nohup` if you want it to persist while the lid is closed.
+
+### `runs.jsonl` — one machine-readable record per run
+
+The log file is prose, and every run's prose is interleaved with every
+other run's. Alongside it bellows keeps an **append-only** JSON-lines
+file — one object per line, one line per finished run — at
+`[logging].metrics_path` (default `runs.jsonl` in the working
+directory). Existing lines are never rewritten, so the file is safe to
+`tail -f`, `jq`, or load into a spreadsheet mid-run.
+
+A record is appended for **every** terminal outcome — success, failure,
+rate-limit, cancellation — because the failure distribution is the
+interesting part:
+
+```json
+{"schema":1,"issue":168,"repo":"marad2001/bellows","pr":200,
+ "started_at":"2026-07-25T22:04:11Z","finished_at":"2026-07-25T22:41:02Z",
+ "wall_clock_seconds":2211,"exit_reason":"Success","merger_verdict":"MERGE",
+ "draft":false,"outcome_label":"agent-done",
+ "phases":[{"phase":"implement","engine":"claude","model":"opus-4-7","seconds":1401,"exit_code":0},
+           {"phase":"post_implement_gate","engine":null,"model":null,"seconds":122,"exit_code":0},
+           {"phase":"review","engine":"codex","model":"gpt-5.5","seconds":380,"exit_code":0}]}
+```
+
+(Wrapped here for readability — on disk each record is a single line.)
+
+- `schema` — record version, currently `1`. Bumped if a field's meaning
+  changes; new fields may be added without a bump.
+- `exit_reason` — the run's classification verbatim: `Success`,
+  `AgentSelfReportedFailure`, `Crash`, `FinalTestsRed`,
+  `WallClockExceeded`, `RateLimited`, `AuthError`, or `Cancelled`.
+- `merger_verdict` — the phase-8 merger's token (`MERGE`, `HOLD-NOTED`,
+  `HOLD-DRAFT`), or `null` when the merger did not run or wrote nothing
+  parseable.
+- `draft` / `outcome_label` — the PR state and issue label the run
+  landed on, so the file explains itself without a GitHub lookup.
+- `phases` — the phases that actually ran, in execution order. Phases
+  the run never reached are **omitted** rather than listed with
+  placeholder values, so counting rows is a valid way to measure how
+  far runs get. Cargo-gate phases (`post_implement_gate`,
+  `end_pipeline_gate`) run no agent, so their `engine` and `model` are
+  `null`; `wall_clock_seconds` is the whole run, while each phase's
+  `seconds` is that phase's own share.
+
+Writing the record is **best-effort**: if the append fails (permissions,
+full disk) bellows warns on the log and the run finalises exactly as it
+otherwise would. A missing line means the write failed, never that the
+run did.
 
 ### `bellows status` — is bellows busy or idle?
 

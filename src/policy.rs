@@ -25,7 +25,12 @@
 /// kill firing and the cancellation check would otherwise misclassify
 /// as a successful run, producing a ready-for-review PR a reviewer
 /// could plausibly merge).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Issue #168: the variant name is the wire form in the `exit_reason`
+/// field of a `runs.jsonl` record (serde's default representation for a
+/// unit-variant enum), so renaming a variant is a breaking change for
+/// any reader built on that file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExitReason {
     Success,
     AgentSelfReportedFailure,
@@ -864,6 +869,23 @@ pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
     nonzero(&gate.cargo_clippy) || nonzero(&gate.cargo_test)
 }
 
+/// Collapse a gate's two check results into the one exit code the
+/// `runs.jsonl` record carries for the gate phase (issue #168). Clippy
+/// runs first and short-circuits the gate, so its non-zero code is the
+/// one that explains the failure; a green clippy defers to test. Zero
+/// means the gate passed (or, on a `Cargo.toml`-less workspace, that
+/// neither check ran — the phase is omitted from the record in that
+/// case, so the value never surfaces).
+pub fn gate_exit_code(gate: &GateOutcome) -> i64 {
+    let code = |c: &Option<CheckResult>| match c {
+        Some(r) if r.exit_code != 0 => Some(r.exit_code),
+        _ => None,
+    };
+    code(&gate.cargo_clippy)
+        .or_else(|| code(&gate.cargo_test))
+        .unwrap_or(0)
+}
+
 /// Phase 8 merger verdict vocabulary (issue #123 / ADR-0009 slice 1).
 ///
 /// The merger agent emits a natural-language prose review followed by a
@@ -878,10 +900,17 @@ pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
 ///   `bellows-agent-notes.md`; the merger surfaces it for human review.
 /// - `HoldDraft` — the diff does not yet satisfy the brief; the merger
 ///   recommends opening a draft PR so a human can take over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Issue #168: the serde renames pin each variant to its canonical
+/// token, so the `merger_verdict` field of a `runs.jsonl` record carries
+/// exactly the token the agent wrote on its verdict line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MergerVerdict {
+    #[serde(rename = "MERGE")]
     Merge,
+    #[serde(rename = "HOLD-NOTED")]
     HoldNoted,
+    #[serde(rename = "HOLD-DRAFT")]
     HoldDraft,
 }
 
@@ -2259,3 +2288,199 @@ pub const CODEX_INLINED_SKILL_DIAGNOSE: &str = include_str!(
 pub const CODEX_INLINED_SKILL_TRIAGE: &str = include_str!(
     "../policy-image/skills/triage/SKILL.md"
 );
+
+// ---------------------------------------------------------------------
+// Per-run metrics record (issue #168)
+// ---------------------------------------------------------------------
+
+/// Schema version stamped on every `runs.jsonl` record.
+///
+/// A plain integer so a future reader (#167) can migrate. Adding a field
+/// does not bump it — readers are expected to tolerate unknown keys —
+/// but removing, renaming, or changing the meaning of one does.
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 1;
+
+/// One phase's row in a [`RunMetrics`] record.
+///
+/// `engine` / `model` are `Option` because the cargo-checks gates run no
+/// agent at all: they serialise as explicit `null`s rather than being
+/// omitted, so a reader can treat a missing key as a schema problem
+/// rather than as a gate phase. `model` is additionally `None` for an
+/// engine phase whose chain entry carried no model pin (bellows omitted
+/// the CLI's `-m` flag and took the CLI's default).
+///
+/// `seconds` is the phase's own wall-clock, not cumulative; for the
+/// multi-invocation review-fix phase it is the sum across that phase's
+/// invocations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhaseMetrics {
+    pub phase: String,
+    pub engine: Option<String>,
+    pub model: Option<String>,
+    pub seconds: u64,
+    pub exit_code: i64,
+}
+
+/// The phases that actually ran, in execution order.
+///
+/// The runner pushes one entry per phase as the pipeline progresses, so
+/// omission is structural: a phase the run never reached was never
+/// recorded and therefore cannot appear in the record with placeholder
+/// values. The two recording methods keep the engine-vs-gate distinction
+/// out of the call sites' hands — a gate physically cannot be recorded
+/// with an engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseTimeline {
+    entries: Vec<PhaseMetrics>,
+}
+
+impl PhaseTimeline {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a phase served by an agent engine.
+    ///
+    /// `entry` is the chain entry that actually served the phase — which
+    /// may be a later one than the pipeline first picked, since a
+    /// transient outage falls back along the chain mid-phase. `None`
+    /// means no engine ever served the phase (every chain entry was
+    /// cooling, so no container was dispatched): nothing is recorded,
+    /// because a phase that did not run is omitted from the record
+    /// rather than emitted with a placeholder engine.
+    pub fn record_engine_phase(
+        &mut self,
+        phase: &str,
+        entry: Option<&crate::config::ChainEntry>,
+        seconds: u64,
+        exit_code: i64,
+    ) {
+        let Some(entry) = entry else {
+            return;
+        };
+        self.entries.push(PhaseMetrics {
+            phase: phase.to_string(),
+            engine: Some(entry.engine.as_name().to_string()),
+            model: entry.model.clone(),
+            seconds,
+            exit_code,
+        });
+    }
+
+    /// Record a cargo-checks gate phase. Gates spawn a container but no
+    /// agent, so `engine` and `model` are `null`.
+    pub fn record_gate_phase(&mut self, phase: &str, seconds: u64, exit_code: i64) {
+        self.entries.push(PhaseMetrics {
+            phase: phase.to_string(),
+            engine: None,
+            model: None,
+            seconds,
+            exit_code,
+        });
+    }
+
+    pub fn entries(&self) -> &[PhaseMetrics] {
+        &self.entries
+    }
+}
+
+/// One line of `runs.jsonl`: the machine-readable summary of a finished
+/// run (issue #168).
+///
+/// Written for every terminal outcome — success, failure, rate-limit,
+/// cancellation — because the failure distribution is the point. The
+/// field names are the contract for readers (#167); add fields freely,
+/// but a rename is breaking.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunMetrics {
+    pub schema: u32,
+    pub issue: u64,
+    /// `owner/repo`, matching the `bellows-repo` container label.
+    pub repo: String,
+    pub pr: u64,
+    #[serde(serialize_with = "serialize_rfc3339_seconds")]
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(serialize_with = "serialize_rfc3339_seconds")]
+    pub finished_at: chrono::DateTime<chrono::Utc>,
+    /// `finished_at - started_at`, floored at zero so a backwards clock
+    /// step (NTP correction mid-run) cannot produce a negative duration
+    /// in a machine-read field.
+    pub wall_clock_seconds: u64,
+    pub exit_reason: ExitReason,
+    /// The phase-8 merger's parsed token, or `null` when the merger did
+    /// not run or wrote nothing parseable.
+    pub merger_verdict: Option<MergerVerdict>,
+    pub draft: bool,
+    pub outcome_label: String,
+    pub phases: Vec<PhaseMetrics>,
+}
+
+impl RunMetrics {
+    /// Serialise to exactly one line, newline-terminated — the unit the
+    /// append helper writes and a reader consumes.
+    pub fn to_jsonl_line(&self) -> Result<String, serde_json::Error> {
+        // `to_string` (not `to_string_pretty`) is what keeps the record
+        // on one line; any embedded newline in a string field would be
+        // escaped as `\n` by serde, so the one-line invariant holds for
+        // arbitrary field content.
+        Ok(format!("{}\n", serde_json::to_string(self)?))
+    }
+}
+
+/// Timestamps are RFC 3339 / UTC at second resolution. `chrono`'s
+/// default serialiser would emit the sub-second component that
+/// `Utc::now()` carries; a run's start and end are meaningful to the
+/// second at most, and second resolution keeps the line readable.
+fn serialize_rfc3339_seconds<S>(
+    ts: &chrono::DateTime<chrono::Utc>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// Everything [`build_run_metrics`] needs, all of which the runner
+/// already has in hand at finalisation.
+pub struct RunMetricsInput<'a> {
+    pub issue: u64,
+    pub repo: &'a str,
+    pub pr: u64,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: chrono::DateTime<chrono::Utc>,
+    pub exit_reason: &'a ExitReason,
+    pub merger_verdict: Option<MergerVerdict>,
+    pub draft: bool,
+    pub outcome_label: &'a str,
+    pub phases: &'a PhaseTimeline,
+}
+
+/// Build the `runs.jsonl` record for a finished run.
+///
+/// Pure — no clock, no filesystem, no GitHub — so the record's shape is
+/// unit-testable the way `classify_exit` and `render_kickoff` are. The
+/// caller owns the append (see `runner::append_run_metrics`), which is
+/// best-effort and cannot fail the run.
+pub fn build_run_metrics(input: RunMetricsInput<'_>) -> RunMetrics {
+    let wall_clock_seconds = (input.finished_at - input.started_at)
+        .num_seconds()
+        .max(0)
+        // `num_seconds` is i64 and already floored at 0, so the cast is
+        // lossless for any duration a run can plausibly have.
+        .unsigned_abs();
+    RunMetrics {
+        schema: RUN_METRICS_SCHEMA_VERSION,
+        issue: input.issue,
+        repo: input.repo.to_string(),
+        pr: input.pr,
+        started_at: input.started_at,
+        finished_at: input.finished_at,
+        wall_clock_seconds,
+        exit_reason: input.exit_reason.clone(),
+        merger_verdict: input.merger_verdict,
+        draft: input.draft,
+        outcome_label: input.outcome_label.to_string(),
+        phases: input.phases.entries().to_vec(),
+    }
+}
