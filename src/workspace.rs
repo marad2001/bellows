@@ -536,7 +536,7 @@ pub async fn workflow_files_changed_between(
 }
 
 /// Whether the file list touched between `base` and `head` is exactly
-/// `["agent-notes.md"]`. The general-case helper used by the slice-9.6
+/// `["bellows-agent-notes.md"]`. The general-case helper used by the slice-9.6
 /// per-finding loop after PR #38: with the agent free to self-commit
 /// its code fix under its own commit message, looking only at the most
 /// recent commit (as the PR #37 helper did) is not enough — the runner
@@ -545,7 +545,7 @@ pub async fn workflow_files_changed_between(
 /// by either the agent or bellows.
 ///
 /// Returns `Ok(false)` when `base == head` (the empty diff is not
-/// exactly `["agent-notes.md"]`). The runner short-circuits before
+/// exactly `["bellows-agent-notes.md"]`). The runner short-circuits before
 /// reaching this helper on the no-advancement path anyway; the
 /// `Ok(false)` contract is defensive consistency.
 pub async fn diff_between_touches_only_agent_notes(
@@ -573,7 +573,7 @@ pub async fn diff_between_touches_only_agent_notes(
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    Ok(files.len() == 1 && files[0] == "agent-notes.md")
+    Ok(files.len() == 1 && files[0] == "bellows-agent-notes.md")
 }
 
 /// Capture `git diff <default_branch>...HEAD` and write it to

@@ -2,7 +2,7 @@
 //!
 //! ADR-0006 is expected to guide a later classifier change. These
 //! assertions pin the part of the design that prevents agent-writable
-//! `agent-notes.md` text from becoming trusted provenance.
+//! `bellows-agent-notes.md` text from becoming trusted provenance.
 
 use std::fs;
 use std::path::PathBuf;

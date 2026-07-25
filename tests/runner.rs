@@ -490,7 +490,7 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
     );
 }
 
-// ---- Issue #85: agent-notes.md must be ephemeral to the pipeline run.
+// ---- Issue #85: bellows-agent-notes.md must be ephemeral to the pipeline run.
 //      The file should NOT appear on the agent branch's pushed end-state
 //      (so squash-merge to master can never inherit stale notes), and
 //      its content should be surfaced via a PR comment so the operator
@@ -498,13 +498,13 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
 
 #[tokio::test]
 async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_tree() {
-    // Issue #85 AC #5: pipeline run with the agent writing `agent-notes.md`
+    // Issue #85 AC #5: pipeline run with the agent writing `bellows-agent-notes.md`
     // produces (a) a PR comment containing the content AND (b) a final push
     // that does not include the file in its tree.
     //
     // Drives both helpers end-to-end against a real git workspace + wiremock
     // GitHub: simulate an intermediate phase that commits + pushes
-    // `agent-notes.md` as part of normal phase work, then run the finalise
+    // `bellows-agent-notes.md` as part of normal phase work, then run the finalise
     // helpers (capture+remove the file, push the deletion, post the PR
     // comment) and assert both outcomes on the remote (tree clean) and on
     // wiremock (POST received with the content embedded).
@@ -525,12 +525,12 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         .await
         .expect("workspace::prepare should succeed");
 
-    // Simulate an intermediate pipeline phase: agent writes agent-notes.md,
+    // Simulate an intermediate pipeline phase: agent writes bellows-agent-notes.md,
     // bellows's per-phase commit_all+push commits it onto the agent branch.
     // After this, the remote's tree for agent/77-ephemeral-notes contains
     // the file — this is exactly the leak the slice fixes.
     tokio::fs::write(
-        workspace.path().join("agent-notes.md"),
+        workspace.path().join("bellows-agent-notes.md"),
         "stuck on the brief: refactor scope unclear\n",
     )
     .await
@@ -542,7 +542,7 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         .await
         .expect("intermediate push should succeed");
 
-    // Sanity: the remote currently has agent-notes.md in the agent branch's
+    // Sanity: the remote currently has bellows-agent-notes.md in the agent branch's
     // tree (this is the pre-fix leak state).
     let pre_tree = Command::new("git")
         .args(["ls-tree", "--name-only", "agent/77-ephemeral-notes"])
@@ -551,7 +551,7 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         .unwrap();
     let pre_tree_str = String::from_utf8(pre_tree.stdout).unwrap();
     assert!(
-        pre_tree_str.contains("agent-notes.md"),
+        pre_tree_str.contains("bellows-agent-notes.md"),
         "test precondition: pre-finalise pushed tree should still contain the file (pre-fix leak state); got: {pre_tree_str}",
     );
 
@@ -566,7 +566,7 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         "captured content should preserve the raw file body for byte-span provenance",
     );
     assert!(
-        !workspace.path().join("agent-notes.md").exists(),
+        !workspace.path().join("bellows-agent-notes.md").exists(),
         "the file must be removed from the workspace after capture",
     );
 
@@ -597,8 +597,8 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
         .unwrap();
     let post_tree_str = String::from_utf8(post_tree.stdout).unwrap();
     assert!(
-        !post_tree_str.contains("agent-notes.md"),
-        "agent branch's pushed tree must not contain agent-notes.md after finalise; got: {post_tree_str}",
+        !post_tree_str.contains("bellows-agent-notes.md"),
+        "agent branch's pushed tree must not contain bellows-agent-notes.md after finalise; got: {post_tree_str}",
     );
     // mock.verify() at scope-drop enforces expect(1) on the comments POST —
     // AC #2: the captured content was surfaced as a PR comment.
@@ -607,7 +607,7 @@ async fn agent_notes_when_present_post_pr_comment_and_do_not_persist_in_pushed_t
 #[tokio::test]
 async fn no_agent_notes_means_no_pr_comment_is_posted() {
     // Issue #85 AC #6: a bellows pipeline run where the agent does NOT write
-    // `agent-notes.md` continues to work unchanged — no spurious
+    // `bellows-agent-notes.md` continues to work unchanged — no spurious
     // agent-notes-related PR comment.
     //
     // `expect(0)` on the comments endpoint pins the contract: if the helper
