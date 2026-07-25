@@ -8,10 +8,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bellows::config::GatesConfig;
 use bellows::workflow_parse::Provenance;
+use bellows::large_files::LargeFile;
 use bellows::workspace::{
     commit_all, commit_all_and_push_if_advanced, commit_to_branch, compute_diff_against_base,
-    diff_between_touches_only_agent_notes, generate_commit_log, head_sha, open_pr, prepare,
-    prepare_with_gates, push_branch, workflow_files_changed_between, OpenPrRequest,
+    diff_between_touches_only_agent_notes, generate_commit_log, head_sha, large_files_announcement,
+    open_pr, prepare, prepare_with_gates, push_branch, workflow_files_changed_between,
+    OpenPrRequest,
 };
 
 fn init_remote_repo(path: &Path) {
@@ -1658,4 +1660,70 @@ async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_conf
     assert_eq!(gc.test, "cargo test --all-targets --all-features");
     assert!(matches!(gc.clippy_source, Provenance::FallbackFromConfig));
     assert!(matches!(gc.test_source, Provenance::FallbackFromConfig));
+}
+
+// ---- Issue #161: large-file pre-scan snapshot + announcement ----
+
+#[test]
+fn large_files_announcement_reports_the_count_when_files_are_found() {
+    // AC7: the announcement line shape for the "N large files found"
+    // case — a single operator-visible run-log line stating how many
+    // files the scan flagged.
+    let files = vec![
+        LargeFile {
+            path: std::path::PathBuf::from("src/runner.rs"),
+            bytes: 400_000,
+            estimated_tokens: 100_000,
+        },
+        LargeFile {
+            path: std::path::PathBuf::from("src/policy.rs"),
+            bytes: 320_000,
+            estimated_tokens: 80_000,
+        },
+    ];
+    let line = large_files_announcement(&files);
+    assert!(line.contains('2'), "must state the count: {line}");
+    assert!(
+        line.to_lowercase().contains("large"),
+        "must identify itself as the large-file pre-scan: {line}"
+    );
+}
+
+#[test]
+fn large_files_announcement_reports_none_when_the_clone_is_clean() {
+    // AC7: the announcement line shape for the "none found" case — the
+    // operator still gets exactly one line, stating nothing was flagged.
+    let line = large_files_announcement(&[]);
+    assert!(
+        line.to_lowercase().contains("large"),
+        "must identify itself as the large-file pre-scan: {line}"
+    );
+    assert!(
+        line.to_lowercase().contains("no") || line.to_lowercase().contains("none"),
+        "must state that no files were flagged: {line}"
+    );
+    // A single line — no embedded newline that would split the log.
+    assert!(!line.contains('\n'), "announcement must be a single line: {line}");
+}
+
+#[tokio::test]
+async fn prepare_snapshots_the_large_files_scan_on_the_workspace() {
+    // AC (key interface): the scan is snapshotted on Workspace at clone
+    // time and exposed via large_files(), so an over-large file present
+    // in the clone is surfaced to the runner.
+    let remote_dir = TempDir::new().unwrap();
+    init_remote_repo(remote_dir.path());
+    // A file estimated well over the 20k-token threshold (>80_000 bytes).
+    std::fs::write(remote_dir.path().join("huge.rs"), "a".repeat(120_000)).unwrap();
+    run_git(remote_dir.path(), &["add", "."]);
+    run_git(remote_dir.path(), &["commit", "-m", "add huge file"]);
+
+    let remote_url = remote_dir.path().to_string_lossy().to_string();
+    let workspace = prepare(&remote_url, "agent/161-scan").await.unwrap();
+
+    let large = workspace.large_files();
+    assert!(
+        large.iter().any(|f| f.path == Path::new("huge.rs")),
+        "clone-time scan must flag huge.rs: {large:?}"
+    );
 }

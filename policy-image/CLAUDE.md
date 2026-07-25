@@ -30,6 +30,7 @@ Real repos contain large source files (tens of thousands of tokens). The `Read` 
 - Use `Grep` to locate the symbols, functions, or lines you need, then `Read` with `offset`/`limit` to pull only those ranges.
 - If a `Read` returns a max-token error, do **not** retry the same whole-file read — switch to `Grep` + ranged `Read`.
 - Only read a whole file when you already know it is small.
+- When the implement kickoff carries a `## Large files in this repo` section, it already names the specific over-cap files in this clone — treat that list as the concrete application of this guidance and `Grep` those files rather than reading them whole.
 
 ## What Bellows does after you exit
 

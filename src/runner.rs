@@ -955,6 +955,14 @@ pub async fn run_once(
         log_writer,
         "bellows: phase 1/8 — implement (running agent in sandbox container, this is the long one)",
     );
+    // Issue #161: announce what the clone-time large-file pre-scan found
+    // once, before the (possibly re-rendering) implement loop. The list
+    // is snapshotted on the workspace, so a single line here reflects
+    // every iteration's kickoff.
+    announce(
+        log_writer,
+        &workspace::large_files_announcement(workspace.large_files()),
+    );
     let head_before_implement = workspace::head_sha(&workspace).await?;
     let mut implement_advances_used: u8 = 0;
     let mut rate_limited_phase: Option<&'static str> = None;
@@ -1020,11 +1028,12 @@ pub async fn run_once(
         // Render kickoff for this engine. Each iteration re-renders so
         // an in-place advance to a different engine sees the
         // engine-specific kickoff body.
-        let kickoff = policy::render_kickoff_for_engine(
+        let kickoff = policy::render_kickoff_for_engine_with_large_files(
             picked.entry.engine,
             &brief,
             &repo_url,
             &branch_name,
+            workspace.large_files(),
         );
         tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff).await?;
 
