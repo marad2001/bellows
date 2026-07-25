@@ -47,3 +47,18 @@ into pure functions that are tested — `classify_stall`, `StallTracker`,
 `oscillation_kill_window`, `decide_oscillation_advance_action`, the
 sampler against a real git repo — so what remains untested is the
 plumbing between them, not any judgement.
+
+**Security fixes: why the sampler got a whole isolated git dir.** The
+security review asked for `git diff --no-ext-diff --no-textconv HEAD`
+plus `-c` overrides. I checked each vector against real git (2.47) and
+those flags are not sufficient: they close `diff.external`,
+`diff.<driver>.command` and `.textconv`, and `-c core.fsmonitor=false`
+closes fsmonitor, but *any* command that compares worktree content
+against the index still runs the clean filter named by
+`.git/info/attributes` — which the agent can write, and which
+`GIT_ATTR_SOURCE`/`core.attributesFile` overrides do not reach. There
+is no supported way to make git ignore a repository's own
+`.git/config`, so the only complete answer was the review's other
+option: an isolated environment. The sampler now reads the worktree
+through a bellows-owned scratch git dir that borrows the workspace's
+object store via `objects/info/alternates` and nothing else.
