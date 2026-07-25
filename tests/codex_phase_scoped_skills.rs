@@ -224,6 +224,93 @@ fn codex_skill_free_phases_do_not_point_at_a_missing_baked_skills_section() {
     );
 }
 
+/// The exact sentences the operating context's `## How to work`
+/// section can render as. Pinned as constants so a regression that
+/// leaves the claude-flavoured original in place fails loudly rather
+/// than silently shipping a prompt that names an unavailable skill.
+const TDD_GUIDANCE: &str = "Use the `tdd` skill";
+const DIAGNOSE_GUIDANCE: &str = "The `diagnose` skill is also available";
+const RED_GREEN_REFACTOR: &str = "red → green → refactor";
+const NO_SKILLS_GUIDANCE: &str = "No skill bodies are inlined for this phase";
+
+#[test]
+fn codex_skill_free_phases_do_not_advertise_tdd_or_diagnose() {
+    // The whole reason for inlining skill bodies is that codex cannot
+    // discover them on demand. A phase that inlines none must not be
+    // told to "use the `tdd` skill" or that "the `diagnose` skill is
+    // also available" — both name instructions the agent does not
+    // have. Read-only phases must not be handed the red-green-refactor
+    // workflow either: they write no code.
+    for phase in [Phase::Review, Phase::SecurityReview, Phase::Merger] {
+        let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, phase, BODY);
+        assert!(
+            !wrapped.contains(TDD_GUIDANCE),
+            "{phase:?} inlines no skill bodies, so the operating context must not tell \
+             the agent to use the tdd skill: {wrapped}",
+        );
+        assert!(
+            !wrapped.contains(DIAGNOSE_GUIDANCE),
+            "{phase:?} inlines no skill bodies, so the operating context must not claim \
+             the diagnose skill is available: {wrapped}",
+        );
+        assert!(
+            !wrapped.contains(RED_GREEN_REFACTOR),
+            "{phase:?} is read-only — the operating context must not prescribe the \
+             red-green-refactor workflow: {wrapped}",
+        );
+        assert!(
+            wrapped.contains(NO_SKILLS_GUIDANCE),
+            "{phase:?} must say plainly that no skill bodies are inlined, so the agent \
+             does not go looking for them: {wrapped}",
+        );
+    }
+}
+
+#[test]
+fn codex_tdd_only_phases_advertise_tdd_but_not_diagnose() {
+    // review-fix and security-fix inline `tdd` and only `tdd`. The
+    // operating context must advertise exactly that set: keep the tdd
+    // guidance, drop the sentence claiming diagnose is available.
+    for phase in [Phase::ReviewFix, Phase::SecurityFix] {
+        let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, phase, BODY);
+        assert!(
+            wrapped.contains(TDD_GUIDANCE),
+            "{phase:?} inlines the tdd body, so the operating context must still point \
+             the agent at it: {wrapped}",
+        );
+        assert!(
+            wrapped.contains(RED_GREEN_REFACTOR),
+            "{phase:?} carries the tdd skill, so the red-green-refactor framing stays",
+        );
+        assert!(
+            !wrapped.contains(DIAGNOSE_GUIDANCE),
+            "{phase:?} does not inline the diagnose body, so the operating context must \
+             not claim it is available: {wrapped}",
+        );
+        assert!(
+            !wrapped.contains(NO_SKILLS_GUIDANCE),
+            "{phase:?} does inline a skill body — it must not claim otherwise: {wrapped}",
+        );
+    }
+}
+
+#[test]
+fn codex_implement_phase_advertises_both_skills() {
+    let wrapped = wrap_phase_prompt_for_engine(Engine::Codex, Phase::Implement, BODY);
+    assert!(
+        wrapped.contains(TDD_GUIDANCE),
+        "implement inlines the tdd body — the operating context must point at it",
+    );
+    assert!(
+        wrapped.contains(DIAGNOSE_GUIDANCE),
+        "implement inlines the diagnose body — the operating context must point at it",
+    );
+    assert!(
+        !wrapped.contains(NO_SKILLS_GUIDANCE),
+        "implement inlines two skill bodies — it must not claim otherwise",
+    );
+}
+
 #[test]
 fn codex_neutralises_claude_phrasing_for_every_phase() {
     // Pre-existing contract (issue #81): the inlined policy-image

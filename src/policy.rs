@@ -2258,8 +2258,7 @@ pub fn wrap_phase_prompt_for_engine(
             }
             prepended.push_str("---\n\n");
 
-            let mut out =
-                neutralise_claude_phrasing_for_codex(&prepended, !skills.is_empty());
+            let mut out = neutralise_claude_phrasing_for_codex(&prepended, skills);
             out.push_str(body);
             out
         }
@@ -2341,32 +2340,47 @@ pub const CODEX_INLINED_OPERATING_CONTEXT: &str = include_str!(
 /// the operating-context body *and* the baked-skill bodies, since
 /// any of those may have been authored in claude's voice.
 ///
-/// `skills_inlined` says whether this phase actually emitted a
-/// baked-skills section (issue #169). The operating context points the
-/// agent at where skill bodies live; on a phase that inlines none
-/// (review, security-review, merger) that pointer would dangle, so the
-/// replacement text says so instead of naming a section that is not
-/// there.
+/// `skills` is the exact set this phase inlined (issue #169). The
+/// operating context's `## How to work` section names `tdd` and
+/// `diagnose` by hand and points at where their bodies live; on a
+/// phase that inlines a subset — or none — those sentences advertise
+/// instructions the codex agent does not have and cannot fetch, so
+/// they are rewritten to match the set actually present rather than
+/// merely re-pointed.
 fn neutralise_claude_phrasing_for_codex(
     claude_flavored: &str,
-    skills_inlined: bool,
+    skills: &[(&str, &str)],
 ) -> String {
-    let (lives_in, look_for) = if skills_inlined {
-        (
-            "(its body is inlined in the baked-skills section above)",
-            "look for its body in the baked-skills section above",
-        )
-    } else {
-        (
-            "(no skill bodies are inlined for this phase)",
-            "note that no skill bodies are inlined for this phase",
-        )
+    let has = |name: &str| skills.iter().any(|(n, _)| *n == name);
+    let (tdd, diagnose) = (has("tdd"), has("diagnose"));
+
+    // The canonical `## How to work` guidance, verbatim from
+    // `policy-image/CLAUDE.md`. Rewritten wholesale rather than
+    // phrase-patched because dropping a skill means dropping a whole
+    // sentence, not re-pointing one clause. If the canonical copy is
+    // reworded these replacements no-op — the rendered-text assertions
+    // in `tests/codex_phase_scoped_skills.rs` fail in that case rather
+    // than letting a stale advertisement ship.
+    let how_to_work = "Use the `tdd` skill that lives in your skills directory. The pattern is red → green → refactor, one behaviour at a time. The `diagnose` skill is also available if you hit a hard bug or perf regression.";
+    let brief_skills = "When the brief mentions a skill, look for it under your skills directory and follow it.";
+
+    let how_to_work_replacement = match (tdd, diagnose) {
+        (true, true) => "Use the `tdd` skill (its body is inlined in the baked-skills section above). The pattern is red → green → refactor, one behaviour at a time. The `diagnose` skill is also available if you hit a hard bug or perf regression — its body is inlined there too.".to_string(),
+        (true, false) => "Use the `tdd` skill (its body is inlined in the baked-skills section above). The pattern is red → green → refactor, one behaviour at a time.".to_string(),
+        (false, true) => "The `diagnose` skill is available if you hit a hard bug or perf regression — its body is inlined in the baked-skills section above.".to_string(),
+        (false, false) => "No skill bodies are inlined for this phase — it does not write code, so there is no test-first workflow to follow. Work from the phase-specific instructions below.".to_string(),
     };
+    let brief_skills_replacement = if skills.is_empty() {
+        "No skill bodies are inlined for this phase, so a skill the brief names by name is not available to you — follow the phase-specific instructions below instead."
+    } else {
+        "When the brief mentions a skill, look for its body in the baked-skills section above and follow it."
+    };
+
     claude_flavored
         .replace("Claude Code agent", "the agent")
         .replace("Claude Code", "the agent")
-        .replace("that lives in your skills directory", lives_in)
-        .replace("look for it under your skills directory", look_for)
+        .replace(how_to_work, &how_to_work_replacement)
+        .replace(brief_skills, brief_skills_replacement)
 }
 
 /// Inlined body of the `tdd` baked skill — per ADR-0005, codex's
