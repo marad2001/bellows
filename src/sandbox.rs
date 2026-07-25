@@ -752,6 +752,11 @@ pub struct CargoChecksRun {
 /// deadline fires, the container is killed and `killed_by_deadline` is
 /// set on the returned `CargoChecksRun`.
 ///
+/// `env_override` (issue #186) forces build env for this invocation,
+/// winning over anything mirrored from the target's CI. The OOM retry
+/// path uses it to serialise linking (`CARGO_BUILD_JOBS=1`); an empty
+/// slice is the normal case and changes nothing.
+///
 /// No credentials volume — the gate has no Anthropic dependency.
 // See run_agent's note on the too_many_arguments suppression.
 #[allow(clippy::too_many_arguments)]
@@ -764,6 +769,7 @@ pub async fn run_cargo_checks(
     deploy_keys: &[String],
     log_writer: &mut dyn Write,
     deadline: Option<Duration>,
+    env_override: &[(String, String)],
 ) -> Result<CargoChecksRun, SandboxError> {
     let image_tag = ensure_policy_image().await?;
 
@@ -809,7 +815,10 @@ pub async fn run_cargo_checks(
         image: Some(image_tag),
         entrypoint: Some(build_cargo_checks_entrypoint()),
         cmd: Some(vec![]),
-        env: Some(build_cargo_checks_env(workspace.gate_commands())),
+        env: Some(build_cargo_checks_env(
+            workspace.gate_commands(),
+            env_override,
+        )),
         working_dir: Some("/workspace".to_string()),
         labels: Some(labels),
         host_config: Some(host_config),
@@ -1055,15 +1064,21 @@ fn build_cargo_checks_entrypoint() -> Vec<String> {
 /// env cannot express that. It also means the policy image's
 /// `run-cargo-checks` script needs no change — it already `sh -c`'s each
 /// command, and `sh` applies assignment prefixes natively.
-fn build_cargo_checks_env(gate_commands: &GateCommands) -> Vec<String> {
+/// `env_override` (issue #186) is merged over the CI-mirrored env, so a
+/// retry's forced value cannot be undone by a same-named variable the
+/// target's CI happens to set.
+fn build_cargo_checks_env(
+    gate_commands: &GateCommands,
+    env_override: &[(String, String)],
+) -> Vec<String> {
     vec![
         format!(
             "BELLOWS_CLIPPY_CMD={}",
-            with_env_prefix(&gate_commands.clippy_env, &gate_commands.clippy),
+            with_env_prefix(&gate_commands.clippy_env, env_override, &gate_commands.clippy),
         ),
         format!(
             "BELLOWS_TEST_CMD={}",
-            with_env_prefix(&gate_commands.test_env, &gate_commands.test),
+            with_env_prefix(&gate_commands.test_env, env_override, &gate_commands.test),
         ),
     ]
 }
@@ -1071,14 +1086,30 @@ fn build_cargo_checks_env(gate_commands: &GateCommands) -> Vec<String> {
 /// Render `KEY='value' ... <cmd>`. Values are single-quoted, which is
 /// airtight for `sh` because `workflow_parse::env_value_is_safe` has
 /// already rejected any value containing a single quote. An empty env
-/// list returns the command untouched, so repos whose CI declares no
-/// build env see byte-identical behaviour to before #180.
-fn with_env_prefix(env: &[(String, String)], cmd: &str) -> String {
-    if env.is_empty() {
+/// list (and no override) returns the command untouched, so repos whose
+/// CI declares no build env see byte-identical behaviour to before #180.
+///
+/// `overrides` are applied last and win on a name collision. The merge
+/// happens here rather than by emitting two assignments for the same
+/// name, because `VAR=a VAR=b cmd` is not portably defined — one
+/// assignment per name keeps the composed command unambiguous.
+fn with_env_prefix(
+    env: &[(String, String)],
+    overrides: &[(String, String)],
+    cmd: &str,
+) -> String {
+    if env.is_empty() && overrides.is_empty() {
         return cmd.to_string();
     }
+    let mut merged: std::collections::BTreeMap<&str, &str> = env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    for (key, value) in overrides {
+        merged.insert(key.as_str(), value.as_str());
+    }
     let mut out = String::new();
-    for (key, value) in env {
+    for (key, value) in merged {
         out.push_str(key);
         out.push_str("='");
         out.push_str(value);
@@ -2137,7 +2168,7 @@ mod tests {
             test_source: crate::workflow_parse::Provenance::FallbackFromConfig,
             test_env: Vec::new(),
         };
-        let env = build_cargo_checks_env(&gc);
+        let env = build_cargo_checks_env(&gc, &[]);
         assert!(
             env.iter().any(|e| e
                 == "BELLOWS_CLIPPY_CMD=cargo clippy --all-targets -- -D clippy::correctness"),
@@ -2167,7 +2198,7 @@ mod tests {
             ),
             test_env: vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
         };
-        let env = build_cargo_checks_env(&gc);
+        let env = build_cargo_checks_env(&gc, &[]);
         assert!(
             env.iter().any(|e| e
                 == "BELLOWS_TEST_CMD=CARGO_PROFILE_TEST_DEBUG='0' cargo test --locked --workspace --lib --bins --tests --all-features"),
@@ -2185,8 +2216,42 @@ mod tests {
         // Issue #180 no-regression: repos whose CI sets no build env
         // (e.g. bellows itself) must see a byte-identical command.
         assert_eq!(
-            with_env_prefix(&[], "cargo test --all-features"),
+            with_env_prefix(&[], &[], "cargo test --all-features"),
             "cargo test --all-features",
+        );
+    }
+
+    #[test]
+    fn env_override_wins_over_a_same_named_ci_mirrored_value() {
+        // Issue #186: the OOM retry forces CARGO_BUILD_JOBS=1. A target
+        // repo whose CI sets its own value must not be able to undo it
+        // via #180's mirroring — otherwise the retry links in parallel
+        // again and OOMs a second time.
+        let ci = vec![
+            ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
+            ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
+        ];
+        let overrides = vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())];
+        let rendered = with_env_prefix(&ci, &overrides, "cargo test --workspace");
+        assert_eq!(
+            rendered,
+            "CARGO_BUILD_JOBS='1' CARGO_PROFILE_TEST_DEBUG='0' cargo test --workspace",
+            "override must win, and exactly one assignment per name",
+        );
+        assert!(
+            !rendered.contains("CARGO_BUILD_JOBS='8'"),
+            "the CI value must not survive alongside the override: {rendered}",
+        );
+    }
+
+    #[test]
+    fn env_override_applies_even_when_ci_declares_no_env() {
+        // The common case for the retry: bellows itself, or any repo
+        // with no CI build env, still gets serialised linking.
+        let overrides = vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())];
+        assert_eq!(
+            with_env_prefix(&[], &overrides, "cargo test"),
+            "CARGO_BUILD_JOBS='1' cargo test",
         );
     }
 

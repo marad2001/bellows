@@ -86,3 +86,43 @@ Specifics of the extension:
 Consequence: the "workflow-shape brittleness" caveat above now extends to
 env blocks — an env value bellows cannot safely mirror is dropped
 individually, which is strictly closer to CI than dropping all of them.
+
+## Amendment (issue #186): a dead gate is not a verdict
+
+#180 closed the env half of the mirror. What it could not close is the
+*machine*: bellows's gate runs in a container whose memory ceiling is far
+below a GitHub runner's, and no amount of mirroring makes those the same
+computer.
+
+On FA #314 (PR #650) the mirrored env applied correctly — the gate's rustc
+invocation carried `-C strip=debuginfo` — and the gate still failed, because
+cargo links several large test binaries concurrently and the kernel SIGKILLed
+one. Cargo surfaced exit 101, `gate_failed` saw a non-zero check, and the run
+was classified `FinalTestsRed`. The agent's own verification of the same diff
+was green: 1314 lib tests passing. Third run in a row (after #46 and #280)
+where a passing codebase was reported as red and a human had to intervene.
+
+The distinction this ADR now draws: **a check that ran and reported a
+verdict** versus **a check that was killed before reaching one**. Only the
+first is evidence about the code. A failing assertion exits non-zero
+*normally*; a SIGKILL is a death, and no signal-9 shape can be produced by a
+test that merely failed. So:
+
+- `policy::is_oom_kill_signature` / `gate_oom_killed` identify a gate that
+  died rather than judged, consulting only checks that actually failed (a
+  passing check quoting an OOM string in its output cannot trip it).
+- The runner retries such a gate **once** with `CARGO_BUILD_JOBS=1`.
+  Serialised linking fits in memory — the #314 agent demonstrated exactly
+  this — so the retry usually reaches a real verdict and the run continues
+  into review instead of halting. The retry's env is merged *over* the
+  CI-mirrored env so a repo that sets its own `CARGO_BUILD_JOBS` cannot
+  undo it.
+- If the retry also dies, the run still drafts — unreviewed code should not
+  auto-merge — but the PR body says plainly that the container ran out of
+  memory, that this is not a code failure, and that the repo's own CI is
+  authoritative. The ADR-0004 "this is the same failure CI would report"
+  line is suppressed, because in this one case it is false.
+
+This keeps the ADR's invariant honest. "Bellows gate passes ⇒ CI gate passes"
+was always a claim about *verdicts*. A gate that never produced one has no
+claim to make, and must not borrow the authority of one that did.
