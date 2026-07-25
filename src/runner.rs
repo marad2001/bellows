@@ -153,6 +153,38 @@ fn pr_routing_for_reason<'a>(
     }
 }
 
+/// The authoritative terminal classification for a finished run, as the
+/// `runs.jsonl` record must report it.
+///
+/// `run_once` computes its exit reason before opening the PR, but
+/// `tracker::finalise`'s GET is the last word on cancellation: an
+/// operator can `bellows kill <N>` in the narrow window between the
+/// pre-PR check and finalisation. In that case finalise skips the label
+/// PATCH (the operator's `agent-cancelled` is already on the issue) and
+/// `run_once` returns `RunOutcome::Cancelled` — so the metrics record
+/// has to say `Cancelled` too, otherwise `runs.jsonl` permanently
+/// reports the stale pipeline `Success` / `agent-done` for a cancelled
+/// run and the failure distribution the file exists for is wrong.
+///
+/// Returns the effective reason and the outcome label the issue landed
+/// on. `draft` is deliberately NOT re-derived from the effective reason:
+/// the PR was opened before finalise ran, so the record reports the
+/// state the run actually landed on rather than the state a `Cancelled`
+/// routing would have chosen.
+pub fn effective_terminal_outcome<'a>(
+    pipeline_reason: &ExitReason,
+    finalise_externally_cancelled: bool,
+    labels: &'a RuntimeLabelsConfig,
+) -> (ExitReason, &'a str) {
+    let reason = if finalise_externally_cancelled {
+        ExitReason::Cancelled
+    } else {
+        pipeline_reason.clone()
+    };
+    let outcome_label = pr_routing_for_reason(&reason, labels).outcome_label;
+    (reason, outcome_label)
+}
+
 /// Why a `RunOutcome::Blocked` tick refused to claim. Split into one
 /// variant per block source so the status file's on-disk schema, the
 /// polling-loop log line, and `bellows status`'s human-readable
@@ -2525,31 +2557,11 @@ pub async fn run_once(
     )
     .await?;
 
+    // The run-log comment's own clock. It has to be read before
+    // `finalise` because `finalise` posts the body; the metrics record
+    // takes its own reading afterwards (see below) so the documented
+    // whole-run wall clock includes the finalisation request.
     let finished = chrono::Utc::now();
-
-    // Issue #168: append this run's structured record to `runs.jsonl`.
-    // Every terminal outcome gets a line — success, failure, rate-limit,
-    // cancellation — because the failure distribution is the point of
-    // the file. Deliberately placed after the outcome label, draft
-    // state, PR number, and merger verdict are all settled, and
-    // deliberately best-effort: `append_run_metrics` has no error
-    // channel, so nothing here can change how the run finalises.
-    append_run_metrics(
-        &config.logging.metrics_path,
-        &policy::build_run_metrics(policy::RunMetricsInput {
-            issue: claimed.number,
-            repo: &repo_label,
-            pr: pr.number,
-            started_at: started,
-            finished_at: finished,
-            exit_reason: &reason,
-            merger_verdict: outcomes.merger_verdict,
-            draft,
-            outcome_label,
-            phases: &phase_timeline,
-        }),
-        log_writer,
-    );
 
     let log_body = build_log_body(
         &reason,
@@ -2590,6 +2602,43 @@ pub async fn run_once(
         let _ = writeln!(log_writer, "{line}");
     }
 
+    // Issue #168: append this run's structured record to `runs.jsonl`.
+    // Every terminal outcome gets a line — success, failure, rate-limit,
+    // cancellation — because the failure distribution is the point of
+    // the file.
+    //
+    // Placed AFTER `finalise` on purpose. `finalise`'s GET is the last
+    // word on cancellation: it can discover an operator `bellows kill`
+    // that landed after our pre-PR check, and the return path below
+    // treats that as `RunOutcome::Cancelled`. Recording before that
+    // point would leave a permanent `Success` / `agent-done` line for a
+    // cancelled run. `effective_terminal_outcome` folds finalise's
+    // verdict in; `draft` stays as opened, because the PR predates
+    // finalise and a late cancellation cannot retroactively draft it.
+    // Still best-effort: `append_run_metrics` has no error channel, so
+    // nothing here can change how the run finalises.
+    let (effective_reason, effective_outcome_label) = effective_terminal_outcome(
+        &reason,
+        finalise_outcome.externally_cancelled,
+        &config.runtime_labels,
+    );
+    append_run_metrics(
+        &config.logging.metrics_path,
+        &policy::build_run_metrics(policy::RunMetricsInput {
+            issue: claimed.number,
+            repo: &repo_label,
+            pr: pr.number,
+            started_at: started,
+            finished_at: chrono::Utc::now(),
+            exit_reason: &effective_reason,
+            merger_verdict: outcomes.merger_verdict,
+            draft,
+            outcome_label: effective_outcome_label,
+            phases: &phase_timeline,
+        }),
+        log_writer,
+    );
+
     // Slice 9: announce we're back to idle. Best-effort —
     // halt paths still reach finalise above, so a single
     // write here covers all exit-reason variants.
@@ -2612,8 +2661,10 @@ pub async fn run_once(
     //     finalise's GET. PR was opened with whatever the pipeline
     //     reason was; finalise then skipped the label PATCH.
     // Both routes return RunOutcome::Cancelled so the polling loop
-    // logs the right line.
-    if matches!(reason, ExitReason::Cancelled) || finalise_outcome.externally_cancelled {
+    // logs the right line. `effective_terminal_outcome` above already
+    // folded both signals into one reason, so the polling loop and the
+    // `runs.jsonl` record cannot disagree about how the run ended.
+    if matches!(effective_reason, ExitReason::Cancelled) {
         Ok(RunOutcome::Cancelled {
             issue_number: claimed.number,
             pr_number: pr.number,
@@ -2622,7 +2673,7 @@ pub async fn run_once(
         Ok(RunOutcome::Finalised {
             issue_number: claimed.number,
             pr_number: pr.number,
-            reason,
+            reason: effective_reason,
         })
     }
 }

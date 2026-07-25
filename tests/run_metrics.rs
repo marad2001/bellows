@@ -14,11 +14,12 @@
 
 use std::io::Cursor;
 
-use bellows::config::{ChainEntry, Engine};
+use bellows::config::{ChainEntry, Engine, RuntimeLabelsConfig};
 use bellows::policy::{
     build_run_metrics, gate_exit_code, CheckResult, ExitReason, GateOutcome, MergerVerdict,
     PhaseTimeline, RunMetrics, RunMetricsInput, RUN_METRICS_SCHEMA_VERSION,
 };
+use bellows::runner::effective_terminal_outcome;
 
 fn ts(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
@@ -463,5 +464,114 @@ fn a_successful_append_stays_silent_on_the_run_log() {
     assert_eq!(
         String::from_utf8(log.into_inner()).expect("log should be utf-8"),
         "",
+    );
+}
+
+// ---------------------------------------------------------------------
+// Late cancellation — the record must follow finalise, not the pipeline
+//
+// `run_once` computes its exit reason before opening the PR, but
+// `tracker::finalise`'s GET is the last word on cancellation: an
+// operator can `bellows kill <N>` in the window between the pre-PR check
+// and finalisation. That run returns `RunOutcome::Cancelled`, so the
+// `runs.jsonl` line has to agree — otherwise the file permanently
+// reports `Success` / `agent-done` for a cancelled run and the failure
+// distribution the file exists for is wrong.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_cancellation_seen_only_by_finalise_overrides_the_pipeline_classification() {
+    let labels = RuntimeLabelsConfig::default();
+    let (reason, outcome_label) =
+        effective_terminal_outcome(&ExitReason::Success, true, &labels);
+
+    assert_eq!(reason, ExitReason::Cancelled);
+    assert_eq!(outcome_label, labels.agent_cancelled);
+}
+
+#[test]
+fn without_a_late_cancellation_the_pipeline_classification_passes_through() {
+    let labels = RuntimeLabelsConfig::default();
+
+    for (pipeline_reason, expected_label) in [
+        (ExitReason::Success, &labels.agent_done),
+        (ExitReason::Crash, &labels.agent_failed),
+        (ExitReason::RateLimited, &labels.agent_rate_limited),
+        // A cancellation the *pre-PR* check already caught stays
+        // cancelled even though finalise's own flag is false (the label
+        // PATCH ran normally in that case).
+        (ExitReason::Cancelled, &labels.agent_cancelled),
+    ] {
+        let (reason, outcome_label) =
+            effective_terminal_outcome(&pipeline_reason, false, &labels);
+        assert_eq!(reason, pipeline_reason);
+        assert_eq!(&outcome_label.to_string(), expected_label);
+    }
+}
+
+#[test]
+fn a_late_cancelled_run_emits_a_cancelled_record_with_the_landed_label() {
+    // End-to-end over the two surfaces `run_once` composes after
+    // `finalise` returns: derive the authoritative outcome, build the
+    // record from it, append it. The emitted line must say `Cancelled`
+    // and carry the label the issue actually landed on, while `draft`
+    // still reports the PR state the run really opened (the PR predates
+    // finalise, so a late cancellation cannot retroactively draft it).
+    let labels = RuntimeLabelsConfig::default();
+    let (reason, outcome_label) =
+        effective_terminal_outcome(&ExitReason::Success, true, &labels);
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("runs.jsonl");
+    let mut log = Cursor::new(Vec::new());
+    bellows::runner::append_run_metrics(
+        &path,
+        &build_run_metrics(RunMetricsInput {
+            issue: 168,
+            repo: "marad2001/bellows",
+            pr: 200,
+            started_at: ts("2026-07-25T22:04:11Z"),
+            finished_at: ts("2026-07-25T22:41:02Z"),
+            exit_reason: &reason,
+            merger_verdict: Some(MergerVerdict::Merge),
+            draft: false,
+            outcome_label,
+            phases: &successful_multi_phase_timeline(),
+        }),
+        &mut log,
+    );
+
+    let body = std::fs::read_to_string(&path).expect("the record should have been written");
+    let json: serde_json::Value =
+        serde_json::from_str(body.trim_end()).expect("the line should parse");
+    assert_eq!(json["exit_reason"], serde_json::json!("Cancelled"));
+    assert_eq!(json["outcome_label"], serde_json::json!("agent-cancelled"));
+    assert_eq!(json["draft"], serde_json::json!(false));
+}
+
+#[test]
+fn run_once_appends_the_record_after_finalise_has_returned() {
+    // Ordering guard. The whole point of deriving the record from
+    // `finalise`'s outcome is that the append happens *after* the call
+    // that produces it — an append moved back above `tracker::finalise`
+    // would still compile and every assertion above would still pass,
+    // but the run would be back to recording the stale pre-finalise
+    // classification. `run_once` needs Docker and GitHub to reach this
+    // code, so the call order is asserted at the source level.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runner.rs"))
+        .expect("runner.rs should be readable");
+    let finalise_at = src
+        .find("tracker::finalise(")
+        .expect("run_once should call tracker::finalise");
+    // Indented, so this is the call inside `run_once` and not the
+    // top-level `pub fn append_run_metrics` definition.
+    let append_at = src
+        .find("    append_run_metrics(")
+        .expect("run_once should call append_run_metrics");
+
+    assert!(
+        append_at > finalise_at,
+        "the metrics append must follow tracker::finalise so the record \
+         can carry the authoritative cancellation outcome",
     );
 }
