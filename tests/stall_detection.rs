@@ -28,7 +28,7 @@ use bellows::chain_walker::{
     PickReason, RateLimitDisposition, DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION,
 };
 use bellows::config::{Config, Engine};
-use bellows::workspace::sample_workspace_state;
+use bellows::workspace::{sample_workspace_state, sample_workspace_state_bounded};
 
 fn samples(seq: &[&str]) -> Vec<SampleHash> {
     seq.iter().map(|s| SampleHash::new(*s)).collect()
@@ -54,6 +54,121 @@ fn init_repo(path: &Path) {
     std::fs::write(path.join(".gitignore"), "target/\n").unwrap();
     run_git(path, &["add", "."]);
     run_git(path, &["commit", "-m", "initial"]);
+}
+
+/// Plant every repository-configured git helper the agent could write
+/// into the bind-mounted workspace, each one wired to the same marker
+/// script. The sampler runs on the *host*; if any of these fires, the
+/// container has just run code outside itself.
+#[cfg(unix)]
+fn plant_repo_local_helpers(path: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = path.join("helper-ran");
+    let helper = path.join("helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ntouch {}\ncat >/dev/null 2>&1\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let helper = helper.to_str().unwrap().to_string();
+
+    // `.git/config` — writable by the agent, and the only place a
+    // helper's *command* can come from.
+    run_git(path, &["config", "diff.external", &helper]);
+    run_git(path, &["config", "diff.evil.command", &helper]);
+    run_git(path, &["config", "diff.evil.textconv", &helper]);
+    run_git(path, &["config", "filter.evil.clean", &helper]);
+    run_git(path, &["config", "core.fsmonitor", &helper]);
+    // Both attribute sources the agent can reach: the in-tree one and
+    // the one inside `.git/`, which no `--no-ext-diff`-style flag
+    // covers.
+    std::fs::write(path.join(".gitattributes"), "* diff=evil filter=evil\n").unwrap();
+    std::fs::create_dir_all(path.join(".git/info")).unwrap();
+    std::fs::write(
+        path.join(".git/info/attributes"),
+        "* diff=evil filter=evil\n",
+    )
+    .unwrap();
+    marker
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sampling_never_runs_helpers_configured_by_the_sampled_repository() {
+    // The workspace is bind-mounted into the agent's container, so
+    // everything in it — `.git/config`, `.gitattributes`,
+    // `.git/info/attributes` — is attacker-controlled. Host-side git
+    // must not be reachable as a way to execute any of it.
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    let marker = plant_repo_local_helpers(dir.path());
+
+    // A tracked edit, so the sampler has real work to do: a diff to
+    // render and a worktree file to compare against the index.
+    std::fs::write(dir.path().join("src.rs"), "fn main() { todo!() }\n").unwrap();
+    std::fs::write(dir.path().join("new.rs"), "// new\n").unwrap();
+
+    let hash = sample_workspace_state(dir.path()).await.expect("sample");
+
+    assert!(
+        !marker.exists(),
+        "host git executed a helper configured by the sampled repository",
+    );
+
+    // And the sample is still a sample: the same workspace twice over
+    // is the same state, a changed one is not.
+    let again = sample_workspace_state(dir.path()).await.expect("sample");
+    assert_eq!(hash, again);
+    std::fs::write(dir.path().join("src.rs"), "fn main() { println!(); }\n").unwrap();
+    let changed = sample_workspace_state(dir.path()).await.expect("sample");
+    assert_ne!(hash, changed, "isolation must not blind the sampler");
+    assert!(!marker.exists(), "host git executed a repository helper");
+}
+
+#[tokio::test]
+async fn a_sample_larger_than_the_read_limit_is_refused_rather_than_buffered() {
+    // The sampled bytes are chosen by the agent. Reading them without a
+    // ceiling would let a workspace made pathological on purpose cost
+    // the host unbounded work on every tick.
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    std::fs::write(dir.path().join("src.rs"), "x\n".repeat(50_000)).unwrap();
+
+    assert!(
+        sample_workspace_state_bounded(dir.path(), 1024)
+            .await
+            .is_err(),
+        "an oversized diff must fail the sample, not be buffered",
+    );
+
+    // A failed sample is skipped, not fatal: the same workspace under a
+    // limit that fits still samples.
+    sample_workspace_state_bounded(dir.path(), 16 * 1024 * 1024)
+        .await
+        .expect("sample within the limit");
+}
+
+#[tokio::test]
+async fn a_flood_of_untracked_paths_is_refused_rather_than_retained() {
+    // The other half of the same exposure: untracked paths have to be
+    // collected and sorted, so their volume is bounded too.
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    for i in 0..2_000 {
+        std::fs::write(dir.path().join(format!("untracked-{i:06}.txt")), "").unwrap();
+    }
+
+    assert!(
+        sample_workspace_state_bounded(dir.path(), 4096)
+            .await
+            .is_err(),
+        "an oversized untracked listing must fail the sample",
+    );
 }
 
 #[test]

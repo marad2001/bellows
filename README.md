@@ -113,9 +113,14 @@ Sections of `orchestrator.toml`, all of which are read at startup:
   routes to a draft PR with `agent-failed`.
 - **`[agent].oscillation_sample_seconds`** — how often bellows samples
   the implement-phase workspace looking for a stall. Default 60. Each
-  sample hashes `git diff HEAD` plus the untracked-and-not-ignored
-  paths, so gitignored build output (`target/`) never registers as
-  change. A workspace that returns to a previously-seen state with a
+  sample hashes the diff against `HEAD` plus the
+  untracked-and-not-ignored paths, so gitignored build output
+  (`target/`) never registers as change. The sample is read through a
+  throwaway, bellows-owned git directory that borrows only the
+  workspace's object store, so nothing the agent writes into `.git/` or
+  `.gitattributes` can name a helper for host-side git to run, and each
+  read is capped so an oversized workspace fails the sample rather than
+  the host. A workspace that returns to a previously-seen state with a
   different state in between is *oscillating* — an edit made, reverted,
   and made again — and bellows abandons that engine's attempt and
   advances to the next chain entry. A workspace that is merely

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -30,6 +30,10 @@ pub enum WorkspaceError {
     },
     #[error("agent produced no changes to commit; the brief was probably unmet")]
     NoChangesToCommit,
+    #[error("workspace sample exceeded the {limit}-byte read limit for git {args:?}")]
+    SampleTooLarge { args: Vec<String>, limit: u64 },
+    #[error("workspace sample could not be isolated from the agent's repository: {0}")]
+    SampleIsolation(String),
 }
 
 /// Render the trailing `: <stderr>` for [`WorkspaceError::GitFailed`]'s
@@ -551,36 +555,313 @@ pub async fn head_sha_at(repo: &Path) -> Result<String, WorkspaceError> {
 /// hash to repeat three times before it reports **Oscillation**, so a
 /// spurious sample can at worst delay or skip a detection, never
 /// invent one.
+///
+/// # Sampling a workspace the agent controls
+///
+/// Everything under the bind mount is attacker-controlled from the
+/// host's point of view, `.git/` included. Git will happily execute
+/// commands named by the repository it is pointed at — `diff.external`,
+/// a `.gitattributes` driver backed by `diff.<driver>.command` or
+/// `filter.<driver>.clean`, `core.fsmonitor` — so a sampler that ran
+/// plain `git diff` against the live workspace would be a path for the
+/// container to run code on the host. Flags alone do not close it:
+/// `--no-ext-diff --no-textconv` stop the diff helpers, but any command
+/// that compares worktree content against the index still runs the
+/// clean filter named by `$GIT_DIR/info/attributes`, which the agent
+/// can write.
+///
+/// So the sampler never lets git read the agent's configuration at all.
+/// It builds a throwaway, bellows-owned git directory whose only link
+/// to the workspace is `objects/info/alternates`, points git at it with
+/// `--git-dir` plus `--work-tree`, and reads the worktree through that.
+/// Attributes are sourced from the empty tree and the helper-bearing
+/// config keys are overridden for good measure, so neither
+/// `.git/config`, `.git/info/attributes` nor an in-tree `.gitattributes`
+/// can name anything for the host to execute.
 pub async fn sample_workspace_state(
     repo: &Path,
 ) -> Result<crate::policy::SampleHash, WorkspaceError> {
-    let diff = git_stdout(repo, &["diff", "HEAD"]).await?;
-    let status = git_stdout(repo, &["status", "--porcelain"]).await?;
+    sample_workspace_state_bounded(repo, SAMPLE_BYTE_LIMIT).await
+}
 
-    // `git status --porcelain` marks untracked entries with `?? `, and
-    // already excludes anything .gitignore covers. Sorting makes the
-    // sample independent of git's enumeration order.
-    let status = String::from_utf8_lossy(&status).into_owned();
-    let mut untracked: Vec<&str> = status
-        .lines()
-        .filter_map(|line| line.strip_prefix("?? "))
-        .map(str::trim_end)
-        .collect();
-    untracked.sort_unstable();
+/// [`sample_workspace_state`] with the per-shellout read limit spelled
+/// out, so the bound itself is testable without materialising the
+/// default's worth of workspace.
+pub async fn sample_workspace_state_bounded(
+    repo: &Path,
+    limit: u64,
+) -> Result<crate::policy::SampleHash, WorkspaceError> {
+    let sample = SampleRepo::isolate(repo).await?;
+
+    // Populate the throwaway index from the workspace's HEAD tree so
+    // `git diff` has something to compare the worktree against.
+    stream_sample_git(&sample, &["read-tree", &sample.head], limit, |_| {}).await?;
 
     let mut hasher = Sha256::new();
-    hasher.update(&diff);
+    stream_sample_git(
+        &sample,
+        &["diff", "--no-ext-diff", "--no-textconv", &sample.head],
+        limit,
+        |chunk| hasher.update(chunk),
+    )
+    .await?;
+
+    // `git status --porcelain -z` marks untracked entries with `?? `,
+    // and already excludes anything .gitignore covers. `-z` is what
+    // makes the records parseable a chunk at a time without buffering
+    // the whole listing, and leaves paths unquoted. Sorting makes the
+    // sample independent of git's enumeration order.
+    let mut scan = UntrackedScan::default();
+    stream_sample_git(
+        &sample,
+        &["status", "--porcelain", "-z"],
+        limit,
+        |chunk| scan.push_chunk(chunk),
+    )
+    .await?;
+
     // Domain separator: without it a diff ending in a path-shaped line
     // and an untracked path could hash identically to a different
     // split of the same bytes.
     hasher.update(b"\0untracked\0");
-    for path in untracked {
-        hasher.update(path.as_bytes());
+    for path in scan.finish() {
+        hasher.update(&path);
         hasher.update(b"\n");
     }
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     Ok(crate::policy::SampleHash::new(hex))
+}
+
+/// Hard cap on the bytes bellows will read from one sampling shellout.
+/// The diff is streamed straight into the hasher rather than buffered,
+/// so this is not what keeps memory flat — it is what stops a workspace
+/// that has been made pathological on purpose (a multi-gigabyte tracked
+/// diff, a flood of untracked paths) from costing the host unbounded
+/// time and retained path bytes on every tick. Tripping the cap fails
+/// the sample, and a failed sample is skipped by the caller: the
+/// classifier needs a hash three times over before it reports anything,
+/// so skipping can only delay or miss a detection, never invent one.
+pub const SAMPLE_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// The empty tree, which git synthesises in every repository without it
+/// having to be written. Handed to git as `GIT_ATTR_SOURCE` so the
+/// sampler resolves gitattributes against a tree that has none.
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+/// A bellows-owned git directory that can read the agent's worktree
+/// without reading the agent's repository configuration. See
+/// [`sample_workspace_state`] for why that separation exists.
+struct SampleRepo {
+    /// Held for its `Drop`: the scratch directory lives exactly as long
+    /// as the sample being taken from it.
+    _scratch: TempDir,
+    git_dir: PathBuf,
+    work_tree: PathBuf,
+    /// The workspace's `HEAD`, resolved to an object id before
+    /// isolation so the sampler never has to consult the agent's refs.
+    head: String,
+    empty_tree: &'static str,
+}
+
+impl SampleRepo {
+    async fn isolate(repo: &Path) -> Result<Self, WorkspaceError> {
+        // `rev-parse` reads the agent's config but cannot be made to
+        // execute anything out of it, so it is safe to ask the
+        // workspace itself for the three facts isolation needs.
+        let facts = git_stdout(
+            repo,
+            &[
+                "rev-parse",
+                "--absolute-git-dir",
+                "--show-object-format",
+                "HEAD",
+            ],
+        )
+        .await?;
+        let facts = String::from_utf8_lossy(&facts);
+        let mut lines = facts.lines();
+        let real_git_dir = lines.next().unwrap_or_default().trim();
+        let object_format = lines.next().unwrap_or_default().trim();
+        let head = lines.next().unwrap_or_default().trim();
+
+        if real_git_dir.is_empty() {
+            return Err(WorkspaceError::SampleIsolation(
+                "git did not report an absolute git dir".to_string(),
+            ));
+        }
+        // Both of these end up on a git command line and inside the
+        // scratch config, so neither is taken on trust: an object id is
+        // hex of a known width and an object format is one of two
+        // words. Anything else fails the sample rather than being
+        // passed through.
+        if !(head.len() == 40 || head.len() == 64) || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(WorkspaceError::SampleIsolation(format!(
+                "HEAD did not resolve to an object id: {head:?}"
+            )));
+        }
+        let (format_version, extensions, empty_tree) = match object_format {
+            "sha1" => (0, "", EMPTY_TREE_SHA1),
+            "sha256" => (1, "[extensions]\n\tobjectformat = sha256\n", EMPTY_TREE_SHA256),
+            other => {
+                return Err(WorkspaceError::SampleIsolation(format!(
+                    "unknown object format {other:?}"
+                )))
+            }
+        };
+
+        let scratch = TempDir::new()?;
+        let git_dir = scratch.path().to_path_buf();
+        std::fs::create_dir_all(git_dir.join("objects/info"))?;
+        std::fs::create_dir_all(git_dir.join("refs/heads"))?;
+        std::fs::write(
+            git_dir.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = {format_version}\n\tbare = true\n\tlogallrefupdates = false\n{extensions}"
+            ),
+        )?;
+        // Detached at the workspace's HEAD. The scratch repo borrows
+        // the workspace's object store and nothing else.
+        std::fs::write(git_dir.join("HEAD"), format!("{head}\n"))?;
+        std::fs::write(
+            git_dir.join("objects/info/alternates"),
+            format!("{real_git_dir}/objects\n"),
+        )?;
+
+        Ok(Self {
+            _scratch: scratch,
+            git_dir,
+            work_tree: repo.to_path_buf(),
+            head: head.to_string(),
+            empty_tree,
+        })
+    }
+}
+
+/// Run one sampling git command against the isolated repo, streaming
+/// its stdout through `sink` and refusing to read past `limit` bytes.
+///
+/// stderr is discarded rather than piped: nothing reads it (a failed
+/// sample is swallowed by the caller), and an unread pipe would be one
+/// more thing an adversarial workspace could fill to wedge the host.
+async fn stream_sample_git(
+    sample: &SampleRepo,
+    args: &[&str],
+    limit: u64,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<(), WorkspaceError> {
+    let mut child = Command::new("git")
+        .arg("--git-dir")
+        .arg(&sample.git_dir)
+        .arg("--work-tree")
+        .arg(&sample.work_tree)
+        // Never write to the agent's repository, and never take a lock
+        // in it that the container's own git could contend with.
+        .arg("--no-optional-locks")
+        // Belt and braces on top of the isolated git dir: even a
+        // host-level config must not get to run a helper over
+        // attacker-chosen attributes.
+        .args(["-c", "core.fsmonitor=false", "-c", "core.attributesFile="])
+        .args(args)
+        .env("GIT_ATTR_SOURCE", sample.empty_tree)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| WorkspaceError::SampleIsolation("git stdout was not piped".to_string()))?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = tokio::io::AsyncReadExt::read(&mut stdout, &mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > limit {
+            // Stop reading and stop the producer, so an oversized
+            // sample costs a bounded amount of work rather than
+            // whatever the workspace felt like emitting.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(WorkspaceError::SampleTooLarge {
+                args: args.iter().map(|a| (*a).to_string()).collect(),
+                limit,
+            });
+        }
+        sink(&buf[..read]);
+    }
+
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(WorkspaceError::GitFailed {
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            status,
+            stderr: String::new(),
+        });
+    }
+    Ok(())
+}
+
+/// Incremental parser over `git status --porcelain -z`, keeping only
+/// the untracked paths. Records arrive NUL-terminated as `XY <path>`,
+/// so the scan can run chunk by chunk and retain nothing but the `?? `
+/// entries, rather than holding the whole listing in memory.
+#[derive(Default)]
+struct UntrackedScan {
+    pending: Vec<u8>,
+    untracked: Vec<Vec<u8>>,
+    /// A rename or copy entry is followed by a second record carrying
+    /// the origin path; it is a bare path, not an `XY `-prefixed
+    /// record, so it must not be read as one.
+    skip_next_record: bool,
+}
+
+impl UntrackedScan {
+    fn push_chunk(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            if byte == 0 {
+                let record = std::mem::take(&mut self.pending);
+                self.take_record(&record);
+            } else {
+                self.pending.push(byte);
+            }
+        }
+    }
+
+    fn take_record(&mut self, record: &[u8]) {
+        if self.skip_next_record {
+            self.skip_next_record = false;
+            return;
+        }
+        if record.len() < 3 {
+            return;
+        }
+        let (x, y) = (record[0], record[1]);
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            self.skip_next_record = true;
+        }
+        if x == b'?' && y == b'?' {
+            self.untracked.push(record[3..].to_vec());
+        }
+    }
+
+    /// Sorted untracked paths. A trailing unterminated record — a torn
+    /// read against the writing container — is taken as a whole record;
+    /// the worst it can do is perturb one sample's hash.
+    fn finish(mut self) -> Vec<Vec<u8>> {
+        if !self.pending.is_empty() {
+            let record = std::mem::take(&mut self.pending);
+            self.take_record(&record);
+        }
+        self.untracked.sort_unstable();
+        self.untracked
+    }
 }
 
 /// Run `git <args>` in `repo` and return its stdout, mapping a
