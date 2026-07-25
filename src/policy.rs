@@ -514,6 +514,30 @@ pub fn is_rate_limit_signature(text: &str) -> bool {
     is_opencode_rate_limit_signature(text)
 }
 
+/// Whether `text` carries a transient backend-outage signature —
+/// `503 Service Unavailable`, `504 Gateway Timeout`, a `500 Internal
+/// Server Error` from the model endpoint, or the codex/ChatGPT
+/// "experiencing high demand" overload banner. Used (issue #170) to
+/// distinguish a momentary upstream outage from a genuine crash: on a
+/// match, the runner marks the engine cooling and falls back to the next
+/// `cli_chain` entry rather than classifying the phase as `Crash`.
+///
+/// Matches case-insensitively. The status code is required alongside the
+/// standard reason phrase (`503 service unavailable`, not a bare
+/// `service unavailable`) so an unrelated mention in agent-fetched
+/// content is far less likely to false-positive — the same conservatism
+/// `is_rate_limit_signature` applies to a bare `429`.
+pub fn is_service_unavailable_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 4] = [
+        "503 service unavailable",
+        "504 gateway timeout",
+        "500 internal server error",
+        "experiencing high demand",
+    ];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
 /// Opencode-side rate-limit signature: composite match of
 /// `AI_APICallError` AND `"statusCode":429` on the ANSI-stripped form
 /// of the input (issue #120 / ADR-0008 AC4). Substrings come from the

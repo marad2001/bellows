@@ -282,6 +282,40 @@ fn is_rate_limit_signature_does_not_false_positive_on_loose_usage_word_collocati
 }
 
 #[test]
+fn is_service_unavailable_signature_matches_codex_503_outage() {
+    // Issue #170: the codex/ChatGPT backend outage that crashed the FA
+    // review phase. Status code + reason phrase must match.
+    let stderr = "ERROR: unexpected status 503 Service Unavailable: Service Unavailable, url: https://chatgpt.com/backend-api/codex/responses";
+    assert!(bellows::policy::is_service_unavailable_signature(stderr));
+}
+
+#[test]
+fn is_service_unavailable_signature_matches_high_demand_and_504_500() {
+    assert!(bellows::policy::is_service_unavailable_signature(
+        "Falling back from WebSockets to HTTPS transport. We're currently experiencing high demand, which may cause temporary errors."
+    ));
+    assert!(bellows::policy::is_service_unavailable_signature(
+        "HTTP error: 504 Gateway Timeout"
+    ));
+    assert!(bellows::policy::is_service_unavailable_signature(
+        "500 Internal Server Error"
+    ));
+}
+
+#[test]
+fn is_service_unavailable_signature_does_not_false_positive_on_bare_phrases() {
+    // The status code is required — a bare reason phrase in agent-fetched
+    // prose must NOT trigger (mirrors is_rate_limit_signature's bare-429
+    // caution).
+    assert!(!bellows::policy::is_service_unavailable_signature(
+        "the docs note the service was unavailable during maintenance; check the gateway settings"
+    ));
+    assert!(!bellows::policy::is_service_unavailable_signature(
+        "thread 'main' panicked at src/lib.rs:10: index out of bounds"
+    ));
+}
+
+#[test]
 fn is_auth_error_signature_matches_anthropic_refresh_token_expired_response() {
     // Anthropic-style auth-error stderr after a refresh token expires.
     // The canonical shape is a 401 with an underscore-style identifier;

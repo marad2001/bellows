@@ -1375,67 +1375,34 @@ pub async fn run_once(
             log_writer,
             "bellows: phase 3/8 — review (reads diff, produces findings)",
         );
-        let review_picked_opt = pick_non_implement_engine(
+        // Issue #170: pick + run with in-phase engine fallback on a
+        // transient backend outage (503/500/504). A rate-limit or a
+        // fully-exhausted chain terminates as RateLimited (retry-later),
+        // not Crash.
+        let review_analysis = run_analysis_agent_with_fallback(
+            &workspace,
+            config,
             &config.phases.review.cli_chain,
-            &state,
+            &mut state,
+            &state_path,
             implementer_cli,
             engine_label_override,
             "review",
+            policy::REVIEW_PROMPT,
+            true,
+            claimed.number,
+            &repo_label,
+            &repo_slug,
+            &ssh_keys_volume,
+            &deploy_keys,
+            &mut budget,
             log_writer,
-        );
-        if review_picked_opt.is_none() {
+        )
+        .await?;
+        if review_analysis.terminate_as_rate_limited {
             rate_limited_phase = Some("review");
         }
-        let review_picked = review_picked_opt.unwrap_or(PickedEntry {
-            entry: ChainEntry { engine: Engine::Claude, model: None },
-            reason: PickReason::ChainFirstHotEntry,
-        });
-        let review_chain_entry = review_picked.entry.clone();
-        let review_auth = auth_for(&review_chain_entry);
-        let review_agent_run = if rate_limited_phase.is_some() {
-            // Picker terminated; skip the agent invocation.
-            sandbox::AgentRun {
-                exit_code: 0,
-                stderr_tail: String::new(),
-                killed_by_deadline: false,
-            }
-        } else {
-            workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-            workspace::generate_commit_log(&workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
-            let review_kickoff = policy::wrap_phase_prompt_for_engine(
-                review_chain_entry.engine,
-                policy::REVIEW_PROMPT,
-            );
-            tokio::fs::write(
-                workspace.path().join(".bellows-kickoff.md"),
-                review_kickoff,
-            )
-            .await?;
-            let run = sandbox::run_agent(
-                &workspace,
-                &review_auth,
-                claimed.number,
-                &repo_label,
-                &repo_slug,
-                &ssh_keys_volume,
-                &deploy_keys,
-                log_writer,
-                budget.deadline_or_halt(),
-            )
-            .await?;
-            budget.mark_killed_if(run.killed_by_deadline);
-            if process_non_implement_rate_limit(
-                &mut state,
-                &state_path,
-                review_chain_entry.engine,
-                "review",
-                &run,
-                log_writer,
-            ) {
-                rate_limited_phase = Some("review");
-            }
-            run
-        };
+        let review_agent_run = review_analysis.run;
 
         // Read the findings file. Don't remove it yet — review-fix may
         // need to read it. If review-fix runs successfully it removes
@@ -1843,65 +1810,33 @@ pub async fn run_once(
                 log_writer,
                 "bellows: phase 5/8 — security-review (reads diff for the five security focus categories, produces findings)",
             );
-            let security_review_picked_opt = pick_non_implement_engine(
+            // Issue #170: pick + run with in-phase engine fallback on a
+            // transient backend outage; rate-limit / exhausted chain
+            // terminates as RateLimited (retry-later), not Crash.
+            let security_analysis = run_analysis_agent_with_fallback(
+                &workspace,
+                config,
                 &config.phases.security_review.cli_chain,
-                &state,
+                &mut state,
+                &state_path,
                 implementer_cli,
                 engine_label_override,
                 "security-review",
+                policy::SECURITY_REVIEW_PROMPT,
+                false,
+                claimed.number,
+                &repo_label,
+                &repo_slug,
+                &ssh_keys_volume,
+                &deploy_keys,
+                &mut budget,
                 log_writer,
-            );
-            if security_review_picked_opt.is_none() {
+            )
+            .await?;
+            if security_analysis.terminate_as_rate_limited {
                 rate_limited_phase = Some("security-review");
             }
-            let security_review_picked = security_review_picked_opt.unwrap_or(PickedEntry {
-                entry: ChainEntry { engine: Engine::Claude, model: None },
-                reason: PickReason::ChainFirstHotEntry,
-            });
-            let security_review_chain_entry = security_review_picked.entry.clone();
-            let security_review_auth = auth_for(&security_review_chain_entry);
-            let security_agent_run = if rate_limited_phase.is_some() {
-                sandbox::AgentRun {
-                    exit_code: 0,
-                    stderr_tail: String::new(),
-                    killed_by_deadline: false,
-                }
-            } else {
-                workspace::generate_diff(&workspace, policy::REVIEW_DIFF_FILE).await?;
-                let security_kickoff = policy::wrap_phase_prompt_for_engine(
-                    security_review_chain_entry.engine,
-                    policy::SECURITY_REVIEW_PROMPT,
-                );
-                tokio::fs::write(
-                    workspace.path().join(".bellows-kickoff.md"),
-                    security_kickoff,
-                )
-                .await?;
-                let run = sandbox::run_agent(
-                    &workspace,
-                    &security_review_auth,
-                    claimed.number,
-                    &repo_label,
-                    &repo_slug,
-                    &ssh_keys_volume,
-                    &deploy_keys,
-                    log_writer,
-                    budget.deadline_or_halt(),
-                )
-                .await?;
-                budget.mark_killed_if(run.killed_by_deadline);
-                if process_non_implement_rate_limit(
-                    &mut state,
-                    &state_path,
-                    security_review_chain_entry.engine,
-                    "security-review",
-                    &run,
-                    log_writer,
-                ) {
-                    rate_limited_phase = Some("security-review");
-                }
-                run
-            };
+            let security_agent_run = security_analysis.run;
 
             // Read the security findings file. Don't remove it yet —
             // security-fix may need to read it. The security-fix phase
@@ -2958,6 +2893,144 @@ pub fn state_file_path_alongside_log(log_path: &std::path::Path) -> std::path::P
 /// chain entry is cooling (caller short-circuits to RateLimited).
 /// Surfaces the diversity-collapse warning when pass-2 of the picker
 /// fired so the operator can see why the implementer-CLI ran review.
+/// Issue #170: a transient backend outage (503/500/504 / high demand) on
+/// one engine marks it cooling for a short 2-minute window so the
+/// chain-walk falls back to the next hot entry — distinct from a
+/// rate-limit's longer cooldown. Reuses the `cooling_until` mechanism so
+/// `pick_non_implement_engine` skips the engine on the re-pick.
+fn mark_transient_outage(
+    state: &mut StateFile,
+    state_path: &std::path::Path,
+    engine: Engine,
+    phase_name: &str,
+    log_writer: &mut dyn Write,
+) {
+    let now = chrono::Utc::now();
+    state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+    let _ = state.save(state_path);
+    announce(
+        log_writer,
+        &format!(
+            "bellows: phase `{phase_name}` engine={} hit a transient backend outage (503/500/504); marking it cooling and falling back to the next chain entry (issue #170)",
+            engine.as_name(),
+        ),
+    );
+}
+
+/// Outcome of an analysis-phase agent run with in-phase engine fallback.
+struct AnalysisRun {
+    run: sandbox::AgentRun,
+    /// `true` when the phase could not complete on any chain engine —
+    /// every entry was cooling, hit a rate-limit, or hit a transient
+    /// outage. The caller sets `rate_limited_phase` so the run
+    /// terminates as RateLimited (leave the PR open for re-run) rather
+    /// than Crash.
+    terminate_as_rate_limited: bool,
+}
+
+/// Issue #170: run a read-only analysis phase (review / security-review)
+/// with in-phase chain fallback on a transient backend outage. Picks the
+/// phase's engine, renders the kickoff, runs the agent; on a
+/// service-unavailable signature it marks the engine cooling and retries
+/// with the next hot chain entry, bounded by the chain length. A
+/// rate-limit still terminates (existing behaviour); a fully-exhausted
+/// chain terminates as RateLimited (retry-later, not Crash). Read-only
+/// only — the failed invocation commits nothing, so re-running on a
+/// different engine cannot lose work.
+#[allow(clippy::too_many_arguments)]
+async fn run_analysis_agent_with_fallback(
+    workspace: &workspace::Workspace,
+    config: &Config,
+    chain: &[ChainEntry],
+    state: &mut StateFile,
+    state_path: &std::path::Path,
+    implementer: Option<Engine>,
+    forced: Option<Engine>,
+    phase_name: &'static str,
+    prompt: &str,
+    generate_commit_log: bool,
+    issue_number: u64,
+    repo_label: &str,
+    repo_slug: &str,
+    ssh_keys_volume: &str,
+    deploy_keys: &[String],
+    budget: &mut WallClockBudget,
+    log_writer: &mut dyn Write,
+) -> Result<AnalysisRun, RunError> {
+    let skipped = || sandbox::AgentRun {
+        exit_code: 0,
+        stderr_tail: String::new(),
+        killed_by_deadline: false,
+    };
+    let chain_len = chain.len().max(1);
+    for attempt in 0..chain_len {
+        let Some(picked) =
+            pick_non_implement_engine(chain, state, implementer, forced, phase_name, log_writer)
+        else {
+            return Ok(AnalysisRun {
+                run: skipped(),
+                terminate_as_rate_limited: true,
+            });
+        };
+        let entry = picked.entry.clone();
+        let auth = auth_for_chain_entry(config, &entry);
+        workspace::generate_diff(workspace, policy::REVIEW_DIFF_FILE).await?;
+        if generate_commit_log {
+            workspace::generate_commit_log(workspace, policy::REVIEW_COMMIT_LOG_FILE).await?;
+        }
+        let kickoff = policy::wrap_phase_prompt_for_engine(entry.engine, prompt);
+        tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), kickoff).await?;
+        let run = sandbox::run_agent(
+            workspace,
+            &auth,
+            issue_number,
+            repo_label,
+            repo_slug,
+            ssh_keys_volume,
+            deploy_keys,
+            log_writer,
+            budget.deadline_or_halt(),
+        )
+        .await?;
+        budget.mark_killed_if(run.killed_by_deadline);
+        if process_non_implement_rate_limit(
+            state,
+            state_path,
+            entry.engine,
+            phase_name,
+            &run,
+            log_writer,
+        ) {
+            return Ok(AnalysisRun {
+                run,
+                terminate_as_rate_limited: true,
+            });
+        }
+        if run.exit_code != 0
+            && !budget.exceeded
+            && policy::is_service_unavailable_signature(&run.stderr_tail)
+        {
+            mark_transient_outage(state, state_path, entry.engine, phase_name, log_writer);
+            if attempt + 1 < chain_len {
+                continue;
+            }
+            // Every chain entry hit the outage → retry-later, not Crash.
+            return Ok(AnalysisRun {
+                run,
+                terminate_as_rate_limited: true,
+            });
+        }
+        return Ok(AnalysisRun {
+            run,
+            terminate_as_rate_limited: false,
+        });
+    }
+    Ok(AnalysisRun {
+        run: skipped(),
+        terminate_as_rate_limited: true,
+    })
+}
+
 fn pick_non_implement_engine(
     chain: &[ChainEntry],
     state: &StateFile,
