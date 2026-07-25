@@ -1081,7 +1081,7 @@ pub async fn run_once(
     // and no log comment. Witnessed live on issue #42 (CRLF shebang
     // in policy-image/entrypoint-user).
     //
-    // The fix: synthesise a bellows-authored `agent-notes.md` entry
+    // The fix: synthesise a bellows-authored `bellows-agent-notes.md` entry
     // capturing the implement-phase exit code + a bounded prefix of
     // its stderr/stdout tail. That gives the run a single commit on
     // the agent branch (so the push succeeds) AND something readable
@@ -1096,8 +1096,8 @@ pub async fn run_once(
     //   - `implement_agent_run.exit_code != 0` — the new path only
     //     activates on a true crash. A clean exit with no commits
     //     (agent decided the brief was unnecessary or wrote
-    //     agent-notes.md instead of code) still routes through the
-    //     existing `agent-notes.md` precedence, per the brief.
+    //     bellows-agent-notes.md instead of code) still routes through the
+    //     existing `bellows-agent-notes.md` precedence, per the brief.
     //   - `head_after_implement == head_before_implement` — and the
     //     workspace must genuinely be at base. If the agent self-
     //     committed before crashing, HEAD has advanced; the existing
@@ -1110,7 +1110,7 @@ pub async fn run_once(
             log_writer,
             "bellows: implement crashed with no commits — synthesising agent-notes entry so the run produces a draft PR + agent-failed label rather than silently stalling at agent-in-progress",
         );
-        let notes_path = workspace.path().join("agent-notes.md");
+        let notes_path = workspace.path().join("bellows-agent-notes.md");
         let existing = if notes_path.exists() {
             tokio::fs::read_to_string(&notes_path).await?
         } else {
@@ -1178,7 +1178,7 @@ pub async fn run_once(
     // test suite) but is otherwise indistinguishable from a real
     // Success — falling through to a non-draft PR a reviewer might
     // merge. The guard catches this by synthesising an `## Unaddressed
-    // finding: no new tests added` section in agent-notes.md, which
+    // finding: no new tests added` section in bellows-agent-notes.md, which
     // routes the run to AgentSelfReportedFailure via the existing
     // slice-9.6 has_agent_notes precedence in classify_exit.
     //
@@ -1220,7 +1220,7 @@ pub async fn run_once(
                 log_writer,
                 "bellows: weak-test guard fired — diff against base has no new Rust test attributes; synthesising agent-notes entry to force agent-self-reported-failure",
             );
-            let notes_path = workspace.path().join("agent-notes.md");
+            let notes_path = workspace.path().join("bellows-agent-notes.md");
             let existing = if notes_path.exists() {
                 tokio::fs::read_to_string(&notes_path).await?
             } else {
@@ -1530,7 +1530,7 @@ pub async fn run_once(
                     &policy::per_finding_kickoff(
                         finding,
                         policy::REVIEW_DIFF_FILE,
-                        "agent-notes.md",
+                        "bellows-agent-notes.md",
                     ),
                 );
                 tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), &kickoff)
@@ -1576,7 +1576,7 @@ pub async fn run_once(
                 //      subsequent commit_all sees nothing to stage and
                 //      returns NoChangesToCommit. commit_landed=true
                 //      iff the diff between head_before..head_after
-                //      touched any file other than agent-notes.md.
+                //      touched any file other than bellows-agent-notes.md.
                 //   2. Bellows commits on the agent's behalf (existing
                 //      case). Agent left uncommitted edits; commit_all
                 //      produces the boilerplate "Bellows agent run"
@@ -1586,7 +1586,7 @@ pub async fn run_once(
                 //   3. Notes-only edit (any author). The agent only
                 //      wrote an Unaddressed-finding section; HEAD may
                 //      advance via bellows's commit but the diff is
-                //      exactly [agent-notes.md]. commit_landed=false
+                //      exactly [bellows-agent-notes.md]. commit_landed=false
                 //      so the verbatim-title fallback in
                 //      compute_coverage_violations runs.
                 //   4. No commit at all. HEAD did not advance (agent
@@ -1696,14 +1696,14 @@ pub async fn run_once(
             });
             halt_after_fix = review_fix_exit != 0;
 
-            // Parser-as-backstop: independently parse agent-notes.md
+            // Parser-as-backstop: independently parse bellows-agent-notes.md
             // and cross-reference with the urgent-finding coverage we
             // tracked above. Findings with neither a commit nor a
             // verbatim-title section are violations; we synthesise
             // entries for them so the existing has_agent_notes →
             // AgentSelfReportedFailure precedence in classify_exit
             // fires.
-            let notes_path = workspace.path().join("agent-notes.md");
+            let notes_path = workspace.path().join("bellows-agent-notes.md");
             let notes_text = if notes_path.exists() {
                 tokio::fs::read_to_string(&notes_path).await?
             } else {
@@ -2002,7 +2002,7 @@ pub async fn run_once(
         //
         // Read-only end-of-pipeline judgement. Reads the squashed
         // diff, the brief's verbatim ACs (carried in the kickoff
-        // prompt), the final `agent-notes.md` content, and the
+        // prompt), the final `bellows-agent-notes.md` content, and the
         // cargo-checks gate status; writes its prose review to
         // `MERGER_OUTPUT_FILE` ending with a `VERDICT: <token>` line.
         // Bellows parses the verdict and stores it in `PhaseOutcomes`.
@@ -2113,13 +2113,13 @@ pub async fn run_once(
         cleanup_phase_handoff_files(&workspace).await?;
     }
 
-    // Issue #85: capture `agent-notes.md` content ONCE at the very end,
+    // Issue #85: capture `bellows-agent-notes.md` content ONCE at the very end,
     // then remove the file + commit + push the deletion. Any phase may
     // have written/appended to it (implement, weak-test guard, review-fix,
     // security-fix, parser-as-backstop synth) and the per-phase commits
     // would have already pushed the file onto the agent branch — we
     // explicitly commit the deletion here so the agent branch's pushed
-    // end-state has no `agent-notes.md`. A subsequent squash-merge to
+    // end-state has no `bellows-agent-notes.md`. A subsequent squash-merge to
     // `master` therefore cannot inherit stale notes into the next run's
     // fresh clone. The captured content still drives
     // `classify_exit`'s `has_agent_notes` precedence below (unchanged)
@@ -2499,7 +2499,7 @@ fn build_pr_body(
             }),
         ExitReason::AgentSelfReportedFailure => format!(
             "## Agent self-reported failure\n\n\
-             The agent wrote `agent-notes.md` rather than complete the brief. The file itself is ephemeral to the run (issue #85) and does not appear in this PR's diff; its content is posted as a separate `## Agent notes` PR comment for visibility and quoted below for convenience.\n\n\
+             The agent wrote `bellows-agent-notes.md` rather than complete the brief. The file itself is ephemeral to the run (issue #85) and does not appear in this PR's diff; its content is posted as a separate `## Agent notes` PR comment for visibility and quoted below for convenience.\n\n\
              ```\n{}\n```\n\n\
              See the run-log comment on this PR for the agent's output tail.",
             agent_notes.unwrap_or("(no notes content captured)")
@@ -2651,7 +2651,7 @@ fn build_log_body(
     // agent-notes entries to force agent-self-reported-failure. Surface
     // the violation list explicitly here so a reader of the PR comment
     // sees which findings the agent dropped, rather than having to
-    // diff agent-notes.md to figure out why the run was forced into
+    // diff bellows-agent-notes.md to figure out why the run was forced into
     // failure.
     if !outcomes.backstop_violations.is_empty() {
         body.push_str(&policy::build_violation_callout(&outcomes.backstop_violations));
@@ -3001,13 +3001,13 @@ impl WallClockBudget {
     }
 }
 
-/// Issue #85: read `agent-notes.md` from the workspace (if present)
+/// Issue #85: read `bellows-agent-notes.md` from the workspace (if present)
 /// and remove the file from disk in a single step. Returns the raw
 /// content, or `None` if the file did not exist.
 ///
 /// Pipeline phases (implement, weak-test guard, review-fix's per-finding
 /// invocations, security-fix, parser-as-backstop synth) write/append
-/// to `agent-notes.md` and commit it as part of their per-phase `git
+/// to `bellows-agent-notes.md` and commit it as part of their per-phase `git
 /// add -A`. Pre-#85 the file then rode along on the agent branch into
 /// `master` via squash-merge, and every subsequent fresh clone
 /// inherited the stale content — `classify_exit`'s `has_agent_notes`
@@ -3022,7 +3022,7 @@ impl WallClockBudget {
 pub async fn capture_and_remove_agent_notes(
     workspace: &workspace::Workspace,
 ) -> Result<Option<String>, std::io::Error> {
-    let path = workspace.path().join("agent-notes.md");
+    let path = workspace.path().join("bellows-agent-notes.md");
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3039,7 +3039,7 @@ pub async fn capture_and_remove_agent_notes(
 /// comment posts in [`run_once`]: a dedicated, clearly-titled comment
 /// the operator can find in the PR's conversation tab without having to
 /// scan the file diff. Pre-#85 the content sat in the PR's diff via
-/// `agent-notes.md` itself; now the file is ephemeral, and this comment
+/// `bellows-agent-notes.md` itself; now the file is ephemeral, and this comment
 /// is the operator-visible surface that replaces it.
 pub async fn post_agent_notes_comment_if_present(
     client: &octocrab::Octocrab,
@@ -3955,7 +3955,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
         // `### Address-or-explain contract violated` callout naming
         // each offending finding by verbatim title + severity. Without
         // this surface, a reader of the PR comment would have to diff
-        // agent-notes.md to figure out which findings the agent
+        // bellows-agent-notes.md to figure out which findings the agent
         // skipped — defeating the point of the explicit-failure mode.
         use crate::policy::{ParsedFinding, Severity};
         let started = fixed_timestamp();
@@ -4070,7 +4070,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
         // synth flag (set true by the runner when implement crashed
         // with no commits) and a non-zero implement exit must route
         // through `classify_exit` to `Crash`. The synth wrote
-        // agent-notes.md and committed it; per ADR-0006 / issue #95
+        // bellows-agent-notes.md and committed it; per ADR-0006 / issue #95
         // that content now flows through note classification with the
         // recorded Bellows synth span, which recognises the synth-only
         // file as `NotesShape::Absent`. Routing then falls through to

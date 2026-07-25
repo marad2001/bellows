@@ -42,7 +42,7 @@ pub enum ExitReason {
     Cancelled,
 }
 
-/// Classification of `agent-notes.md` content. Drives the
+/// Classification of `bellows-agent-notes.md` content. Drives the
 /// new `classify_exit` signature (issue #95 / ADR-0006): replaces the
 /// pre-ADR-0006 bare `has_agent_notes: bool` so the classifier can
 /// distinguish the three meaningful states of the file rather than
@@ -50,7 +50,7 @@ pub enum ExitReason {
 ///
 /// The three variants:
 ///
-/// - `Absent` — no agent-notes.md, an empty file, or a file whose only
+/// - `Absent` — no bellows-agent-notes.md, an empty file, or a file whose only
 ///   content is bellows-authored synth material (issue-#49
 ///   implement-crash recovery). After removing recorded synth spans,
 ///   nothing agent-authored remains, so the run routes on phase
@@ -79,7 +79,7 @@ pub enum NotesShape {
     HasUnaddressedFinding,
 }
 
-/// Why Bellows appended a synthetic span to `agent-notes.md`.
+/// Why Bellows appended a synthetic span to `bellows-agent-notes.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BellowsSynthCause {
     /// Issue #49 crash recovery: Bellows wrote diagnostic notes so the
@@ -101,7 +101,7 @@ impl BellowsSynthCause {
 }
 
 /// Out-of-band provenance for a Bellows-authored append to
-/// `agent-notes.md`. `start` and `end` are byte offsets into the final
+/// `bellows-agent-notes.md`. `start` and `end` are byte offsets into the final
 /// captured note text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BellowsSynthSpan {
@@ -165,7 +165,7 @@ fn remove_synth_spans(text: &str, spans: &[BellowsSynthSpan]) -> String {
     out
 }
 
-/// Decide the `NotesShape` of an `agent-notes.md` file's raw content.
+/// Decide the `NotesShape` of an `bellows-agent-notes.md` file's raw content.
 ///
 /// `None` is `Absent` (file missing). For `Some(text)` the precedence
 /// is:
@@ -319,7 +319,7 @@ pub struct PhaseOutcomes {
     /// callout that names each offending finding.
     pub backstop_violations: Vec<ParsedFinding>,
     /// Issue #49: true when the runner synthesised an
-    /// `agent-notes.md` entry to recover from an implement-phase
+    /// `bellows-agent-notes.md` entry to recover from an implement-phase
     /// crash that left the workspace with no commits. The synth's
     /// only purpose is to give the run something to commit so the
     /// branch can be pushed and a draft PR opened (otherwise the
@@ -350,7 +350,7 @@ pub struct PhaseOutcomes {
     pub merger_prose: Option<String>,
     /// Issue #124 / ADR-0009 slice 2: out-of-band provenance for any
     /// Bellows-authored `## Unaddressed finding:` spans appended to
-    /// `agent-notes.md` during this run. The runner populates this
+    /// `bellows-agent-notes.md` during this run. The runner populates this
     /// from the `BellowsSynthSpan`s recorded by
     /// `append_bellows_synth_entry`. `classify_exit` treats these as
     /// a hard override: when any of `WeakTestGuard`,
@@ -653,7 +653,7 @@ pub(crate) fn gate_failed(gate: &GateOutcome) -> bool {
 /// - `Merge` — the diff satisfies the brief's ACs and the agent
 ///   recommends opening a normal (non-draft) PR.
 /// - `HoldNoted` — the diff is broadly OK but a gap was flagged in
-///   `agent-notes.md`; the merger surfaces it for human review.
+///   `bellows-agent-notes.md`; the merger surfaces it for human review.
 /// - `HoldDraft` — the diff does not yet satisfy the brief; the merger
 ///   recommends opening a draft PR so a human can take over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -738,7 +738,7 @@ pub fn parse_merger_verdict(agent_output: &str) -> Option<MergerVerdict> {
 /// ending in a `VERDICT: <token>` line carrying exactly one of
 /// `MERGE`, `HOLD-NOTED`, or `HOLD-DRAFT`. The merger reads the diff
 /// vs master, the brief's verbatim ACs (appended by the runner to the
-/// kickoff prompt), the final `agent-notes.md` content (with synth-
+/// kickoff prompt), the final `bellows-agent-notes.md` content (with synth-
 /// provenance markers), and end-pipeline cargo-checks status (also
 /// appended by the runner) — then judges whether the diff satisfies
 /// the ACs. Notes are treated as agent-stated
@@ -753,15 +753,15 @@ pub fn render_merger_prompt() -> String {
     MERGER_PROMPT.to_string()
 }
 
-const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bellows agent pipeline. The implement → cargo-checks → review → review-fix → security-review → security-fix → cargo-checks phases have already run; your job is to integrate the resulting diff, the brief's acceptance criteria, the final `agent-notes.md` content, and the CI / cargo-checks status into a single end-of-pipeline judgement.
+const MERGER_PROMPT: &str = r#"You are running as the **merger phase** of a Bellows agent pipeline. The implement → cargo-checks → review → review-fix → security-review → security-fix → cargo-checks phases have already run; your job is to integrate the resulting diff, the brief's acceptance criteria, the final `bellows-agent-notes.md` content, and the CI / cargo-checks status into a single end-of-pipeline judgement.
 
 ## Inputs
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta this run produced against master. Read this as the primary anchor.
 - The agent brief (with its verbatim `## Acceptance criteria` list) is appended to this kickoff under `## Bellows-supplied run inputs`. Treat the brief's acceptance criteria as the contract — your verdict is a judgement on whether the diff satisfies them.
-- `/workspace/agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
+- `/workspace/bellows-agent-notes.md` may exist (any earlier phase may have appended to it, including bellows-side synths which carry `<!-- bellows ... -->` provenance markers). Read it for context, but treat the content as agent-stated reasoning, NOT evidence the code is correct. The diff and ACs are the evidence; the notes are commentary.
 
-  **Synth-provenance markers are a hard signal: do NOT vote `MERGE` when any `<!-- bellows parser-as-backstop ... -->`, `<!-- bellows weak-test guard ... -->`, or `<!-- bellows implement-crash recovery ... -->` HTML comment is present in agent-notes.md.** These markers are Bellows' own out-of-band evidence that the run is not mergeable: the parser-as-backstop detected a finding the agent silently skipped, the weak-test guard fired, or the implement phase crashed. The marker text itself appears verbatim in the file; you cannot strip it. The correct verdict in their presence is `HOLD-DRAFT` (or `HOLD-NOTED` if the markers are stale relative to the current diff and a human reviewer should still glance at the gap before merge — but never `MERGE`). Your verdict is advisory and does not gate the run, but emitting the right verdict here produces a sharper `## Merge verdict` PR comment that accurately flags, for the operator's review, that Bellows' own out-of-band signals judged the run not mergeable.
+  **Synth-provenance markers are a hard signal: do NOT vote `MERGE` when any `<!-- bellows parser-as-backstop ... -->`, `<!-- bellows weak-test guard ... -->`, or `<!-- bellows implement-crash recovery ... -->` HTML comment is present in bellows-agent-notes.md.** These markers are Bellows' own out-of-band evidence that the run is not mergeable: the parser-as-backstop detected a finding the agent silently skipped, the weak-test guard fired, or the implement phase crashed. The marker text itself appears verbatim in the file; you cannot strip it. The correct verdict in their presence is `HOLD-DRAFT` (or `HOLD-NOTED` if the markers are stale relative to the current diff and a human reviewer should still glance at the gap before merge — but never `MERGE`). Your verdict is advisory and does not gate the run, but emitting the right verdict here produces a sharper `## Merge verdict` PR comment that accurately flags, for the operator's review, that Bellows' own out-of-band signals judged the run not mergeable.
 - The end-pipeline cargo-checks gate status is appended to this kickoff under `## Bellows-supplied run inputs`. Treat a passing cargo-checks gate as a necessary-but-not-sufficient signal.
 
 ## What this phase does NOT do
@@ -773,7 +773,7 @@ You are read-only with respect to the repo contents: do NOT edit any tracked fil
 Write your natural-language prose review to `/workspace/.bellows-merger-output.md`. Cover:
 
 1. Whether each acceptance criterion in the brief is satisfied by the diff. Reference the diff (file paths, function names) for each AC you confirm or flag.
-2. Whether `agent-notes.md` raises any concern the diff has not addressed. Remember: notes are reasoning, not evidence. A note that says "I deviated from strict test-first on AC4" is fine; a note that says "I couldn't satisfy AC2" is a hold signal.
+2. Whether `bellows-agent-notes.md` raises any concern the diff has not addressed. Remember: notes are reasoning, not evidence. A note that says "I deviated from strict test-first on AC4" is fine; a note that says "I couldn't satisfy AC2" is a hold signal.
 3. Whether the cargo-checks gate's outcome is consistent with the diff (e.g. green gate over a diff that touches Rust source is the expected shape; green gate over a no-Rust-source diff is also fine).
 
 End the file's contents with a SINGLE trailing line of the EXACT form:
@@ -785,7 +785,7 @@ VERDICT: <TOKEN>
 where `<TOKEN>` is exactly one of (CASE-SENSITIVE, no quotes, no trailing punctuation). Per ADR-0011 your verdict is **advisory** — it is your opinion for the operator's morning review, NOT a gate on the run. It does not route the run, does not decide whether the PR lands as draft or non-draft, and does not feed `classify_exit` (only mechanical, objective failures — red CI, a red cargo-checks gate, an agent crash, a budget/rate-limit stop — gate a merge). Pick the token that best captures your opinion of the shipped diff:
 
 - `MERGE` — ship-ready: the diff satisfies the brief's ACs and you would happily see it land as-is.
-- `HOLD-NOTED` — ship-but-worth-a-look: the diff broadly satisfies the ACs but `agent-notes.md` or the diff flags a gap the operator should glance at before or after the merge.
+- `HOLD-NOTED` — ship-but-worth-a-look: the diff broadly satisfies the ACs but `bellows-agent-notes.md` or the diff flags a gap the operator should glance at before or after the merge.
 - `HOLD-DRAFT` — would-hold-if-it-could: the diff does NOT satisfy the brief's ACs, and if the verdict still gated the run you would hold it for a human. It no longer does, but the token records that opinion clearly.
 
 The trailing verdict line is still parsed — Bellows greps `/workspace/.bellows-merger-output.md` for it after your run to build the `## Merge verdict` PR comment and to drive the `[phases.merge].posting` toggle (e.g. `post-on-hold-only`, which posts the comment only for `HOLD-NOTED` / `HOLD-DRAFT`). Emitting the right token therefore still matters for what the operator sees, even though it no longer affects whether the PR is draft or merged. Off-vocabulary tokens (e.g. `LGTM`, `merge`, `OK`) will not be recognised and the run will be logged as having no parseable verdict. Emit exactly one verdict line; do not quote it elsewhere in the prose with a different token.
@@ -846,7 +846,7 @@ pub const REVIEW_PROMPT: &str = r#"You are running as the **review phase** of a 
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` — the entire delta the implement phase produced. Read this file as the primary input. Do not browse the wider codebase except to disambiguate symbols referenced in the diff; the patch is the contract.
 - `/workspace/.bellows-review-commit-log.txt` contains `git log --name-status <base>...HEAD` — the commit-by-commit history of the agent branch since it diverged from the base. Use this to reason about commit *ordering* (which the squashed diff cannot show): which files arrived in which commit, in what order. Required for the test-first check below.
-- `/workspace/agent-notes.md` may exist (the implement phase appended to it if it could not complete some part of the brief). Read it for context on deliberate gaps or known limitations.
+- `/workspace/bellows-agent-notes.md` may exist (the implement phase appended to it if it could not complete some part of the brief). Read it for context on deliberate gaps or known limitations.
 
 ## Test-first commit-shape check
 
@@ -855,7 +855,7 @@ The implement-phase kickoff mandates a test-first commit shape: one failing-test
 - **mega-commit**: a single commit on the agent branch touches BOTH test files (`tests/**`, files containing `#[test]` / `#[tokio::test]` attributes) AND non-trivial source files at the same time. The two should land in separate commits so the make-it-pass commit demonstrates the test transitioning from red to green.
 - **source-before-test**: a source-file commit lands earlier in the agent-branch history than the corresponding test commit. Tests added after the implementation are not test-first — they post-hoc rationalise whatever the implementation happens to do.
 
-If the entire branch is a single mega-commit, that one commit is the violation; if individual commits ordered source-before-test, name each offending pair. Use the existing finding format and the `important` severity tag so the run's per-finding review-fix loop can route the finding through unchanged: the agent will get one invocation to either rewrite history to be test-first OR append an `## Unaddressed finding: <verbatim title>` section to agent-notes.md.
+If the entire branch is a single mega-commit, that one commit is the violation; if individual commits ordered source-before-test, name each offending pair. Use the existing finding format and the `important` severity tag so the run's per-finding review-fix loop can route the finding through unchanged: the agent will get one invocation to either rewrite history to be test-first OR append an `## Unaddressed finding: <verbatim title>` section to bellows-agent-notes.md.
 
 A diff with no test files at all is out of scope for this check — the slice-8 weak-test guard handles "no tests added" separately. Briefs that the operator labelled with the skip-label are also out of scope here; the bellows runner will already have skipped the weak-test guard for those, but the test-first check is a stylistic recommendation rather than a hard gate, so it is acceptable to skip flagging where the brief makes test-first ordering impractical (e.g. pure-docs PRs).
 
@@ -863,7 +863,7 @@ A diff with no test files at all is out of scope for this check — the slice-8 
 
 Write your findings to `/workspace/.bellows-review-findings.md` in this markdown format. Each finding's title line MUST end with ` — ` followed by exactly one severity tag drawn from the closed vocabulary `blocker | important | nit` — use exactly one of these three values, never invent another tag (no "medium", "minor", "follow-up", etc.). The review-fix phase keys its address-OR-explain contract on these exact strings, so a missing or off-vocabulary tag silently demotes the finding.
 
-Additional title-format constraints (load-bearing for the bellows parser-as-backstop — the runner extracts the title verbatim and matches it against `## Unaddressed finding: <title>` sections in agent-notes.md, so any drift breaks the cross-reference):
+Additional title-format constraints (load-bearing for the bellows parser-as-backstop — the runner extracts the title verbatim and matches it against `## Unaddressed finding: <title>` sections in bellows-agent-notes.md, so any drift breaks the cross-reference):
 
 - The title MUST be on one line. No line breaks inside a title.
 - The title line MUST end with ` — <tag>` (space, em-dash, space, then the severity tag).
@@ -903,11 +903,11 @@ If you find no issues worth flagging, write the file with a single line: `(no fi
 
 ## What this phase does NOT do
 
-You are read-only. Do NOT edit any files except `.bellows-review-findings.md` and (optionally) `agent-notes.md`. Do NOT create commits. Do NOT push. The review-fix phase that follows you will read your findings and address them.
+You are read-only. Do NOT edit any files except `.bellows-review-findings.md` and (optionally) `bellows-agent-notes.md`. Do NOT create commits. Do NOT push. The review-fix phase that follows you will read your findings and address them.
 
 ## When you cannot complete
 
-If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from the implement phase that must remain visible to the human reviewer.
+If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/bellows-agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from the implement phase that must remain visible to the human reviewer.
 "#;
 
 /// Vendored review-fix-phase prompt — slice 9.6 per-finding shape.
@@ -916,7 +916,7 @@ If the diff is malformed, missing, or you genuinely cannot review it, append a s
 /// finding interpolated. The prompt scopes the agent to a SINGLE finding
 /// per invocation: there is no list to silently skip, only one finding
 /// and two options (address in code OR write an `## Unaddressed finding:
-/// <verbatim title>` section to agent-notes.md). The slice-9.5 prompt's
+/// <verbatim title>` section to bellows-agent-notes.md). The slice-9.5 prompt's
 /// "every finding marked blocker or important" framing is gone — that
 /// wording is exactly what enabled four consecutive silent-skip
 /// regressions (#26, #28, #30, #33), so the per-finding shape removes
@@ -929,7 +929,7 @@ If the diff is malformed, missing, or you genuinely cannot review it, append a s
 /// - `{body}` — the finding's description + suggestion block
 /// - `{urgency}` — severity-flavoured tone line
 /// - `{diff_path}` — workspace-relative path to the review diff
-/// - `{agent_notes_path}` — workspace-relative path to agent-notes.md
+/// - `{agent_notes_path}` — workspace-relative path to bellows-agent-notes.md
 pub const REVIEW_FIX_PROMPT: &str = r#"You are running as a **single-finding review-fix invocation** of a Bellows agent pipeline. You have ONE finding to handle. That's the entire job.
 
 ## The finding
@@ -960,7 +960,7 @@ APPEND to `/workspace/{agent_notes_path}` — do not overwrite; the file may alr
 
 Exiting without either a code-fix commit OR an `## Unaddressed finding: {title}` section is prompt-out-of-bounds. The bellows parser-as-backstop will detect a silent skip after this phase ends and synthesize an `## Unaddressed finding:` entry on your behalf, forcing the run to agent-self-reported-failure anyway. It is strictly better to write the section yourself with the real reason than to let the synthetic entry replace it.
 
-## What appending to agent-notes.md signals
+## What appending to bellows-agent-notes.md signals
 
 The presence of `/workspace/{agent_notes_path}` at the end of the pipeline routes the run to **agent-self-reported-failure**: bellows opens the resulting PR as a draft with the `agent-failed` label, attaches your notes, and surfaces the partial commits to the operator for review. This is the intended escalation path for `blocker` / `important` work you cannot complete — the operator sees the draft PR plus your notes plus the partial commits and decides what to do.
 
@@ -1001,12 +1001,12 @@ Look for issues in exactly these five categories. Do not expand the scope:
 4. **Injection** — command, SQL, shell, or template injection via string interpolation that mixes untrusted input with code paths.
 5. **Data exposure** — secrets in logs, error messages, or commit content; sensitive data written to world-readable locations; PII or credentials traversing unintended boundaries.
 
-A finding outside these five categories is out of scope for this phase — flag it as a `## Unaddressed finding` section in agent-notes.md only if it materially blocks the review, otherwise leave it for the standard review phase.
+A finding outside these five categories is out of scope for this phase — flag it as a `## Unaddressed finding` section in bellows-agent-notes.md only if it materially blocks the review, otherwise leave it for the standard review phase.
 
 ## Inputs
 
 - `/workspace/.bellows-review-diff.patch` contains `git diff <base>...HEAD` regenerated from the POST-review-fix workspace state — the entire delta the implement + review-fix phases produced. Read this file as the primary input. Do not browse the wider codebase except to disambiguate symbols referenced in the diff.
-- `/workspace/agent-notes.md` may exist (prior phases may have appended to it). Read it for context on deliberate gaps or known limitations.
+- `/workspace/bellows-agent-notes.md` may exist (prior phases may have appended to it). Read it for context on deliberate gaps or known limitations.
 
 ## Output
 
@@ -1035,29 +1035,29 @@ Example findings file:
 
 **Suggestion:** pass arguments as a `&[&str]` slice to `Command::new("git").args([...])` so the shell never sees the user-controlled value.
 
-### 2. agent-notes.md may contain secrets and is committed to the PR diff — important
+### 2. bellows-agent-notes.md may contain secrets and is committed to the PR diff — important
 
-The implement-phase synth embeds a prefix of the agent's stderr tail in agent-notes.md. If the agent printed an API key or OAuth token to stderr before crashing, that secret would be committed to the PR's branch and visible in the diff.
+The implement-phase synth embeds a prefix of the agent's stderr tail in bellows-agent-notes.md. If the agent printed an API key or OAuth token to stderr before crashing, that secret would be committed to the PR's branch and visible in the diff.
 
-**Suggestion:** scrub well-known secret shapes (Bearer tokens, AWS keys, OAuth refresh tokens) from the embedded tail before writing it to agent-notes.md.
+**Suggestion:** scrub well-known secret shapes (Bearer tokens, AWS keys, OAuth refresh tokens) from the embedded tail before writing it to bellows-agent-notes.md.
 ```
 
 If you find no issues worth flagging, write the file with a single line: `(no findings)`. The file MUST exist either way — Bellows reads it after the run and treats it as the contract for the security-fix phase.
 
 ## What this phase does NOT do
 
-You are read-only. Do NOT edit any files except `.bellows-security-findings.md` and (optionally) `agent-notes.md`. Do NOT create commits. Do NOT push. The security-fix phase that follows you will read your findings and address them.
+You are read-only. Do NOT edit any files except `.bellows-security-findings.md` and (optionally) `bellows-agent-notes.md`. Do NOT create commits. Do NOT push. The security-fix phase that follows you will read your findings and address them.
 
 ## When you cannot complete
 
-If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from earlier phases that must remain visible to the human reviewer.
+If the diff is malformed, missing, or you genuinely cannot review it, append a section to `/workspace/bellows-agent-notes.md` explaining what stopped you. APPEND — do not overwrite. The file may already contain notes from earlier phases that must remain visible to the human reviewer.
 "#;
 
 /// Vendored security-fix-phase prompt (slice X2). Sibling of
 /// `REVIEW_FIX_PROMPT` but in the batch shape (single invocation handling
 /// all findings) — the security-fix phase reads the findings file
 /// written by `SECURITY_REVIEW_PROMPT`, addresses each finding, commits
-/// each fix, and removes the findings file. Appends to `agent-notes.md`
+/// each fix, and removes the findings file. Appends to `bellows-agent-notes.md`
 /// if any finding can't be addressed cleanly.
 pub const SECURITY_FIX_PROMPT: &str = r#"You are running as the **security-fix phase** of a Bellows agent pipeline. The security-review phase produced findings; your job is to address each one and remove the findings file.
 
@@ -1065,7 +1065,7 @@ pub const SECURITY_FIX_PROMPT: &str = r#"You are running as the **security-fix p
 
 - `/workspace/.bellows-security-findings.md` contains the security findings produced by the security-review phase. Each finding has a title ending in ` — blocker | important | nit`, a description, and a suggested remediation.
 - `/workspace/.bellows-review-diff.patch` contains the post-review-fix diff that the security review was performed against. Read it if you need disambiguation.
-- `/workspace/agent-notes.md` may exist with notes from earlier phases. Read it for context; APPEND only, never overwrite.
+- `/workspace/bellows-agent-notes.md` may exist with notes from earlier phases. Read it for context; APPEND only, never overwrite.
 
 ## Your job
 
@@ -1076,11 +1076,11 @@ For each finding in `.bellows-security-findings.md`:
 3. Run `cargo check` (or equivalent) after each change to confirm you have not broken compilation.
 4. Commit each fix with a clear, scoped commit message — one commit per finding is ideal so the operator can map fixes back to the security-findings PR comment.
 
-When every finding has been addressed (or explicitly escalated to agent-notes.md), delete `/workspace/.bellows-security-findings.md`. The runner uses the absence of this file as the signal that the security-fix phase is complete; leaving it behind would cause a downstream readability problem (the file would ship in the PR diff).
+When every finding has been addressed (or explicitly escalated to bellows-agent-notes.md), delete `/workspace/.bellows-security-findings.md`. The runner uses the absence of this file as the signal that the security-fix phase is complete; leaving it behind would cause a downstream readability problem (the file would ship in the PR diff).
 
 ## When a finding cannot be addressed
 
-If you cannot address a finding in this run (requires architectural decision, missing context, etc.), APPEND an `## Unaddressed finding: <title>` section to `/workspace/agent-notes.md` using the EXACT VERBATIM title from the finding. Then move on to the next finding. The presence of an `## Unaddressed finding:` section at the end of the pipeline routes the run to **agent-self-reported-failure** (draft PR with the `agent-failed` label), surfacing the gap to a human reviewer.
+If you cannot address a finding in this run (requires architectural decision, missing context, etc.), APPEND an `## Unaddressed finding: <title>` section to `/workspace/bellows-agent-notes.md` using the EXACT VERBATIM title from the finding. Then move on to the next finding. The presence of an `## Unaddressed finding:` section at the end of the pipeline routes the run to **agent-self-reported-failure** (draft PR with the `agent-failed` label), surfacing the gap to a human reviewer.
 
 Do NOT silently skip a finding — either address it in code or escalate it via the unaddressed-finding section.
 
@@ -1092,7 +1092,7 @@ Do NOT silently skip a finding — either address it in code or escalate it via 
 
 ## Stop conditions
 
-Stop when EITHER (1) every finding has been addressed in code AND `cargo check` is green AND `.bellows-security-findings.md` has been removed, OR (2) every finding has been routed (some to code commits, the remainder to `## Unaddressed finding:` sections in agent-notes.md) AND the findings file has been removed.
+Stop when EITHER (1) every finding has been addressed in code AND `cargo check` is green AND `.bellows-security-findings.md` has been removed, OR (2) every finding has been routed (some to code commits, the remainder to `## Unaddressed finding:` sections in bellows-agent-notes.md) AND the findings file has been removed.
 "#;
 
 /// Closed severity vocabulary for review findings. The review prompt
@@ -1250,7 +1250,7 @@ fn strip_leading_numbering(s: &str) -> &str {
 }
 
 /// One `## Unaddressed finding: <title>` section parsed from an
-/// `agent-notes.md` file. The per-finding enact agent appends one of
+/// `bellows-agent-notes.md` file. The per-finding enact agent appends one of
 /// these per finding it deliberately chose not to address in code —
 /// the parser-as-backstop reads them to confirm the agent met the
 /// address-OR-explain contract.
@@ -1261,7 +1261,7 @@ pub struct AgentNoteSection {
 }
 
 /// Parse the `## Unaddressed finding: <title>` sections out of an
-/// `agent-notes.md` file. Title comparison is verbatim — the agent
+/// `bellows-agent-notes.md` file. Title comparison is verbatim — the agent
 /// must use the exact title from the findings file for the section to
 /// match its finding. Other `## ...` headings (general notes from
 /// implement / review / earlier phases) are ignored.
@@ -1316,7 +1316,7 @@ pub struct FindingCoverage {
 
 /// The parser-as-backstop. Returns the `blocker`/`important` findings
 /// that have neither an associated commit nor a matching `##
-/// Unaddressed finding: <title>` section in agent-notes.md.
+/// Unaddressed finding: <title>` section in bellows-agent-notes.md.
 ///
 /// `nit` findings are operator-discretionary and are never violations
 /// (silent skip is explicitly permitted for the nit severity).
@@ -1337,7 +1337,7 @@ pub fn compute_coverage_violations(
         .collect()
 }
 
-/// Build the markdown bellows appends to agent-notes.md when the
+/// Build the markdown bellows appends to bellows-agent-notes.md when the
 /// parser-as-backstop finds blocker/important findings that the
 /// per-finding agent silently skipped (no commit, no explanation
 /// section). The synthesised entries trigger the existing
@@ -1347,7 +1347,7 @@ pub fn compute_coverage_violations(
 ///
 /// Each entry uses the verbatim finding title so a reader can map it
 /// back to the review-findings PR comment. The body identifies bellows
-/// as the author so a human reviewing agent-notes.md doesn't mistake
+/// as the author so a human reviewing bellows-agent-notes.md doesn't mistake
 /// the synthesised entry for one the agent wrote.
 ///
 /// Returns an empty string when there are no violations. The runner
@@ -1394,7 +1394,7 @@ pub fn build_violation_callout(violations: &[ParsedFinding]) -> String {
     out.push_str(
         "The parser-as-backstop detected blocker/important findings that the per-finding \
          review-fix invocations neither addressed in code nor explained via an `## \
-         Unaddressed finding:` section in agent-notes.md. Bellows synthesised the missing \
+         Unaddressed finding:` section in bellows-agent-notes.md. Bellows synthesised the missing \
          entries to force this run to agent-self-reported-failure. Offending findings:\n\n",
     );
     for v in violations {
@@ -1417,12 +1417,12 @@ pub const BATCH_REVIEW_FIX_NIT_PROMPT: &str = r#"You are running as the **batche
 
 `nit` findings are operator-discretionary. You MAY skip a `nit` without explanation — the operator already sees every finding in the review-findings PR comment and can decide whether to follow up. Silent skip IS allowed for nits.
 
-Apply the cheap, in-scope ones. Skip cosmetic findings that would burn time. Do NOT append to agent-notes.md for nits — appending routes the run to agent-self-reported-failure (draft PR + agent-failed label), which is too heavy for a nit you simply chose not to do.
+Apply the cheap, in-scope ones. Skip cosmetic findings that would burn time. Do NOT append to bellows-agent-notes.md for nits — appending routes the run to agent-self-reported-failure (draft PR + agent-failed label), which is too heavy for a nit you simply chose not to do.
 
 ## Inputs
 
 - The list of nit findings is interpolated at the top of this kickoff (one per `### ` block).
-- `/workspace/agent-notes.md` may exist with notes from earlier phases. Read it for context. APPEND only — do not overwrite.
+- `/workspace/bellows-agent-notes.md` may exist with notes from earlier phases. Read it for context. APPEND only — do not overwrite.
 
 ## Process
 
@@ -1447,7 +1447,7 @@ Stop when you have made the changes you intend to make and `cargo test` is green
 /// interpolated. The agent sees exactly one finding — there is no list
 /// to silently skip — and must either address it in code OR append a
 /// `## Unaddressed finding: <verbatim title>` section to
-/// `agent-notes.md`. Severity flavours the urgency line so a `blocker`
+/// `bellows-agent-notes.md`. Severity flavours the urgency line so a `blocker`
 /// reads as more urgent than an `important`.
 ///
 /// The `diff_path` and `agent_notes_path` arguments are interpolated
@@ -1486,7 +1486,7 @@ pub fn per_finding_kickoff(
 }
 
 /// Canonical title of the synthetic `## Unaddressed finding:` entry the
-/// slice-8 weak-test guard appends to `agent-notes.md` when an implement
+/// slice-8 weak-test guard appends to `bellows-agent-notes.md` when an implement
 /// run produced changes but no new Rust test attributes. Verbatim per the
 /// brief; the agent-notes parser (and any future cross-reference) keys
 /// on this exact string.
@@ -1625,12 +1625,12 @@ fn path_ends_with_rs(path: &str) -> bool {
 }
 
 /// Build the markdown the slice-8 weak-test guard appends to
-/// `agent-notes.md` when the post-implement diff contains no new Rust
+/// `bellows-agent-notes.md` when the post-implement diff contains no new Rust
 /// test attributes (and the issue does not carry the skip-label). The
 /// section's title is the canonical `NO_NEW_TESTS_FINDING_TITLE`
 /// constant so a parser cross-reference matches verbatim; the body
 /// identifies bellows as the author so a human reviewing
-/// `agent-notes.md` later isn't confused about provenance.
+/// `bellows-agent-notes.md` later isn't confused about provenance.
 ///
 /// Reuses the existing slice-9.6 mechanism rather than introducing a
 /// new pipeline phase: the presence of an `## Unaddressed finding:`
@@ -1658,7 +1658,7 @@ pub fn synthesize_no_new_tests_entry() -> String {
 }
 
 /// Maximum bytes of captured stderr/stdout tail that the implement-crash
-/// synth embeds in `agent-notes.md`. The sandbox already caps the raw
+/// synth embeds in `bellows-agent-notes.md`. The sandbox already caps the raw
 /// `stderr_tail` at 64KB; for the synth note (which ships in the PR diff
 /// AND the agent-notes commit body) a tighter bound keeps the entry
 /// human-readable while still leaving plenty of room to fingerprint the
@@ -1666,7 +1666,7 @@ pub fn synthesize_no_new_tests_entry() -> String {
 /// so a multibyte glyph at the boundary cannot slice through UTF-8.
 const IMPLEMENT_CRASH_TAIL_CAP_BYTES: usize = 4 * 1024;
 
-/// Build the markdown bellows appends to `agent-notes.md` when the
+/// Build the markdown bellows appends to `bellows-agent-notes.md` when the
 /// implement phase exits non-zero AND produced no commits — typical of
 /// an early-exit crash (sandbox setup failure, container start failure,
 /// immediate Anthropic error, etc.) where the agent never wrote
@@ -1696,7 +1696,7 @@ const IMPLEMENT_CRASH_TAIL_CAP_BYTES: usize = 4 * 1024;
 /// parser's view of the file.
 ///
 /// The body identifies bellows as the author so a human reviewing
-/// agent-notes.md later isn't confused about provenance, surfaces the
+/// bellows-agent-notes.md later isn't confused about provenance, surfaces the
 /// implement-phase exit code, and embeds a bounded prefix of the
 /// captured stderr/stdout tail so the operator can diagnose the
 /// underlying failure (CRLF shebang, missing image, OAuth expiry, ...)
@@ -1848,7 +1848,7 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          \n\
          ## Headless mode\n\
          \n\
-         You are running headlessly via `claude -p`. There is no interactive user to approve plan exits — do NOT use the `ExitPlanMode` tool. If you call it, the exit is auto-rejected, you will read that as user pushback, and the session will end with no commits made. Implement directly: read the brief, write the failing tests, write the implementation, commit. If the brief is too large to hold in one pass, write a short outline into `agent-notes.md` (informational channel — no `## Unaddressed finding:` heading) and proceed with the first slice.\n\
+         You are running headlessly via `claude -p`. There is no interactive user to approve plan exits — do NOT use the `ExitPlanMode` tool. If you call it, the exit is auto-rejected, you will read that as user pushback, and the session will end with no commits made. Implement directly: read the brief, write the failing tests, write the implementation, commit. If the brief is too large to hold in one pass, write a short outline into `bellows-agent-notes.md` (informational channel — no `## Unaddressed finding:` heading) and proceed with the first slice.\n\
          \n\
          ## How to work\n\
          \n\
@@ -1862,11 +1862,11 @@ fn base_kickoff_body(brief: &str, repo_url: &str, branch_name: &str) -> String {
          - For each acceptance criterion in the brief, produce TWO commits in order: first a **failing-test commit** that adds the test(s) and would fail against the unchanged source, then a **make-it-pass commit** that changes the source so those tests pass.\n\
          - One failing-test commit then one make-it-pass commit, per acceptance criterion. Do NOT bundle tests and source into a single mega-commit. Do NOT land source-file changes before their corresponding tests.\n\
          - It is fine to add small refactors as separate follow-up commits after the make-it-pass commit. The constraint is on test-vs-source ordering, not on commit count overall.\n\
-         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `agent-notes.md` per the channel rules below rather than silently bundling tests and source.\n\
+         - If an acceptance criterion is genuinely impossible to drive test-first (e.g. a pure-prompt-text change with no observable behaviour), record that in `bellows-agent-notes.md` per the channel rules below rather than silently bundling tests and source.\n\
          \n\
-         ## agent-notes.md channels (informational vs escalation)\n\
+         ## bellows-agent-notes.md channels (informational vs escalation)\n\
          \n\
-         `agent-notes.md` has exactly two channels, and the classifier routes the PR based on which one you used. Pick deliberately:\n\
+         `bellows-agent-notes.md` has exactly two channels, and the classifier routes the PR based on which one you used. Pick deliberately:\n\
          \n\
          - **Informational channel** — the file exists but has *no* `## Unaddressed finding:` heading. Use this for freeform observations you want a human reviewer to see (e.g. \"I deviated from strict test-first on AC4 because it was a pure-prompt-text change with no observable behaviour\"). The classifier returns `Success`; per ADR-0011 the note is *advisory* — Bellows opens a normal (non-draft) PR that auto-merges on green CI and surfaces the note as a separate `## Agent notes` PR comment, so the run still counts as a green stop.\n\
          - **Escalation channel** — the file contains a `## Unaddressed finding: <AC title>` heading naming the unsatisfied acceptance criterion, with body text describing what you tried and why you stopped. The classifier returns `AgentSelfReportedFailure`, Bellows opens a *draft* PR labelled `agent-failed`, and a human is expected to take over.\n\

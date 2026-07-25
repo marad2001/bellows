@@ -122,7 +122,7 @@ fn parse_merger_verdict_returns_none_when_verdict_keyword_appears_inside_prose()
 #[test]
 fn render_merger_prompt_names_each_input_source() {
     // The merger reads four inputs: diff vs master, the brief's
-    // verbatim ACs, the final agent-notes.md (with synth-provenance
+    // verbatim ACs, the final bellows-agent-notes.md (with synth-provenance
     // markers), and CI / cargo-checks status. The prompt must
     // explicitly name each so the agent reads from the right place.
     let prompt = render_merger_prompt();
@@ -137,8 +137,8 @@ fn render_merger_prompt_names_each_input_source() {
         "merger prompt must reference the brief's ACs: {prompt}",
     );
     assert!(
-        prompt.contains("agent-notes.md"),
-        "merger prompt must reference agent-notes.md: {prompt}",
+        prompt.contains("bellows-agent-notes.md"),
+        "merger prompt must reference bellows-agent-notes.md: {prompt}",
     );
     assert!(
         prompt.contains("CI") || prompt.contains("cargo-checks") || prompt.contains("cargo checks"),
@@ -197,7 +197,7 @@ fn render_merger_prompt_identifies_phase_as_merger() {
 #[test]
 fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_markers_present() {
     // AC8 of issue #124 / ADR-0009 slice 2: the merger reads
-    // agent-notes.md but the in-band content may contain
+    // bellows-agent-notes.md but the in-band content may contain
     // Bellows-authored synth-provenance markers
     // (`<!-- bellows parser-as-backstop ... -->`,
     //  `<!-- bellows weak-test guard ... -->`,
@@ -232,7 +232,7 @@ fn render_merger_prompt_instructs_not_to_vote_merge_when_synth_provenance_marker
             || lowered.contains("never vote `merge`")
             || lowered.contains("not vote `merge`"),
         "merger prompt must instruct the agent NOT to vote MERGE when \
-         synth-provenance markers are present in agent-notes.md: {prompt}",
+         synth-provenance markers are present in bellows-agent-notes.md: {prompt}",
     );
 }
 

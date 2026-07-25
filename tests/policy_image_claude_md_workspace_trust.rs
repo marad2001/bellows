@@ -3,7 +3,7 @@
 //! must scope Claude Code's per-tool-result malware-analysis safety
 //! reminder to externally-sourced suspect content (not `/workspace`,
 //! which is first-party code from the cloned bellows repo) and name
-//! `## Unaddressed finding:` in `agent-notes.md` as the explicit
+//! `## Unaddressed finding:` in `bellows-agent-notes.md` as the explicit
 //! escape hatch for genuine concerns.
 //!
 //! A drive-by edit that drops any of the load-bearing phrases must
@@ -95,7 +95,7 @@ fn workspace_trust_section_scopes_the_malware_reminder() {
 
 #[test]
 fn workspace_trust_section_names_unaddressed_finding_escape_hatch() {
-    // AC (b): "the escape hatch via `agent-notes.md`
+    // AC (b): "the escape hatch via `bellows-agent-notes.md`
     // `## Unaddressed finding:` is named explicitly so genuine
     // concerns route through bellows's existing failure channel
     // rather than silent refusal."
@@ -107,8 +107,8 @@ fn workspace_trust_section_names_unaddressed_finding_escape_hatch() {
          concerns route to the existing AgentSelfReportedFailure channel (ADR-0006): {section}",
     );
     assert!(
-        section.contains("agent-notes.md"),
-        "Workspace trust clause must name `agent-notes.md` as the escalation destination: {section}",
+        section.contains("bellows-agent-notes.md"),
+        "Workspace trust clause must name `bellows-agent-notes.md` as the escalation destination: {section}",
     );
 }
 
@@ -130,7 +130,7 @@ fn workspace_trust_section_warns_against_silent_refusal() {
 
 #[test]
 fn workspace_trust_section_warns_against_quoting_secret_values() {
-    // Security review: `agent-notes.md` is committed and surfaced in
+    // Security review: `bellows-agent-notes.md` is committed and surfaced in
     // PR comments, so the escalation path must preserve useful context
     // without re-publishing a credential or secret value.
     let body = read_policy_image_claude_md();

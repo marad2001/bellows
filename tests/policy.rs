@@ -756,7 +756,7 @@ fn synthesize_unaddressed_entries_produces_appendable_markdown_with_verbatim_tit
     // effect. The synthesized markdown must (a) use the verbatim
     // finding title, (b) be appendable (no leading whitespace issues),
     // and (c) carry a body explaining bellows synthesized this — so a
-    // human reading agent-notes.md later can see it wasn't written by
+    // human reading bellows-agent-notes.md later can see it wasn't written by
     // claude.
     let violations = vec![
         finding("first violation", Severity::Blocker),
@@ -859,7 +859,7 @@ fn batch_review_fix_nit_prompt_does_not_route_through_unaddressed_finding_path()
     // every skipped nit.
     let lower = BATCH_REVIEW_FIX_NIT_PROMPT.to_lowercase();
     assert!(
-        lower.contains("do not append to agent-notes.md for nits"),
+        lower.contains("do not append to bellows-agent-notes.md for nits"),
         "BATCH_REVIEW_FIX_NIT_PROMPT must tell the agent not to append unaddressed-finding \
          sections for nits: {BATCH_REVIEW_FIX_NIT_PROMPT}"
     );
@@ -933,7 +933,7 @@ fn per_finding_kickoff_interpolates_title_severity_and_body_into_the_prompt() {
         severity: Severity::Blocker,
         body: "`Config::from_str(\"\")` panics inside serde_json.\n\n**Suggestion:** map to ConfigError::Parse.".to_string(),
     };
-    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "agent-notes.md");
+    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "bellows-agent-notes.md");
 
     assert!(
         kickoff.contains("config parser panics on empty input"),
@@ -961,7 +961,7 @@ fn per_finding_kickoff_instructs_exact_verbatim_unaddressed_finding_header() {
         severity: Severity::Important,
         body: "body".to_string(),
     };
-    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "agent-notes.md");
+    let kickoff = per_finding_kickoff(&finding, ".bellows-review-diff.patch", "bellows-agent-notes.md");
     assert!(
         kickoff.contains("## Unaddressed finding: title with — em dashes — in it"),
         "kickoff must show the exact `## Unaddressed finding: <verbatim title>` header the agent should append: {kickoff}"
@@ -1029,7 +1029,7 @@ fn parse_agent_notes_sections_extracts_unaddressed_finding_sections_by_verbatim_
     // contract. Title comparison is verbatim — the section's title must
     // match the finding's title character-for-character.
     let text = "\
-# agent-notes.md
+# bellows-agent-notes.md
 
 Some preamble.
 
@@ -1051,7 +1051,7 @@ Requires a guard-pattern refactor in run_one; deferred to a follow-up.
 
 #[test]
 fn parse_agent_notes_sections_ignores_other_headings_at_same_level() {
-    // agent-notes.md often carries general notes from the implement or
+    // bellows-agent-notes.md often carries general notes from the implement or
     // review phases under unrelated `## ...` headings. The parser must
     // only collect Unaddressed-finding sections — others end the
     // current section (if any) but do NOT contribute a phantom entry.
@@ -1076,7 +1076,7 @@ Unrelated content that must not become a section.
 
 #[test]
 fn parse_agent_notes_sections_returns_empty_for_file_with_no_unaddressed_sections() {
-    // A typical implement-phase agent-notes.md (general notes, no
+    // A typical implement-phase bellows-agent-notes.md (general notes, no
     // unaddressed-finding sections) must parse to an empty list — the
     // parser-as-backstop will then see "no explained findings" and apply
     // the address-OR-explain rule accordingly.
@@ -1388,7 +1388,7 @@ fn synthesize_no_new_tests_entry_uses_canonical_unaddressed_finding_title() {
 #[test]
 fn synthesize_no_new_tests_entry_identifies_bellows_as_the_author() {
     // Sibling contract to synthesize_unaddressed_entries: a human
-    // reading agent-notes.md must be able to tell that the entry was
+    // reading bellows-agent-notes.md must be able to tell that the entry was
     // synthesised by bellows, not written by claude. Otherwise the
     // operator could mistake a guard-driven failure for an agent-
     // initiated handoff.
@@ -1403,7 +1403,7 @@ fn synthesize_no_new_tests_entry_identifies_bellows_as_the_author() {
 #[test]
 fn synthesize_no_new_tests_entry_routes_through_classify_exit_to_self_reported_failure() {
     // Integration of the slice-8 guard with the existing slice-9.6
-    // precedence: appending the synthesised entry to agent-notes.md
+    // precedence: appending the synthesised entry to bellows-agent-notes.md
     // must, in turn, make `parse_agent_notes_sections` see an
     // Unaddressed-finding section with the canonical title. Without
     // that, `classify_exit(has_agent_notes=true, ..., None)` would still
@@ -1456,11 +1456,11 @@ fn weak_test_guard_and_parser_as_backstop_entries_coexist_in_a_single_agent_note
 #[test]
 fn synthesize_implement_crash_entry_includes_exit_code_and_stderr_tail_prefix() {
     // Acceptance criterion (brief): "exactly one commit on `agent/<N>-...`
-    // containing a synthesised `agent-notes.md` that includes the
+    // containing a synthesised `bellows-agent-notes.md` that includes the
     // implement-phase exit code and a bounded prefix of its captured
     // stderr/stdout tail." The synth helper is the textual half of that —
     // it must surface the exit code AND embed (bounded) stderr content so
-    // an operator reading agent-notes.md can diagnose without having to
+    // an operator reading bellows-agent-notes.md can diagnose without having to
     // fetch container logs.
     let stderr_tail = "Error: container exited 1: /workspace/entrypoint-user: bad interpreter\n";
     let entry = synthesize_implement_crash_entry(137, stderr_tail);
@@ -1477,7 +1477,7 @@ fn synthesize_implement_crash_entry_includes_exit_code_and_stderr_tail_prefix() 
 #[test]
 fn synthesize_implement_crash_entry_identifies_bellows_as_the_author() {
     // Sibling contract to the existing synth helpers: a human reading
-    // agent-notes.md must be able to tell that the entry was synthesised
+    // bellows-agent-notes.md must be able to tell that the entry was synthesised
     // by bellows rather than written by claude. Otherwise the operator
     // could mistake a crash-recovery synth for an agent-initiated
     // handoff.
@@ -1511,7 +1511,7 @@ fn synthesize_implement_crash_entry_bounds_a_very_long_stderr_tail() {
     // The brief explicitly calls out "a bounded prefix" — the sandbox
     // already caps `stderr_tail` at 64KB, but for the synth note (which
     // ships in the PR diff), a smaller bound is appropriate so the
-    // agent-notes.md entry stays human-readable. The exact bound is an
+    // bellows-agent-notes.md entry stays human-readable. The exact bound is an
     // implementation detail; the contract is that an unbounded blob is
     // not embedded verbatim.
     let long_tail = "A".repeat(64 * 1024);
@@ -1530,7 +1530,7 @@ fn classify_exit_returns_crash_when_implement_crash_synth_is_recorded_even_with_
     // Issue #49 core acceptance criterion (post-ADR-0006 migration):
     // when the implement phase exits non-zero with no commits, bellows
     // synthesises an agent-notes entry to ensure SOMETHING ships in
-    // the resulting PR's diff. The synth makes agent-notes.md exist on
+    // the resulting PR's diff. The synth makes bellows-agent-notes.md exist on
     // disk, which under the pre-ADR-0006 model would have routed the
     // run to AgentSelfReportedFailure via the bare-bool precedence.
     // That was the wrong routing: the agent did not self-report —
@@ -1733,7 +1733,7 @@ acceptance criterion; a single combined commit defeats the test-first ordering \
 the kickoff mandates.
 
 **Suggestion:** rewrite history to split the implementation commit from its \
-test commit, OR append an `## Unaddressed finding:` section to agent-notes.md.
+test commit, OR append an `## Unaddressed finding:` section to bellows-agent-notes.md.
 ";
     let result = parse_findings(text);
     assert!(
@@ -1752,7 +1752,7 @@ test commit, OR append an `## Unaddressed finding:` section to agent-notes.md.
     // Verbatim title round-trip through the per-finding kickoff and
     // back through the agent-notes parser — the same contract the
     // existing slice 9.6 plumbing keys on.
-    let kickoff = per_finding_kickoff(f, ".bellows-review-diff.patch", "agent-notes.md");
+    let kickoff = per_finding_kickoff(f, ".bellows-review-diff.patch", "bellows-agent-notes.md");
     assert!(
         kickoff.contains(
             "## Unaddressed finding: tests and implementation landed in a single mega-commit"
@@ -1769,7 +1769,7 @@ test commit, OR append an `## Unaddressed finding:` section to agent-notes.md.
     assert_eq!(sections[0].title, f.title);
 
     // Cross-reference through the parser-as-backstop: a finding with
-    // an explanation section in agent-notes.md is NOT a violation.
+    // an explanation section in bellows-agent-notes.md is NOT a violation.
     let coverage = vec![FindingCoverage {
         finding: f.clone(),
         commit_landed: false,
@@ -1843,14 +1843,14 @@ fn security_review_prompt_locks_same_severity_vocabulary_as_review() {
 #[test]
 fn security_review_prompt_instructs_agent_notes_append_when_unclear() {
     // Acceptance criterion (brief): the agent must append to
-    // `agent-notes.md` if any finding can't be expressed cleanly.
+    // `bellows-agent-notes.md` if any finding can't be expressed cleanly.
     // The prompt must spell out the APPEND-not-overwrite contract so a
     // partial security-review run doesn't clobber implementation /
     // review notes already in the file.
     let lower = SECURITY_REVIEW_PROMPT.to_lowercase();
     assert!(
-        lower.contains("agent-notes.md") || lower.contains("agent notes"),
-        "SECURITY_REVIEW_PROMPT must reference agent-notes.md: {SECURITY_REVIEW_PROMPT}",
+        lower.contains("bellows-agent-notes.md") || lower.contains("agent notes"),
+        "SECURITY_REVIEW_PROMPT must reference bellows-agent-notes.md: {SECURITY_REVIEW_PROMPT}",
     );
     assert!(
         lower.contains("append"),
@@ -1862,7 +1862,7 @@ fn security_review_prompt_instructs_agent_notes_append_when_unclear() {
 fn security_review_prompt_is_read_only() {
     // Same contract as REVIEW_PROMPT: the security-review phase is
     // read-only and must not commit, push, or edit files outside the
-    // findings file + agent-notes.md. Without this lock the phase could
+    // findings file + bellows-agent-notes.md. Without this lock the phase could
     // drift into "fix and review" semantics and collide with the
     // dedicated security-fix phase.
     let lower = SECURITY_REVIEW_PROMPT.to_lowercase();
@@ -1907,7 +1907,7 @@ fn security_fix_prompt_preserves_commit_per_finding_convention() {
 
 #[test]
 fn security_fix_prompt_routes_unaddressable_findings_through_agent_notes_section() {
-    // Acceptance criterion (brief): "append to agent-notes.md if any
+    // Acceptance criterion (brief): "append to bellows-agent-notes.md if any
     // finding can't be addressed." The prompt must demand the verbatim
     // `## Unaddressed finding: <title>` header so a future parser-as-
     // backstop could cross-reference the same way the review-fix path
@@ -2213,7 +2213,7 @@ diff --git a/docs/rs-notes.md b/docs/rs-notes.md
 #[test]
 fn classify_agent_notes_returns_absent_when_input_is_none() {
     // Acceptance criterion (brief): "classify_agent_notes(None) returns Absent."
-    // No agent-notes.md on disk means no agent voice in the run — classification
+    // No bellows-agent-notes.md on disk means no agent voice in the run — classification
     // must route on phase signals alone.
     assert_eq!(classify_agent_notes(None), NotesShape::Absent);
 }
@@ -2525,7 +2525,7 @@ fn classify_exit_routes_synth_only_notes_through_crash_via_classify_agent_notes(
     // `synth_suppresses_notes` shim in classify_exit is removed."
     //
     // End-to-end shape: bellows writes the synth on a crash, the runner
-    // reads agent-notes.md, passes the raw content to
+    // reads bellows-agent-notes.md, passes the raw content to
     // classify_agent_notes_with_synth_spans, which returns Absent
     // because the file is only a recorded synth span (stripped to
     // nothing). With Absent + non-zero implement exit, classify_exit

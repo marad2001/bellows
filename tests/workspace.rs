@@ -149,7 +149,7 @@ async fn diff_between_returns_true_when_only_agent_notes_changed_between_refs() 
 
     let base = head_sha(&workspace).await.unwrap();
 
-    std::fs::write(workspace.path().join("agent-notes.md"), "stuck\n").unwrap();
+    std::fs::write(workspace.path().join("bellows-agent-notes.md"), "stuck\n").unwrap();
     commit_all(&workspace).await.unwrap();
     let head = head_sha(&workspace).await.unwrap();
 
@@ -166,7 +166,7 @@ async fn diff_between_returns_true_when_only_agent_notes_changed_between_refs() 
 async fn diff_between_returns_false_when_only_code_files_changed_across_two_commits() {
     // Cycle 3: the "agent committed real fixes" case — the most common
     // true-negative. Two code commits between base and head; no
-    // agent-notes.md touched. commit_landed must be true at the call
+    // bellows-agent-notes.md touched. commit_landed must be true at the call
     // site (the helper returns false → !helper → true). Models the
     // PR #38 / issue #36 scenario where the agent self-committed a
     // code fix under its own commit message.
@@ -215,7 +215,7 @@ async fn diff_between_returns_false_when_mixed_code_and_agent_notes_commits_exis
 
     std::fs::write(workspace.path().join("src.rs"), "fn a() {}\n").unwrap();
     commit_all(&workspace).await.unwrap();
-    std::fs::write(workspace.path().join("agent-notes.md"), "explanation\n").unwrap();
+    std::fs::write(workspace.path().join("bellows-agent-notes.md"), "explanation\n").unwrap();
     commit_all(&workspace).await.unwrap();
     let head = head_sha(&workspace).await.unwrap();
 
@@ -232,7 +232,7 @@ async fn diff_between_returns_false_when_mixed_code_and_agent_notes_commits_exis
 async fn diff_between_returns_false_when_base_equals_head() {
     // Cycle 5: pin the contract for base == head (no advancement
     // between refs). Chosen contract: Ok(false) — the empty diff is
-    // not exactly `["agent-notes.md"]`, so vacuously false. The
+    // not exactly `["bellows-agent-notes.md"]`, so vacuously false. The
     // runner short-circuits on the head_after == head_before path
     // before calling this helper anyway; pinning Ok(false) here is
     // defensive consistency so a future caller that drops the
@@ -252,7 +252,7 @@ async fn diff_between_returns_false_when_base_equals_head() {
         .expect("base==head must NOT surface an error");
     assert!(
         !only_notes,
-        "base==head is the empty diff; cannot be exactly [agent-notes.md]"
+        "base==head is the empty diff; cannot be exactly [bellows-agent-notes.md]"
     );
 }
 
@@ -706,7 +706,7 @@ async fn commit_all_and_push_if_advanced_pushes_once_for_mixed_self_commit_plus_
     let after_self_commit = head_sha(&workspace).await.unwrap();
 
     // Leftover uncommitted edits in the same invocation.
-    std::fs::write(workspace.path().join("agent-notes.md"), "trailing\n").unwrap();
+    std::fs::write(workspace.path().join("bellows-agent-notes.md"), "trailing\n").unwrap();
 
     let head_after = commit_all_and_push_if_advanced(&workspace, &head_before)
         .await
