@@ -198,6 +198,12 @@ pub enum PickReason {
     /// in-place advance; the picker walked the chain afresh and
     /// produced the next hot entry to re-run.
     InPlaceAdvancementAfterRateLimit,
+    /// The implement phase was found **Oscillating** at base SHA with
+    /// the shared advance allowance unspent and budget above the floor
+    /// (issue #164). Same advance, different trigger — kept as its own
+    /// reason so the run-log distinguishes "the engine ran out of
+    /// quota" from "the engine wedged".
+    InPlaceAdvancementAfterOscillation,
 }
 
 impl PickReason {
@@ -213,6 +219,9 @@ impl PickReason {
             PickReason::ForcedViaLabel => "forced via label",
             PickReason::InPlaceAdvancementAfterRateLimit => {
                 "in-place advancement after rate-limit"
+            }
+            PickReason::InPlaceAdvancementAfterOscillation => {
+                "in-place advancement after oscillation"
             }
         }
     }
@@ -254,6 +263,71 @@ pub enum PickError {
 /// later phases). With `None`, the picker degrades to pure chain
 /// walking — the first hot entry wins, no diversity preference.
 pub fn pick_engine(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
+    pick_from_chain(chain, state, implementer, now)
+}
+
+/// [`pick_engine`] with one engine struck out of the chain before the
+/// walk begins (issue #164).
+///
+/// An **Oscillation**-triggered **Advance** has no state-file trace to
+/// steer the next pick: unlike a rate-limit it records no
+/// `cooling_until`, because `CONTEXT.md` is explicit that an advance is
+/// "never a verdict on quality" and the engine is not out of quota — it
+/// wedged on *this* issue. Without an exclusion the re-pick would see an
+/// unchanged `StateFile` and hand the phase straight back to the engine
+/// that just oscillated. So the runner names the abandoned engine here
+/// instead, for exactly the one retry iteration.
+///
+/// The exclusion is **engine-level**, matching the rate-limit path's
+/// engine-level `cooling_until`: `CONTEXT.md` defines an advance as
+/// meaning "no further progress is available from this engine", so a
+/// model-pinned sibling entry (`claude:opus` after `claude:sonnet`
+/// wedged) is struck out too.
+///
+/// `excluded` of `None` is exactly [`pick_engine`].
+pub fn pick_engine_excluding(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    excluded: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
+    let Some(excluded) = excluded else {
+        return pick_from_chain(chain, state, implementer, now);
+    };
+    let retained: Vec<ChainEntry> = chain
+        .iter()
+        .filter(|e| e.engine != excluded)
+        .cloned()
+        .collect();
+    pick_from_chain(&retained, state, implementer, now)
+}
+
+/// Whether an **Advance** away from `abandoned` has anywhere to go: at
+/// least one chain entry that is both hot and on a different engine
+/// (issue #164). The runner consults this *before* discarding the
+/// workspace — an advance with no target would throw the attempt away
+/// and then re-run the same engine, or fail the re-pick outright.
+pub fn has_advance_target(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    abandoned: Engine,
+    now: DateTime<Utc>,
+) -> bool {
+    chain
+        .iter()
+        .any(|e| e.engine != abandoned && state.is_hot(e.engine, now))
+}
+
+/// The two-pass walk itself. Private so the exclusion is applied by
+/// filtering the chain the walk sees, keeping one implementation of the
+/// pass-1/pass-2 rules.
+fn pick_from_chain(
     chain: &[ChainEntry],
     state: &StateFile,
     implementer: Option<Engine>,
@@ -364,6 +438,26 @@ pub fn pick_engine_for_phase(
     forced_engine: Option<Engine>,
     now: DateTime<Utc>,
 ) -> Result<PickedEntry, PickError> {
+    pick_engine_for_phase_excluding(chain, state, implementer, forced_engine, None, now)
+}
+
+/// [`pick_engine_for_phase`] with an engine struck out of the chain
+/// walk (issue #164) — see [`pick_engine_excluding`] for why an
+/// **Oscillation**-triggered advance needs one.
+///
+/// `forced_engine` still wins: a forced engine bypasses chain walking
+/// entirely, and the runner never advances on an oscillation under a
+/// forced engine, so the two are never both set in practice. Keeping
+/// the forced branch first preserves ADR-0005's "the labeled engine is
+/// used for every phase" promise regardless.
+pub fn pick_engine_for_phase_excluding(
+    chain: &[ChainEntry],
+    state: &StateFile,
+    implementer: Option<Engine>,
+    forced_engine: Option<Engine>,
+    excluded: Option<Engine>,
+    now: DateTime<Utc>,
+) -> Result<PickedEntry, PickError> {
     if let Some(engine) = forced_engine {
         let entry = chain
             .iter()
@@ -378,7 +472,7 @@ pub fn pick_engine_for_phase(
             reason: PickReason::ForcedViaLabel,
         });
     }
-    pick_engine(chain, state, implementer, now)
+    pick_engine_excluding(chain, state, implementer, excluded, now)
 }
 
 /// Implement-phase response to a rate-limit signature. Pure decision
@@ -444,9 +538,188 @@ pub fn decide_non_implement_rate_limit_action(
     NonImplementRateLimitAction::Terminate
 }
 
+/// Default budget floor for an **Advance**: at least half the
+/// configured `[agent].wall_clock_minutes` must remain. Overridable via
+/// `[agent].advance_budget_floor_fraction`.
+pub const DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION: f64 = 0.5;
+
+/// Implement-phase response to an **Oscillation** (issue #164). The
+/// sibling of [`ImplementRateLimitAction`] for the second advance
+/// trigger; a separate enum because the fallback differs — a
+/// rate-limit that cannot advance terminates the run as `RateLimited`,
+/// whereas an oscillation that cannot advance is merely recorded and
+/// the run continues to whatever terminal state it would have reached
+/// anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscillationAdvanceAction {
+    /// Drop the workspace, pick the next hot chain entry, re-run the
+    /// implement phase from base — the same response the rate-limit
+    /// path takes.
+    InPlaceAdvance,
+    /// Log the **Oscillation** and leave the run alone. Reached when
+    /// the shared allowance is spent, the workspace is ahead of base
+    /// SHA, or too little budget remains to be worth handing on.
+    ContinueRun,
+}
+
+impl OscillationAdvanceAction {
+    /// The disposition this action maps to, or `None` when the run
+    /// carries on untouched. `InPlaceAdvance` deliberately produces the
+    /// *same* [`RateLimitDisposition::InPlaceAdvance`] the rate-limit
+    /// path produces: `CONTEXT.md` defines both triggers as meaning "no
+    /// progress is available from this engine", so they share one
+    /// response as well as one allowance.
+    pub fn disposition(self) -> Option<RateLimitDisposition> {
+        match self {
+            OscillationAdvanceAction::InPlaceAdvance => {
+                Some(RateLimitDisposition::InPlaceAdvance)
+            }
+            OscillationAdvanceAction::ContinueRun => None,
+        }
+    }
+}
+
+/// Decide how the runner should handle an **Oscillation** detected
+/// during the implement phase. Pure function so the runner-level
+/// contract is testable without docker, git, or a clock.
+///
+/// Four guards, all of which must pass:
+///
+/// 1. **At base SHA** — the pre-existing advance guard, unchanged. An
+///    advance discards the workspace, so past base SHA there is
+///    committed work to lose.
+/// 2. **Shared allowance** — `advances_used == 0`. Oscillation and
+///    rate-limit draw on the same max-1-per-phase-invocation budget; a
+///    run that already advanced for either reason does not advance
+///    again.
+/// 3. **Budget floor** — at least `floor_fraction` of the configured
+///    wall clock still remains. Handing a fresh engine the last ten
+///    minutes of an hour wastes them.
+/// 4. **Somewhere to advance to** — `next_entry_available`, from
+///    [`has_advance_target`]. An advance that re-picked the engine that
+///    just oscillated would discard the workspace to repeat the wedge;
+///    with no other hot entry the honest answer is to log and continue.
+pub fn decide_oscillation_advance_action(
+    at_base_sha: bool,
+    advances_used: u8,
+    remaining: std::time::Duration,
+    cap: std::time::Duration,
+    floor_fraction: f64,
+    next_entry_available: bool,
+) -> OscillationAdvanceAction {
+    if !at_base_sha || advances_used > 0 || !next_entry_available {
+        return OscillationAdvanceAction::ContinueRun;
+    }
+    if !budget_above_floor(remaining, cap, floor_fraction) {
+        return OscillationAdvanceAction::ContinueRun;
+    }
+    OscillationAdvanceAction::InPlaceAdvance
+}
+
+/// Whether `remaining` is at least `floor_fraction` of `cap`. A zero
+/// `cap` is treated as "no budget left to hand on" rather than
+/// dividing by zero; the config type forbids it, but the arithmetic
+/// should not depend on that.
+fn budget_above_floor(
+    remaining: std::time::Duration,
+    cap: std::time::Duration,
+    floor_fraction: f64,
+) -> bool {
+    if cap.is_zero() {
+        return false;
+    }
+    remaining.as_secs_f64() >= cap.as_secs_f64() * floor_fraction
+}
+
+/// How far into an implement-phase container an **Oscillation** may
+/// still interrupt it (issue #164). `None` means "observe and log
+/// only" — nothing detected during this container run could earn an
+/// advance, so there is no reason to cut the run short.
+///
+/// This is the pre-launch half of the same guards
+/// [`decide_oscillation_advance_action`] applies afterwards: the
+/// shared allowance and the engine-forced bypass are already settled
+/// before the container starts, and the budget floor becomes a
+/// deadline on this container's own clock (budget at launch minus the
+/// floor). The at-base-SHA guard is deliberately absent — the agent
+/// can self-commit mid-run, so only the post-run decision can judge
+/// it.
+///
+/// `phase_deadline` is the budget remaining as the phase starts;
+/// `None` (budget already spent) yields no window.
+///
+/// `floor_fraction` is expected in `0.0..=1.0` —
+/// [`ConfigError::InvalidBudgetFloorFraction`](crate::config::ConfigError)
+/// rejects anything else at config-load time. Should one reach here
+/// anyway (this is a `pub` entry point), the floor is computed
+/// fallibly rather than with the panicking
+/// `Duration::from_secs_f64`, and an uncomputable floor yields `None`
+/// — the conservative answer, since `None` only ever costs an
+/// advance, never a run.
+pub fn oscillation_kill_window(
+    phase_deadline: Option<std::time::Duration>,
+    cap: std::time::Duration,
+    floor_fraction: f64,
+    advances_used: u8,
+    engine_forced: bool,
+) -> Option<std::time::Duration> {
+    if advances_used > 0 || engine_forced {
+        return None;
+    }
+    let floor = std::time::Duration::try_from_secs_f64(cap.as_secs_f64() * floor_fraction).ok()?;
+    phase_deadline?
+        .checked_sub(floor)
+        .filter(|window| !window.is_zero())
+}
+
+/// Render the run-log line for an **Oscillation**-triggered advance.
+/// Names the trigger, the engine whose attempt is being abandoned, and
+/// the engine the phase is being handed to, so an operator reading the
+/// log alone can tell it from a rate-limit advance.
+pub fn format_oscillation_advance_log(abandoned: Engine, advancing_to: Engine) -> String {
+    format!(
+        "bellows: implement oscillation detected with engine={abandoned}; \
+         abandoning its attempt at base SHA and in-place-advancing to engine={advancing_to} \
+         (max 1 advance per phase invocation, shared with the rate-limit trigger)",
+        abandoned = abandoned.as_name(),
+        advancing_to = advancing_to.as_name(),
+    )
+}
+
+/// Render the run-log line for an **Oscillation** bellows declined to
+/// act on. `CONTEXT.md`: an advance is bounded, so a wedged run below
+/// the floor or past its allowance continues to its existing terminal
+/// state — but the operator still gets told what was seen.
+pub fn format_oscillation_not_advanced_log(engine: Engine, why: &str) -> String {
+    format!(
+        "bellows: implement oscillation detected with engine={engine}; not advancing ({why}); \
+         the run continues to its existing terminal state",
+        engine = engine.as_name(),
+    )
+}
+
+/// Render the run-log line for an **Idleness** observation.
+/// `CONTEXT.md`: "Recorded for the operator, never acted on" — a still
+/// workspace is indistinguishable from an engine reasoning about a
+/// hard problem or one about to exit cleanly.
+pub fn format_idleness_log(samples: usize, interval_seconds: u64) -> String {
+    format!(
+        "bellows: implement workspace unchanged for {samples} consecutive samples \
+         (~{minutes} minutes); recording idleness, not acting on it",
+        minutes = (samples as u64 * interval_seconds) / 60,
+    )
+}
+
 /// Disposition the runner consults after a rate-limit signature
 /// match. Unifies the implement and non-implement paths so the
 /// runner's phase-exit handler has one shape to match on.
+///
+/// Issue #164 gave `InPlaceAdvance` a second trigger: an
+/// **Oscillation** detected while the implement container runs takes
+/// this same disposition, via
+/// [`OscillationAdvanceAction::disposition`]. The type name still says
+/// "rate limit" only because renaming it would ripple across the
+/// runner for no behavioural gain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitDisposition {
     /// Implement-phase only: drop workspace, pick next hot chain

@@ -199,6 +199,28 @@ wall_clock_minutes = 60
 # refactors, dependency bumps) should carry this label so the guard
 # skips them. Default: "refactor".
 weak_test_guard_skip_label = "refactor"
+# How often bellows samples the implement-phase workspace looking for a
+# stall (issue #164). Each sample hashes `git diff HEAD` plus the
+# untracked-and-not-ignored paths, so `target/` churn is invisible to
+# it. Two shapes are classified from the sample sequence:
+#   * Oscillation — the workspace returns to a previously-seen state
+#     with a different state in between (an edit made, reverted, and
+#     made again). No healthy run does this, so it abandons the
+#     engine's attempt and advances to the next chain entry.
+#   * Idleness — the workspace is unchanged for a prolonged stretch.
+#     Recorded in the run log and never acted on: a still workspace is
+#     indistinguishable from an engine reasoning about a hard problem
+#     or one about to exit cleanly. Default: 60 seconds.
+oscillation_sample_seconds = 60
+# How much of `wall_clock_minutes` must still remain for an
+# oscillation to earn an advance. Handing a fresh engine the last ten
+# minutes of an hour wastes them, so below this floor the oscillation
+# is logged and the run continues to its existing terminal state. The
+# advance allowance itself is shared with the rate-limit trigger and
+# capped at one per phase invocation. A fraction between 0.0 and 1.0
+# inclusive — anything else is rejected at config-load time.
+# Default: 0.5 (half the budget).
+advance_budget_floor_fraction = 0.5
 
 [gates]
 # ADR-0004 fallback flags for the cargo-checks gate. By default

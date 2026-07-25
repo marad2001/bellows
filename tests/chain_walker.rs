@@ -665,6 +665,131 @@ fn forced_single_engine_synthesises_entry_when_chain_lacks_it() {
 }
 
 // -----------------------------------------------------------------
+// Issue #164: an **Oscillation**-triggered **Advance** must actually
+// land on a different engine. Unlike a rate-limit it writes no
+// `cooling_until`, so the re-pick is steered by an explicit exclusion
+// instead of by the state file.
+// -----------------------------------------------------------------
+
+use bellows::chain_walker::{
+    has_advance_target, pick_engine_excluding, pick_engine_for_phase_excluding,
+};
+
+#[test]
+fn oscillation_repick_advances_past_the_engine_that_wedged() {
+    // Chain = [claude, codex], both hot, implement phase (no
+    // implementer-CLI yet). Claude oscillated and its attempt was
+    // discarded: the re-pick must produce codex. Without the exclusion
+    // the unchanged state file would hand the phase straight back to
+    // claude and the "advance" would be an advance from an engine to
+    // itself.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine_excluding(&chain, &state, None, Some(Engine::Claude), now)
+        .expect("the exclusion must leave codex pickable");
+    assert_eq!(
+        picked.entry.engine,
+        Engine::Codex,
+        "an oscillation advance must re-run under the next chain entry, not the wedged one",
+    );
+}
+
+#[test]
+fn oscillation_repick_runs_through_the_phase_picker_too() {
+    // The runner calls the phase-level picker, not `pick_engine`
+    // directly, so the exclusion has to survive that layer.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked =
+        pick_engine_for_phase_excluding(&chain, &state, None, None, Some(Engine::Claude), now)
+            .expect("the exclusion must leave codex pickable");
+    assert_eq!(picked.entry.engine, Engine::Codex);
+}
+
+#[test]
+fn oscillation_repick_skips_model_pinned_siblings_of_the_wedged_engine() {
+    // CONTEXT.md: an Advance means "no further progress is available
+    // from this engine". The exclusion is engine-level, so a second
+    // claude entry with a different model pin is struck out too — the
+    // same reach the rate-limit path's engine-level `cooling_until`
+    // has.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![
+        ChainEntry {
+            engine: Engine::Claude,
+            model: Some("opus".to_string()),
+        },
+        ChainEntry {
+            engine: Engine::Claude,
+            model: Some("sonnet".to_string()),
+        },
+        entry(Engine::Codex),
+    ];
+    let picked = pick_engine_excluding(&chain, &state, None, Some(Engine::Claude), now)
+        .expect("codex is still hot and unexcluded");
+    assert_eq!(picked.entry.engine, Engine::Codex);
+}
+
+#[test]
+fn oscillation_repick_without_an_exclusion_is_plain_chain_walking() {
+    // `None` must be exactly `pick_engine` — the first iteration of the
+    // implement loop passes it.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    let picked = pick_engine_excluding(&chain, &state, None, None, now).unwrap();
+    assert_eq!(picked.entry.engine, Engine::Claude);
+    assert_eq!(picked.reason, PickReason::ChainFirstHotEntry);
+}
+
+#[test]
+fn oscillation_repick_reports_all_cooling_when_the_exclusion_empties_the_chain() {
+    // A single-entry chain has nothing left once the wedged engine is
+    // struck out. The runner guards against reaching here via
+    // `has_advance_target`, but the picker must still fail closed
+    // rather than quietly re-picking the excluded engine.
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude)];
+    let result = pick_engine_excluding(&chain, &state, None, Some(Engine::Claude), now);
+    assert!(
+        matches!(result, Err(PickError::AllCooling)),
+        "an emptied chain must error, not re-pick the excluded engine; got {result:?}",
+    );
+}
+
+#[test]
+fn has_advance_target_is_false_when_only_the_wedged_engine_is_hot() {
+    // Guard 4 of `decide_oscillation_advance_action`: discarding the
+    // workspace to re-run the same engine is worse than continuing.
+    let now = DateTime::parse_from_rfc3339("2026-05-12T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut state = StateFile::default();
+    state.record_rate_limit(Engine::Codex, now + Duration::minutes(30));
+    let chain = vec![entry(Engine::Claude), entry(Engine::Codex)];
+    assert!(
+        !has_advance_target(&chain, &state, Engine::Claude, now),
+        "codex is cooling, so claude's oscillation has nowhere to advance to",
+    );
+    assert!(
+        has_advance_target(&chain, &state, Engine::Codex, now),
+        "claude is hot, so a codex oscillation does have somewhere to go",
+    );
+}
+
+#[test]
+fn has_advance_target_is_false_for_a_single_entry_chain() {
+    let now = Utc::now();
+    let state = StateFile::default();
+    let chain = vec![entry(Engine::Claude)];
+    assert!(!has_advance_target(&chain, &state, Engine::Claude, now));
+}
+
+// -----------------------------------------------------------------
 // AC: Run-log line at each phase-start carries phase name, engine,
 // model, and **reason** (one of five). Operator can reconstruct the
 // trail from the run-log alone.

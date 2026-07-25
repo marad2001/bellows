@@ -30,6 +30,20 @@ pub enum ConfigError {
          got `{value}`"
     )]
     InvalidPostingMode { value: String },
+    /// Issue #164: the budget floor is a *fraction* of
+    /// `wall_clock_minutes`, so only `0.0..=1.0` is meaningful. A
+    /// negative or non-finite value reaches
+    /// `Duration::from_secs_f64` in `chain_walker::
+    /// oscillation_kill_window` and panics the runner at the start of
+    /// the implement phase; a value above `1.0` silently disables every
+    /// actionable oscillation rather than doing what the operator
+    /// asked. Both are config mistakes, so both are rejected here
+    /// rather than tolerated at run time.
+    #[error(
+        "[agent].advance_budget_floor_fraction must be a fraction of the wall-clock \
+         budget between 0.0 and 1.0 inclusive; got `{value}`"
+    )]
+    InvalidBudgetFloorFraction { value: f64 },
 }
 
 /// One of the two engines bellows can dispatch to. Wired through the
@@ -532,6 +546,22 @@ pub struct AgentConfig {
     /// refactors, dependency bumps).
     #[serde(default = "default_weak_test_guard_skip_label")]
     pub weak_test_guard_skip_label: String,
+    /// Issue #164: how often bellows samples the implement-phase
+    /// workspace looking for a **Stall**. `NonZeroU64` for the same
+    /// reason `wall_clock_minutes` is: a `0` would spin the sampler in
+    /// a tight loop against the directory the container is writing to,
+    /// and is better rejected at config-load time than tolerated.
+    #[serde(default = "default_oscillation_sample_seconds")]
+    pub oscillation_sample_seconds: NonZeroU64,
+    /// Issue #164: the fraction of `wall_clock_minutes` that must
+    /// still remain for an **Oscillation** to trigger an **Advance**.
+    /// Handing a fresh engine the tail end of a spent budget wastes
+    /// it, so below this floor the oscillation is logged and the run
+    /// continues to its existing terminal state. Validated to
+    /// `0.0..=1.0` by `Config::from_str` — see
+    /// [`ConfigError::InvalidBudgetFloorFraction`].
+    #[serde(default = "default_advance_budget_floor_fraction")]
+    pub advance_budget_floor_fraction: f64,
 }
 
 impl Default for AgentConfig {
@@ -539,8 +569,18 @@ impl Default for AgentConfig {
         Self {
             wall_clock_minutes: default_wall_clock_minutes(),
             weak_test_guard_skip_label: default_weak_test_guard_skip_label(),
+            oscillation_sample_seconds: default_oscillation_sample_seconds(),
+            advance_budget_floor_fraction: default_advance_budget_floor_fraction(),
         }
     }
+}
+
+fn default_oscillation_sample_seconds() -> NonZeroU64 {
+    NonZeroU64::new(60).expect("60 is non-zero")
+}
+
+fn default_advance_budget_floor_fraction() -> f64 {
+    crate::chain_walker::DEFAULT_ADVANCE_BUDGET_FLOOR_FRACTION
 }
 
 fn default_wall_clock_minutes() -> NonZeroU64 {
@@ -864,6 +904,14 @@ impl FromStr for Config {
         };
         if repos.is_empty() {
             return Err(ConfigError::EmptyRepoList);
+        }
+        let floor = raw.agent.advance_budget_floor_fraction;
+        // `!(0.0..=1.0).contains(..)` rather than two `<`/`>` tests so
+        // NaN — which compares false against everything — is rejected
+        // too rather than falling through to the panicking
+        // `Duration::from_secs_f64`.
+        if !(0.0..=1.0).contains(&floor) {
+            return Err(ConfigError::InvalidBudgetFloorFraction { value: floor });
         }
         Ok(Config {
             repos,
