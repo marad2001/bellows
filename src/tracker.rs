@@ -425,17 +425,54 @@ pub async fn find_next_issue(
     in_progress_label: &str,
     blocked_by_label: &str,
 ) -> Result<Option<Issue>, octocrab::Error> {
+    Ok(find_next_issues(
+        client,
+        owner,
+        repo,
+        pickup_label,
+        in_progress_label,
+        blocked_by_label,
+    )
+    .await?
+    .into_iter()
+    .next())
+}
+
+/// Every eligible candidate in this repo, in the same order
+/// `find_next_issue` would consider them (issue #189).
+///
+/// `find_next_issue` returns only the head of this list, which makes a
+/// single unclaimable issue — one labelled `ready-for-agent` with no
+/// `## Agent Brief` — a permanent head-of-line block: the tick fails on
+/// it, and because selection is deterministic every subsequent tick
+/// picks the same issue forever while younger work starves. Witnessed
+/// on `workboard-frontend-financial-advice#342`, which stalled six
+/// issues behind it.
+///
+/// Returning the full ordered list lets the caller skip an unclaimable
+/// candidate and try the next. The caller is expected to walk it
+/// lazily and stop at the first claimable entry, so the steady-state
+/// cost is unchanged.
+pub async fn find_next_issues(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    pickup_label: &str,
+    in_progress_label: &str,
+    blocked_by_label: &str,
+) -> Result<Vec<Issue>, octocrab::Error> {
     let mut issues = list_all_open_issues_with_labels(client, owner, repo, pickup_label).await?;
     // Sort the complete paginated candidate set by issue.number so
     // the lowest-number un-filtered candidate wins. Sorting only the
     // first GitHub page would miss older/lower-number issues on
     // later pages.
     issues.sort_by_key(|i| i.number);
-    Ok(issues.into_iter().find(|issue| {
+    issues.retain(|issue| {
         let labels = &issue.labels;
         !labels.iter().any(|l| l.name == in_progress_label)
             && !labels.iter().any(|l| l.name == blocked_by_label)
-    }))
+    });
+    Ok(issues)
 }
 
 /// List every open issue carrying `blocked_by_label` (the dependents

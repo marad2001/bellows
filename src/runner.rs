@@ -692,7 +692,11 @@ pub async fn run_once(
             }
         }
 
-        let next = tracker::find_next_issue(
+        // Issue #189: take EVERY eligible candidate, not just this
+        // repo's head. The selection walk below skips candidates that
+        // cannot be claimed (no brief / ambiguous engine labels), and
+        // it can only do that if the ones behind them are present.
+        let next = tracker::find_next_issues(
             client,
             &owner,
             &repo,
@@ -701,7 +705,7 @@ pub async fn run_once(
             &config.runtime_labels.blocked_by,
         )
         .await?;
-        if let Some(issue) = next {
+        for issue in next {
             candidates.push(RepoCandidate {
                 owner: owner.clone(),
                 repo: repo.clone(),
@@ -778,13 +782,80 @@ pub async fn run_once(
             a_t.cmp(&b_t).then_with(|| a.repo_order.cmp(&b.repo_order))
         })
     });
+    // Issue #189: walk the sorted candidates and take the first that is
+    // actually claimable, rather than failing the whole tick on the
+    // head. A missing `## Agent Brief` (or an ambiguous `engine:*` label
+    // pair) is a defect in ONE issue; treating it as a tick-level
+    // failure let a single mis-labelled issue starve the queue forever,
+    // because selection is deterministic and every later tick re-picked
+    // it. Both checks happen BEFORE any claim, so a skipped issue is
+    // left completely untouched — no label swap, no branch, no
+    // container.
+    //
+    // The walk is lazy: it stops at the first claimable candidate, so
+    // the steady state still performs exactly one brief fetch per tick.
+    // Only a broken head costs extra calls.
+    let mut first_skip: Option<RunError> = None;
+    let mut skipped: Vec<u64> = Vec::new();
+    let mut selected: Option<(RepoCandidate, String)> = None;
+    for candidate in candidates {
+        let number = candidate.issue.number;
+        let label_names: Vec<&str> = candidate
+            .issue
+            .labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect();
+        if EngineLabelOverride::parse(&label_names).is_err() {
+            first_skip.get_or_insert(RunError::AmbiguousEngineLabels(number));
+            skipped.push(number);
+            continue;
+        }
+        match tracker::fetch_agent_brief(client, &candidate.owner, &candidate.repo, number).await? {
+            Some(brief) => {
+                selected = Some((candidate, brief));
+                break;
+            }
+            None => {
+                first_skip.get_or_insert(RunError::MissingAgentBrief(number));
+                skipped.push(number);
+            }
+        }
+    }
+
+    let Some((candidate, brief)) = selected else {
+        // Nothing claimable this tick. Return the FIRST skip's error so
+        // the polling loop's `OutcomeTransition` dedupes it exactly as
+        // it did before #189 — an all-broken queue must not start
+        // flooding the log every 30s.
+        return Err(first_skip.expect("non-empty candidates yield a skip when none is selected"));
+    };
+
+    if !skipped.is_empty() {
+        let list = skipped
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Safe to log unconditionally: we only reach here when a claim
+        // follows, and a claim starts a 30-60 minute pipeline, so this
+        // is at most one line per pipeline rather than one per tick.
+        let _ = writeln!(
+            log_writer,
+            "bellows: skipped {} unclaimable issue(s) ahead of the queue ({}): labelled `{}` but missing an `## Agent Brief` or carrying ambiguous `engine:*` labels — move them back to needs-triage",
+            skipped.len(),
+            list,
+            config.polling.pickup_label,
+        );
+    }
+
     let RepoCandidate {
         owner,
         repo,
         repo_url,
         issue,
         repo_order: _,
-    } = candidates.into_iter().next().expect("non-empty candidates");
+    } = candidate;
 
     // Issue #76 / ADR-0003: pre-claim sweep. Delete every `agent/<N>-*`
     // ref on origin for the candidate's issue number before we attempt
@@ -848,13 +919,12 @@ pub async fn run_once(
         );
     }
 
-    // Fetch the agent brief BEFORE claiming. If it's missing we return
-    // an error without label-swapping the issue — the next polling tick
-    // will see it fresh once a human posts the brief, instead of leaving
-    // it stuck in agent-in-progress with no automated recovery.
-    let brief = tracker::fetch_agent_brief(client, &owner, &repo, issue.number)
-        .await?
-        .ok_or(RunError::MissingAgentBrief(issue.number))?;
+    // The agent brief was fetched BEFORE claiming, during candidate
+    // selection above (issue #189 moved the fetch there so an issue
+    // without one can be skipped rather than failing the tick). A
+    // missing brief never reaches this point, and nothing has been
+    // label-swapped for the issues that were skipped — they stay
+    // exactly as they were for the next tick, or for a human to triage.
     let repo_label = format!("{}/{}", owner, repo);
 
     // Issue #81 / ADR-0005: engine-override resolution from labels,

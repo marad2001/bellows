@@ -147,12 +147,22 @@ async fn run_once_picks_oldest_issue_across_multiple_repos_by_created_at() {
         .mount(&mock)
         .await;
 
-    // Agent-brief comments endpoint returns empty for the chosen issue
-    // so the runner surfaces `MissingAgentBrief(N)` and short-circuits
-    // BEFORE touching the workspace, sandbox, or claim path. The N we
-    // see in the error proves which issue the runner picked.
+    // Agent-brief comments endpoint returns empty for BOTH candidates so
+    // neither is claimable and the runner short-circuits BEFORE touching
+    // the workspace, sandbox, or claim path.
+    //
+    // Issue #189: the walk now skips an unclaimable candidate and tries
+    // the next, so repo-b's #20 is reached and must be stubbed too. With
+    // both briefs missing the tick returns the FIRST skip — #10 — which
+    // is still exactly the assertion this test wants: it proves the
+    // global-oldest candidate was the one considered first.
     Mock::given(method("GET"))
         .and(path("/repos/owner-x/repo-a/issues/10/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues/20/comments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
@@ -266,6 +276,38 @@ async fn reconcile_stranded_in_progress_reclaims_to_pickup_label() {
 //      failure path returns RunOutcome::Blocked with the failing branch
 //      named in the reason so the operator can recover. ----
 
+/// Issue #189: candidate selection now fetches the `## Agent Brief`
+/// BEFORE the pre-claim stale-branch sweep, because an issue without a
+/// brief is skipped and must be left completely untouched — sweeping
+/// its branches would be a side effect on an issue bellows never
+/// claims. Tests that want to observe the sweep therefore have to
+/// supply a brief. Claim is then made to CONTEND (the issue no longer
+/// carries the pickup label) so the tick stops cleanly just after the
+/// sweep, without cloning a workspace — the same role the
+/// `MissingAgentBrief` short-circuit played before #189.
+async fn mock_brief_then_contended_claim(mock: &MockServer, number: u64) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/marad2001/test-repo/issues/{number}/comments"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "body": "## Agent Brief
+
+Do the thing." }
+        ])))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/marad2001/test-repo/issues/{number}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": number,
+            "title": "claim contended after sweep",
+            "labels": [{ "name": "some-other-label" }]
+        })))
+        .mount(mock)
+        .await;
+}
+
 #[tokio::test]
 async fn run_once_sweeps_stale_agent_branches_before_claiming() {
     // Brief AC: "`runner::run_once` calls `delete_stale_agent_branches`
@@ -321,23 +363,18 @@ async fn run_once_sweeps_stale_agent_branches_before_claiming() {
         .mount(&mock)
         .await;
 
-    // Brief is missing on the issue -> short-circuit with MissingAgentBrief.
-    // We choose this path over a real claim because it avoids the workspace
-    // clone while still proving the sweep already happened.
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
+    mock_brief_then_contended_claim(&mock, 16).await;
 
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
     let outcome = run_once(&client, &config, &mut log, None, None).await;
     match outcome {
-        Err(RunError::MissingAgentBrief(16)) => {}
+        // The AC is that the sweep runs after selection and BEFORE the
+        // claim; a contended claim proves we got past the sweep.
+        Ok(RunOutcome::Contended { issue_number: 16 }) => {}
         other => panic!(
-            "expected MissingAgentBrief(16) (sweep must have completed before brief fetch), got {other:?}",
+            "expected Contended(16) (the sweep must have completed before the claim), got {other:?}",
         ),
     }
     // mock drops at end of scope -> verifies expect(1) on the DELETE.
@@ -392,6 +429,12 @@ async fn run_once_returns_blocked_when_stale_branch_deletion_fails() {
         })))
         .mount(&mock)
         .await;
+
+    // Issue #189: selection fetches the brief before the sweep, so the
+    // issue needs one for the sweep (and its failure) to be reached at
+    // all. The contended-claim stub it also installs is never used here
+    // — the sweep fails first and returns Blocked before any claim.
+    mock_brief_then_contended_claim(&mock, 16).await;
 
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
@@ -483,11 +526,7 @@ async fn run_once_logs_sweep_summary_when_deletions_happen() {
         .mount(&mock)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
+    mock_brief_then_contended_claim(&mock, 16).await;
 
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
@@ -535,11 +574,7 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
         .mount(&mock)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&mock)
-        .await;
+    mock_brief_then_contended_claim(&mock, 16).await;
 
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
@@ -1072,4 +1107,147 @@ async fn merge_verdict_post_on_hold_only_mode_silently_suppresses_merge_comment(
     )
     .await
     .expect("helper should succeed for post-on-hold-only MERGE");
+}
+
+// ---- Issue #189: an unclaimable issue must not block the queue ----
+
+#[tokio::test]
+async fn run_once_skips_a_brief_less_issue_and_claims_the_next_one() {
+    // The live failure this fixes: FE#342 was `ready-for-agent` with no
+    // `## Agent Brief`, and because it was the oldest candidate the tick
+    // failed on it every 30s forever — six younger issues starved behind
+    // it, and `OutcomeTransition` dedup meant the log went silent, so it
+    // looked like bellows had stopped.
+    //
+    // #16 (no brief) must be SKIPPED and #17 claimed instead. We let the
+    // claim contend so the tick stops without cloning a workspace; the
+    // Contended issue number is what proves which issue was chosen.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "brief-less head of the queue",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            },
+            {
+                "number": 17,
+                "title": "perfectly claimable issue behind it",
+                "created_at": "2026-05-13T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    // #16 has no brief -> skipped.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/16/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // #17 has a brief and is the one that must be selected. Its
+    // pre-claim sweep is stubbed clean; the claim then contends.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/17-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+    mock_brief_then_contended_claim(&mock, 17).await;
+
+    // A DELETE against #16's refs would mean the skipped issue was
+    // swept — a side effect on an issue bellows never claims.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/16-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    let outcome = run_once(&client, &config, &mut log, None, None).await;
+
+    match outcome {
+        Ok(RunOutcome::Contended { issue_number: 17 }) => {}
+        other => panic!(
+            "expected the tick to skip brief-less #16 and reach #17, got {other:?}",
+        ),
+    }
+
+    let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
+    assert!(
+        log_str.contains("#16"),
+        "the skipped issue must be named so an operator can fix it: {log_str}",
+    );
+    assert!(
+        log_str.contains("skipped 1 unclaimable issue"),
+        "the skip must be reported once: {log_str}",
+    );
+}
+
+#[tokio::test]
+async fn run_once_still_errors_when_every_candidate_is_unclaimable() {
+    // No-regression on the all-broken case: the tick must still return
+    // MissingAgentBrief for the FIRST skip, so the polling loop's
+    // OutcomeTransition dedupes it instead of flooding the log every 30s.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 16,
+                "title": "no brief",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            },
+            {
+                "number": 17,
+                "title": "also no brief",
+                "created_at": "2026-05-13T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+
+    for n in [16, 17] {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/marad2001/test-repo/issues/{n}/comments"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&mock)
+            .await;
+    }
+
+    let client = octocrab_pointed_at(mock.uri());
+    let config = config_for(&mock.uri());
+    let mut log = Cursor::new(Vec::new());
+    match run_once(&client, &config, &mut log, None, None).await {
+        Err(RunError::MissingAgentBrief(16)) => {}
+        other => panic!("expected MissingAgentBrief(16) (the first skip), got {other:?}"),
+    }
 }
