@@ -98,6 +98,17 @@ async fn normal_pass_filters_out_issues_carrying_blocked_by_label() {
         .mount(&mock)
         .await;
 
+    // Issue #189: the tick now SKIPS an unclaimable candidate and walks
+    // to the next, so every candidate this selection could reach needs a
+    // comments stub. With all briefs missing, none is claimable and the
+    // tick returns the FIRST skip — which is exactly the ordering
+    // assertion this test makes.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/3/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
     let client = octocrab_pointed_at(mock.uri());
     let config = single_repo_config(&mock.uri());
     let mut log = Cursor::new(Vec::new());
@@ -154,6 +165,17 @@ async fn claim_order_is_ascending_issue_number_not_created_at() {
 
     Mock::given(method("GET"))
         .and(path("/repos/marad2001/test-repo/issues/5/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // Issue #189: the tick now SKIPS an unclaimable candidate and walks
+    // to the next, so every candidate this selection could reach needs a
+    // comments stub. With all briefs missing, none is claimable and the
+    // tick returns the FIRST skip — which is exactly the ordering
+    // assertion this test makes.
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/20/comments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
@@ -223,6 +245,17 @@ async fn cross_repo_ties_on_number_break_on_older_created_at() {
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/owner-x/repo-a/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // Issue #189: the tick now SKIPS an unclaimable candidate and walks
+    // to the next, so every candidate this selection could reach needs a
+    // comments stub. With all briefs missing, none is claimable and the
+    // tick returns the FIRST skip — which is exactly the ordering
+    // assertion this test makes.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues/7/comments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
@@ -317,6 +350,17 @@ async fn cross_repo_ties_on_number_and_created_at_break_on_repo_declared_order()
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/owner-x/repo-a/issues/11/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    // Issue #189: the tick now SKIPS an unclaimable candidate and walks
+    // to the next, so every candidate this selection could reach needs a
+    // comments stub. With all briefs missing, none is claimable and the
+    // tick returns the FIRST skip — which is exactly the ordering
+    // assertion this test makes.
+    Mock::given(method("GET"))
+        .and(path("/repos/owner-x/repo-b/issues/11/comments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&mock)
         .await;
