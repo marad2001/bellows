@@ -348,6 +348,22 @@ fn is_engine_start_failure_signature_does_not_match_an_error_envelope_after_real
 }
 
 #[test]
+fn is_engine_start_failure_signature_does_not_match_prefixed_turn_field_names() {
+    // A zero-valued setting mentioned alongside an unrelated crash is not
+    // evidence that the engine produced zero turns. The key must be exactly
+    // `num_turns`, rather than merely ending with that text.
+    for tail in [
+        "error_during_execution while minimum_num_turns: 0 was configured",
+        "error_during_execution with expected_num_turns=0",
+    ] {
+        assert!(
+            !bellows::policy::is_engine_start_failure_signature(tail),
+            "prefixed field name must not match: {tail}"
+        );
+    }
+}
+
+#[test]
 fn is_engine_start_failure_signature_matches_the_mid_stream_connection_loss() {
     // Issue #192, observed tail from workboard-financial-advice #671:
     // the engine starts and then loses its connection mid-stream. Same

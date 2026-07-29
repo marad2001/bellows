@@ -799,13 +799,23 @@ pub fn is_connection_closed_mid_response_signature(text: &str) -> bool {
     text.to_lowercase().contains("connection closed mid-response")
 }
 
-/// Whether `lower` (already lowercased) contains `field` in a
-/// `key: value` position whose value is zero. Tolerates the JSON
-/// (`"num_turns":0`), spaced (`num_turns: 0`) and assignment
+/// Whether `lower` (already lowercased) contains `field` as a complete
+/// key in a `key: value` position whose value is zero. Tolerates the
+/// JSON (`"num_turns":0`), spaced (`num_turns: 0`) and assignment
 /// (`num_turns = 0`) renderings, and requires the value to be exactly
-/// zero — `0` matches, `10` and `0.5` do not.
+/// zero — `0` matches, `10` and `0.5` do not. Identifier characters
+/// before `field` are rejected so keys such as `minimum_num_turns` do
+/// not masquerade as the requested field.
 fn has_zero_valued_field(lower: &str, field: &str) -> bool {
     lower.match_indices(field).any(|(idx, _)| {
+        if lower[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+
         let rest = lower[idx + field.len()..].trim_start_matches(['"', '\'']);
         let Some(value) = rest
             .strip_prefix(':')
