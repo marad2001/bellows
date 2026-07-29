@@ -973,9 +973,17 @@ fn per_finding_kickoff_interpolates_title_severity_and_body_into_the_prompt() {
         kickoff.contains("config parser panics on empty input"),
         "title must appear in the kickoff body: {kickoff}"
     );
+    // Pin the interpolated `**Severity:**` line, not the bare tag: the
+    // REVIEW_FIX_PROMPT prose independently mentions "`blocker` / `important`
+    // work you cannot complete", so `contains("blocker")` is satisfied by the
+    // template itself and stays green even if `Severity::as_tag()` stops
+    // rendering the parser's vocabulary. The delimited form is the only
+    // assertion here that actually pins `Severity::Blocker.as_tag() ==
+    // "blocker"` — spelled as a literal on purpose, since deriving it from
+    // `as_tag()` would move both sides together and pin nothing.
     assert!(
-        kickoff.contains("blocker"),
-        "severity tag must appear in the kickoff body: {kickoff}"
+        kickoff.contains("**Severity:** blocker"),
+        "severity tag must be interpolated into the kickoff's Severity line: {kickoff}"
     );
     assert!(
         kickoff.contains("**Suggestion:** map to ConfigError::Parse"),
@@ -1032,8 +1040,13 @@ fn per_finding_kickoff_carries_severity_tone_distinguishing_blocker_from_importa
         blocker_kickoff, important_kickoff,
         "blocker and important kickoffs must differ in urgency wording, not just the severity tag"
     );
-    assert!(blocker_kickoff.contains("blocker"));
-    assert!(important_kickoff.contains("important"));
+    // Delimited form, for the reason given in
+    // per_finding_kickoff_interpolates_title_severity_and_body_into_the_prompt:
+    // both bare tags appear in REVIEW_FIX_PROMPT's own prose, so bare
+    // `contains` would pass for either severity regardless of what
+    // `as_tag()` renders.
+    assert!(blocker_kickoff.contains("**Severity:** blocker"));
+    assert!(important_kickoff.contains("**Severity:** important"));
 }
 
 #[test]
