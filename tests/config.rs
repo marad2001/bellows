@@ -291,17 +291,30 @@ pat_env_var = "GITHUB_TOKEN"
 #[test]
 fn gates_section_defaults_apply_when_omitted() {
     // ADR-0004 acceptance: a config that omits the `[gates]` table
-    // entirely must still parse, and the fallback flag strings must
-    // preserve today's strict-default behaviour
-    // (`--all-targets --all-features -- -D warnings` for clippy,
-    // `--all-targets --all-features` for test). Existing operator
-    // `orchestrator.toml` files therefore keep parsing with no edits.
+    // entirely must still parse. Existing operator `orchestrator.toml`
+    // files therefore keep parsing with no edits.
+    //
+    // The clippy fallback deliberately does not deny warnings. This
+    // value is only reached when bellows could not read the repo's CI,
+    // so it has no evidence of the bar that repo holds itself to;
+    // `-D warnings` invented one and failed a run on a repo with no CI
+    // at all, over three pre-existing lints in untouched files.
     let config = Config::from_str(MINIMAL_CONFIG).unwrap();
-    assert_eq!(
-        config.gates.clippy_flags,
-        "--all-targets --all-features -- -D warnings",
-    );
+    assert_eq!(config.gates.clippy_flags, "--all-targets --all-features");
     assert_eq!(config.gates.test_flags, "--all-targets --all-features");
+}
+
+#[test]
+fn the_clippy_fallback_does_not_deny_warnings() {
+    // Pinned separately from the defaults test because it is a policy
+    // decision, not an incidental string: an unreadable CI must never
+    // be upgraded into a stricter gate than the repo's own.
+    let config = Config::from_str(MINIMAL_CONFIG).unwrap();
+    assert!(
+        !config.gates.clippy_flags.contains("-D warnings"),
+        "the no-CI fallback must not invent a strict bar: {}",
+        config.gates.clippy_flags,
+    );
 }
 
 #[test]
@@ -345,10 +358,7 @@ test_flags = "--features in-memory"
 "#;
     let config = Config::from_str(config_text).unwrap();
     assert_eq!(config.gates.test_flags, "--features in-memory");
-    assert_eq!(
-        config.gates.clippy_flags,
-        "--all-targets --all-features -- -D warnings",
-    );
+    assert_eq!(config.gates.clippy_flags, "--all-targets --all-features");
 }
 
 #[test]

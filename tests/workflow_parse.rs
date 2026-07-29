@@ -415,6 +415,12 @@ jobs:
     }
 }
 
+// `std::os::unix::fs::symlink` does not exist on Windows, and an
+// ungated `use` of it fails the whole test binary to compile — which
+// took the other 14 tests in this file with it and left the parser
+// unrunnable on the host bellows actually runs on. Gated, not deleted:
+// the symlink-skip filter is a real security property and CI is Linux.
+#[cfg(unix)]
 #[test]
 fn symlinked_workflow_file_is_skipped() {
     // Security: a target repo can commit a symlink under
@@ -444,6 +450,7 @@ fn symlinked_workflow_file_is_skipped() {
     assert!(matches!(extracted.source, Provenance::FallbackFromConfig));
 }
 
+#[cfg(unix)]
 #[test]
 fn regular_workflow_alongside_symlink_still_extracts() {
     // Companion to the symlink-skip test: a workflows directory that
@@ -612,4 +619,180 @@ jobs:
             "unresolved GitHub expression leaked via {name}",
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// A UTF-8 BOM must not defeat the parser.
+//
+// `workboard-frontend`'s `ci.yml` was authored on Windows and begins
+// `ef bb bf`. `read_to_string` carries the BOM into the string and the
+// YAML loader reads it as part of the first key, so `name:` arrived as
+// `\u{feff}name`, the `name: CI` check rejected the file, and both
+// commands fell back to `[gates].*_flags`. The repo's own CI runs
+// `cargo clippy --locked --all-targets` and deliberately does not deny
+// warnings; the fallback did. The run failed on 426 pre-existing lints
+// in files the agent never touched and was labelled a test failure.
+// ---------------------------------------------------------------------
+
+/// The real shape: BOM, then a workflow whose clippy step is permissive.
+const BOM_CI_YML: &str = "\u{feff}name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo test
+        run: cargo test --locked --all-targets
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets
+";
+
+#[test]
+fn a_utf8_bom_does_not_stop_the_workflow_being_parsed() {
+    let tmp = TempDir::new().unwrap();
+    write_workflow(tmp.path(), "ci.yml", BOM_CI_YML);
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(
+        extracted.clippy.as_deref(),
+        Some("cargo clippy --locked --all-targets"),
+        "a BOM must not force the clippy fallback: {extracted:?}",
+    );
+    assert_eq!(
+        extracted.test.as_deref(),
+        Some("cargo test --locked --all-targets"),
+    );
+    assert!(
+        matches!(extracted.source, Provenance::ParsedFromWorkflow(_)),
+        "provenance must report the workflow, not the fallback: {:?}",
+        extracted.source,
+    );
+}
+
+#[test]
+fn a_bom_prefixed_workflow_parses_identically_to_the_same_file_without_one() {
+    // The BOM must be inert, not merely survivable — every extracted
+    // field has to match the byte-identical file that lacks it.
+    let with = TempDir::new().unwrap();
+    let without = TempDir::new().unwrap();
+    write_workflow(with.path(), "ci.yml", BOM_CI_YML);
+    write_workflow(
+        without.path(),
+        "ci.yml",
+        BOM_CI_YML.strip_prefix('\u{feff}').expect("test const carries a BOM"),
+    );
+
+    let a = parse_ci_workflow(with.path());
+    let b = parse_ci_workflow(without.path());
+    assert_eq!(a.clippy, b.clippy);
+    assert_eq!(a.test, b.test);
+    assert_eq!(a.clippy_check, b.clippy_check);
+    assert_eq!(a.test_check, b.test_check);
+    assert_eq!(a.clippy_env, b.clippy_env);
+    assert_eq!(a.test_env, b.test_env);
+}
+
+// ---------------------------------------------------------------------
+// Each command carries the CI job it came from.
+//
+// GitHub names a check-run after the job, so the job name — not the
+// command — is what the base-commit-health lookup can match against the
+// commits API.
+// ---------------------------------------------------------------------
+
+#[test]
+fn each_command_carries_the_job_it_was_extracted_from() {
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets
+      - name: cargo test
+        run: cargo test --locked
+"#,
+    );
+
+    let extracted = parse_ci_workflow(tmp.path());
+    // The job key, not the step names — GitHub reports one check called
+    // `ci`, never one called `cargo clippy`.
+    assert_eq!(extracted.clippy_check.as_deref(), Some("ci"));
+    assert_eq!(extracted.test_check.as_deref(), Some("ci"));
+}
+
+#[test]
+fn an_explicit_job_name_wins_over_the_job_key() {
+    // GitHub names the check-run after `name:` when the job declares
+    // one, so the parser must prefer it over the `jobs.<key>` key.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  build-and-test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo clippy
+        run: cargo clippy --locked
+      - name: cargo test
+        run: cargo test --locked
+"#,
+    );
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(extracted.clippy_check.as_deref(), Some("Lint and test"));
+    assert_eq!(extracted.test_check.as_deref(), Some("Lint and test"));
+}
+
+#[test]
+fn sibling_jobs_attribute_each_command_to_its_own_job() {
+    // The split-job shape: clippy and test live in different jobs, so
+    // they are different check-runs and must be recorded separately.
+    // This is the repo shape the command-derived heuristic was built
+    // around — here the jobs happen to be named after their commands.
+    let tmp = TempDir::new().unwrap();
+    write_workflow(
+        tmp.path(),
+        "ci.yml",
+        r#"
+name: CI
+on: [push]
+jobs:
+  cargo test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test --locked --all-targets
+  cargo clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo clippy --locked -- -D clippy::correctness
+"#,
+    );
+
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(extracted.test_check.as_deref(), Some("cargo test"));
+    assert_eq!(extracted.clippy_check.as_deref(), Some("cargo clippy"));
+}
+
+#[test]
+fn a_fallback_command_carries_no_job_attribution() {
+    // No workflow at all: both commands fall back, so there is no CI job
+    // either corresponds to. Guessing one would make the base-health
+    // lookup answer a question about a check bellows never mirrored.
+    let tmp = TempDir::new().unwrap();
+    let extracted = parse_ci_workflow(tmp.path());
+    assert_eq!(extracted, ExtractedCommands::default());
+    assert_eq!(extracted.clippy_check, None);
+    assert_eq!(extracted.test_check, None);
 }

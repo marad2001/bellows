@@ -38,12 +38,20 @@ use yaml_rust2::{Yaml, YamlLoader};
 /// (`FallbackFromConfig`). It is the file-level provenance, not the
 /// per-command one; the caller can compare each field against its
 /// fallback value to attribute provenance per command if needed.
+/// `clippy_check` / `test_check` name the CI *job* each command was
+/// extracted from (issue #196 follow-up). GitHub names a check-run after
+/// the job, never the step, so this — not the command string — is what
+/// the base-commit-health lookup can match against
+/// `GET /commits/{sha}/check-runs`. `None` whenever the command itself is
+/// `None`: with no mirrored command there is no check to attribute.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExtractedCommands {
     pub clippy: Option<String>,
     pub clippy_env: Vec<(String, String)>,
+    pub clippy_check: Option<String>,
     pub test: Option<String>,
     pub test_env: Vec<(String, String)>,
+    pub test_check: Option<String>,
     pub source: Provenance,
 }
 
@@ -118,7 +126,16 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        let docs = match YamlLoader::load_from_str(&content) {
+        // A UTF-8 BOM survives `read_to_string` into the string, and the
+        // YAML loader reads it as part of the first scalar — so the
+        // top-level key becomes `\u{feff}name` and the `name: CI` check
+        // below silently rejects the file. The whole workflow then falls
+        // back to `[gates].*_flags`, which is how a Windows-authored
+        // `ci.yml` got a repo gated on `-D warnings` its own CI does not
+        // apply, and failed a run on 426 pre-existing lints in files the
+        // agent never touched. One invisible byte, one misattributed run.
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let docs = match YamlLoader::load_from_str(content) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -131,8 +148,10 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
             return ExtractedCommands {
                 clippy: extracted.clippy,
                 clippy_env: extracted.clippy_env,
+                clippy_check: extracted.clippy_check,
                 test: extracted.test,
                 test_env: extracted.test_env,
+                test_check: extracted.test_check,
                 source: Provenance::ParsedFromWorkflow(path.clone()),
             };
         }
@@ -167,8 +186,10 @@ pub fn parse_ci_workflow(repo_root: &Path) -> ExtractedCommands {
 struct JobExtract {
     clippy: Option<String>,
     clippy_env: Vec<(String, String)>,
+    clippy_check: Option<String>,
     test: Option<String>,
     test_env: Vec<(String, String)>,
+    test_check: Option<String>,
 }
 
 /// Environment-variable names bellows mirrors from the target repo's CI
@@ -262,14 +283,15 @@ fn extract_from_workflow(doc: &Yaml) -> JobExtract {
     // Workflow-level `env:` is the base layer every job inherits.
     let mut workflow_env = BTreeMap::new();
     collect_build_env(doc, &mut workflow_env);
-    let mut linux_jobs: Vec<&Yaml> = Vec::new();
-    let mut first_job: Option<&Yaml> = None;
-    for (_name, body) in jobs {
+    let mut linux_jobs: Vec<(String, &Yaml)> = Vec::new();
+    let mut first_job: Option<(String, &Yaml)> = None;
+    for (key, body) in jobs {
+        let check = job_check_name(key, body);
         if first_job.is_none() {
-            first_job = Some(body);
+            first_job = Some((check.clone(), body));
         }
         if job_is_linux(body) {
-            linux_jobs.push(body);
+            linux_jobs.push((check, body));
         }
     }
     // No Linux job at all — matrix-without-ubuntu shape: fall back to the
@@ -277,7 +299,7 @@ fn extract_from_workflow(doc: &Yaml) -> JobExtract {
     // an unresolvable `runs-on` still extracts.
     if linux_jobs.is_empty() {
         return match first_job {
-            Some(job) => extract_from_job(job, &workflow_env),
+            Some((check, job)) => attribute(extract_from_job(job, &workflow_env), &check),
             None => JobExtract::default(),
         };
     }
@@ -288,22 +310,55 @@ fn extract_from_workflow(doc: &Yaml) -> JobExtract {
     // either command would drop the other and force a `-D warnings`
     // fallback for it.
     let mut acc = JobExtract::default();
-    for job in &linux_jobs {
-        let found = extract_from_job(job, &workflow_env);
-        // Each command carries its own env, so they must move together.
+    for (check, job) in &linux_jobs {
+        let found = attribute(extract_from_job(job, &workflow_env), check);
+        // Each command carries its own env and its own job, so all three
+        // must move together — a repo that splits clippy and test into
+        // sibling jobs has a different check-run name for each.
         if acc.clippy.is_none() {
             acc.clippy = found.clippy;
             acc.clippy_env = found.clippy_env;
+            acc.clippy_check = found.clippy_check;
         }
         if acc.test.is_none() {
             acc.test = found.test;
             acc.test_env = found.test_env;
+            acc.test_check = found.test_check;
         }
         if acc.clippy.is_some() && acc.test.is_some() {
             break;
         }
     }
     acc
+}
+
+/// Tag whichever commands a job yielded with that job's check-run name.
+/// A command the job did not yield stays unattributed, so a later job in
+/// the accumulation loop can claim it.
+fn attribute(mut found: JobExtract, check: &str) -> JobExtract {
+    found.clippy_check = found.clippy.as_ref().map(|_| check.to_string());
+    found.test_check = found.test.as_ref().map(|_| check.to_string());
+    found
+}
+
+/// The name GitHub will give this job's check-run: the job's `name:` if
+/// it declares one, otherwise the `jobs.<key>` key itself.
+///
+/// This is the whole point of the lookup working at all. GitHub names a
+/// check-run after the job, so a workflow whose steps are named
+/// `cargo clippy` and `cargo test` still reports a single check called
+/// `ci`. Matching the *command* against check-run names — which is what
+/// bellows did before — could therefore never match anything, and the
+/// base-health lookup returned `NotEstablished` on every repo while its
+/// unit tests passed against fixtures that named check-runs after steps.
+fn job_check_name(key: &Yaml, body: &Yaml) -> String {
+    if let Some(name) = body["name"].as_str() {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    key.as_str().unwrap_or_default().trim().to_string()
 }
 
 /// Whether a `jobs.<name>` body runs on a Linux runner. Accepts a
