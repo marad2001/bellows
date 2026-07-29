@@ -278,6 +278,13 @@ pub enum SandboxError {
 /// attached to it, are unaffected.
 const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Portion of a budgeted attempt kept for stopping, observing, and
+/// removing a container after its workload deadline. Without a reserve,
+/// the workload timer and the attempt timer would fire together, leaving
+/// no opportunity to send SIGKILL or reconcile the known container id
+/// while still honoring the attempt's wall-clock bound.
+const CONTAINER_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
+
 /// The one place bellows builds a Docker client. Local-defaults
 /// connector (unix socket / named pipe, or `DOCKER_HOST` when set),
 /// plus the [`DAEMON_REQUEST_TIMEOUT`] every call inherits. Building a
@@ -343,6 +350,24 @@ enum RetryStop {
 /// retries. An overrun clamps to zero rather than wrapping.
 fn remaining_budget(budget: Option<Duration>, elapsed: Duration) -> Option<Duration> {
     budget.map(|b| b.saturating_sub(elapsed))
+}
+
+/// Await one part of a container attempt without letting that operation
+/// extend the attempt's absolute deadline. Docker has its own per-request
+/// timeout, but a phase may have much less time left than that client-wide
+/// bound. Report expiry in the same transport shape Bollard uses for a
+/// daemon request timeout so a pre-create expiry reaches the existing
+/// budget-aware retry accounting.
+async fn before_attempt_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = T>,
+) -> Result<T, SandboxError> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| SandboxError::Bollard(bollard::errors::Error::RequestTimeoutError)),
+        None => Ok(future.await),
+    }
 }
 
 /// How long to wait before attempt `attempt + 1`, or why there will
@@ -753,12 +778,13 @@ enum ContainerAttemptError {
 /// error — the caller (run_agent / run_cargo_checks) and ultimately
 /// policy::classify_exit decide what a non-zero exit means.
 ///
-/// `deadline` is the wall-clock budget for THIS attempt — what
-/// `run_container` has left of the container run's budget after any
-/// earlier attempts. When `Some` and the deadline fires before the
-/// container exits, the container is killed (SIGKILL) and
-/// `killed_by_deadline` is set. When `None`, the container runs to
-/// natural completion regardless of elapsed time.
+/// `deadline` is the wall-clock budget for THIS entire attempt — what
+/// `run_container` has left after any earlier attempts. It covers
+/// create, start, lifecycle observation, and removal. A small tail is
+/// reserved after the workload deadline for SIGKILL, wait, and removal;
+/// when the workload deadline fires, `killed_by_deadline` is set. When
+/// `None`, the container runs to natural completion regardless of
+/// elapsed time.
 ///
 /// `stall_watch` (issue #164) opts this run into periodic **Stall**
 /// sampling of the bind-mounted workspace. It cooperates with the log
@@ -773,28 +799,45 @@ async fn run_container_once(
     deadline: Option<Duration>,
     stall_watch: Option<StallWatch>,
 ) -> Result<ContainerOutcome, ContainerAttemptError> {
-    let container = docker
-        .create_container(None, config)
+    // One absolute instant for the whole attempt. Re-arming a duration
+    // after create or start would let each setup request spend the
+    // Docker client's independent timeout before this budget began.
+    let deadline_at = deadline.map(|duration| tokio::time::Instant::now() + duration);
+
+    let container = before_attempt_deadline(deadline_at, docker.create_container(None, config))
         .await
+        .map_err(ContainerAttemptError::Create)?
         .map_err(SandboxError::from)
         .map_err(ContainerAttemptError::Create)?;
     let id = container.id;
+
+    // Once an id is known, stop setup/workload slightly before the hard
+    // attempt bound so kill/wait/remove can still make progress inside it.
+    let lifecycle_deadline_at = deadline_at.map(|attempt_deadline| {
+        let now = tokio::time::Instant::now();
+        attempt_deadline
+            .checked_sub(CONTAINER_CLEANUP_RESERVE)
+            .unwrap_or(now)
+            .max(now)
+    });
 
     // Once the container exists on the daemon it must be removed even if
     // start/log/wait fail. Run the lifecycle inside an inner async block
     // and force-remove unconditionally afterwards.
     let lifecycle: Result<ContainerOutcome, SandboxError> = async {
-        docker.start_container(&id, None).await?;
+        before_attempt_deadline(lifecycle_deadline_at, docker.start_container(&id, None))
+            .await??;
 
         // Box the deadline future so we can race it against the log
         // stream in tokio::select! while keeping a single sleep for
-        // the whole container lifetime (not re-armed each iteration).
+        // the whole attempt (not re-armed after setup or each loop).
         // When deadline is None, fall back to a never-completing future
         // so the deadline branch effectively never wins.
-        let mut deadline_future: Pin<Box<dyn Future<Output = ()> + Send>> = match deadline {
-            Some(d) => Box::pin(tokio::time::sleep(d)),
-            None => Box::pin(std::future::pending()),
-        };
+        let mut deadline_future: Pin<Box<dyn Future<Output = ()> + Send>> =
+            match lifecycle_deadline_at {
+                Some(deadline) => Box::pin(tokio::time::sleep_until(deadline)),
+                None => Box::pin(std::future::pending()),
+            };
 
         let log_options = LogsOptionsBuilder::default()
             .follow(true)
@@ -858,9 +901,11 @@ async fn run_container_once(
                             }
                         }
                         if observation.kill {
-                            let _ = docker
-                                .kill_container(&id, None::<KillContainerOptions>)
-                                .await;
+                            let _ = before_attempt_deadline(
+                                deadline_at,
+                                docker.kill_container(&id, None::<KillContainerOptions>),
+                            )
+                            .await;
                             break;
                         }
                     }
@@ -884,9 +929,11 @@ async fn run_container_once(
                 _ = &mut deadline_future => {
                     // Deadline fired — SIGKILL the container. wait_container
                     // below will pick up the kill exit code (typically 137).
-                    let _ = docker
-                        .kill_container(&id, None::<KillContainerOptions>)
-                        .await;
+                    let _ = before_attempt_deadline(
+                        deadline_at,
+                        docker.kill_container(&id, None::<KillContainerOptions>),
+                    )
+                    .await;
                     killed_by_deadline = true;
                     break;
                 }
@@ -895,7 +942,7 @@ async fn run_container_once(
 
         let mut wait_stream = docker.wait_container(&id, None);
         let mut exit_code = 0i64;
-        while let Some(response) = wait_stream.next().await {
+        while let Some(response) = before_attempt_deadline(deadline_at, wait_stream.next()).await? {
             match response {
                 Ok(r) => exit_code = r.status_code,
                 // Bollard converts a non-zero container exit into this
@@ -920,10 +967,12 @@ async fn run_container_once(
     .await;
 
     let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
-    let cleanup = docker
-        .remove_container(&id, Some(remove_options))
-        .await
-        .map_err(SandboxError::from);
+    let cleanup = before_attempt_deadline(
+        deadline_at,
+        docker.remove_container(&id, Some(remove_options)),
+    )
+    .await
+    .and_then(|result| result.map_err(SandboxError::from));
 
     match (lifecycle, cleanup) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -2221,6 +2270,44 @@ mod tests {
         assert!(
             log.contains("wall-clock"),
             "the operator must see that the clock, not the daemon, stopped the retries: {log}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_create_cannot_outlive_the_wall_clock_budget() {
+        // The phase deadline covers daemon setup too. In particular, it
+        // must beat the Docker client's independent request timeout when
+        // a connected daemon accepts create but does not answer it.
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(2)))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let started = std::time::Instant::now();
+        let mut log = Vec::new();
+        run_container(
+            &mock_docker(&mock),
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            Some(Duration::from_millis(50)),
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect_err("a create that exceeds the phase budget must fail");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the phase budget must win before the Docker request timeout"
+        );
+        let log = String::from_utf8(log).expect("log is utf8");
+        assert!(
+            log.contains("(attempt 1/3)") && !log.contains("(attempt 2/3)"),
+            "an expired phase must not retry its timed-out create: {log}",
         );
     }
 
