@@ -5,6 +5,7 @@ pub mod large_files;
 pub mod main_helpers;
 pub mod policy;
 pub mod policy_image_gen;
+pub mod run_log;
 pub mod runner;
 pub mod sandbox;
 pub mod status;

@@ -1,3 +1,4 @@
+use crate::narrate;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
@@ -570,8 +571,7 @@ pub async fn ensure_policy_image() -> Result<String, SandboxError> {
 /// and the operator reading `bellows.log` see the same line.
 fn announce(line: &str, log_writer: &mut dyn Write) {
     println!("{line}");
-    let _ = writeln!(log_writer, "{line}");
-    let _ = log_writer.flush();
+    crate::run_log::narrate(log_writer, line);
 }
 
 /// How the lifecycle helper should retain the container's stdout/stderr.
@@ -920,6 +920,13 @@ async fn run_container_once(
                                 bollard::container::LogOutput::StdErr { message } => message,
                                 _ => continue,
                             };
+                            // run-log-raw: the container tee relays the
+                            // agent's and cargo's own stdout verbatim.
+                            // Issue #195 deliberately leaves it
+                            // unstamped — it is the bulk of the file,
+                            // and prefixing it would inflate the log by
+                            // roughly half and break every diff and
+                            // code block the agent emits.
                             log_writer.write_all(&bytes)?;
                             log_writer.flush()?;
                             captured.append(&bytes);
@@ -1812,8 +1819,7 @@ pub async fn cleanup_orphan_containers(
                 success_lines.push(format_orphan_log_line(&info));
             }
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: failed to remove orphan container {} ({e})",
                     info.short_id,
                 );

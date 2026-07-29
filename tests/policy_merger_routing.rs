@@ -16,7 +16,8 @@
 //!    their objective `ExitReason`, beating any advisory signal.
 
 use bellows::policy::{
-    classify_exit, AnalysisOutcome, BellowsSynthCause, CheckResult, ExitReason, FixOutcome,
+    classify_exit, AnalysisOutcome, BaseHealth, BellowsSynthCause, CheckResult, ExitReason,
+    FixOutcome,
     GateOutcome, ImplementOutcome, MergerVerdict, ParsedFinding, PhaseOutcomes, ReviewOutcome,
     Severity,
 };
@@ -47,6 +48,7 @@ fn clean_outcomes() -> PhaseOutcomes {
             cargo_clippy: Some(check(0)),
             cargo_test: Some(check(0)),
         }),
+        base_health: BaseHealth::NotEstablished,
         wall_clock_exceeded: false,
         backstop_violations: Vec::new(),
         implement_crash_synthesised: false,

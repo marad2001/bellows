@@ -9,3 +9,8 @@ bellows.log
 # Claude Code local state (permissions, etc.) — per-operator, never
 # committed.
 .claude/
+
+# Operator-local runtime state, written by the polling loop alongside
+# bellows.log. Both are per-install and per-run; neither is source.
+bellows-state.json
+runs.jsonl

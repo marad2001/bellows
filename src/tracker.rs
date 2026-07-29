@@ -1,3 +1,4 @@
+use crate::narrate;
 use std::io::{self, Write};
 
 use serde::Deserialize;
@@ -827,16 +828,14 @@ pub fn parse_blocked_by_section_with_log_writer(
             continue;
         }
         if token.contains('/') {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: ignoring cross-repo blocker reference `{}` in **Blocked by:** line (v1 is same-repo only; see ADR-0007)",
                 token,
             );
             continue;
         }
         let Some(num_str) = token.strip_prefix('#') else {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: ignoring malformed blocker token `{}` in **Blocked by:** line (expected `#N`)",
                 token,
             );
@@ -845,8 +844,7 @@ pub fn parse_blocked_by_section_with_log_writer(
         match num_str.parse::<u64>() {
             Ok(n) => blockers.push(n),
             Err(_) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: ignoring malformed blocker token `#{}` in **Blocked by:** line (not a u64)",
                     num_str,
                 );
@@ -1125,4 +1123,216 @@ pub async fn claim(
     let body = serde_json::json!({ "labels": new_labels });
     let updated: Issue = client.patch(&route, Some(&body)).await?;
     Ok(updated)
+}
+
+/// One entry from GitHub's commit check-runs API
+/// (`GET /repos/{owner}/{repo}/commits/{ref}/check-runs`).
+///
+/// Issue #196. Only the two fields the base-health decision needs are
+/// deserialised; the endpoint returns a great deal more.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckRun {
+    /// The check-run's display name, e.g. `cargo clippy`. Matched
+    /// against the checks the cargo gate mirrors.
+    pub name: String,
+    /// `success` / `failure` / `neutral` / `cancelled` / `timed_out` /
+    /// `action_required` / `skipped`, or **absent** while the check is
+    /// still queued or in progress. The `None` case is load-bearing: a
+    /// check that has not finished says nothing about the base, and must
+    /// never be read as either red or green.
+    pub conclusion: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    check_runs: Vec<CheckRun>,
+}
+
+/// Issue #196: ask the target repo's own CI whether `base_sha` was
+/// already failing, so a cargo-gate failure is not blamed on a diff that
+/// did not cause it.
+///
+/// This derives the answer rather than remembering it, per the principle
+/// settled in `.out-of-scope/cross-run-memory-store.md`: **derived beats
+/// remembered whenever derivation is possible, because derived facts
+/// cannot go stale.** The alternative — re-running the gate locally at
+/// the base commit and caching the verdict — would add a second store to
+/// curate and cost minutes of container time on every failing run, where
+/// this costs one request against a commit CI has already built.
+///
+/// Returns [`policy::BaseHealth`]. The three states are deliberate:
+///
+/// - `Red` — a check whose name matches one the gate mirrors concluded
+///   in a failing state at this commit.
+/// - `Green` — at least one mirrored check concluded, and none failed.
+/// - `NotEstablished` — no mirrored check has *concluded* (still
+///   running, or the repo has no CI), or the request failed. **Never
+///   collapse this into `Green`**: not knowing is not knowing, and
+///   treating it as green reintroduces the very misattribution this
+///   exists to prevent.
+///
+/// Errors are folded into `NotEstablished` rather than propagated. The
+/// caller is on a failure path already and must still finalise the run;
+/// an unreachable GitHub cannot be allowed to change how a run ends.
+pub async fn base_commit_health(
+    client: &octocrab::Octocrab,
+    owner: &str,
+    repo: &str,
+    base_sha: &str,
+    mirrored_checks: &[String],
+) -> crate::policy::BaseHealth {
+    use crate::policy::BaseHealth;
+
+    if mirrored_checks.is_empty() {
+        // Nothing to match against — asking GitHub would produce an
+        // answer we could not attribute to the gate that just failed.
+        return BaseHealth::NotEstablished;
+    }
+
+    let route = format!("/repos/{owner}/{repo}/commits/{base_sha}/check-runs");
+    let response: CheckRunsResponse = match client.get(&route, None::<&()>).await {
+        Ok(response) => response,
+        Err(_) => return BaseHealth::NotEstablished,
+    };
+
+    classify_base_health(&response.check_runs, base_sha, mirrored_checks)
+}
+
+/// Pure decision half of [`base_commit_health`], split out so the
+/// three-state logic is testable without a live GitHub.
+pub fn classify_base_health(
+    check_runs: &[CheckRun],
+    base_sha: &str,
+    mirrored_checks: &[String],
+) -> crate::policy::BaseHealth {
+    use crate::policy::BaseHealth;
+
+    let relevant: Vec<&CheckRun> = check_runs
+        .iter()
+        .filter(|run| check_is_mirrored(&run.name, mirrored_checks))
+        .collect();
+
+    // A failing mirrored check is conclusive on its own — no need for
+    // every check to have finished.
+    if let Some(failing) = relevant
+        .iter()
+        .find(|run| run.conclusion.as_deref().is_some_and(conclusion_is_failure))
+    {
+        return BaseHealth::Red {
+            base_sha: base_sha.to_string(),
+            failing_check: failing.name.clone(),
+        };
+    }
+
+    // Green requires at least one mirrored check to have actually
+    // concluded. A set of still-running checks, or an empty set, is
+    // `NotEstablished` — it carries no information about the base.
+    let any_concluded = relevant.iter().any(|run| {
+        run.conclusion
+            .as_deref()
+            .is_some_and(conclusion_is_established)
+    });
+    if any_concluded {
+        BaseHealth::Green
+    } else {
+        BaseHealth::NotEstablished
+    }
+}
+
+/// Whether a check-run name corresponds to a check the cargo gate
+/// mirrors.
+///
+/// Matching is **exact** (case-insensitive), after stripping any
+/// `workflow / job` prefix that GitHub prepends when a check belongs to
+/// a named workflow. Substring matching was considered and rejected:
+/// `cargo test` is a substring of `cargo test --examples`, which is a
+/// *different* job that the gate does not run. Letting it stand in would
+/// report the base red on the strength of a check bellows never
+/// mirrored — and a false `Red` is the dangerous direction, because it
+/// suppresses a `FinalTestsRed` on a diff that really is broken.
+///
+/// This filter is also what stops an unrelated red check on the base — a
+/// docs job, a deploy step — from being read as "the base is broken" for
+/// a clippy failure.
+///
+/// The consequence of exactness: a repo whose CI job is named `build`
+/// rather than after the command it runs will never match, and the
+/// lookup returns `NotEstablished`. That is the intended degradation —
+/// no answer rather than a wrong one.
+fn check_is_mirrored(check_name: &str, mirrored_checks: &[String]) -> bool {
+    let name = check_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(check_name)
+        .trim()
+        .to_lowercase();
+    mirrored_checks
+        .iter()
+        .any(|mirrored| !mirrored.is_empty() && mirrored.trim().to_lowercase() == name)
+}
+
+/// Derive the check-run names to consult from the cargo commands the
+/// gate mirrors (ADR-0004 parses those fresh from the target repo's
+/// workflow on every run, so these are derived too — nothing here is
+/// remembered).
+///
+/// A command like `cargo clippy --locked --workspace --all-targets` maps
+/// to the key `cargo clippy`: everything up to the first flag. In
+/// practice CI jobs that run a cargo command are named after it, which
+/// is what makes the mapping work — `marad2001/workboard-financial-advice`
+/// surfaces `cargo clippy` and `cargo test` as check-run names.
+/// Only commands actually parsed from the target's workflow contribute a
+/// key. A command that fell back to the operator-declared `[gates]`
+/// flags is not mirroring CI at all, so there is no CI job it
+/// corresponds to and guessing one would be exactly the kind of wrong
+/// answer this design refuses to give. With no parsed command, the
+/// caller gets no keys and the lookup returns `NotEstablished`.
+pub fn mirrored_check_names(commands: &crate::workspace::GateCommands) -> Vec<String> {
+    use crate::workflow_parse::Provenance;
+
+    let parsed = |command: &str, source: &Provenance| -> Option<String> {
+        match source {
+            Provenance::ParsedFromWorkflow(_) => check_key_for_command(command),
+            Provenance::FallbackFromConfig => None,
+        }
+    };
+
+    [
+        parsed(&commands.clippy, &commands.clippy_source),
+        parsed(&commands.test, &commands.test_source),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// `cargo clippy --locked --workspace` → `cargo clippy`.
+/// Returns `None` when the command has no leading non-flag tokens.
+fn check_key_for_command(command: &str) -> Option<String> {
+    let key: Vec<&str> = command
+        .split_whitespace()
+        .take_while(|token| !token.starts_with('-'))
+        .collect();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.join(" "))
+}
+
+/// Whether a check-run conclusion is a failure the base is answerable
+/// for. `neutral` and `skipped` are not failures; `cancelled` is not a
+/// verdict on the code at all.
+fn conclusion_is_failure(conclusion: &str) -> bool {
+    matches!(
+        conclusion.to_lowercase().as_str(),
+        "failure" | "timed_out" | "action_required" | "startup_failure"
+    )
+}
+
+/// Whether a conclusion establishes anything about the base. `skipped`
+/// and `cancelled` checks ran no code, so they leave the question open
+/// rather than answering it green.
+fn conclusion_is_established(conclusion: &str) -> bool {
+    matches!(conclusion.to_lowercase().as_str(), "success" | "neutral")
+        || conclusion_is_failure(conclusion)
 }

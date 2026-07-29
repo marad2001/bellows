@@ -446,14 +446,14 @@ directory). Existing lines are never rewritten, so the file is safe to
 `tail -f`, `jq`, or load into a spreadsheet mid-run.
 
 A record is appended for **every** terminal outcome — success, failure,
-rate-limit, cancellation — because the failure distribution is the
-interesting part:
+rate-limit, cancellation, and runs that aborted before a PR ever existed
+— because the failure distribution is the interesting part:
 
 ```json
-{"schema":1,"issue":168,"repo":"marad2001/bellows","pr":200,
+{"schema":2,"issue":168,"repo":"marad2001/bellows","pr":200,
  "started_at":"2026-07-25T22:04:11Z","finished_at":"2026-07-25T22:41:02Z",
- "wall_clock_seconds":2211,"exit_reason":"Success","merger_verdict":"MERGE",
- "draft":false,"outcome_label":"agent-done",
+ "wall_clock_seconds":2211,"exit_reason":"Success","abort_cause":null,
+ "merger_verdict":"MERGE","draft":false,"outcome_label":"agent-done",
  "phases":[{"phase":"implement","engine":"claude","model":"opus-4-7","seconds":1401,"exit_code":0},
            {"phase":"post_implement_gate","engine":null,"model":null,"seconds":122,"exit_code":0},
            {"phase":"review","engine":"codex","model":"gpt-5.5","seconds":380,"exit_code":0}]}
@@ -461,16 +461,47 @@ interesting part:
 
 (Wrapped here for readability — on disk each record is a single line.)
 
-- `schema` — record version, currently `1`. Bumped if a field's meaning
-  changes; new fields may be added without a bump.
+A run that ends **before** opening a PR — the daemon drops the
+connection, a push fails, the issue turns out to have no `## Agent
+Brief` — records the same shape with the PR-side fields null and an
+`abort_cause` instead:
+
+```json
+{"schema":2,"issue":672,"repo":"marad2001/workboard-financial-advice","pr":null,
+ "started_at":"2026-07-28T17:14:00Z","finished_at":"2026-07-28T17:14:12Z",
+ "wall_clock_seconds":12,"exit_reason":null,"abort_cause":"Sandbox",
+ "merger_verdict":null,"draft":null,"outcome_label":null,"phases":[]}
+```
+
+- `schema` — record version, currently `2`. Bumped if a field's meaning
+  changes; new fields may be added without a bump. Schema-1 lines
+  (written before aborts were recorded) remain valid and are never
+  rewritten — `pr` was always a number there, and `abort_cause` is
+  simply absent.
 - `exit_reason` — the run's classification verbatim: `Success`,
-  `AgentSelfReportedFailure`, `Crash`, `FinalTestsRed`,
+  `AgentSelfReportedFailure`, `Crash`, `FinalTestsRed`, `BaseAlreadyRed`,
   `WallClockExceeded`, `RateLimited`, `AuthError`, or `Cancelled`.
+  `null` for an aborted run, which never reached a classification.
+- `abort_cause` — why a run ended before a PR existed, or `null` for a
+  run that finalised. Exactly one of `exit_reason` and `abort_cause` is
+  set on any line. One of:
+  - `Sandbox` — the Docker daemon connection failed and the bounded
+    retry was exhausted.
+  - `Workspace` — clone, commit or push failed.
+  - `GitHub` — a GitHub API call failed.
+  - `Io` — host IO failed.
+  - `Unclaimable` — the issue was labelled `ready-for-agent` but had no
+    `## Agent Brief`, carried ambiguous `engine:*` labels, or the repo
+    URL would not parse. The only bucket whose fix is triage rather than
+    infrastructure.
+- `pr` — `null` for an aborted run.
 - `merger_verdict` — the phase-8 merger's token (`MERGE`, `HOLD-NOTED`,
   `HOLD-DRAFT`), or `null` when the merger did not run or wrote nothing
   parseable.
 - `draft` / `outcome_label` — the PR state and issue label the run
-  landed on, so the file explains itself without a GitHub lookup.
+  landed on, so the file explains itself without a GitHub lookup. Both
+  `null` for an aborted run: there is no PR, and the issue is handed back
+  to the pickup label rather than left carrying a terminal one.
 - `phases` — the phases that actually ran, in execution order. Phases
   the run never reached are **omitted** rather than listed with
   placeholder values, so counting rows is a valid way to measure how

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::narrate;
 use crate::auth::Auth;
 use crate::chain_walker::{
     self, decide_implement_rate_limit_action, format_phase_engine_log, handle_implement_rate_limit,
@@ -134,9 +135,16 @@ fn pr_routing_for_reason<'a>(
             draft: false,
             outcome_label: &labels.agent_done,
         },
+        // Issue #196: `BaseAlreadyRed` drafts and labels `agent-failed`
+        // alongside the rest. The run did not produce mergeable work, so
+        // its terminal state is unchanged — what changes is the
+        // attribution the operator reads, not what waits for them. Per
+        // ADR-0012 nothing here may park work, and this does not: the
+        // draft PR is the same terminal state a `FinalTestsRed` reaches.
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
         | ExitReason::FinalTestsRed
+        | ExitReason::BaseAlreadyRed
         | ExitReason::WallClockExceeded
         | ExitReason::AuthError => PrRouting {
             draft: true,
@@ -355,8 +363,7 @@ async fn run_reloop_sweep(
         {
             Ok(d) => d,
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: re-loop list-dependents failed for {}/{}: {}",
                     owner, repo, e,
                 );
@@ -406,16 +413,14 @@ async fn sweep_one_dependent(
     let brief = match tracker::fetch_agent_brief(client, owner, repo, issue_number).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): no `## Agent Brief` comment found",
                 issue_number, owner, repo,
             );
             return false;
         }
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief fetch failed: {}",
                 issue_number, owner, repo, e,
             );
@@ -426,8 +431,7 @@ async fn sweep_one_dependent(
     let parsed = tracker::parse_blocked_by_section_with_log_writer(&brief, log_writer);
     match parsed {
         tracker::BlockedBySection::Unverifiable => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief comment present but malformed (no `## Agent Brief` header inside the parsed body)",
                 issue_number, owner, repo,
             );
@@ -448,16 +452,14 @@ async fn sweep_one_dependent(
             .await
             {
                 Ok(_) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): brief lists no blockers",
                         issue_number, owner, repo,
                     );
                     true
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
                         issue_number, owner, repo, e,
                     );
@@ -470,23 +472,20 @@ async fn sweep_one_dependent(
             for blocker in &blockers {
                 match tracker::fetch_issue_state(client, owner, repo, *blocker).await {
                     Ok(tracker::IssueClosureState::Closed) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is closed",
                             blocker, issue_number, owner, repo,
                         );
                     }
                     Ok(tracker::IssueClosureState::Open) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is still open",
                             blocker, issue_number, owner, repo,
                         );
                         all_closed = false;
                     }
                     Err(e) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: state check for blocker #{} (dependent #{} {}/{}) failed: {}",
                             blocker, issue_number, owner, repo, e,
                         );
@@ -507,16 +506,14 @@ async fn sweep_one_dependent(
             .await
             {
                 Ok(_) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): every blocker closed",
                         issue_number, owner, repo,
                     );
                     true
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
                         issue_number, owner, repo, e,
                     );
@@ -559,8 +556,7 @@ pub async fn reconcile_stranded_in_progress(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: listing {}/{} `{}` issues failed (skipping repo): {}",
                         owner, repo, in_progress_label, e,
                     );
@@ -580,22 +576,19 @@ pub async fn reconcile_stranded_in_progress(
             {
                 Ok(Some(_)) => {
                     reclaimed += 1;
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: reclaimed stranded issue #{} ({}/{}) — `{}` -> `{}`",
                         issue.number, owner, repo, in_progress_label, pickup_label,
                     );
                 }
                 Ok(None) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: skipped issue #{} ({}/{}) because it no longer carries `{}`",
                         issue.number, owner, repo, in_progress_label,
                     );
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: reset failed for issue #{} ({}/{}) (leaving for manual re-label): {}",
                         issue.number, owner, repo, e,
                     );
@@ -615,6 +608,62 @@ pub struct InFlightClaim {
     pub owner: String,
     pub repo: String,
     pub issue_number: u64,
+    /// When `claim` succeeded — the start of the run's wall clock
+    /// (issue #197). Lets an abort's `runs.jsonl` line carry the same
+    /// elapsed-seconds field a finalised run's does, which is what
+    /// separates a run that died twenty minutes in from one that died
+    /// on its first call.
+    pub claimed_at: chrono::DateTime<chrono::Utc>,
+    /// Phases that had completed when the slot was last synced
+    /// (issue #197). Empty for the common abort shape — every docker
+    /// drop in the observed window landed moments after the implement
+    /// phase announced its engine — and non-empty for an abort later in
+    /// the pipeline, where it says how far the run got.
+    pub phases: Vec<policy::PhaseMetrics>,
+}
+
+/// A [`policy::PhaseTimeline`] that mirrors every recorded phase into the
+/// in-flight claim slot (issue #197).
+///
+/// It carries the same two `record_*` method names as the timeline it
+/// wraps, so the runner's existing call sites are untouched — the mirror
+/// cannot be forgotten at a site, because there is nothing to remember.
+/// A phase recorded is a phase the abort record will carry.
+struct MirroredTimeline<'a> {
+    timeline: policy::PhaseTimeline,
+    slot: Option<&'a InFlightClaimSlot>,
+}
+
+impl<'a> MirroredTimeline<'a> {
+    fn new(slot: Option<&'a InFlightClaimSlot>) -> Self {
+        Self {
+            timeline: policy::PhaseTimeline::new(),
+            slot,
+        }
+    }
+
+    fn record_engine_phase(
+        &mut self,
+        phase: &str,
+        entry: Option<&crate::config::ChainEntry>,
+        seconds: u64,
+        exit_code: i64,
+    ) {
+        self.timeline
+            .record_engine_phase(phase, entry, seconds, exit_code);
+        self.sync();
+    }
+
+    fn record_gate_phase(&mut self, phase: &str, seconds: u64, exit_code: i64) {
+        self.timeline.record_gate_phase(phase, seconds, exit_code);
+        self.sync();
+    }
+
+    fn sync(&self) {
+        if let Some(slot) = self.slot {
+            slot.set_phases(self.timeline.entries().to_vec());
+        }
+    }
 }
 
 /// The polling loop's view of the claim currently in flight (issue #193).
@@ -662,6 +711,19 @@ impl InFlightClaimSlot {
         self.lock().take()
     }
 
+    /// Issue #197: refresh the completed-phase snapshot the abort record
+    /// will carry. Driven by [`MirroredTimeline`] rather than by any
+    /// call site, so it cannot drift from the real timeline.
+    ///
+    /// A no-op when the slot is empty: phases recorded after the PR
+    /// exists belong to a run that reaches `finalise` and writes its own
+    /// record from the full timeline.
+    pub fn set_phases(&self, phases: Vec<policy::PhaseMetrics>) {
+        if let Some(claim) = self.lock().as_mut() {
+            claim.phases = phases;
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<InFlightClaim>> {
         self.claim.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -688,17 +750,26 @@ impl InFlightClaimSlot {
 /// `startup reconcile:` lines emitted by [`reconcile_stranded_in_progress`]
 /// — both recovery routes end in the same label swap, and a reader of the
 /// run log needs to be able to tell which one fired.
+// Issue #197 added `error_shape` and `metrics_path`. Bundling them into
+// a context struct for a single call site would trade a clippy lint for
+// indirection; the file already carries this allow in five places.
+#[allow(clippy::too_many_arguments)]
 pub async fn release_claim_after_run_error(
     client: &octocrab::Octocrab,
     slot: &InFlightClaimSlot,
     in_progress_label: &str,
     pickup_label: &str,
     reason: &str,
+    error_shape: &str,
+    metrics_path: &std::path::Path,
     log_writer: &mut dyn Write,
 ) {
     let Some(claim) = slot.take() else {
         return;
     };
+    // Issue #197: bucket the abort before the release, so the record is
+    // built from the same error that triggered it.
+    let cause = policy::AbortCause::from_error_shape(error_shape);
     match tracker::reset_in_progress_to_pickup(
         client,
         &claim.owner,
@@ -710,8 +781,7 @@ pub async fn release_claim_after_run_error(
     .await
     {
         Ok(Some(_)) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: returned claimed issue #{} ({}/{}) to `{}` (was `{}`) — the run failed before any PR existed, so it is claimable again on the next tick: {}",
                 claim.issue_number,
                 claim.owner,
@@ -722,20 +792,38 @@ pub async fn release_claim_after_run_error(
             );
         }
         Ok(None) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: skipped claimed issue #{} ({}/{}) because it no longer carries `{}`; ownership was removed before recovery",
                 claim.issue_number, claim.owner, claim.repo, in_progress_label,
             );
         }
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: could not return claimed issue #{} ({}/{}) to `{}` (leaving it for the startup reconcile sweep): {}",
                 claim.issue_number, claim.owner, claim.repo, pickup_label, e,
             );
         }
     }
+
+    // Issue #197: record the abort in `runs.jsonl`. Appended regardless
+    // of whether the release above succeeded — the run ended either way,
+    // and a file that omits the aborts is the success distribution, not
+    // the failure distribution it is documented to be.
+    //
+    // Best-effort, like the release itself: `append_run_metrics` has no
+    // error channel, so nothing here can change how the tick proceeds.
+    append_run_metrics(
+        metrics_path,
+        &policy::build_abort_metrics(policy::AbortMetricsInput {
+            issue: claim.issue_number,
+            repo: &format!("{}/{}", claim.owner, claim.repo),
+            started_at: claim.claimed_at,
+            finished_at: chrono::Utc::now(),
+            cause,
+            phases: &claim.phases,
+        }),
+        log_writer,
+    );
 }
 
 /// Open the run's pull request and make its claim ineligible for abort
@@ -789,8 +877,7 @@ pub async fn run_once(
                 if let Some(ctx) = status_ctx
                     && let Err(e) = ctx.write_blocked(&reason).await
                 {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: could not write blocked status (continuing): {}",
                         e,
                     );
@@ -804,8 +891,7 @@ pub async fn run_once(
                 // serial polling loop itself, so a transient daemon
                 // hiccup must not stall every repo's throughput.
                 // Subsequent ticks retry the probe.
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: pre-claim container probe failed (proceeding this tick): {}",
                     e,
                 );
@@ -841,8 +927,7 @@ pub async fn run_once(
                     .map(|n| format!("#{}", n))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: skipping repo {}/{} this tick: waiting on open non-draft agent/* PR(s): {}",
                     owner, repo, nums,
                 );
@@ -850,8 +935,7 @@ pub async fn run_once(
             }
             Ok(_) => {}
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: pre-claim PR-open probe failed for {}/{} (proceeding this tick): {}",
                     owner, repo, e,
                 );
@@ -903,8 +987,7 @@ pub async fn run_once(
         if let Some(ctx) = status_ctx
             && let Err(e) = ctx.write_idle().await
         {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: could not clear status (continuing): {}",
                 e,
             );
@@ -919,8 +1002,7 @@ pub async fn run_once(
     if let Some(ctx) = status_ctx
         && let Err(e) = ctx.write_idle().await
     {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not clear blocked status (continuing): {}",
             e,
         );
@@ -1006,8 +1088,7 @@ pub async fn run_once(
         // Safe to log unconditionally: we only reach here when a claim
         // follows, and a claim starts a 30-60 minute pipeline, so this
         // is at most one line per pipeline rather than one per tick.
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: skipped {} unclaimable issue(s) ahead of the queue ({}): labelled `{}` but missing an `## Agent Brief` or carrying ambiguous `engine:*` labels — move them back to needs-triage",
             skipped.len(),
             list,
@@ -1056,8 +1137,7 @@ pub async fn run_once(
             if let Some(ctx) = status_ctx
                 && let Err(write_err) = ctx.write_blocked(&reason).await
             {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: could not write blocked status (continuing): {}",
                     write_err,
                 );
@@ -1138,15 +1218,21 @@ pub async fn run_once(
     // Issue #193: from here until the PR exists, an abort would strand
     // this issue at the in-progress label. Record the coordinates so the
     // polling loop's error arm can hand it back to the pickup queue.
+    let started = chrono::Utc::now();
+
+    // Issue #197: `claimed_at` rides along so an abort's `runs.jsonl`
+    // line carries the same wall clock a finalised run's does. It is the
+    // same instant `started` uses, deliberately — the two records must
+    // not disagree about when the run began.
     if let Some(slot) = claim_slot {
         slot.set(InFlightClaim {
             owner: owner.clone(),
             repo: repo.clone(),
             issue_number: claimed.number,
+            claimed_at: started,
+            phases: Vec::new(),
         });
     }
-
-    let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
     announce(
@@ -1167,8 +1253,7 @@ pub async fn run_once(
             claimed_at: started,
         };
         if let Err(e) = ctx.write_busy(current).await {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: could not write busy status (continuing): {}",
                 e,
             );
@@ -1259,7 +1344,10 @@ pub async fn run_once(
     // accumulated as the pipeline progresses. A phase the run never
     // reaches is never pushed, which is exactly the record's
     // omit-phases-that-did-not-run contract.
-    let mut phase_timeline = policy::PhaseTimeline::new();
+    // Issue #197: mirrors each recorded phase into the claim slot so an
+    // abort can report where in the pipeline it died. Same `record_*`
+    // surface as the plain timeline, so no call site below changes.
+    let mut phase_timeline = MirroredTimeline::new(claim_slot);
     // The chain entry that actually served implement, set once a
     // container has genuinely been dispatched. Stays `None` on the
     // all-entries-cooling path, whose synthesised `ChainEntry` below is
@@ -2536,12 +2624,45 @@ pub async fn run_once(
     )
     .await?;
 
+    // Issue #196: a failing cargo gate says the code did not pass; it
+    // does not say the *diff* is why. Ask the target repo's own CI
+    // whether the base commit this run branched from was already
+    // failing the same check.
+    //
+    // Derived, not remembered (`.out-of-scope/cross-run-memory-store.md`)
+    // — one request against a commit CI has already built, rather than a
+    // cached verdict or a local re-run costing minutes of container time.
+    //
+    // Fires only when a gate actually failed, so the happy path is
+    // untouched and exactly as fast as before. Errors and inconclusive
+    // answers both land on `NotEstablished`, which classifies exactly as
+    // it did before this issue: not knowing is never treated as knowing.
+    let base_health = if policy::should_consult_base_health(
+        &post_implement_gate,
+        end_pipeline_gate.as_ref(),
+    ) {
+        let mirrored = tracker::mirrored_check_names(workspace.gate_commands());
+        let health = tracker::base_commit_health(
+            client,
+            &owner,
+            &repo,
+            &head_before_implement,
+            &mirrored,
+        )
+        .await;
+        announce(log_writer, &base_health_announcement(&health, &head_before_implement));
+        health
+    } else {
+        policy::BaseHealth::NotEstablished
+    };
+
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
             exit_code: implement_agent_run.exit_code,
             stderr_tail: implement_agent_run.stderr_tail.clone(),
             engine: Some(implement_chain_entry.engine),
         },
+        base_health,
         post_implement_gate,
         review: review_outcome,
         review_fix: review_fix_outcome,
@@ -2604,8 +2725,7 @@ pub async fn run_once(
     {
         Ok(in_progress) => !in_progress,
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: pre-PR cancellation check failed (continuing): {}",
                 e,
             );
@@ -2656,8 +2776,7 @@ pub async fn run_once(
     {
         Ok(files) => files,
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: workflow-file diff failed (continuing without callout): {e}",
             );
             Vec::new()
@@ -2797,8 +2916,7 @@ pub async fn run_once(
              transition completed; continuing): {}",
             pr.number, msg,
         );
-        println!("{line}");
-        let _ = writeln!(log_writer, "{line}");
+        announce(log_writer, &line);
     }
 
     // Issue #168: append this run's structured record to `runs.jsonl`.
@@ -2833,7 +2951,7 @@ pub async fn run_once(
             merger_verdict: outcomes.merger_verdict,
             draft,
             outcome_label: effective_outcome_label,
-            phases: &phase_timeline,
+            phases: &phase_timeline.timeline,
         }),
         log_writer,
     );
@@ -2844,8 +2962,7 @@ pub async fn run_once(
     if let Some(ctx) = status_ctx
         && let Err(e) = ctx.write_idle().await
     {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not write idle status after finalise (continuing): {}",
             e,
         );
@@ -2934,22 +3051,70 @@ pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
 /// ADR-0004 claim is false and saying it would actively mislead. `Success`
 /// and `AgentSelfReportedFailure` get nothing — the label already means
 /// exactly what it says.
-fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> &'static str {
+///
+/// Issue #196: `BaseAlreadyRed` gets a third shape. It is not a run
+/// failure and not a code failure — the gate reached a real verdict, and
+/// that verdict was already true before the diff existed. The note names
+/// the base SHA and the failing check so the operator can confirm the
+/// claim rather than take it on trust.
+///
+/// Returns an owned `String` because that callout carries run-specific
+/// detail; the other arms are still fixed prose.
+fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> String {
     match reason {
         ExitReason::Crash
         | ExitReason::WallClockExceeded
         | ExitReason::RateLimited
         | ExitReason::AuthError
         | ExitReason::Cancelled => {
-            "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._"
+            "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._".to_string()
         }
+        ExitReason::BaseAlreadyRed => match &outcomes.base_health {
+            policy::BaseHealth::Red {
+                base_sha,
+                failing_check,
+            } => format!(
+                "\n\n_**This failure predates the diff.** The `{failing_check}` check was already failing on this repo's own CI at the base commit `{base_sha}` that this run branched from, so the same failure would occur with an empty diff. Nothing in the agent's work is implicated — do not read the diff looking for the cause. Fix the base branch, then re-label the issue to re-run._"
+            ),
+            // Unreachable in practice: `classify_exit` only returns this
+            // reason when `base_health` is `Red`. Kept total rather than
+            // panicking, since a PR-body builder must never fail a run.
+            _ => "\n\n_**This failure predates the diff.** The same check was already failing at the base commit this run branched from._".to_string(),
+        },
         ExitReason::FinalTestsRed if any_gate_oom_killed(outcomes) => {
-            "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._"
+            "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._".to_string()
         }
         ExitReason::FinalTestsRed => {
-            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._"
+            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._".to_string()
         }
-        ExitReason::Success | ExitReason::AgentSelfReportedFailure => "",
+        ExitReason::Success | ExitReason::AgentSelfReportedFailure => String::new(),
+    }
+}
+
+/// Issue #196: the operator-visible line reporting which of the three
+/// base-health outcomes the lookup reached.
+///
+/// All three are announced, not just the interesting one. "We checked
+/// and the base was fine" and "we could not check" lead to the same
+/// classification but mean very different things when an operator is
+/// working out why a run was blamed, and a silent `NotEstablished` is
+/// indistinguishable from the lookup never having run.
+fn base_health_announcement(health: &policy::BaseHealth, base_sha: &str) -> String {
+    let short: String = base_sha.chars().take(12).collect();
+    match health {
+        policy::BaseHealth::Red { failing_check, .. } => format!(
+            "bellows: cargo gate failed, and the repo's own CI reports `{failing_check}` already \
+             failing at base {short} — the failure predates the diff (issue #196)"
+        ),
+        policy::BaseHealth::Green => format!(
+            "bellows: cargo gate failed; the repo's own CI was green at base {short}, so the \
+             failure is attributable to the diff"
+        ),
+        policy::BaseHealth::NotEstablished => format!(
+            "bellows: cargo gate failed; could not establish the health of base {short} (checks \
+             still running, no matching CI checks, or the lookup failed) — classifying on the \
+             gate result alone"
+        ),
     }
 }
 
@@ -2996,6 +3161,28 @@ fn build_pr_body(
              The agent reported done with exit 0 but a post-run cargo check (clippy or test, in either the post-implement or end-of-pipeline gate) failed. See the run-log comment on this PR for the per-phase summary and the failing output."
                 .to_string()
         }
+        // Issue #196: the gate failed, and the repo's own CI says the
+        // same check was already failing at the base commit. The heading
+        // must not read as a verdict on the agent's work.
+        ExitReason::BaseAlreadyRed => match &outcomes.base_health {
+            policy::BaseHealth::Red {
+                base_sha,
+                failing_check,
+            } => format!(
+                "## The base branch was already failing\n\n\
+                 A post-run cargo check failed, but this repo's own CI reports `{failing_check}` \
+                 already failing at the base commit `{base_sha}` this run branched from. The \
+                 failure is not attributable to the diff — an empty diff on the same base would \
+                 fail identically.\n\n\
+                 The agent's work is in this PR's diff and has not been judged. Fix the base \
+                 branch, then re-label the issue so the run can be repeated against a green base. \
+                 See the run-log comment for the failing gate output."
+            ),
+            _ => "## The base branch was already failing\n\n\
+                  A post-run cargo check failed and the same check was already failing at this \
+                  run's base commit, so the failure is not attributable to the diff."
+                .to_string(),
+        },
         ExitReason::WallClockExceeded => {
             "## Wall-clock cap reached\n\n\
              The pipeline exceeded the configured per-issue wall-clock budget and was halted. See the run-log comment on this PR for elapsed minutes and a per-phase breakdown of where the time went."
@@ -3019,7 +3206,7 @@ fn build_pr_body(
     // common case is a no-op and there is no whitespace noise.
     header
         + &body
-        + run_failure_disambiguation(reason, outcomes)
+        + &run_failure_disambiguation(reason, outcomes)
         + &workflow_files_changed_callout(workflow_files_changed)
 }
 
@@ -3320,9 +3507,15 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
 /// Per-line write errors are swallowed (consistent with the rest of the
 /// codebase's log-writing policy: log lines are diagnostic, not
 /// load-bearing, and a failed write shouldn't halt the pipeline).
-fn announce(log_writer: &mut dyn Write, line: &str) {
+/// Write one bellows line to both the console and the run log.
+///
+/// Issue #195: the console keeps the bare line (an operator watching
+/// live does not need a timestamp on every line); the file gets the
+/// stamped one via [`crate::run_log::narrate`], which is the only
+/// sanctioned narration write.
+fn announce<W: Write + ?Sized>(log_writer: &mut W, line: &str) {
     println!("{}", line);
-    let _ = writeln!(log_writer, "{}", line);
+    crate::run_log::narrate(log_writer, line);
 }
 
 /// Issue #82: path to the per-engine rate-limit state file, written
@@ -4040,8 +4233,7 @@ pub fn append_run_metrics(
     log_writer: &mut dyn Write,
 ) {
     let warn = |log_writer: &mut dyn Write, e: &dyn std::fmt::Display| {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not append the run metrics record to {} (continuing; \
              the run's outcome is unaffected): {}",
             path.display(),
@@ -4230,8 +4422,7 @@ pub async fn post_merge_verdict_comment_if_present<W: Write + ?Sized>(
             "bellows: posting the Merge verdict comment on PR #{} failed (continuing): {}",
             pr_number, e,
         );
-        println!("{line}");
-        let _ = writeln!(log_writer, "{line}");
+        announce(log_writer, &line);
     }
     Ok(())
 }
@@ -4450,6 +4641,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4478,6 +4670,95 @@ api_key_env_file = "~/bellows-test-opencode.env"
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
         let body = build_pr_body(&ExitReason::Success, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("the agent did not write a PR description"));
+    }
+
+    /// Issue #196 fixture: a gate failure whose cause was already on the
+    /// base commit.
+    fn base_already_red_outcomes() -> PhaseOutcomes {
+        PhaseOutcomes {
+            base_health: policy::BaseHealth::Red {
+                base_sha: "7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4".to_string(),
+                failing_check: "cargo clippy".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_pr_body_for_base_already_red_names_the_base_sha_and_the_check() {
+        // AC: the operator must be able to confirm the claim rather than
+        // take it on trust, so both the commit and the check are quoted.
+        let body = build_pr_body(
+            &ExitReason::BaseAlreadyRed,
+            271,
+            None,
+            None,
+            &[],
+            &base_already_red_outcomes(),
+        );
+        assert!(body.contains("7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4"), "{body}");
+        assert!(body.contains("cargo clippy"), "{body}");
+    }
+
+    #[test]
+    fn build_pr_body_for_base_already_red_does_not_read_as_a_verdict_on_the_agent() {
+        // The whole failure of the old behaviour was sending an operator
+        // to read agent work for a cause that was not there.
+        let body = build_pr_body(
+            &ExitReason::BaseAlreadyRed,
+            271,
+            None,
+            None,
+            &[],
+            &base_already_red_outcomes(),
+        );
+        assert!(
+            body.contains("predates the diff") || body.contains("already failing"),
+            "the body must say plainly that the failure is not the diff's: {body}",
+        );
+        assert!(
+            !body.contains("The agent reported done"),
+            "must not reuse the FinalTestsRed framing: {body}",
+        );
+    }
+
+    #[test]
+    fn final_tests_red_body_is_unchanged_when_the_base_was_green() {
+        // Regression guard: a genuinely broken diff must still be
+        // reported exactly as it was before issue #196.
+        let outcomes = PhaseOutcomes {
+            base_health: policy::BaseHealth::Green,
+            ..Default::default()
+        };
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &outcomes);
+        assert!(body.contains("Cargo checks failed after the agent's run"), "{body}");
+        assert!(body.contains("ADR-0004"), "{body}");
+    }
+
+    #[test]
+    fn base_health_announcement_distinguishes_all_three_outcomes() {
+        // AC: "we checked and the base was fine" must be distinguishable
+        // from "we could not check" in the run log — they classify the
+        // same but mean very different things to an operator.
+        let sha = "7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4";
+        let red = base_health_announcement(
+            &policy::BaseHealth::Red {
+                base_sha: sha.to_string(),
+                failing_check: "cargo clippy".to_string(),
+            },
+            sha,
+        );
+        let green = base_health_announcement(&policy::BaseHealth::Green, sha);
+        let unknown = base_health_announcement(&policy::BaseHealth::NotEstablished, sha);
+
+        assert!(red.contains("predates the diff"), "{red}");
+        assert!(red.contains("cargo clippy"), "{red}");
+        assert!(green.contains("attributable to the diff"), "{green}");
+        assert!(unknown.contains("could not establish"), "{unknown}");
+        assert_ne!(green, unknown, "the two must not read alike");
+        for line in [&red, &green, &unknown] {
+            assert!(line.contains("7d7ab7364443"), "each must name the base: {line}");
+        }
     }
 
     #[test]
@@ -4615,6 +4896,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4653,6 +4935,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4694,6 +4977,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4732,6 +5016,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4814,6 +5099,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: Some(ReviewOutcome { findings_text: None, exit_code: 137 }),
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4851,6 +5137,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4895,6 +5182,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4941,6 +5229,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4995,6 +5284,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5038,6 +5328,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5086,6 +5377,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             }),
             review_fix: Some(FixOutcome { exit_code: 0 }),
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: vec![
                 ParsedFinding {
@@ -5145,6 +5437,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5213,6 +5506,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
@@ -5386,6 +5680,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5603,6 +5898,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5671,6 +5967,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
