@@ -655,20 +655,19 @@ struct StallObservation {
     kill: bool,
 }
 
-/// Run a container through its full lifecycle, retrying the whole
-/// lifecycle a bounded number of times when the *connection to the
-/// daemon* fails (issue #194).
+/// Run a container through its full lifecycle, retrying creation a
+/// bounded number of times when the *connection to the daemon* fails
+/// (issue #194).
 ///
-/// A transport failure is not a result — bellows asked the daemon a
-/// question and never got an answer, so it knows nothing about what
-/// the container did (in the observed aborts, it had not started doing
-/// anything). Re-asking is the only way to find out, and the retry
-/// covers every daemon call the lifecycle makes: create, start, attach
-/// to the log stream, and wait. Which errors qualify is
-/// [`is_transport_failure`]; everything else — above all a container
-/// that started and exited non-zero, which never surfaces as an error
-/// here at all (see the `DockerContainerWaitError` arm below) — is
-/// returned to the caller untouched on the first try.
+/// A lost create response is safe to retry because no workload can
+/// have started. Once create returns a container id, start/log/wait
+/// transport failures are ambiguous: the workload may already be
+/// running or finished, so creating a replacement could execute it
+/// twice. Those errors are surfaced on the first attempt. Which create
+/// errors qualify is [`is_transport_failure`]; everything else —
+/// above all a container that started and exited non-zero, which never
+/// surfaces as an error here at all (see the
+/// `DockerContainerWaitError` arm below) — is returned untouched.
 ///
 /// Retries are spent *inside* `deadline`, never on top of it: each
 /// attempt inherits what is left of the budget, and a backoff that
@@ -676,14 +675,12 @@ struct StallObservation {
 /// original error is returned unchanged, so the operator diagnoses the
 /// daemon rather than a bellows wrapper.
 ///
-/// A failed attempt that got as far as creating a container removes it
-/// before the next attempt starts (the force-remove in
-/// `run_container_once`'s tail runs on every path). The one container
-/// that can outlive an attempt is one the daemon created but whose
-/// create *response* was lost — bellows never learned its id. That one
-/// is reconciled by `cleanup_orphan_containers` at the next `bellows
-/// run` startup, which is why that sweep matches `created` as well as
-/// `exited` containers.
+/// The one container that can outlive an attempt is one the daemon
+/// created but whose create *response* was lost — bellows never
+/// learned its id. That one cannot have started and is reconciled by
+/// `cleanup_orphan_containers` at the next `bellows run` startup,
+/// which is why that sweep matches `created` as well as `exited`
+/// containers.
 async fn run_container(
     docker: &Docker,
     config: ContainerCreateBody,
@@ -708,7 +705,8 @@ async fn run_container(
         .await
         {
             Ok(outcome) => return Ok(outcome),
-            Err(err) => err,
+            Err(ContainerAttemptError::AfterCreate(err)) => return Err(err),
+            Err(ContainerAttemptError::Create(err)) => err,
         };
 
         let transport = matches!(&err, SandboxError::Bollard(e) if is_transport_failure(e));
@@ -738,9 +736,18 @@ async fn run_container(
     }
 }
 
+/// Carries the only fact the retry boundary needs: whether a container
+/// id was received. Before that point no workload could have started;
+/// after it, every transport result is potentially ambiguous.
+enum ContainerAttemptError {
+    Create(SandboxError),
+    AfterCreate(SandboxError),
+}
+
 /// One attempt at the container lifecycle: create, start, stream
 /// stdout/stderr to `log_writer` while capturing per `capture_mode`,
-/// wait for exit, force-remove. Container is removed even on error.
+/// wait for exit, force-remove. A failed removal is surfaced rather
+/// than proceeding as though cleanup succeeded.
 ///
 /// Non-zero container exit is returned as `exit_code`, NOT as a sandbox
 /// error — the caller (run_agent / run_cargo_checks) and ultimately
@@ -765,8 +772,12 @@ async fn run_container_once(
     capture_mode: CaptureMode,
     deadline: Option<Duration>,
     stall_watch: Option<StallWatch>,
-) -> Result<ContainerOutcome, SandboxError> {
-    let container = docker.create_container(None, config).await?;
+) -> Result<ContainerOutcome, ContainerAttemptError> {
+    let container = docker
+        .create_container(None, config)
+        .await
+        .map_err(SandboxError::from)
+        .map_err(ContainerAttemptError::Create)?;
     let id = container.id;
 
     // Once the container exists on the daemon it must be removed even if
@@ -909,9 +920,16 @@ async fn run_container_once(
     .await;
 
     let remove_options = RemoveContainerOptionsBuilder::default().force(true).build();
-    let _ = docker.remove_container(&id, Some(remove_options)).await;
+    let cleanup = docker
+        .remove_container(&id, Some(remove_options))
+        .await
+        .map_err(SandboxError::from);
 
-    lifecycle
+    match (lifecycle, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(cleanup_err)) => Err(ContainerAttemptError::AfterCreate(cleanup_err)),
+        (Err(lifecycle_err), _) => Err(ContainerAttemptError::AfterCreate(lifecycle_err)),
+    }
 }
 
 // Issue #69 added two more arguments (ssh_keys_volume + deploy_keys);
@@ -1987,54 +2005,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retried_attempt_removes_the_container_it_already_created() {
-        // Issue #194 AC: a retry must not leave an orphan behind. When
-        // the connection drops *after* the create succeeded, bellows
-        // knows the container's id, and the force-remove in the
-        // lifecycle's tail reconciles it before the next attempt — no
-        // waiting for the next startup sweep.
+    async fn an_ambiguous_start_never_creates_a_replacement() {
+        // Once create returned an id, a lost start response is
+        // ambiguous: the daemon may have accepted it and the workload
+        // may already be mutating the workspace. Even when cleanup also
+        // fails, bellows must surface the infrastructure error rather
+        // than create a replacement and execute the workload twice.
         let mock = MockServer::start().await;
-        let abandoned = "cccccccccccc3333333333333333333333333333333333333333333333333333";
-        let replacement = "dddddddddddd4444444444444444444444444444444444444444444444444444";
+        let container_id = "cccccccccccc3333333333333333333333333333333333333333333333333333";
 
         Mock::given(method("POST"))
             .and(path("/containers/create"))
             .respond_with(ResponseTemplate::new(201).set_body_json(
-                json!({ "Id": abandoned, "Warnings": [] }),
+                json!({ "Id": container_id, "Warnings": [] }),
             ))
-            .up_to_n_times(1)
+            .expect(1)
             .mount(&mock)
             .await;
-        // ...and then the daemon stops answering, mid-lifecycle.
         Mock::given(method("POST"))
-            .and(path(format!("/containers/{abandoned}/start")))
+            .and(path(format!("/containers/{container_id}/start")))
             .respond_with(ResponseTemplate::new(204).set_delay(UNANSWERED))
             .mount(&mock)
             .await;
         Mock::given(method("DELETE"))
-            .and(path(format!("/containers/{abandoned}")))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1) // the orphan is reconciled by the attempt itself
-            .mount(&mock)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/containers/create"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(
-                json!({ "Id": replacement, "Warnings": [] }),
-            ))
-            .mount(&mock)
-            .await;
-        mount_successful_lifecycle(&mock, replacement, 0).await;
-        Mock::given(method("DELETE"))
-            .and(path(format!("/containers/{replacement}")))
-            .respond_with(ResponseTemplate::new(204))
+            .and(path(format!("/containers/{container_id}")))
+            .respond_with(ResponseTemplate::new(500))
             .expect(1)
             .mount(&mock)
             .await;
 
         let mut log = Vec::new();
-        let outcome = run_container(
+        run_container(
             &mock_docker(&mock),
             ContainerCreateBody::default(),
             &mut log,
@@ -2044,11 +2045,13 @@ mod tests {
             fast_retry_policy(),
         )
         .await
-        .expect("the retry should complete the lifecycle");
+        .expect_err("an ambiguous start must be surfaced, not replayed");
 
-        assert_eq!(outcome.exit_code, 0);
-        // Expectations verified when `mock` drops: exactly one DELETE
-        // for the abandoned container and one for its replacement.
+        let log = String::from_utf8(log).expect("log is utf8");
+        assert!(
+            !log.contains("retrying"),
+            "post-create failures must not be narrated as replacement retries: {log}",
+        );
     }
 
     #[tokio::test]
