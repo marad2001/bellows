@@ -183,7 +183,7 @@ pat_env_var = "BELLOWS_TEST_PAT"
     let config = Config::from_str(&toml).expect("multi-repo config parses");
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None, None).await;
 
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
@@ -368,7 +368,7 @@ async fn run_once_sweeps_stale_agent_branches_before_claiming() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None, None).await;
     match outcome {
         // The AC is that the sweep runs after selection and BEFORE the
         // claim; a contended claim proves we got past the sweep.
@@ -439,7 +439,7 @@ async fn run_once_returns_blocked_when_stale_branch_deletion_fails() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None, None)
+    let outcome = run_once(&client, &config, &mut log, None, None, None)
         .await
         .expect("run_once should map DELETE failure to RunOutcome::Blocked, not Err");
     match outcome {
@@ -531,7 +531,7 @@ async fn run_once_logs_sweep_summary_when_deletions_happen() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let _ = run_once(&client, &config, &mut log, None, None).await;
+    let _ = run_once(&client, &config, &mut log, None, None, None).await;
     let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
     assert!(
         log_str.contains("bellows: pre-claim swept 2 stale agent/16-* branch(es) before claiming issue #16"),
@@ -579,7 +579,7 @@ async fn run_once_does_not_log_sweep_summary_when_no_branches_deleted() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let _ = run_once(&client, &config, &mut log, None, None).await;
+    let _ = run_once(&client, &config, &mut log, None, None, None).await;
     let log_str = String::from_utf8(log.into_inner()).expect("log is utf-8");
     assert!(
         !log_str.contains("pre-claim swept"),
@@ -1179,7 +1179,7 @@ async fn run_once_skips_a_brief_less_issue_and_claims_the_next_one() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    let outcome = run_once(&client, &config, &mut log, None, None).await;
+    let outcome = run_once(&client, &config, &mut log, None, None, None).await;
 
     match outcome {
         Ok(RunOutcome::Contended { issue_number: 17 }) => {}
@@ -1246,7 +1246,7 @@ async fn run_once_still_errors_when_every_candidate_is_unclaimable() {
     let client = octocrab_pointed_at(mock.uri());
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
-    match run_once(&client, &config, &mut log, None, None).await {
+    match run_once(&client, &config, &mut log, None, None, None).await {
         Err(RunError::MissingAgentBrief(16)) => {}
         other => panic!("expected MissingAgentBrief(16) (the first skip), got {other:?}"),
     }

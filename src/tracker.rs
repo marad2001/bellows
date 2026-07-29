@@ -568,8 +568,11 @@ pub async fn strip_issue_label(
 /// Reverse of [`claim`] (issue #158 startup reconciliation): swap
 /// `in_progress_label` back to `pickup_label` on an issue stranded by a
 /// prior aborted run, so the next polling tick re-claims it. One GET +
-/// one PATCH, mirroring `claim`. `pickup_label` is not duplicated if it
-/// is somehow already present, and any other labels are preserved.
+/// one PATCH, mirroring `claim`. Returns `None` without PATCHing when the
+/// GET shows that `in_progress_label` has already been removed: the caller
+/// no longer owns the issue, for example because an operator cancelled it.
+/// `pickup_label` is not duplicated if it is somehow already present, and
+/// any other labels are preserved.
 pub async fn reset_in_progress_to_pickup(
     client: &octocrab::Octocrab,
     owner: &str,
@@ -577,9 +580,16 @@ pub async fn reset_in_progress_to_pickup(
     issue_number: u64,
     in_progress_label: &str,
     pickup_label: &str,
-) -> Result<Issue, octocrab::Error> {
+) -> Result<Option<Issue>, octocrab::Error> {
     let route = format!("/repos/{owner}/{repo}/issues/{issue_number}");
     let current: Issue = client.get(&route, None::<&()>).await?;
+    if !current
+        .labels
+        .iter()
+        .any(|label| label.name == in_progress_label)
+    {
+        return Ok(None);
+    }
     let mut new_labels: Vec<String> = current
         .labels
         .iter()
@@ -590,7 +600,7 @@ pub async fn reset_in_progress_to_pickup(
     new_labels.sort();
     let body = serde_json::json!({ "labels": new_labels });
     let updated: Issue = client.patch(&route, Some(&body)).await?;
-    Ok(updated)
+    Ok(Some(updated))
 }
 
 /// Single entry returned by the GitHub `git/matching-refs/{ref}` API. We
