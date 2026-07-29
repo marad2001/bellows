@@ -190,6 +190,35 @@ async fn last_patched_labels(mock: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// The claimed issue as the release's GET will find it. The release is a
+/// GET-then-PATCH, so a test that mounts only the PATCH never reaches it.
+async fn mock_claimed_issue_get(mock: &MockServer, number: u64) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/marad2001/test-repo/issues/{number}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": number,
+            "title": "aborts before opening a PR",
+            "labels": [{ "name": IN_PROGRESS }, { "name": KEEP }]
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// Issue #197: a fixed claim instant, so an abort record's
+/// `wall_clock_seconds` is deterministic in tests.
+fn claimed_at_fixture() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-07-28T17:14:00Z")
+        .expect("fixture timestamp")
+        .with_timezone(&chrono::Utc)
+}
+
+/// Issue #197: `release_claim_after_run_error` also appends the abort's
+/// `runs.jsonl` line, so every call site needs somewhere to write it.
+/// A per-test temp file keeps the assertions independent.
+fn metrics_file() -> tempfile::NamedTempFile {
+    tempfile::NamedTempFile::new().expect("temp metrics file")
+}
+
 #[tokio::test]
 async fn run_error_before_pr_returns_the_claimed_issue_to_the_pickup_label() {
     // Brief AC1: a run that errors after claiming and before a PR exists
@@ -219,12 +248,15 @@ async fn run_error_before_pr_returns_the_claimed_issue_to_the_pickup_label() {
 
     // The polling loop's error arm: release what was claimed but never
     // reached a PR.
+    let metrics_path = metrics_file();
     release_claim_after_run_error(
         &client,
         &slot,
         &config.runtime_labels.agent_in_progress,
         &config.polling.pickup_label,
         &err.to_string(),
+        "sandbox:test",
+        metrics_path.path(),
         &mut log,
     )
     .await;
@@ -289,6 +321,8 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
         owner: "marad2001".to_string(),
         repo: "test-repo".to_string(),
         issue_number: 42,
+        claimed_at: claimed_at_fixture(),
+        phases: Vec::new(),
     });
     open_pr_and_clear_claim(
         &client,
@@ -307,12 +341,15 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
     .expect("PR creation succeeds before the later finalise failure");
 
     // Simulate the polling loop's error arm after a later finalise error.
+    let metrics_path = metrics_file();
     release_claim_after_run_error(
         &client,
         &slot,
         IN_PROGRESS,
         PICKUP,
         "post-PR failure in finalise",
+        "sandbox:test",
+        metrics_path.path(),
         &mut log,
     )
     .await;
@@ -357,6 +394,8 @@ async fn pr_open_error_leaves_the_claim_releasable() {
         owner: "marad2001".to_string(),
         repo: "test-repo".to_string(),
         issue_number: 42,
+        claimed_at: claimed_at_fixture(),
+        phases: Vec::new(),
     });
 
     open_pr_and_clear_claim(
@@ -381,6 +420,8 @@ async fn pr_open_error_leaves_the_claim_releasable() {
             owner: "marad2001".to_string(),
             repo: "test-repo".to_string(),
             issue_number: 42,
+            claimed_at: claimed_at_fixture(),
+            phases: Vec::new(),
         }),
         "a failed PR open must leave the claim available to the error-arm release",
     );
@@ -406,15 +447,20 @@ async fn operator_cancellation_prevents_run_error_release_from_requeueing_the_is
         owner: "marad2001".to_string(),
         repo: "test-repo".to_string(),
         issue_number: 42,
+        claimed_at: claimed_at_fixture(),
+        phases: Vec::new(),
     });
     let mut log = Cursor::new(Vec::new());
 
+    let metrics_path = metrics_file();
     release_claim_after_run_error(
         &client,
         &slot,
         IN_PROGRESS,
         PICKUP,
         "workspace failed after the operator cancelled",
+        "workspace:test",
+        metrics_path.path(),
         &mut log,
     )
     .await;
@@ -471,12 +517,15 @@ async fn a_failing_release_leaves_the_original_run_error_intact() {
     // `release_claim_after_run_error` returns `()`: there is no channel by
     // which a release failure could replace the run error, and the caller
     // does not have to decide between them.
+    let metrics_path = metrics_file();
     release_claim_after_run_error(
         &client,
         &slot,
         &config.runtime_labels.agent_in_progress,
         &config.polling.pickup_label,
         &err.to_string(),
+        "sandbox:test",
+        metrics_path.path(),
         &mut log,
     )
     .await;
@@ -521,12 +570,15 @@ async fn a_released_issue_is_claimed_by_the_very_next_polling_tick() {
     let err = run_once(&client, &config, &mut log, None, None, Some(&slot))
         .await
         .expect_err("the post-claim workspace clone must fail against wiremock");
+    let metrics_path = metrics_file();
     release_claim_after_run_error(
         &client,
         &slot,
         &config.runtime_labels.agent_in_progress,
         &config.polling.pickup_label,
         &err.to_string(),
+        "sandbox:test",
+        metrics_path.path(),
         &mut log,
     )
     .await;
@@ -563,4 +615,109 @@ async fn a_released_issue_is_claimed_by_the_very_next_polling_tick() {
         claim_patch.iter().any(|l| l == IN_PROGRESS),
         "the next tick's claim must move the released issue to the in-progress label; PATCHed {claim_patch:?}",
     );
+}
+
+/// Issue #197: the release path is also where the abort's `runs.jsonl`
+/// line is written. Without this the file records only the runs that
+/// reached a PR, which is the success distribution rather than the
+/// failure distribution it is documented to be.
+#[tokio::test]
+async fn releasing_an_aborted_claim_also_appends_its_runs_jsonl_line() {
+    let mock = MockServer::start().await;
+    mock_claimed_issue_get(&mock, 42).await;
+    mock_release_patch(
+        &mock,
+        42,
+        ResponseTemplate::new(200).set_body_json(released_issue_body(42)),
+    )
+    .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let slot = InFlightClaimSlot::new();
+    slot.set(InFlightClaim {
+        owner: "marad2001".to_string(),
+        repo: "test-repo".to_string(),
+        issue_number: 42,
+        claimed_at: claimed_at_fixture(),
+        phases: Vec::new(),
+    });
+    let mut log = Cursor::new(Vec::new());
+    let metrics_path = metrics_file();
+
+    release_claim_after_run_error(
+        &client,
+        &slot,
+        IN_PROGRESS,
+        PICKUP,
+        "docker: error reading a body from connection",
+        "sandbox:docker: error reading a body from connection",
+        metrics_path.path(),
+        &mut log,
+    )
+    .await;
+
+    let body = std::fs::read_to_string(metrics_path.path()).expect("metrics file readable");
+    assert_eq!(
+        body.lines().count(),
+        1,
+        "exactly one record per aborted run: {body:?}",
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(body.trim_end()).expect("the line should parse");
+
+    assert_eq!(json["issue"], serde_json::json!(42));
+    assert_eq!(json["repo"], serde_json::json!("marad2001/test-repo"));
+    assert_eq!(json["pr"], serde_json::Value::Null, "an abort has no PR");
+    assert_eq!(
+        json["abort_cause"],
+        serde_json::json!("Sandbox"),
+        "the daemon-drop bucket, derived from the error shape",
+    );
+    assert_eq!(json["exit_reason"], serde_json::Value::Null);
+    assert_eq!(json["schema"], serde_json::json!(2));
+}
+
+/// A release that fails must still record the abort. The run ended
+/// either way, and the record is what makes it countable.
+#[tokio::test]
+async fn a_failed_release_still_appends_the_abort_record() {
+    let mock = MockServer::start().await;
+    mock_claimed_issue_get(&mock, 42).await;
+    // Mounted without an exact-call expectation: octocrab may retry a
+    // 500, and the point here is the record, not the request count.
+    Mock::given(method("PATCH"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .and(body_string_contains(PICKUP))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let slot = InFlightClaimSlot::new();
+    slot.set(InFlightClaim {
+        owner: "marad2001".to_string(),
+        repo: "test-repo".to_string(),
+        issue_number: 42,
+        claimed_at: claimed_at_fixture(),
+        phases: Vec::new(),
+    });
+    let mut log = Cursor::new(Vec::new());
+    let metrics_path = metrics_file();
+
+    release_claim_after_run_error(
+        &client,
+        &slot,
+        IN_PROGRESS,
+        PICKUP,
+        "missing brief",
+        "missing_agent_brief:42",
+        metrics_path.path(),
+        &mut log,
+    )
+    .await;
+
+    let body = std::fs::read_to_string(metrics_path.path()).expect("metrics file readable");
+    let json: serde_json::Value =
+        serde_json::from_str(body.trim_end()).expect("the line should parse");
+    assert_eq!(json["abort_cause"], serde_json::json!("Unclaimable"));
 }

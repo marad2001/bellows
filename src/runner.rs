@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::narrate;
 use crate::auth::Auth;
 use crate::chain_walker::{
     self, decide_implement_rate_limit_action, format_phase_engine_log, handle_implement_rate_limit,
@@ -362,8 +363,7 @@ async fn run_reloop_sweep(
         {
             Ok(d) => d,
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: re-loop list-dependents failed for {}/{}: {}",
                     owner, repo, e,
                 );
@@ -413,16 +413,14 @@ async fn sweep_one_dependent(
     let brief = match tracker::fetch_agent_brief(client, owner, repo, issue_number).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): no `## Agent Brief` comment found",
                 issue_number, owner, repo,
             );
             return false;
         }
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief fetch failed: {}",
                 issue_number, owner, repo, e,
             );
@@ -433,8 +431,7 @@ async fn sweep_one_dependent(
     let parsed = tracker::parse_blocked_by_section_with_log_writer(&brief, log_writer);
     match parsed {
         tracker::BlockedBySection::Unverifiable => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: re-loop: leaving blocked-by on issue #{} ({}/{}): brief comment present but malformed (no `## Agent Brief` header inside the parsed body)",
                 issue_number, owner, repo,
             );
@@ -455,16 +452,14 @@ async fn sweep_one_dependent(
             .await
             {
                 Ok(_) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): brief lists no blockers",
                         issue_number, owner, repo,
                     );
                     true
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
                         issue_number, owner, repo, e,
                     );
@@ -477,23 +472,20 @@ async fn sweep_one_dependent(
             for blocker in &blockers {
                 match tracker::fetch_issue_state(client, owner, repo, *blocker).await {
                     Ok(tracker::IssueClosureState::Closed) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is closed",
                             blocker, issue_number, owner, repo,
                         );
                     }
                     Ok(tracker::IssueClosureState::Open) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: blocker #{} for dependent #{} ({}/{}) is still open",
                             blocker, issue_number, owner, repo,
                         );
                         all_closed = false;
                     }
                     Err(e) => {
-                        let _ = writeln!(
-                            log_writer,
+                        narrate!(log_writer,
                             "bellows: re-loop: state check for blocker #{} (dependent #{} {}/{}) failed: {}",
                             blocker, issue_number, owner, repo, e,
                         );
@@ -514,16 +506,14 @@ async fn sweep_one_dependent(
             .await
             {
                 Ok(_) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: stripped blocked-by from issue #{} ({}/{}): every blocker closed",
                         issue_number, owner, repo,
                     );
                     true
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: re-loop: strip-label PATCH failed for issue #{} ({}/{}): {}",
                         issue_number, owner, repo, e,
                     );
@@ -566,8 +556,7 @@ pub async fn reconcile_stranded_in_progress(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: listing {}/{} `{}` issues failed (skipping repo): {}",
                         owner, repo, in_progress_label, e,
                     );
@@ -587,22 +576,19 @@ pub async fn reconcile_stranded_in_progress(
             {
                 Ok(Some(_)) => {
                     reclaimed += 1;
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: reclaimed stranded issue #{} ({}/{}) — `{}` -> `{}`",
                         issue.number, owner, repo, in_progress_label, pickup_label,
                     );
                 }
                 Ok(None) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: skipped issue #{} ({}/{}) because it no longer carries `{}`",
                         issue.number, owner, repo, in_progress_label,
                     );
                 }
                 Err(e) => {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: startup reconcile: reset failed for issue #{} ({}/{}) (leaving for manual re-label): {}",
                         issue.number, owner, repo, e,
                     );
@@ -622,6 +608,62 @@ pub struct InFlightClaim {
     pub owner: String,
     pub repo: String,
     pub issue_number: u64,
+    /// When `claim` succeeded — the start of the run's wall clock
+    /// (issue #197). Lets an abort's `runs.jsonl` line carry the same
+    /// elapsed-seconds field a finalised run's does, which is what
+    /// separates a run that died twenty minutes in from one that died
+    /// on its first call.
+    pub claimed_at: chrono::DateTime<chrono::Utc>,
+    /// Phases that had completed when the slot was last synced
+    /// (issue #197). Empty for the common abort shape — every docker
+    /// drop in the observed window landed moments after the implement
+    /// phase announced its engine — and non-empty for an abort later in
+    /// the pipeline, where it says how far the run got.
+    pub phases: Vec<policy::PhaseMetrics>,
+}
+
+/// A [`policy::PhaseTimeline`] that mirrors every recorded phase into the
+/// in-flight claim slot (issue #197).
+///
+/// It carries the same two `record_*` method names as the timeline it
+/// wraps, so the runner's existing call sites are untouched — the mirror
+/// cannot be forgotten at a site, because there is nothing to remember.
+/// A phase recorded is a phase the abort record will carry.
+struct MirroredTimeline<'a> {
+    timeline: policy::PhaseTimeline,
+    slot: Option<&'a InFlightClaimSlot>,
+}
+
+impl<'a> MirroredTimeline<'a> {
+    fn new(slot: Option<&'a InFlightClaimSlot>) -> Self {
+        Self {
+            timeline: policy::PhaseTimeline::new(),
+            slot,
+        }
+    }
+
+    fn record_engine_phase(
+        &mut self,
+        phase: &str,
+        entry: Option<&crate::config::ChainEntry>,
+        seconds: u64,
+        exit_code: i64,
+    ) {
+        self.timeline
+            .record_engine_phase(phase, entry, seconds, exit_code);
+        self.sync();
+    }
+
+    fn record_gate_phase(&mut self, phase: &str, seconds: u64, exit_code: i64) {
+        self.timeline.record_gate_phase(phase, seconds, exit_code);
+        self.sync();
+    }
+
+    fn sync(&self) {
+        if let Some(slot) = self.slot {
+            slot.set_phases(self.timeline.entries().to_vec());
+        }
+    }
 }
 
 /// The polling loop's view of the claim currently in flight (issue #193).
@@ -669,6 +711,19 @@ impl InFlightClaimSlot {
         self.lock().take()
     }
 
+    /// Issue #197: refresh the completed-phase snapshot the abort record
+    /// will carry. Driven by [`MirroredTimeline`] rather than by any
+    /// call site, so it cannot drift from the real timeline.
+    ///
+    /// A no-op when the slot is empty: phases recorded after the PR
+    /// exists belong to a run that reaches `finalise` and writes its own
+    /// record from the full timeline.
+    pub fn set_phases(&self, phases: Vec<policy::PhaseMetrics>) {
+        if let Some(claim) = self.lock().as_mut() {
+            claim.phases = phases;
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<InFlightClaim>> {
         self.claim.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -695,17 +750,26 @@ impl InFlightClaimSlot {
 /// `startup reconcile:` lines emitted by [`reconcile_stranded_in_progress`]
 /// — both recovery routes end in the same label swap, and a reader of the
 /// run log needs to be able to tell which one fired.
+// Issue #197 added `error_shape` and `metrics_path`. Bundling them into
+// a context struct for a single call site would trade a clippy lint for
+// indirection; the file already carries this allow in five places.
+#[allow(clippy::too_many_arguments)]
 pub async fn release_claim_after_run_error(
     client: &octocrab::Octocrab,
     slot: &InFlightClaimSlot,
     in_progress_label: &str,
     pickup_label: &str,
     reason: &str,
+    error_shape: &str,
+    metrics_path: &std::path::Path,
     log_writer: &mut dyn Write,
 ) {
     let Some(claim) = slot.take() else {
         return;
     };
+    // Issue #197: bucket the abort before the release, so the record is
+    // built from the same error that triggered it.
+    let cause = policy::AbortCause::from_error_shape(error_shape);
     match tracker::reset_in_progress_to_pickup(
         client,
         &claim.owner,
@@ -717,8 +781,7 @@ pub async fn release_claim_after_run_error(
     .await
     {
         Ok(Some(_)) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: returned claimed issue #{} ({}/{}) to `{}` (was `{}`) — the run failed before any PR existed, so it is claimable again on the next tick: {}",
                 claim.issue_number,
                 claim.owner,
@@ -729,20 +792,38 @@ pub async fn release_claim_after_run_error(
             );
         }
         Ok(None) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: skipped claimed issue #{} ({}/{}) because it no longer carries `{}`; ownership was removed before recovery",
                 claim.issue_number, claim.owner, claim.repo, in_progress_label,
             );
         }
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: run-abort release: could not return claimed issue #{} ({}/{}) to `{}` (leaving it for the startup reconcile sweep): {}",
                 claim.issue_number, claim.owner, claim.repo, pickup_label, e,
             );
         }
     }
+
+    // Issue #197: record the abort in `runs.jsonl`. Appended regardless
+    // of whether the release above succeeded — the run ended either way,
+    // and a file that omits the aborts is the success distribution, not
+    // the failure distribution it is documented to be.
+    //
+    // Best-effort, like the release itself: `append_run_metrics` has no
+    // error channel, so nothing here can change how the tick proceeds.
+    append_run_metrics(
+        metrics_path,
+        &policy::build_abort_metrics(policy::AbortMetricsInput {
+            issue: claim.issue_number,
+            repo: &format!("{}/{}", claim.owner, claim.repo),
+            started_at: claim.claimed_at,
+            finished_at: chrono::Utc::now(),
+            cause,
+            phases: &claim.phases,
+        }),
+        log_writer,
+    );
 }
 
 /// Open the run's pull request and make its claim ineligible for abort
@@ -796,8 +877,7 @@ pub async fn run_once(
                 if let Some(ctx) = status_ctx
                     && let Err(e) = ctx.write_blocked(&reason).await
                 {
-                    let _ = writeln!(
-                        log_writer,
+                    narrate!(log_writer,
                         "bellows: could not write blocked status (continuing): {}",
                         e,
                     );
@@ -811,8 +891,7 @@ pub async fn run_once(
                 // serial polling loop itself, so a transient daemon
                 // hiccup must not stall every repo's throughput.
                 // Subsequent ticks retry the probe.
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: pre-claim container probe failed (proceeding this tick): {}",
                     e,
                 );
@@ -848,8 +927,7 @@ pub async fn run_once(
                     .map(|n| format!("#{}", n))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: skipping repo {}/{} this tick: waiting on open non-draft agent/* PR(s): {}",
                     owner, repo, nums,
                 );
@@ -857,8 +935,7 @@ pub async fn run_once(
             }
             Ok(_) => {}
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: pre-claim PR-open probe failed for {}/{} (proceeding this tick): {}",
                     owner, repo, e,
                 );
@@ -910,8 +987,7 @@ pub async fn run_once(
         if let Some(ctx) = status_ctx
             && let Err(e) = ctx.write_idle().await
         {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: could not clear status (continuing): {}",
                 e,
             );
@@ -926,8 +1002,7 @@ pub async fn run_once(
     if let Some(ctx) = status_ctx
         && let Err(e) = ctx.write_idle().await
     {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not clear blocked status (continuing): {}",
             e,
         );
@@ -1013,8 +1088,7 @@ pub async fn run_once(
         // Safe to log unconditionally: we only reach here when a claim
         // follows, and a claim starts a 30-60 minute pipeline, so this
         // is at most one line per pipeline rather than one per tick.
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: skipped {} unclaimable issue(s) ahead of the queue ({}): labelled `{}` but missing an `## Agent Brief` or carrying ambiguous `engine:*` labels — move them back to needs-triage",
             skipped.len(),
             list,
@@ -1063,8 +1137,7 @@ pub async fn run_once(
             if let Some(ctx) = status_ctx
                 && let Err(write_err) = ctx.write_blocked(&reason).await
             {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: could not write blocked status (continuing): {}",
                     write_err,
                 );
@@ -1145,15 +1218,21 @@ pub async fn run_once(
     // Issue #193: from here until the PR exists, an abort would strand
     // this issue at the in-progress label. Record the coordinates so the
     // polling loop's error arm can hand it back to the pickup queue.
+    let started = chrono::Utc::now();
+
+    // Issue #197: `claimed_at` rides along so an abort's `runs.jsonl`
+    // line carries the same wall clock a finalised run's does. It is the
+    // same instant `started` uses, deliberately — the two records must
+    // not disagree about when the run began.
     if let Some(slot) = claim_slot {
         slot.set(InFlightClaim {
             owner: owner.clone(),
             repo: repo.clone(),
             issue_number: claimed.number,
+            claimed_at: started,
+            phases: Vec::new(),
         });
     }
-
-    let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
 
     announce(
@@ -1174,8 +1253,7 @@ pub async fn run_once(
             claimed_at: started,
         };
         if let Err(e) = ctx.write_busy(current).await {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: could not write busy status (continuing): {}",
                 e,
             );
@@ -1266,7 +1344,10 @@ pub async fn run_once(
     // accumulated as the pipeline progresses. A phase the run never
     // reaches is never pushed, which is exactly the record's
     // omit-phases-that-did-not-run contract.
-    let mut phase_timeline = policy::PhaseTimeline::new();
+    // Issue #197: mirrors each recorded phase into the claim slot so an
+    // abort can report where in the pipeline it died. Same `record_*`
+    // surface as the plain timeline, so no call site below changes.
+    let mut phase_timeline = MirroredTimeline::new(claim_slot);
     // The chain entry that actually served implement, set once a
     // container has genuinely been dispatched. Stays `None` on the
     // all-entries-cooling path, whose synthesised `ChainEntry` below is
@@ -2644,8 +2725,7 @@ pub async fn run_once(
     {
         Ok(in_progress) => !in_progress,
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: pre-PR cancellation check failed (continuing): {}",
                 e,
             );
@@ -2696,8 +2776,7 @@ pub async fn run_once(
     {
         Ok(files) => files,
         Err(e) => {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: workflow-file diff failed (continuing without callout): {e}",
             );
             Vec::new()
@@ -2872,7 +2951,7 @@ pub async fn run_once(
             merger_verdict: outcomes.merger_verdict,
             draft,
             outcome_label: effective_outcome_label,
-            phases: &phase_timeline,
+            phases: &phase_timeline.timeline,
         }),
         log_writer,
     );
@@ -2883,8 +2962,7 @@ pub async fn run_once(
     if let Some(ctx) = status_ctx
         && let Err(e) = ctx.write_idle().await
     {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not write idle status after finalise (continuing): {}",
             e,
         );
@@ -4155,8 +4233,7 @@ pub fn append_run_metrics(
     log_writer: &mut dyn Write,
 ) {
     let warn = |log_writer: &mut dyn Write, e: &dyn std::fmt::Display| {
-        let _ = writeln!(
-            log_writer,
+        narrate!(log_writer,
             "bellows: could not append the run metrics record to {} (continuing; \
              the run's outcome is unaffected): {}",
             path.display(),

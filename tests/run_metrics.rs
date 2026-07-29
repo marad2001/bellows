@@ -102,7 +102,7 @@ fn run_metrics_carries_the_brief_contract_fields() {
         serde_json::to_value(successful_run_metrics()).expect("record should serialise");
 
     assert_eq!(json["schema"], serde_json::json!(RUN_METRICS_SCHEMA_VERSION));
-    assert_eq!(json["schema"], serde_json::json!(1));
+    assert_eq!(json["schema"], serde_json::json!(2));
     assert_eq!(json["issue"], serde_json::json!(168));
     assert_eq!(json["repo"], serde_json::json!("marad2001/bellows"));
     assert_eq!(json["pr"], serde_json::json!(200));
@@ -558,8 +558,18 @@ fn run_once_appends_the_record_after_finalise_has_returned() {
     // but the run would be back to recording the stale pre-finalise
     // classification. `run_once` needs Docker and GitHub to reach this
     // code, so the call order is asserted at the source level.
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runner.rs"))
+    let whole = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runner.rs"))
         .expect("runner.rs should be readable");
+    // Scope the search to `run_once`'s own body. Issue #197 added a
+    // second `append_run_metrics` call — the abort record, written from
+    // `release_claim_after_run_error` — which sits earlier in the file
+    // and is not subject to this ordering rule at all (there is no
+    // `finalise` on the abort path). Searching the whole file would
+    // find that one and fail on a contract it does not participate in.
+    let run_once_at = whole
+        .find("pub async fn run_once(")
+        .expect("runner.rs should define run_once");
+    let src = &whole[run_once_at..];
     let finalise_at = src
         .find("tracker::finalise(")
         .expect("run_once should call tracker::finalise");

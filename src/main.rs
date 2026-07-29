@@ -2113,12 +2113,22 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
                 // to run the startup sweep with that repo configured. A
                 // run that got as far as a PR left the slot empty and is
                 // deliberately untouched — it reaches finalise instead.
+                //
+                // Issue #197: the same call appends the abort's
+                // `runs.jsonl` line, so the file records the runs that
+                // never reached a PR as well as the ones that did.
+                // `shape` carries the error's variant so the record can
+                // say whether this was a daemon drop, a git failure or
+                // an unclaimable issue — three different operator
+                // responses that must not collapse into one bucket.
                 runner::release_claim_after_run_error(
                     &client,
                     &claim_slot,
                     &config.runtime_labels.agent_in_progress,
                     &config.polling.pickup_label,
                     &e.to_string(),
+                    &shape,
+                    &config.logging.metrics_path,
                     &mut log_file,
                 )
                 .await;

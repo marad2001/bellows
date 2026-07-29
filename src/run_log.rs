@@ -72,15 +72,34 @@ fn is_continuation(physical: &str) -> bool {
 /// log writer appears anywhere else in `src/`, so a call site added
 /// later cannot quietly produce an unstamped line.
 ///
-/// Best-effort, like every other write to the run log: a failure here
-/// must never change how a run ends. Flushes so an operator tailing the
-/// file sees the line as it happens.
 /// Generic over the writer rather than taking `&mut dyn Write`, because
 /// some narration paths are themselves generic over an unsized writer
 /// (`W: Write + ?Sized`) and cannot coerce to a trait object.
+///
+/// Best-effort, like every other write to the run log: a failure here
+/// must never change how a run ends. Flushes so an operator tailing the
+/// file sees the line as it happens.
 pub fn narrate<W: Write + ?Sized>(log_writer: &mut W, line: &str) {
     let _ = writeln!(log_writer, "{}", stamped(Utc::now(), line));
     let _ = log_writer.flush();
+}
+
+/// `writeln!`-shaped narration into the run log, stamped.
+///
+/// Takes exactly the argument list `writeln!` did — `narrate!(log_writer,
+/// "...", args)` — so converting the tree's existing narration sites was
+/// a one-token change per site rather than a reshape of every call. That
+/// matters beyond tidiness: a mechanical rewrite that also reformats is
+/// a rewrite nobody can review.
+///
+/// Prefer this over calling [`narrate`] with a hand-built `format!` when
+/// the line has interpolated arguments; call [`narrate`] directly when
+/// the line is already a `String` or a bare literal.
+#[macro_export]
+macro_rules! narrate {
+    ($log_writer:expr, $($arg:tt)*) => {
+        $crate::run_log::narrate($log_writer, &format!($($arg)*))
+    };
 }
 
 #[cfg(test)]

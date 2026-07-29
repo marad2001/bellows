@@ -1,3 +1,4 @@
+use crate::narrate;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
@@ -1818,8 +1819,7 @@ pub async fn cleanup_orphan_containers(
                 success_lines.push(format_orphan_log_line(&info));
             }
             Err(e) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: failed to remove orphan container {} ({e})",
                     info.short_id,
                 );

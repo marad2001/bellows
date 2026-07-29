@@ -1,3 +1,4 @@
+use crate::narrate;
 use std::io::{self, Write};
 
 use serde::Deserialize;
@@ -827,16 +828,14 @@ pub fn parse_blocked_by_section_with_log_writer(
             continue;
         }
         if token.contains('/') {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: ignoring cross-repo blocker reference `{}` in **Blocked by:** line (v1 is same-repo only; see ADR-0007)",
                 token,
             );
             continue;
         }
         let Some(num_str) = token.strip_prefix('#') else {
-            let _ = writeln!(
-                log_writer,
+            narrate!(log_writer,
                 "bellows: ignoring malformed blocker token `{}` in **Blocked by:** line (expected `#N`)",
                 token,
             );
@@ -845,8 +844,7 @@ pub fn parse_blocked_by_section_with_log_writer(
         match num_str.parse::<u64>() {
             Ok(n) => blockers.push(n),
             Err(_) => {
-                let _ = writeln!(
-                    log_writer,
+                narrate!(log_writer,
                     "bellows: ignoring malformed blocker token `#{}` in **Blocked by:** line (not a u64)",
                     num_str,
                 );

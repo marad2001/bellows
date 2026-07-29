@@ -2697,7 +2697,12 @@ pub const CODEX_INLINED_SKILL_DIAGNOSE: &str = include_str!(
 /// A plain integer so a future reader (#167) can migrate. Adding a field
 /// does not bump it — readers are expected to tolerate unknown keys —
 /// but removing, renaming, or changing the meaning of one does.
-pub const RUN_METRICS_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 by issue #197, which made `pr` nullable and added
+/// `abort_cause`. A schema-1 line remains parseable under 2: `pr` was
+/// always a number and deserialises into `Some`, `exit_reason` is
+/// unchanged, and `abort_cause` is absent (a finalised run has none).
+/// The file is append-only and prior lines are never rewritten.
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 2;
 
 /// One phase's row in a [`RunMetrics`] record.
 ///
@@ -2796,7 +2801,10 @@ pub struct RunMetrics {
     pub issue: u64,
     /// `owner/repo`, matching the `bellows-repo` container label.
     pub repo: String,
-    pub pr: u64,
+    /// `None` for a run that aborted before opening a PR (issue #197).
+    /// Every schema-1 line carries a number here, so old lines still
+    /// deserialise.
+    pub pr: Option<u64>,
     #[serde(serialize_with = "serialize_rfc3339_seconds")]
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(serialize_with = "serialize_rfc3339_seconds")]
@@ -2805,13 +2813,80 @@ pub struct RunMetrics {
     /// step (NTP correction mid-run) cannot produce a negative duration
     /// in a machine-read field.
     pub wall_clock_seconds: u64,
-    pub exit_reason: ExitReason,
+    /// How the pipeline classified a run that reached a PR. `None` for
+    /// an aborted run (issue #197) — an abort has no terminal
+    /// classification because the pipeline never finished to produce
+    /// one. Exactly one of `exit_reason` and `abort_cause` is set, and
+    /// the two builders enforce that by construction.
+    pub exit_reason: Option<ExitReason>,
+    /// Why a run ended before opening a PR, or `None` for a run that
+    /// finalised normally (issue #197).
+    pub abort_cause: Option<AbortCause>,
     /// The phase-8 merger's parsed token, or `null` when the merger did
     /// not run or wrote nothing parseable.
     pub merger_verdict: Option<MergerVerdict>,
-    pub draft: bool,
-    pub outcome_label: String,
+    /// `None` for an aborted run — there is no PR to be draft or not.
+    pub draft: Option<bool>,
+    /// `None` for an aborted run. Issue #193 returns an aborted issue to
+    /// the pickup label rather than leaving an outcome label on it, so
+    /// there is no terminal label to record.
+    pub outcome_label: Option<String>,
     pub phases: Vec<PhaseMetrics>,
+}
+
+/// Issue #197: why a run ended before a PR existed.
+///
+/// The file's own documentation says every terminal outcome gets a line
+/// "because the failure distribution is the point of the file", and that
+/// was not true: the record was appended only after `finalise`, which is
+/// reached only once a PR exists. In the 2026-07-25 → 2026-07-28 window
+/// the file held 13 lines, 12 of them `Success`, while the log for the
+/// same window showed 46 claims against 31 finalised runs.
+///
+/// The buckets are chosen so an operator can act on the count. A daemon
+/// dropping connections, a repo that will not clone, and an issue
+/// labelled `ready-for-agent` with no brief demand three different
+/// responses and must not collapse into one number.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AbortCause {
+    /// The Docker daemon connection failed. Seven of these in the window
+    /// above, all on `workboard-financial-advice`. Issue #194 added a
+    /// bounded retry; one recorded here means the retries were exhausted.
+    Sandbox,
+    /// Clone, commit or push failed. Distinct from `Sandbox` because the
+    /// operator response is a git/credentials question, not a daemon one.
+    Workspace,
+    /// A GitHub API call failed.
+    GitHub,
+    /// Host IO failed.
+    Io,
+    /// Bellows refused to claim the issue: no `## Agent Brief`, ambiguous
+    /// `engine:*` labels, or an unparseable repo URL. Nine of these in
+    /// the window above. Not a failure of the run — a failure of the
+    /// issue's readiness, and the only bucket whose fix is triage rather
+    /// than infrastructure.
+    Unclaimable,
+}
+
+impl AbortCause {
+    /// Map a `RunError` shape prefix onto a bucket. Takes the shape key
+    /// rather than the error itself so `policy` stays free of a
+    /// dependency on `runner`'s error type — the same split that keeps
+    /// `classify_exit` pure.
+    ///
+    /// An unrecognised shape falls to `Io` rather than panicking: a
+    /// metrics record must never be the thing that fails a run.
+    pub fn from_error_shape(shape: &str) -> Self {
+        match shape.split(':').next().unwrap_or_default() {
+            "sandbox" => AbortCause::Sandbox,
+            "workspace" => AbortCause::Workspace,
+            "octocrab" => AbortCause::GitHub,
+            "missing_agent_brief" | "ambiguous_engine_labels" | "invalid_repo_url" => {
+                AbortCause::Unclaimable
+            }
+            _ => AbortCause::Io,
+        }
+    }
 }
 
 impl RunMetrics {
@@ -2872,14 +2947,62 @@ pub fn build_run_metrics(input: RunMetricsInput<'_>) -> RunMetrics {
         schema: RUN_METRICS_SCHEMA_VERSION,
         issue: input.issue,
         repo: input.repo.to_string(),
-        pr: input.pr,
+        pr: Some(input.pr),
         started_at: input.started_at,
         finished_at: input.finished_at,
         wall_clock_seconds,
-        exit_reason: input.exit_reason.clone(),
+        exit_reason: Some(input.exit_reason.clone()),
+        abort_cause: None,
         merger_verdict: input.merger_verdict,
-        draft: input.draft,
-        outcome_label: input.outcome_label.to_string(),
+        draft: Some(input.draft),
+        outcome_label: Some(input.outcome_label.to_string()),
         phases: input.phases.entries().to_vec(),
+    }
+}
+
+/// Inputs for [`build_abort_metrics`] (issue #197).
+pub struct AbortMetricsInput<'a> {
+    pub issue: u64,
+    pub repo: &'a str,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: chrono::DateTime<chrono::Utc>,
+    pub cause: AbortCause,
+    /// Phases that completed before the abort. Often empty — the aborts
+    /// in the observed window all landed moments after the implement
+    /// phase announced its engine — but an abort later in the pipeline
+    /// says where the run died.
+    pub phases: &'a [PhaseMetrics],
+}
+
+/// Build the `runs.jsonl` record for a run that ended before opening a
+/// PR (issue #197).
+///
+/// The sibling of [`build_run_metrics`], and the reason the "exactly one
+/// of `exit_reason` / `abort_cause`" invariant holds without a runtime
+/// check: each builder sets one and nulls the other, and `RunMetrics`
+/// has no other constructor in the tree.
+///
+/// `pr`, `draft` and `outcome_label` are all `None` — there is no PR to
+/// describe, and issue #193 returns the issue to the pickup label rather
+/// than leaving a terminal one on it.
+pub fn build_abort_metrics(input: AbortMetricsInput<'_>) -> RunMetrics {
+    let wall_clock_seconds = (input.finished_at - input.started_at)
+        .num_seconds()
+        .max(0)
+        .unsigned_abs();
+    RunMetrics {
+        schema: RUN_METRICS_SCHEMA_VERSION,
+        issue: input.issue,
+        repo: input.repo.to_string(),
+        pr: None,
+        started_at: input.started_at,
+        finished_at: input.finished_at,
+        wall_clock_seconds,
+        exit_reason: None,
+        abort_cause: Some(input.cause),
+        merger_verdict: None,
+        draft: None,
+        outcome_label: None,
+        phases: input.phases.to_vec(),
     }
 }
