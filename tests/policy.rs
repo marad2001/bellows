@@ -316,6 +316,78 @@ fn is_service_unavailable_signature_does_not_false_positive_on_bare_phrases() {
 }
 
 #[test]
+fn is_engine_start_failure_signature_matches_the_zero_turn_result_envelope() {
+    // Issue #192: a headless engine that fails to start exits non-zero
+    // having done nothing, and the claude CLI reports the run as a
+    // result envelope with subtype `error_during_execution`, zero
+    // turns, zero tokens and zero duration. Composite match — the
+    // subtype AND the zero turn count.
+    let tail = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":0,"duration_api_ms":0,"num_turns":0,"session_id":"9f1c","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}"#;
+    assert!(bellows::policy::is_engine_start_failure_signature(tail));
+}
+
+#[test]
+fn is_engine_start_failure_signature_does_not_match_the_phrase_in_agent_prose() {
+    // The bare subtype string in agent prose must NOT trigger — the
+    // same conservatism `is_rate_limit_signature` applies to a bare
+    // `429`. Without the zero turn count there is no evidence the
+    // engine never started.
+    assert!(!bellows::policy::is_engine_start_failure_signature(
+        "the runner maps subtype error_during_execution onto a crash today; see runner.rs"
+    ));
+}
+
+#[test]
+fn is_engine_start_failure_signature_does_not_match_an_error_envelope_after_real_turns() {
+    // An engine that ran twelve turns and then errored DID work — it
+    // may have committed, so it is a genuine crash, not a
+    // never-started engine. Only a zero turn count is the start-failure
+    // signal.
+    let tail = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":12,"duration_ms":840123}"#;
+    assert!(!bellows::policy::is_engine_start_failure_signature(tail));
+}
+
+#[test]
+fn is_engine_start_failure_signature_does_not_match_prefixed_turn_field_names() {
+    // A zero-valued setting mentioned alongside an unrelated crash is not
+    // evidence that the engine produced zero turns. The key must be exactly
+    // `num_turns`, rather than merely ending with that text.
+    for tail in [
+        "error_during_execution while minimum_num_turns: 0 was configured",
+        "error_during_execution with expected_num_turns=0",
+    ] {
+        assert!(
+            !bellows::policy::is_engine_start_failure_signature(tail),
+            "prefixed field name must not match: {tail}"
+        );
+    }
+}
+
+#[test]
+fn is_engine_start_failure_signature_matches_the_mid_stream_connection_loss() {
+    // Issue #192, observed tail from workboard-financial-advice #671:
+    // the engine starts and then loses its connection mid-stream. Same
+    // class — the phase produced nothing usable — so the same signal.
+    let tail = "API Error: Connection closed mid-response. The response above may be incomplete.";
+    assert!(bellows::policy::is_engine_start_failure_signature(tail));
+    assert!(bellows::policy::is_connection_closed_mid_response_signature(
+        tail
+    ));
+}
+
+#[test]
+fn is_connection_closed_mid_response_signature_does_not_match_ordinary_prose() {
+    // `connection closed` alone is ordinary networking prose; the
+    // `mid-response` qualifier is required.
+    assert!(!bellows::policy::is_connection_closed_mid_response_signature(
+        "the pool logs a warning when a connection closed while idle, which is expected"
+    ));
+    assert!(!bellows::policy::is_engine_start_failure_signature(
+        "thread 'main' panicked at src/lib.rs:10: index out of bounds"
+    ));
+}
+
+#[test]
 fn is_auth_error_signature_matches_anthropic_refresh_token_expired_response() {
     // Anthropic-style auth-error stderr after a refresh token expires.
     // The canonical shape is a 401 with an underscore-style identifier;

@@ -1286,102 +1286,34 @@ pub async fn run_once(
         let head_after =
             workspace::commit_all_and_push_if_advanced(&workspace, &head_before_implement).await?;
 
-        // Rate-limit / transient-outage handling (issue #82; extended
-        // to transient backend outages by #174). A credit/quota-
-        // exhaustion (rate-limit) OR a transient outage (503/500/504) at
-        // base SHA in-place-advances to the next hot chain entry; either
-        // signal after commits have landed terminates as RateLimited
-        // (retry-later). Forced engine bypasses chain walking: either
-        // signal terminates without an in-place advance.
-        let implement_rate_limited_sig = policy::is_rate_limit_signature(&agent_run.stderr_tail);
-        let implement_outage_sig = !implement_rate_limited_sig
-            && policy::is_service_unavailable_signature(&agent_run.stderr_tail);
-        if agent_run.exit_code != 0
-            && (implement_rate_limited_sig || implement_outage_sig)
-            && !budget.exceeded
-        {
-            let at_base_sha = head_after == head_before_implement;
-            let now = chrono::Utc::now();
-            // Record the appropriate cooling window for the engine: a
-            // rate-limit carries a parsed (or 5-minute fallback)
-            // cooldown; a transient outage gets a short 2-minute window.
-            if implement_rate_limited_sig {
-                let parsed = chain_walker::parse_cooling_until(
-                    picked.entry.engine,
-                    &agent_run.stderr_tail,
-                    now,
-                );
-                if parsed.used_fallback {
-                    announce(
-                        log_writer,
-                        "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
-                    );
-                }
-                state.record_rate_limit(picked.entry.engine, parsed.cooling_until);
-            } else {
-                state.record_rate_limit(
-                    picked.entry.engine,
-                    now + chrono::Duration::minutes(2),
-                );
-                announce(
-                    log_writer,
-                    &format!(
-                        "bellows: implement engine={} hit a transient backend outage (503/500/504); marking it cooling for 2 minutes (issue #174)",
-                        picked.entry.engine.as_name(),
-                    ),
-                );
+        // Transient-signal handling (issue #82; extended to transient
+        // backend outages by #174 and to zero-turn engine start-
+        // failures by #192). A credit/quota-exhaustion (rate-limit), a
+        // transient outage (503/500/504) or an engine that never
+        // produced a turn, all at base SHA, in-place-advance to the next
+        // hot chain entry; any of them after commits have landed
+        // terminates as RateLimited (retry-later). Forced engine
+        // bypasses chain walking: every signal terminates without an
+        // in-place advance.
+        match classify_and_record_implement_transient(
+            &mut state,
+            &state_path,
+            picked.entry.engine,
+            &agent_run,
+            &budget,
+            engine_label_override.is_some(),
+            head_after == head_before_implement,
+            implement_advances_used,
+            log_writer,
+        ) {
+            ImplementTransientDecision::NotTransient => {}
+            ImplementTransientDecision::InPlaceAdvance => {
+                implement_advances_used += 1;
+                continue;
             }
-            let _ = state.save(&state_path);
-            if engine_label_override.is_some() {
+            ImplementTransientDecision::TerminateRetryLater => {
                 rate_limited_phase = Some("implement");
                 break (picked.entry, agent_run, head_after, pr_body);
-            }
-            // The in-place-advance-vs-terminate decision is identical
-            // for both signals (bounded to max-1 advance per phase
-            // invocation, only at base SHA). For a rate-limit we still
-            // route through `handle_implement_rate_limit` so its
-            // cooling bookkeeping stays the single source of truth;
-            // the transient-outage cooling was recorded above so we
-            // consult `decide_implement_rate_limit_action` directly.
-            let disposition = if implement_rate_limited_sig {
-                handle_implement_rate_limit(
-                    &mut state,
-                    picked.entry.engine,
-                    &agent_run.stderr_tail,
-                    now,
-                    at_base_sha,
-                    implement_advances_used,
-                )
-            } else {
-                match decide_implement_rate_limit_action(at_base_sha, implement_advances_used) {
-                    ImplementRateLimitAction::InPlaceAdvance => {
-                        RateLimitDisposition::InPlaceAdvance
-                    }
-                    ImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
-                }
-            };
-            let _ = state.save(&state_path);
-            match disposition {
-                RateLimitDisposition::InPlaceAdvance => {
-                    implement_advances_used += 1;
-                    announce(
-                        log_writer,
-                        &format!(
-                            "bellows: implement {} at base SHA with engine={}; in-place-advancing to next hot chain entry (max 1 per phase invocation)",
-                            if implement_rate_limited_sig {
-                                "rate-limited"
-                            } else {
-                                "hit a transient outage (503/500/504)"
-                            },
-                            picked.entry.engine.as_name(),
-                        ),
-                    );
-                    continue;
-                }
-                RateLimitDisposition::Terminate => {
-                    rate_limited_phase = Some("implement");
-                    break (picked.entry, agent_run, head_after, pr_body);
-                }
             }
         }
 
@@ -1778,9 +1710,11 @@ pub async fn run_once(
             // picks the phase engine through `run_invocation_with_fallback`
             // (issue #174): a transient outage or credit/quota
             // exhaustion on one engine falls back to the next hot chain
-            // entry mid-phase (a failed invocation commits nothing, so
-            // the retry is safe), and only a fully-exhausted chain sets
-            // `rate_limited_phase` to terminate as retry-later.
+            // entry mid-phase. An ambiguous mid-response disconnect is
+            // retried only when HEAD and the worktree are unchanged;
+            // otherwise ordinary crash recovery keeps the partial work.
+            // Only a fully-exhausted chain sets `rate_limited_phase` to
+            // terminate as retry-later.
 
             // Per-finding loop: one container per blocker/important
             // finding. Each invocation respects the remaining wall-
@@ -1841,10 +1775,10 @@ pub async fn run_once(
 
                 // Capture HEAD BEFORE the agent runs so we can detect
                 // whether the agent self-committed during the
-                // invocation. Failed in-phase fallback attempts leave
-                // HEAD untouched, so this stays valid across an engine
-                // fallback. See the four-corners comment below the run
-                // for the full contract.
+                // invocation. A mid-response fallback is permitted only
+                // when the attempt left HEAD and the worktree unchanged,
+                // so this stays valid across an engine fallback. See the
+                // four-corners comment below the run for the full contract.
                 let head_before = workspace::head_sha(&workspace).await?;
                 let per_finding_started_at = std::time::Instant::now();
                 let per_finding_invocation = run_invocation_with_fallback(
@@ -3296,6 +3230,125 @@ async fn run_cargo_checks_with_oom_retry(
     Ok(retry)
 }
 
+/// What the implement phase does with one completed agent run that
+/// carries (or does not carry) a transient signal. The implement-phase
+/// sibling of [`FallbackDecision`]: it differs because the implement
+/// phase advances *in place* — same phase invocation, next hot chain
+/// entry, re-run from the base commit — rather than re-picking inside a
+/// read-only invocation loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ImplementTransientDecision {
+    /// No transient signal (or the run succeeded / the budget is
+    /// spent). The caller falls through to the ordinary path, including
+    /// the implement-crash recovery of issue #49.
+    NotTransient,
+    /// Drop the workspace and re-run the implement phase from base
+    /// under the next hot chain entry. Cooling for the failed engine
+    /// has already been recorded.
+    InPlaceAdvance,
+    /// Terminate the run as RateLimited (retry-later), never Crash.
+    /// Reached when the workspace is ahead of base SHA, when this
+    /// phase invocation has already used its one in-place advance, or
+    /// when a forced engine bypasses chain walking.
+    TerminateRetryLater,
+}
+
+/// Classify a completed implement-phase run for transient-signal
+/// routing and record the appropriate cooling as a side effect. The
+/// implement-side counterpart of [`classify_and_record_fallback`],
+/// extracted from the phase loop (issue #192) so the routing contract
+/// is testable without docker.
+///
+/// Handles all three transient signals identically in shape — record
+/// cooling, then consult the existing disposition — differing only in
+/// the cooling window: a rate-limit routes through
+/// `handle_implement_rate_limit` so its parse-and-record bookkeeping
+/// stays the single source of truth, while a transient outage and a
+/// zero-turn engine start-failure both take the short 2-minute window.
+///
+/// No new advance allowance is introduced for the start-failure signal
+/// (ADR-0012): the decision is the same
+/// `decide_implement_rate_limit_action` the other two signals consult,
+/// so the max-one-in-place-advance-per-phase-invocation cap governs all
+/// three together.
+#[allow(clippy::too_many_arguments)]
+fn classify_and_record_implement_transient(
+    state: &mut StateFile,
+    state_path: &std::path::Path,
+    engine: Engine,
+    run: &sandbox::AgentRun,
+    budget: &WallClockBudget,
+    forced_engine: bool,
+    at_base_sha: bool,
+    advances_used: u8,
+    log_writer: &mut dyn Write,
+) -> ImplementTransientDecision {
+    if run.exit_code == 0 || budget.exceeded {
+        return ImplementTransientDecision::NotTransient;
+    }
+    let Some(signal) = policy::classify_transient_signal(&run.stderr_tail) else {
+        return ImplementTransientDecision::NotTransient;
+    };
+    let now = chrono::Utc::now();
+    // The rate-limit disposition is computed by the helper that also
+    // records the parsed cooldown; the other two signals record their
+    // short window here and consult the same decision directly.
+    let disposition = match signal {
+        policy::TransientSignal::RateLimit => {
+            let parsed = chain_walker::parse_cooling_until(engine, &run.stderr_tail, now);
+            if parsed.used_fallback {
+                announce(
+                    log_writer,
+                    "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown",
+                );
+            }
+            handle_implement_rate_limit(
+                state,
+                engine,
+                &run.stderr_tail,
+                now,
+                at_base_sha,
+                advances_used,
+            )
+        }
+        policy::TransientSignal::ServiceOutage | policy::TransientSignal::EngineStartFailure => {
+            state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: implement engine={} hit {}; marking it cooling for 2 minutes",
+                    engine.as_name(),
+                    signal.log_label(),
+                ),
+            );
+            match decide_implement_rate_limit_action(at_base_sha, advances_used) {
+                ImplementRateLimitAction::InPlaceAdvance => RateLimitDisposition::InPlaceAdvance,
+                ImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
+            }
+        }
+    };
+    let _ = state.save(state_path);
+    // A forced engine bypasses chain walking entirely: there is no next
+    // entry to advance to, so every signal terminates as retry-later.
+    if forced_engine {
+        return ImplementTransientDecision::TerminateRetryLater;
+    }
+    match disposition {
+        RateLimitDisposition::InPlaceAdvance => {
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: implement hit {} at base SHA with engine={}; in-place-advancing to next hot chain entry (max 1 per phase invocation)",
+                    signal.log_label(),
+                    engine.as_name(),
+                ),
+            );
+            ImplementTransientDecision::InPlaceAdvance
+        }
+        RateLimitDisposition::Terminate => ImplementTransientDecision::TerminateRetryLater,
+    }
+}
+
 /// In-phase fallback decision for one completed agent run (issue #174).
 #[derive(Debug, PartialEq, Eq)]
 enum FallbackDecision {
@@ -3314,6 +3367,21 @@ enum FallbackDecision {
     Exhausted,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FallbackWorkspaceState {
+    head: String,
+    worktree: policy::SampleHash,
+}
+
+async fn capture_fallback_workspace_state(
+    workspace: &workspace::Workspace,
+) -> Result<FallbackWorkspaceState, workspace::WorkspaceError> {
+    Ok(FallbackWorkspaceState {
+        head: workspace::head_sha(workspace).await?,
+        worktree: workspace::sample_workspace_state(workspace.path()).await?,
+    })
+}
+
 /// Classify a completed agent run for in-phase engine fallback and
 /// record the appropriate cooling as a side effect (issue #174,
 /// generalising #170). Two signals warrant falling back to the next
@@ -3328,9 +3396,9 @@ enum FallbackDecision {
 /// A rate-limit no longer terminates outright: credits can run out
 /// mid-run at any phase, and the next chain engine may still be hot, so
 /// we walk to it in-run and only terminate as RateLimited when EVERY
-/// entry is exhausted. Because a failed invocation commits nothing,
-/// re-running on the next engine is safe in every phase, mutating or
-/// not.
+/// entry is exhausted. A mid-response disconnect is ambiguous, so the
+/// caller must prove it left HEAD and the worktree unchanged before it
+/// can take this fallback path.
 #[allow(clippy::too_many_arguments)]
 fn classify_and_record_fallback(
     state: &mut StateFile,
@@ -3341,36 +3409,50 @@ fn classify_and_record_fallback(
     budget: &WallClockBudget,
     attempt: usize,
     chain_len: usize,
+    mid_response_retry_safe: bool,
     log_writer: &mut dyn Write,
 ) -> FallbackDecision {
     if run.exit_code == 0 || budget.exceeded {
         return FallbackDecision::Keep;
     }
-    let rate_limited = policy::is_rate_limit_signature(&run.stderr_tail);
-    // A rate-limit shape wins over an incidental 503 substring so the
-    // longer, parsed cooldown is recorded rather than the 2-minute one.
-    let outage = !rate_limited && policy::is_service_unavailable_signature(&run.stderr_tail);
-    if !rate_limited && !outage {
+    if policy::is_connection_closed_mid_response_signature(&run.stderr_tail)
+        && !mid_response_retry_safe
+    {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: phase `{phase_name}` engine={} disconnected mid-response after the repository state changed or could not be verified; keeping the run on the ordinary crash/recovery path",
+                engine.as_name(),
+            ),
+        );
         return FallbackDecision::Keep;
     }
-    let now = chrono::Utc::now();
-    let signal = if rate_limited {
-        let parsed = chain_walker::parse_cooling_until(engine, &run.stderr_tail, now);
-        if parsed.used_fallback {
-            announce(
-                log_writer,
-                &format!(
-                    "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown for engine={}",
-                    engine.as_name(),
-                ),
-            );
-        }
-        state.record_rate_limit(engine, parsed.cooling_until);
-        "credit/quota exhaustion"
-    } else {
-        state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
-        "a transient backend outage (503/500/504)"
+    let Some(signal) = policy::classify_transient_signal(&run.stderr_tail) else {
+        return FallbackDecision::Keep;
     };
+    let now = chrono::Utc::now();
+    match signal {
+        policy::TransientSignal::RateLimit => {
+            let parsed = chain_walker::parse_cooling_until(engine, &run.stderr_tail, now);
+            if parsed.used_fallback {
+                announce(
+                    log_writer,
+                    &format!(
+                        "bellows: rate-limit stderr had no parseable timestamp; using conservative 5-minute fallback cooldown for engine={}",
+                        engine.as_name(),
+                    ),
+                );
+            }
+            state.record_rate_limit(engine, parsed.cooling_until);
+        }
+        // A never-started engine is cooled exactly like a transient
+        // outage (issue #192): both are momentary, so the short window
+        // is enough to let the chain walk past this engine in-run.
+        policy::TransientSignal::ServiceOutage | policy::TransientSignal::EngineStartFailure => {
+            state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+        }
+    }
+    let signal = signal.log_label();
     let _ = state.save(state_path);
     if attempt + 1 < chain_len {
         announce(
@@ -3471,14 +3553,15 @@ async fn run_analysis_agent_with_fallback(
 /// `render_kickoff`, runs the agent; on a transient backend outage OR a
 /// credit/quota-exhaustion signal it marks the engine cooling and
 /// retries on the next hot chain entry, bounded by the chain length.
-/// Because a failed invocation commits nothing, re-running on a
-/// different engine cannot lose work — safe for the mutating fix phases
-/// as well as the read-only analysis/merger phases. Returns the run the
-/// caller should treat as the phase result plus a
+/// Before dispatch, the helper snapshots HEAD and the worktree. An
+/// ambiguous mid-response disconnect can re-run on another engine only
+/// when the post-run snapshot matches; otherwise it remains an ordinary
+/// crash so mutating fix phases preserve partial work. Returns the run
+/// the caller should treat as the phase result plus a
 /// `terminate_as_rate_limited` flag set only when every chain entry is
 /// exhausted/cooling. The caller owns any commit/push that follows —
-/// capturing HEAD before this call stays valid because failed attempts
-/// leave HEAD untouched.
+/// capturing HEAD before this call stays valid across any disconnect
+/// fallback because those attempts are proven not to have moved HEAD.
 #[allow(clippy::too_many_arguments)]
 async fn run_invocation_with_fallback<F>(
     workspace: &workspace::Workspace,
@@ -3526,6 +3609,11 @@ where
         let entry = picked.entry.clone();
         let auth = auth_for_chain_entry(config, &entry);
         let kickoff = render_kickoff(entry.engine);
+        // Capture before writing the handoff file: `run-agent` deletes
+        // `.bellows-kickoff.md` before the engine starts, while the
+        // isolated worktree sampler deliberately sees all untracked
+        // files regardless of `.git/info/exclude`.
+        let workspace_before = capture_fallback_workspace_state(workspace).await.ok();
         tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), kickoff).await?;
         let run = sandbox::run_agent(
             workspace,
@@ -3545,6 +3633,18 @@ where
         )
         .await?;
         budget.mark_killed_if(run.killed_by_deadline);
+        let mid_response_retry_safe =
+            if policy::is_connection_closed_mid_response_signature(&run.stderr_tail) {
+                match (
+                    workspace_before,
+                    capture_fallback_workspace_state(workspace).await,
+                ) {
+                    (Some(before), Ok(after)) => before == after,
+                    _ => false,
+                }
+            } else {
+                true
+            };
         match classify_and_record_fallback(
             state,
             state_path,
@@ -3554,6 +3654,7 @@ where
             budget,
             attempt,
             chain_len,
+            mid_response_retry_safe,
             log_writer,
         ) {
             FallbackDecision::Keep => {
@@ -5695,6 +5796,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             budget,
             attempt,
             chain_len,
+            true,
             &mut sink,
         )
     }
@@ -5769,6 +5871,243 @@ api_key_env_file = "~/bellows-test-opencode.env"
             decision,
             FallbackDecision::Exhausted,
             "a single-engine chain has nothing to fall back to → retry-later",
+        );
+    }
+
+    /// The result envelope the claude CLI emits when a headless engine
+    /// fails to start: `error_during_execution`, zero turns, zero
+    /// tokens, zero duration (issue #192).
+    const ZERO_TURN_ENVELOPE: &str = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":0,"duration_api_ms":0,"num_turns":0,"total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0}}"#;
+
+    fn classify_for_test_with_log(
+        state: &mut StateFile,
+        run: &sandbox::AgentRun,
+        attempt: usize,
+        chain_len: usize,
+        mid_response_retry_safe: bool,
+    ) -> (FallbackDecision, String) {
+        let state_path = std::env::temp_dir().join("bellows-test-192-state.json");
+        let mut sink = Vec::<u8>::new();
+        let decision = classify_and_record_fallback(
+            state,
+            &state_path,
+            Engine::Codex,
+            "review",
+            run,
+            &fallback_test_budget(),
+            attempt,
+            chain_len,
+            mid_response_retry_safe,
+            &mut sink,
+        );
+        (decision, String::from_utf8(sink).unwrap())
+    }
+
+    #[test]
+    fn classify_fallback_falls_back_on_a_zero_turn_engine_start_failure() {
+        // Issue #192: a never-started engine produced nothing, so an
+        // analysis phase must fall back to the next chain entry rather
+        // than classify the run as a crash.
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
+        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
+        assert_eq!(decision, FallbackDecision::Fallback);
+        assert!(
+            state.engines.contains_key(Engine::Codex.as_name()),
+            "the engine that failed to start must be recorded cooling so the re-pick skips it",
+        );
+        // The run-log line must name this signal distinctly, so an
+        // operator can tell it from a rate-limit or a 503 without
+        // reading the raw tail.
+        assert!(
+            log.contains("start-failure"),
+            "run-log must name the start-failure signal: {log}",
+        );
+        assert!(
+            !log.contains("503") && !log.to_lowercase().contains("quota"),
+            "must not be described as an outage or a rate-limit: {log}",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_falls_back_on_a_mid_stream_connection_loss() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+        );
+        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
+        assert_eq!(decision, FallbackDecision::Fallback);
+        assert!(
+            log.contains("start-failure"),
+            "the mid-stream variant shares the start-failure signal: {log}",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_keeps_a_mid_stream_disconnect_after_workspace_changes() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+        );
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 0, 2, false);
+        assert_eq!(
+            decision,
+            FallbackDecision::Keep,
+            "an ambiguous disconnect after partial work must use ordinary crash recovery",
+        );
+        assert!(
+            state.engines.is_empty(),
+            "an unsafe disconnect must not cool the engine as a zero-turn failure",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_exhausts_on_a_start_failure_at_the_last_chain_entry() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 1, 2, true);
+        assert_eq!(
+            decision,
+            FallbackDecision::Exhausted,
+            "a start-failure on the final chain entry terminates as retry-later, never Crash",
+        );
+    }
+
+    #[test]
+    fn classify_fallback_keeps_a_crash_whose_prose_mentions_the_start_failure_subtype() {
+        // Negative: agent prose quoting the subtype is still a crash.
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "the runner maps subtype error_during_execution onto a crash; 14 turns elapsed",
+        );
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
+        assert_eq!(decision, FallbackDecision::Keep);
+        assert!(state.engines.is_empty());
+    }
+
+    // ---- Issue #192: implement-phase transient-signal routing ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn implement_transient_for_test(
+        state: &mut StateFile,
+        run: &sandbox::AgentRun,
+        forced_engine: bool,
+        at_base_sha: bool,
+        advances_used: u8,
+    ) -> (ImplementTransientDecision, String) {
+        let state_path = std::env::temp_dir().join("bellows-test-192-implement-state.json");
+        let mut sink = Vec::<u8>::new();
+        let decision = classify_and_record_implement_transient(
+            state,
+            &state_path,
+            Engine::Claude,
+            run,
+            &fallback_test_budget(),
+            forced_engine,
+            at_base_sha,
+            advances_used,
+            &mut sink,
+        );
+        (decision, String::from_utf8(sink).unwrap())
+    }
+
+    #[test]
+    fn implement_start_failure_at_base_sha_advances_to_the_next_chain_entry() {
+        // Issue #192: the first chain entry's engine never started, so
+        // the implement phase must in-place-advance to the next hot
+        // entry and re-run from the base commit — NOT fall through to
+        // the implement-crash recovery and finalise as Crash.
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
+        let (decision, log) = implement_transient_for_test(&mut state, &run, false, true, 0);
+        assert_eq!(decision, ImplementTransientDecision::InPlaceAdvance);
+        assert_ne!(
+            decision,
+            ImplementTransientDecision::NotTransient,
+            "a never-started engine must never reach the crash path",
+        );
+        assert!(
+            state.engines.contains_key(Engine::Claude.as_name()),
+            "the engine that failed to start must be recorded cooling",
+        );
+        assert!(
+            log.contains("start-failure"),
+            "run-log must name the start-failure signal distinctly: {log}",
+        );
+        assert!(
+            !log.contains("503") && !log.to_lowercase().contains("rate-limit"),
+            "must not read as an outage or a rate-limit: {log}",
+        );
+    }
+
+    #[test]
+    fn implement_start_failure_gets_no_advance_allowance_of_its_own() {
+        // ADR-0012 / CONTEXT.md: this is a resilience retry, not an
+        // **Advance**, and it draws on no new allowance. The existing
+        // max-one-in-place-advance-per-phase-invocation cap governs, so
+        // a second transient signal in the same invocation terminates.
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
+        let (decision, _log) = implement_transient_for_test(&mut state, &run, false, true, 1);
+        assert_eq!(decision, ImplementTransientDecision::TerminateRetryLater);
+    }
+
+    #[test]
+    fn implement_start_failure_away_from_base_sha_terminates_as_retry_later() {
+        // Exactly what the existing rate-limit / outage signals do: with
+        // commits on the branch there is nothing to re-run from base.
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+        );
+        let (decision, _log) = implement_transient_for_test(&mut state, &run, false, false, 0);
+        assert_eq!(decision, ImplementTransientDecision::TerminateRetryLater);
+    }
+
+    #[test]
+    fn implement_start_failure_under_a_forced_engine_terminates_without_advancing() {
+        // A forced engine bypasses chain walking; unchanged by #192.
+        let mut state = StateFile::default();
+        let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
+        let (decision, _log) = implement_transient_for_test(&mut state, &run, true, true, 0);
+        assert_eq!(decision, ImplementTransientDecision::TerminateRetryLater);
+    }
+
+    #[test]
+    fn implement_crash_whose_prose_mentions_the_subtype_still_reaches_the_crash_path() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "I looked at error_during_execution handling, then panicked at src/lib.rs:1:1",
+        );
+        let (decision, _log) = implement_transient_for_test(&mut state, &run, false, true, 0);
+        assert_eq!(decision, ImplementTransientDecision::NotTransient);
+        assert!(state.engines.is_empty());
+    }
+
+    #[test]
+    fn implement_rate_limit_still_records_its_parsed_cooldown() {
+        // No-regression on the pre-#192 shape: a rate-limit keeps its
+        // parsed (long) cooldown rather than the short transient one.
+        let mut state = StateFile::default();
+        let reset = chrono::Utc::now() + chrono::Duration::hours(3);
+        let run = agent_run_with(
+            1,
+            &format!(
+                "API Error: {{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\"}}}}\nClaude AI usage limit reached|{}",
+                reset.timestamp(),
+            ),
+        );
+        let (decision, _log) = implement_transient_for_test(&mut state, &run, false, true, 0);
+        assert_eq!(decision, ImplementTransientDecision::InPlaceAdvance);
+        let cooling = state.engines[Engine::Claude.as_name()].cooling_until.unwrap();
+        assert!(
+            cooling > chrono::Utc::now() + chrono::Duration::hours(2),
+            "the parsed rate-limit cooldown must survive the refactor: {cooling}",
         );
     }
 

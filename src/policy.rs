@@ -741,6 +741,156 @@ pub fn is_service_unavailable_signature(text: &str) -> bool {
     SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
+/// Whether `text` carries the signature of an **Engine** that never
+/// produced a turn — it failed to start, or lost its connection before
+/// the first turn completed (issue #192).
+///
+/// Two shapes reported by engines:
+///   - the zero-turn result envelope (see
+///     [`is_zero_turn_result_envelope_signature`]);
+///   - the mid-stream connection loss (see
+///     [`is_connection_closed_mid_response_signature`]).
+///
+/// A zero-turn envelope is a *resilience retry* signal, not an
+/// **Advance** (ADR-0012 / `CONTEXT.md`). A mid-stream connection loss
+/// is retryable only when the runner separately proves that HEAD and the
+/// worktree are unchanged; the phrase alone does not prove that the
+/// engine produced no turn.
+pub fn is_engine_start_failure_signature(text: &str) -> bool {
+    is_zero_turn_result_envelope_signature(text) || is_connection_closed_mid_response_signature(text)
+}
+
+/// The zero-turn start-failure shape (issue #192): a headless engine
+/// that fails to start exits non-zero having done nothing, and the
+/// claude CLI reports the run as a result envelope with subtype
+/// `error_during_execution`, a turn count of zero, zero input/output
+/// tokens and a zero duration. Witnessed six times in the 2026-07-25 →
+/// 2026-07-28 window on `marad2001/workboard-financial-advice`.
+///
+/// Composite (the subtype AND a zero turn count) rather than a bare
+/// substring, for two reasons. The subtype string alone can appear in
+/// agent prose — a review agent quoting this very code path would trip
+/// it. And a result envelope carrying *real* turns is a genuine crash:
+/// the engine ran, may have committed, and the implement-crash recovery
+/// (issue #49) is the right destination for it. Only a zero turn count
+/// says the engine never started.
+///
+/// Matches case-insensitively; accepts the JSON (`"num_turns":0`) and
+/// pretty-printed (`num_turns: 0`, `num_turns = 0`) renderings, since
+/// what reaches the stderr tail depends on the CLI's output format.
+pub fn is_zero_turn_result_envelope_signature(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("error_during_execution") && has_zero_valued_field(&lower, "num_turns")
+}
+
+/// The mid-stream variant of the same class (issue #192, observed on
+/// `workboard-financial-advice` #671): the engine starts, then loses
+/// its connection to the backend and reports
+/// `API Error: Connection closed mid-response. The response above may
+/// be incomplete.` Documented sibling of
+/// [`is_zero_turn_result_envelope_signature`] rather than a case of it,
+/// because there is no result envelope to read a turn count from.
+///
+/// Matches case-insensitively on the full phrase — `connection closed`
+/// alone would false-positive on ordinary networking prose, so the
+/// `mid-response` qualifier is required, the same conservatism
+/// `is_service_unavailable_signature` applies to a bare status phrase.
+pub fn is_connection_closed_mid_response_signature(text: &str) -> bool {
+    text.to_lowercase().contains("connection closed mid-response")
+}
+
+/// Whether `lower` (already lowercased) contains `field` as a complete
+/// key in a `key: value` position whose value is zero. Tolerates the
+/// JSON (`"num_turns":0`), spaced (`num_turns: 0`) and assignment
+/// (`num_turns = 0`) renderings, and requires the value to be exactly
+/// zero — `0` matches, `10` and `0.5` do not. Identifier characters
+/// before `field` are rejected so keys such as `minimum_num_turns` do
+/// not masquerade as the requested field.
+fn has_zero_valued_field(lower: &str, field: &str) -> bool {
+    lower.match_indices(field).any(|(idx, _)| {
+        if lower[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+
+        let rest = lower[idx + field.len()..].trim_start_matches(['"', '\'']);
+        let Some(value) = rest
+            .strip_prefix(':')
+            .or_else(|| rest.strip_prefix('='))
+            .map(str::trim_start)
+        else {
+            return false;
+        };
+        let mut digits = value.chars();
+        digits.next() == Some('0')
+            && !digits
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '.')
+    })
+}
+
+/// A transient, non-crash signal carried by a completed agent run —
+/// the shapes that mean "this engine could not do the work now", as
+/// opposed to "this engine did the work and it went wrong". Every
+/// variant routes to the same response: mark the engine cooling and
+/// hand the phase to the next hot chain entry.
+///
+/// Per ADR-0012 none of these is an **Advance**: the phase produced
+/// nothing, so nothing is discarded and no operator is summoned. They
+/// draw on no advance allowance of their own — the implement phase's
+/// existing max-one-in-place-advance-per-phase-invocation cap governs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientSignal {
+    /// Credit/quota exhaustion. Carries the parsed (or 5-minute
+    /// fallback) cooldown so the exhausted engine is skipped on the
+    /// next claim too.
+    RateLimit,
+    /// A momentary upstream outage (503/500/504 / high demand).
+    ServiceOutage,
+    /// The **Engine** never produced a turn — it failed to start, or
+    /// lost its connection mid-stream (issue #192).
+    EngineStartFailure,
+}
+
+impl TransientSignal {
+    /// How this signal reads in the run log. Each variant is worded
+    /// distinctly so an operator can tell which occurred without
+    /// reading the raw stderr tail.
+    pub fn log_label(self) -> &'static str {
+        match self {
+            TransientSignal::RateLimit => "a credit/quota exhaustion (rate limit)",
+            TransientSignal::ServiceOutage => "a transient backend outage (503/500/504)",
+            TransientSignal::EngineStartFailure => {
+                "a zero-turn engine start-failure (the engine never started, \
+                 or lost its connection mid-stream)"
+            }
+        }
+    }
+}
+
+/// Classify a failed run's stderr tail into the transient signal it
+/// carries, if any. `None` means a genuine crash — the caller keeps the
+/// run and classifies it as it always has.
+///
+/// Precedence is by cooling cost: a rate-limit shape wins over an
+/// incidental 503 substring so the longer, parsed cooldown is recorded
+/// rather than the short one, and either outage shape wins over a
+/// start-failure for the same reason.
+pub fn classify_transient_signal(text: &str) -> Option<TransientSignal> {
+    if is_rate_limit_signature(text) {
+        Some(TransientSignal::RateLimit)
+    } else if is_service_unavailable_signature(text) {
+        Some(TransientSignal::ServiceOutage)
+    } else if is_engine_start_failure_signature(text) {
+        Some(TransientSignal::EngineStartFailure)
+    } else {
+        None
+    }
+}
+
 /// Whether `text` carries the signature of a process killed by the
 /// kernel rather than one that ran and reported a verdict (issue #186).
 ///
