@@ -32,6 +32,10 @@ _Avoid_: Thrash, flapping, churn.
 The shape of **Stall** in which the workspace is unchanged for a prolonged stretch. Ambiguous by nature — indistinguishable from an **Engine** reasoning about a hard problem, or one that has finished and is about to exit. Recorded for the operator, never acted on.
 _Avoid_: Hang, freeze, timeout, inactivity.
 
+**Transport Failure**:
+A failure of the connection between bellows and the Docker daemon — the connection dropped, or the daemon never answered — as opposed to any answer the daemon or a container gave. Bellows learns nothing about the operation it asked for, so a transport failure is the one sandbox error it re-issues: `sandbox::is_transport_failure` names the Bollard variants that qualify, and `run_container` re-attempts the whole container lifecycle a bounded number of times inside the phase's wall-clock budget. A container that started and exited non-zero is never one of these — that is a verdict about the code, and re-running it would re-bill the phase that produced it. Unrelated to **Advance**: the engine, the workspace and the phase are all unchanged.
+_Avoid_: Docker error, daemon crash, flake (the first is too broad, the last two claim a cause bellows cannot see).
+
 ### Run quality
 
 **Correction**:

@@ -635,7 +635,7 @@ async fn prune_cmd(
     target: Option<String>,
     registry: bool,
 ) -> Result<()> {
-    let docker = bollard::Docker::connect_with_local_defaults()
+    let docker = sandbox::connect_docker()
         .context("connect to local docker daemon")?;
 
     if let Some(slug) = target {
@@ -1078,7 +1078,7 @@ async fn kill_cmd(config_path: &PathBuf, target: &str) -> Result<()> {
     // currently up (transient gap between phases) — still proceed to
     // the GitHub-side transition; the running orchestrator will detect
     // the label flip in its next finalise pass.
-    let docker = bollard::Docker::connect_with_local_defaults()
+    let docker = sandbox::connect_docker()
         .context("connect to local docker daemon")?;
     let container_ids =
         sandbox::find_containers_for_issue(&docker, &resolved.repo_label, issue)
@@ -1876,7 +1876,7 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
     // Per-orphan lines are routed through `log()` so the operator
     // running bellows interactively sees *which* container was cleaned
     // up, not just the summary count.
-    match bollard::Docker::connect_with_local_defaults() {
+    match sandbox::connect_docker() {
         Ok(docker) => {
             match sandbox::cleanup_orphan_containers(&docker, &mut log_file).await {
                 Ok(lines) if lines.is_empty() => log(

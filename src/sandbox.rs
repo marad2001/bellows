@@ -265,6 +265,200 @@ pub enum SandboxError {
     AuthEnv(#[source] anyhow::Error),
 }
 
+/// How long a single Docker API request may wait for the daemon's
+/// response headers before bollard gives up with
+/// `RequestTimeoutError` (issue #194). Tighter than bollard's
+/// two-minute default so a daemon that has stopped answering becomes a
+/// *retryable* error in bounded time rather than an open-ended wait.
+///
+/// This bounds the wait for the response to arrive, not the lifetime
+/// of the body that follows it (bollard applies it around the request
+/// future in `execute_request`, then streams the body separately), so
+/// a container that runs for hours, and the `follow=true` log stream
+/// attached to it, are unaffected.
+const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The one place bellows builds a Docker client. Local-defaults
+/// connector (unix socket / named pipe, or `DOCKER_HOST` when set),
+/// plus the [`DAEMON_REQUEST_TIMEOUT`] every call inherits. Building a
+/// client does not touch the daemon — a failure here is a malformed
+/// `DOCKER_HOST` or a missing socket path, not an unreachable daemon.
+pub fn connect_docker() -> Result<Docker, SandboxError> {
+    Ok(with_daemon_timeout(Docker::connect_with_local_defaults()?))
+}
+
+/// Apply [`DAEMON_REQUEST_TIMEOUT`] to a client. Split out from
+/// [`connect_docker`] so the bound is testable without a live daemon
+/// socket — the sandbox the gate runs in has no `/var/run/docker.sock`.
+fn with_daemon_timeout(docker: Docker) -> Docker {
+    docker.with_timeout(DAEMON_REQUEST_TIMEOUT)
+}
+
+/// How many times one container lifecycle may be attempted against a
+/// daemon that keeps dropping the connection (issue #194). Small on
+/// purpose: a dropped socket is usually a momentary blip and comes
+/// back on the next attempt, while a daemon that fails three attempts
+/// in a row is sick in a way bellows cannot fix by asking again.
+const DAEMON_TRANSPORT_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff before the second attempt; the third waits twice this. Kept
+/// short — the daemon is a local process, so there is no far-end
+/// recovery to wait out, only the moment it takes for a restarted or
+/// briefly-wedged daemon to accept connections again.
+const DAEMON_TRANSPORT_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// How hard bellows tries a container lifecycle against a daemon that
+/// keeps dropping the connection. A parameter of `run_container`
+/// rather than a pair of constants read inline so the lifecycle tests
+/// can exercise the real attempt accounting without spending the real
+/// backoff seconds.
+#[derive(Debug, Clone, Copy)]
+struct TransportRetryPolicy {
+    max_attempts: u32,
+    backoff_base: Duration,
+}
+
+impl Default for TransportRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DAEMON_TRANSPORT_MAX_ATTEMPTS,
+            backoff_base: DAEMON_TRANSPORT_BACKOFF_BASE,
+        }
+    }
+}
+
+/// Why a transport retry was not attempted. Both outcomes surface the
+/// original error unchanged; the distinction is for the operator
+/// reading the log — a sick daemon (`AttemptsExhausted`) and a phase
+/// that simply ran out of clock (`BudgetExhausted`) call for different
+/// follow-ups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryStop {
+    AttemptsExhausted,
+    BudgetExhausted,
+}
+
+/// Time left in this container run's wall-clock budget after `elapsed`.
+/// `None` in, `None` out — an unbudgeted run stays unbudgeted across
+/// retries. An overrun clamps to zero rather than wrapping.
+fn remaining_budget(budget: Option<Duration>, elapsed: Duration) -> Option<Duration> {
+    budget.map(|b| b.saturating_sub(elapsed))
+}
+
+/// How long to wait before attempt `attempt + 1`, or why there will
+/// not be one. `attempt` is the 1-based number of the attempt that
+/// just failed.
+///
+/// The budget check is what keeps the retry allowance inside the
+/// phase's wall-clock budget rather than on top of it: the backoff has
+/// to fit in what is left, and the retried attempt then inherits the
+/// remainder as its own deadline (see `run_container`).
+fn next_retry_delay(
+    attempt: u32,
+    policy: TransportRetryPolicy,
+    budget: Option<Duration>,
+    elapsed: Duration,
+) -> Result<Duration, RetryStop> {
+    if attempt >= policy.max_attempts {
+        return Err(RetryStop::AttemptsExhausted);
+    }
+    let delay = policy.backoff_base * 2u32.pow(attempt - 1);
+    match remaining_budget(budget, elapsed) {
+        Some(remaining) if remaining <= delay => Err(RetryStop::BudgetExhausted),
+        _ => Ok(delay),
+    }
+}
+
+/// The line an operator reads when bellows is about to retry a dropped
+/// daemon connection. Names the attempt and the bound so repeated
+/// retries read as a sick daemon rather than as a long silence, and
+/// quotes the error verbatim so the eventual failure and the retries
+/// that preceded it are greppable by the same string.
+fn format_daemon_retry_log(
+    attempt: u32,
+    max_attempts: u32,
+    err: &SandboxError,
+    delay: Duration,
+) -> String {
+    format!(
+        "bellows: docker daemon transport failure (attempt {attempt}/{max_attempts}): {err}; \
+         retrying in {}s",
+        delay.as_secs(),
+    )
+}
+
+/// The closing line of a retry sequence that gave up. The error itself
+/// is returned unchanged to the caller — this line only records *why*
+/// bellows stopped asking, which the error alone cannot say.
+fn format_daemon_retry_stop_log(
+    attempt: u32,
+    max_attempts: u32,
+    err: &SandboxError,
+    stop: RetryStop,
+) -> String {
+    let reason = match stop {
+        RetryStop::AttemptsExhausted => "retries exhausted".to_string(),
+        RetryStop::BudgetExhausted => {
+            "no wall-clock budget left to retry within".to_string()
+        }
+    };
+    format!(
+        "bellows: docker daemon transport failure (attempt {attempt}/{max_attempts}): {err}; \
+         {reason}",
+    )
+}
+
+/// Whether a Bollard error is a failure of the *transport* between
+/// bellows and the Docker daemon, rather than an answer either the
+/// daemon or a container has already given (issue #194).
+///
+/// This is the retry predicate: a transport failure means bellows never
+/// learned anything about the operation it asked for, so re-issuing it
+/// is the only way to find out. Everything else — including every
+/// verdict about the code under test — is surfaced unchanged.
+///
+/// Retryable, with the error text that motivated each:
+///   - [`IOError`](bollard::errors::Error::IOError): the connection to
+///     the daemon dropped mid-request. Observed verbatim on seven runs
+///     aborted in the 2026-07-25 → 2026-07-28 window on
+///     `marad2001/workboard-financial-advice` (#39, #46, #280, #314,
+///     #672, #675) as `error reading a body from connection`, a
+///     `std::io::ErrorKind::Other` custom error. Covers the writer-side
+///     half (`BrokenPipe`, `ConnectionReset`) of the same drop.
+///   - [`RequestTimeoutError`](bollard::errors::Error::RequestTimeoutError):
+///     the daemon never answered within the client timeout (see
+///     [`DAEMON_REQUEST_TIMEOUT`]). The eighth abort in that window.
+///   - [`HyperResponseError`](bollard::errors::Error::HyperResponseError)
+///     and [`HyperLegacyError`](bollard::errors::Error::HyperLegacyError):
+///     the same class one layer down, when hyper reports the connection
+///     failure before bollard maps it to an IO error. Not observed in
+///     the aborted runs, but indistinguishable in kind — a dropped
+///     socket surfaces as whichever layer noticed first.
+///
+/// Deliberately NOT retryable:
+///   - [`DockerContainerWaitError`](bollard::errors::Error::DockerContainerWaitError):
+///     a container that started and exited non-zero. That is a verdict
+///     about the code, not about the connection; retrying it would
+///     re-run the cargo gate and re-bill the agent phase. `run_container`
+///     already un-wraps this variant back into a plain exit code, so it
+///     never reaches the retry loop as an error — the predicate says no
+///     a second time so a future caller can't get it wrong.
+///   - [`DockerResponseServerError`](bollard::errors::Error::DockerResponseServerError):
+///     the daemon received the request and replied. The transport
+///     worked; re-sending gets the same answer.
+///   - Everything else (JSON decode failures, URL/encoding errors,
+///     certificate problems): deterministic, so a retry cannot help.
+pub fn is_transport_failure(err: &bollard::errors::Error) -> bool {
+    use bollard::errors::Error;
+    matches!(
+        err,
+        Error::IOError { .. }
+            | Error::RequestTimeoutError
+            | Error::HyperResponseError { .. }
+            | Error::HyperLegacyError { .. }
+    )
+}
+
 /// List every regular filename in the named deploy-keys volume (issue
 /// #69 / ADR-0002 startup validation). Spawns a one-shot policy-image
 /// container with the volume mounted read-only and runs `ls -1A`
@@ -346,7 +540,17 @@ pub async fn ensure_policy_image() -> Result<String, SandboxError> {
     Ok(image_tag)
 }
 
+/// Write one bellows line to both the console and the run log, the way
+/// the runner's own `announce` does — the operator watching the console
+/// and the operator reading `bellows.log` see the same line.
+fn announce(line: &str, log_writer: &mut dyn Write) {
+    println!("{line}");
+    let _ = writeln!(log_writer, "{line}");
+    let _ = log_writer.flush();
+}
+
 /// How the lifecycle helper should retain the container's stdout/stderr.
+#[derive(Debug, Clone, Copy)]
 enum CaptureMode {
     /// Keep at most this many bytes of the most-recent output (used for
     /// the agent run's failure-log tail).
@@ -384,6 +588,7 @@ impl Captured {
     }
 }
 
+#[derive(Debug)]
 struct ContainerOutcome {
     exit_code: i64,
     captured: String,
@@ -439,11 +644,7 @@ async fn observe_stall(
             },
         ),
     };
-    // Same shape as the runner's `announce`: the operator watching the
-    // console and the operator reading bellows.log see the same line.
-    println!("{line}");
-    let _ = writeln!(log_writer, "{line}");
-    let _ = log_writer.flush();
+    announce(&line, log_writer);
     Some(StallObservation { shape, kill })
 }
 
@@ -454,7 +655,90 @@ struct StallObservation {
     kill: bool,
 }
 
-/// Run a container through its full lifecycle: create, start, stream
+/// Run a container through its full lifecycle, retrying the whole
+/// lifecycle a bounded number of times when the *connection to the
+/// daemon* fails (issue #194).
+///
+/// A transport failure is not a result — bellows asked the daemon a
+/// question and never got an answer, so it knows nothing about what
+/// the container did (in the observed aborts, it had not started doing
+/// anything). Re-asking is the only way to find out, and the retry
+/// covers every daemon call the lifecycle makes: create, start, attach
+/// to the log stream, and wait. Which errors qualify is
+/// [`is_transport_failure`]; everything else — above all a container
+/// that started and exited non-zero, which never surfaces as an error
+/// here at all (see the `DockerContainerWaitError` arm below) — is
+/// returned to the caller untouched on the first try.
+///
+/// Retries are spent *inside* `deadline`, never on top of it: each
+/// attempt inherits what is left of the budget, and a backoff that
+/// would not fit stops the sequence. When the retries run out the
+/// original error is returned unchanged, so the operator diagnoses the
+/// daemon rather than a bellows wrapper.
+///
+/// A failed attempt that got as far as creating a container removes it
+/// before the next attempt starts (the force-remove in
+/// `run_container_once`'s tail runs on every path). The one container
+/// that can outlive an attempt is one the daemon created but whose
+/// create *response* was lost — bellows never learned its id. That one
+/// is reconciled by `cleanup_orphan_containers` at the next `bellows
+/// run` startup, which is why that sweep matches `created` as well as
+/// `exited` containers.
+async fn run_container(
+    docker: &Docker,
+    config: ContainerCreateBody,
+    log_writer: &mut dyn Write,
+    capture_mode: CaptureMode,
+    deadline: Option<Duration>,
+    stall_watch: Option<StallWatch>,
+    retry: TransportRetryPolicy,
+) -> Result<ContainerOutcome, SandboxError> {
+    let started = std::time::Instant::now();
+    let mut attempt = 1u32;
+    loop {
+        let attempt_deadline = remaining_budget(deadline, started.elapsed());
+        let err = match run_container_once(
+            docker,
+            config.clone(),
+            log_writer,
+            capture_mode,
+            attempt_deadline,
+            stall_watch.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => err,
+        };
+
+        let transport = matches!(&err, SandboxError::Bollard(e) if is_transport_failure(e));
+        if !transport {
+            return Err(err);
+        }
+
+        match next_retry_delay(attempt, retry, deadline, started.elapsed()) {
+            Ok(delay) => {
+                announce(
+                    &format_daemon_retry_log(attempt, retry.max_attempts, &err, delay),
+                    log_writer,
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(stop) => {
+                announce(
+                    &format_daemon_retry_stop_log(attempt, retry.max_attempts, &err, stop),
+                    log_writer,
+                );
+                // The original error, with no bellows wrapper around
+                // it: the operator diagnoses the daemon's own words.
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// One attempt at the container lifecycle: create, start, stream
 /// stdout/stderr to `log_writer` while capturing per `capture_mode`,
 /// wait for exit, force-remove. Container is removed even on error.
 ///
@@ -462,18 +746,19 @@ struct StallObservation {
 /// error — the caller (run_agent / run_cargo_checks) and ultimately
 /// policy::classify_exit decide what a non-zero exit means.
 ///
-/// `deadline` is the wall-clock budget for THIS container run. When
-/// `Some` and the deadline fires before the container exits, the
-/// container is killed (SIGKILL) and `killed_by_deadline` is set. When
-/// `None`, the container runs to natural completion regardless of
-/// elapsed time.
+/// `deadline` is the wall-clock budget for THIS attempt — what
+/// `run_container` has left of the container run's budget after any
+/// earlier attempts. When `Some` and the deadline fires before the
+/// container exits, the container is killed (SIGKILL) and
+/// `killed_by_deadline` is set. When `None`, the container runs to
+/// natural completion regardless of elapsed time.
 ///
 /// `stall_watch` (issue #164) opts this run into periodic **Stall**
 /// sampling of the bind-mounted workspace. It cooperates with the log
 /// stream rather than replacing it: sampling is a third branch of the
 /// same `select!`, so logs keep streaming while bellows watches for a
 /// wedged engine.
-async fn run_container(
+async fn run_container_once(
     docker: &Docker,
     config: ContainerCreateBody,
     log_writer: &mut dyn Write,
@@ -652,7 +937,7 @@ pub async fn run_agent(
 
     let image_tag = ensure_policy_image().await?;
 
-    let docker = Docker::connect_with_local_defaults()?;
+    let docker = connect_docker()?;
     let run_id = Uuid::new_v4().to_string();
 
     // tempfile gives an absolute path already; canonicalize() on Windows
@@ -700,6 +985,7 @@ pub async fn run_agent(
         CaptureMode::BoundedTail(OUTPUT_TAIL_CAP_BYTES),
         deadline,
         stall_watch,
+        TransportRetryPolicy::default(),
     )
     .await?;
 
@@ -773,7 +1059,7 @@ pub async fn run_cargo_checks(
 ) -> Result<CargoChecksRun, SandboxError> {
     let image_tag = ensure_policy_image().await?;
 
-    let docker = Docker::connect_with_local_defaults()?;
+    let docker = connect_docker()?;
     let run_id = Uuid::new_v4().to_string();
 
     let workspace_path = workspace.path().to_string_lossy().to_string();
@@ -833,8 +1119,16 @@ pub async fn run_cargo_checks(
     // file ⇒ raise CargoChecksScriptCrashed instead of silently passing.
     // The cargo-checks gate is bellows' own container, not an agent's
     // — there is no engine to stall, so no sampling.
-    let outcome =
-        run_container(&docker, config, log_writer, CaptureMode::Full, deadline, None).await?;
+    let outcome = run_container(
+        &docker,
+        config,
+        log_writer,
+        CaptureMode::Full,
+        deadline,
+        None,
+        TransportRetryPolicy::default(),
+    )
+    .await?;
 
     let workspace_path = workspace.path();
     let clippy_output = read_and_remove(workspace_path.join(CARGO_CLIPPY_OUTPUT_FILE))
@@ -1271,7 +1565,17 @@ fn build_orphan_container_filter() -> HashMap<String, Vec<String>> {
         "label".to_string(),
         vec![format!("{}=true", BELLOWS_MANAGED_LABEL)],
     );
-    filters.insert("status".to_string(), vec!["exited".to_string()]);
+    // `exited` is the ordinary orphan: a container that ran and whose
+    // bellows process died before removing it. `created` (issue #194)
+    // is the transport-failure orphan: the daemon created a container
+    // and the create *response* was lost, so bellows never learned the
+    // id and its own retry could not remove it. Both are safe to
+    // force-remove; `running` is deliberately absent so the pre-claim
+    // probe can still report a live container as Blocked.
+    filters.insert(
+        "status".to_string(),
+        vec!["exited".to_string(), "created".to_string()],
+    );
     filters
 }
 
@@ -1291,7 +1595,7 @@ impl DockerContainerProbe {
     /// Build a probe wired to the local Docker daemon — same connection
     /// style every other `sandbox.rs` daemon call uses.
     pub fn new() -> Result<Self, SandboxError> {
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = connect_docker()?;
         Ok(Self { docker })
     }
 }
@@ -1584,6 +1888,445 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// The production retry bound with the backoff collapsed, so the
+    /// lifecycle tests exercise the real attempt accounting without
+    /// spending the real seconds.
+    fn fast_retry_policy() -> TransportRetryPolicy {
+        TransportRetryPolicy {
+            backoff_base: Duration::from_millis(10),
+            ..TransportRetryPolicy::default()
+        }
+    }
+
+    /// A wiremock-backed Docker client whose request timeout is short
+    /// enough that a deliberately-delayed mock response surfaces as
+    /// bollard's `RequestTimeoutError` — one of the two transport
+    /// shapes observed aborting real runs.
+    fn mock_docker(mock: &MockServer) -> Docker {
+        Docker::connect_with_http(&mock.uri(), 1, bollard::API_DEFAULT_VERSION)
+            .expect("mock Docker connection")
+    }
+
+    /// Longer than `mock_docker`'s request timeout, so any response
+    /// carrying this delay is never received.
+    const UNANSWERED: Duration = Duration::from_secs(30);
+
+    async fn mount_successful_lifecycle(mock: &MockServer, container_id: &str, exit_code: i64) {
+        Mock::given(method("POST"))
+            .and(path(format!("/containers/{container_id}/start")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/containers/{container_id}/logs")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::new()))
+            .mount(mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/containers/{container_id}/wait")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "StatusCode": exit_code })),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dropped_daemon_connection_is_retried_and_the_run_continues() {
+        // Issue #194. Seven runs died here: the daemon connection went
+        // away moments after the phase started, before the container
+        // had produced anything, and the whole run aborted. One retry
+        // is all it takes for the phase to go on.
+        let mock = MockServer::start().await;
+        let container_id = "aaaaaaaaaaaa1111111111111111111111111111111111111111111111111111";
+
+        // Attempt 1: the daemon never answers the create.
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_delay(UNANSWERED))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+        // Attempt 2: the daemon is back.
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                json!({ "Id": container_id, "Warnings": [] }),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        mount_successful_lifecycle(&mock, container_id, 0).await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/containers/{container_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut log = Vec::new();
+        let outcome = run_container(
+            &mock_docker(&mock),
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            None,
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect("a transport failure must not abort the run");
+
+        assert_eq!(outcome.exit_code, 0);
+        let log = String::from_utf8(log).expect("log is utf8");
+        assert!(
+            log.contains("(attempt 1/3)"),
+            "the retry must be visible in the run log: {log}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_attempt_removes_the_container_it_already_created() {
+        // Issue #194 AC: a retry must not leave an orphan behind. When
+        // the connection drops *after* the create succeeded, bellows
+        // knows the container's id, and the force-remove in the
+        // lifecycle's tail reconciles it before the next attempt — no
+        // waiting for the next startup sweep.
+        let mock = MockServer::start().await;
+        let abandoned = "cccccccccccc3333333333333333333333333333333333333333333333333333";
+        let replacement = "dddddddddddd4444444444444444444444444444444444444444444444444444";
+
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                json!({ "Id": abandoned, "Warnings": [] }),
+            ))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+        // ...and then the daemon stops answering, mid-lifecycle.
+        Mock::given(method("POST"))
+            .and(path(format!("/containers/{abandoned}/start")))
+            .respond_with(ResponseTemplate::new(204).set_delay(UNANSWERED))
+            .mount(&mock)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/containers/{abandoned}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1) // the orphan is reconciled by the attempt itself
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                json!({ "Id": replacement, "Warnings": [] }),
+            ))
+            .mount(&mock)
+            .await;
+        mount_successful_lifecycle(&mock, replacement, 0).await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/containers/{replacement}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut log = Vec::new();
+        let outcome = run_container(
+            &mock_docker(&mock),
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            None,
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect("the retry should complete the lifecycle");
+
+        assert_eq!(outcome.exit_code, 0);
+        // Expectations verified when `mock` drops: exactly one DELETE
+        // for the abandoned container and one for its replacement.
+    }
+
+    #[tokio::test]
+    async fn a_container_that_exited_non_zero_is_never_retried() {
+        // The distinction the whole retry rests on. Bollard reports a
+        // non-zero container exit as DockerContainerWaitError, which
+        // *looks* like an error and is in fact a verdict about the code
+        // under test. Retrying it would silently re-run the cargo gate
+        // and re-bill the agent phase that produced it — so the
+        // lifecycle is attempted exactly once and the exit code comes
+        // back as data.
+        let mock = MockServer::start().await;
+        let container_id = "bbbbbbbbbbbb2222222222222222222222222222222222222222222222222222";
+
+        Mock::given(method("POST"))
+            .and(path("/containers/create"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                json!({ "Id": container_id, "Warnings": [] }),
+            ))
+            .expect(1) // exactly one attempt — verified on drop
+            .mount(&mock)
+            .await;
+        mount_successful_lifecycle(&mock, container_id, 1).await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/containers/{container_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut log = Vec::new();
+        let outcome = run_container(
+            &mock_docker(&mock),
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            None,
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect("a non-zero exit is data, not a sandbox error");
+
+        assert_eq!(outcome.exit_code, 1, "the verdict must reach the caller");
+        let log = String::from_utf8(log).expect("log is utf8");
+        assert!(
+            !log.contains("attempt"),
+            "a failing container must not be narrated as a transport retry: {log}",
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_transport_retries_surface_the_original_error_unchanged() {
+        // A daemon that is down stays down: bellows tries the bound,
+        // narrates every attempt, and then hands the operator the
+        // daemon's own error rather than a bellows wrapper around it.
+        // Pointed at a closed port, so every attempt fails at the
+        // transport with no timing dependency.
+        let closed_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            listener.local_addr().expect("addr")
+            // dropped here — nothing is listening on that port now
+        };
+        let docker = Docker::connect_with_http(
+            &format!("http://{closed_addr}"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("client construction does not connect");
+
+        let mut log = Vec::new();
+        let err = run_container(
+            &docker,
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            None,
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect_err("an unreachable daemon must still fail the run");
+
+        let SandboxError::Bollard(inner) = &err else {
+            panic!("expected the bollard error to survive the retry loop, got {err:?}");
+        };
+        assert!(
+            is_transport_failure(inner),
+            "an unreachable daemon must be classified as a transport failure: {inner:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("docker: {inner}"),
+            "the error chain the operator sees must be unchanged by retrying",
+        );
+
+        let log = String::from_utf8(log).expect("log is utf8");
+        for attempt in 1..=3 {
+            assert!(
+                log.contains(&format!("(attempt {attempt}/3)")),
+                "attempt {attempt} must be visible in the run log: {log}",
+            );
+        }
+        assert!(
+            log.to_lowercase().contains("retries exhausted"),
+            "the operator must see the bound was reached: {log}",
+        );
+    }
+
+    #[test]
+    fn the_daemon_client_bounds_how_long_a_wedged_daemon_can_stall_a_request() {
+        // Issue #194. The retry can only start once the failing request
+        // gives up, so the client-level timeout is what turns "the
+        // daemon stopped answering" into a retryable error in bounded
+        // time instead of an open-ended wait. Bollard's own default is
+        // two minutes; bellows asks for less.
+        // Built against a URL rather than via `connect_docker` because
+        // the container this gate runs in has no docker socket;
+        // `connect_docker` is that same call plus this one line.
+        let docker = with_daemon_timeout(
+            Docker::connect_with_http("http://127.0.0.1:2375", 120, bollard::API_DEFAULT_VERSION)
+                .expect("client construction does not connect"),
+        );
+
+        assert_eq!(docker.timeout(), DAEMON_REQUEST_TIMEOUT);
+        assert!(
+            DAEMON_REQUEST_TIMEOUT < Duration::from_secs(120),
+            "the point of setting a timeout is to be tighter than bollard's default",
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_are_not_attempted_once_the_wall_clock_budget_is_spent() {
+        // The retry allowance is spent inside the phase's wall-clock
+        // budget, never on top of it: a phase with a millisecond left
+        // fails immediately rather than buying three more attempts and
+        // two backoffs of runway.
+        let closed_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            listener.local_addr().expect("addr")
+        };
+        let docker = Docker::connect_with_http(
+            &format!("http://{closed_addr}"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("client construction does not connect");
+
+        let mut log = Vec::new();
+        run_container(
+            &docker,
+            ContainerCreateBody::default(),
+            &mut log,
+            CaptureMode::Full,
+            Some(Duration::from_millis(1)),
+            None,
+            fast_retry_policy(),
+        )
+        .await
+        .expect_err("an unreachable daemon still fails");
+
+        let log = String::from_utf8(log).expect("log is utf8");
+        assert!(
+            log.contains("(attempt 1/3)") && !log.contains("(attempt 2/3)"),
+            "the first failure must end the sequence when the budget is spent: {log}",
+        );
+        assert!(
+            log.contains("wall-clock"),
+            "the operator must see that the clock, not the daemon, stopped the retries: {log}",
+        );
+    }
+
+    #[test]
+    fn retry_log_line_carries_the_attempt_number_the_bound_and_the_cause() {
+        // A genuinely sick daemon must read as repeated retries in
+        // bellows.log, not as a long silence — so the line names the
+        // attempt, the bound, how long bellows is about to wait, and
+        // the error verbatim.
+        let err = SandboxError::Bollard(bollard::errors::Error::IOError {
+            err: std::io::Error::other("error reading a body from connection"),
+        });
+        let line = format_daemon_retry_log(1, 3, &err, Duration::from_secs(2));
+
+        assert!(line.contains("1/3"), "missing attempt/bound: {line}");
+        assert!(
+            line.contains("error reading a body from connection"),
+            "missing the cause: {line}",
+        );
+        assert!(line.contains("2s"), "missing the backoff: {line}");
+        assert!(line.contains("docker"), "not greppable as docker: {line}");
+    }
+
+    #[test]
+    fn retry_stop_line_says_which_bound_was_hit() {
+        let err = SandboxError::Bollard(bollard::errors::Error::RequestTimeoutError);
+
+        let attempts = format_daemon_retry_stop_log(3, 3, &err, RetryStop::AttemptsExhausted);
+        assert!(attempts.contains("3/3"), "missing attempt/bound: {attempts}");
+        assert!(
+            attempts.to_lowercase().contains("exhaust"),
+            "an operator must see the bound was hit: {attempts}",
+        );
+
+        let budget = format_daemon_retry_stop_log(1, 3, &err, RetryStop::BudgetExhausted);
+        assert!(
+            budget.contains("wall-clock"),
+            "budget stop must name the wall-clock budget, not the attempt bound: {budget}",
+        );
+    }
+
+    #[test]
+    fn transport_retry_backs_off_between_attempts_and_stops_at_the_bound() {
+        // Issue #194. A daemon that dropped one connection is usually
+        // fine on the next try, so the first backoff is short; a daemon
+        // that keeps dropping gets a little more room before the last
+        // attempt. The bound is what stops a genuinely sick daemon from
+        // spinning forever.
+        let policy = TransportRetryPolicy::default();
+        assert_eq!(
+            next_retry_delay(1, policy, None, Duration::ZERO),
+            Ok(DAEMON_TRANSPORT_BACKOFF_BASE),
+        );
+        assert_eq!(
+            next_retry_delay(2, policy, None, Duration::ZERO),
+            Ok(DAEMON_TRANSPORT_BACKOFF_BASE * 2),
+        );
+        assert_eq!(
+            next_retry_delay(policy.max_attempts, policy, None, Duration::ZERO),
+            Err(RetryStop::AttemptsExhausted),
+            "the last attempt must not schedule another one",
+        );
+    }
+
+    #[test]
+    fn transport_retry_never_outlives_the_wall_clock_budget() {
+        // The retry budget is spent *inside* the container run's
+        // wall-clock budget, not on top of it: a phase with seconds
+        // left does not get three more attempts plus their backoffs.
+        let policy = TransportRetryPolicy::default();
+        let budget = Some(Duration::from_secs(60));
+
+        assert_eq!(
+            next_retry_delay(1, policy, budget, Duration::from_secs(10)),
+            Ok(DAEMON_TRANSPORT_BACKOFF_BASE),
+            "plenty of budget left — retry normally",
+        );
+        assert_eq!(
+            next_retry_delay(1, policy, budget, Duration::from_secs(59)),
+            Err(RetryStop::BudgetExhausted),
+            "the backoff alone would overrun the budget",
+        );
+        assert_eq!(
+            next_retry_delay(1, policy, budget, Duration::from_secs(120)),
+            Err(RetryStop::BudgetExhausted),
+            "already over budget — no retry at any price",
+        );
+    }
+
+    #[test]
+    fn remaining_budget_shrinks_each_attempts_deadline() {
+        // Each retried attempt inherits what is *left* of the budget,
+        // so three attempts of a 60s-budget phase still total 60s.
+        assert_eq!(
+            remaining_budget(Some(Duration::from_secs(60)), Duration::from_secs(25)),
+            Some(Duration::from_secs(35)),
+        );
+        assert_eq!(
+            remaining_budget(Some(Duration::from_secs(60)), Duration::from_secs(90)),
+            Some(Duration::ZERO),
+            "an overrun clamps to zero rather than wrapping",
+        );
+        assert_eq!(
+            remaining_budget(None, Duration::from_secs(90)),
+            None,
+            "an unbudgeted run stays unbudgeted across retries",
+        );
+    }
+
     #[test]
     fn build_agent_env_surfaces_env_file_errors_without_panicking() {
         let dir = TempDir::new().unwrap();
@@ -1675,16 +2418,33 @@ mod tests {
         );
 
         let status_values = filter.get("status").expect("status key required");
-        assert_eq!(
-            status_values,
-            &vec!["exited".to_string()],
-            "cleanup must only target stopped containers: {:?}",
+        assert!(
+            status_values.iter().any(|v| v == "exited"),
+            "cleanup must target stopped containers: {:?}",
             status_values,
         );
         assert!(
             !status_values.iter().any(|v| v == "running"),
             "cleanup must not include running containers: {:?}",
             status_values,
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_filter_also_targets_never_started_containers() {
+        // Issue #194. When a create request is answered by the daemon
+        // but the *response* is lost to a dropped connection, bellows
+        // never learns the container's id, so the retry cannot remove
+        // it — it is left sitting in `created`, never started, never
+        // exited. That is the one orphan shape the retry itself cannot
+        // reconcile, so the startup sweep has to.
+        let filter = build_orphan_container_filter();
+        let status_values = filter.get("status").expect("status key required");
+
+        assert!(
+            status_values.iter().any(|v| v == "created"),
+            "a container created by an attempt whose connection dropped \
+             would never be swept: {status_values:?}",
         );
     }
 
