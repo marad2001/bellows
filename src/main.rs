@@ -2009,6 +2009,12 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
             }
         };
 
+    // Issue #193: the loop's handle on the claim currently in flight.
+    // `run_once` fills it in at claim time and empties it as soon as the
+    // PR exists, so the error arm below can tell a stranded pre-PR claim
+    // (release it) from a post-PR failure (leave it to finalise).
+    let claim_slot = runner::InFlightClaimSlot::new();
+
     loop {
         let outcome = runner::run_once(
             &client,
@@ -2016,6 +2022,7 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
             &mut log_file,
             status_ctx.as_ref(),
             container_probe.as_deref(),
+            Some(&claim_slot),
         )
         .await;
         match outcome {
@@ -2096,6 +2103,26 @@ async fn run(config_path: &PathBuf, repo_filter: Option<&str>) -> Result<()> {
                         ),
                     );
                 }
+                // Issue #193: the run error is already surfaced above and
+                // the local status file is already correct — this last
+                // step is best-effort and cannot change either. If the
+                // tick claimed an issue and died before opening a PR,
+                // hand it back to the pickup label so the next tick
+                // re-claims it; without it the issue carries the
+                // in-progress label with no PR and no outcome label,
+                // invisible to the polling query, until a restart happens
+                // to run the startup sweep with that repo configured. A
+                // run that got as far as a PR left the slot empty and is
+                // deliberately untouched — it reaches finalise instead.
+                runner::release_claim_after_run_error(
+                    &client,
+                    &claim_slot,
+                    &config.runtime_labels.agent_in_progress,
+                    &config.polling.pickup_label,
+                    &e.to_string(),
+                    &mut log_file,
+                )
+                .await;
             }
         }
         tokio::time::sleep(interval).await;

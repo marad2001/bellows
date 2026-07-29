@@ -599,13 +599,146 @@ pub async fn reconcile_stranded_in_progress(
     reclaimed
 }
 
+/// The GitHub coordinates of the issue a tick has claimed and not yet
+/// turned into a PR (issue #193). Enough for the polling loop's error arm
+/// to hand back to [`tracker::reset_in_progress_to_pickup`], and nothing
+/// more — the release is a label swap, not a resumption of the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightClaim {
+    pub owner: String,
+    pub repo: String,
+    pub issue_number: u64,
+}
+
+/// The polling loop's view of the claim currently in flight (issue #193).
+///
+/// `run_once` owns the lifecycle: cleared on entry, set once `claim`
+/// succeeds, and cleared again the moment the PR exists. So a non-empty
+/// slot means exactly one thing — "this issue is claimed and has no PR" —
+/// which is the precise condition under which an aborted run must return
+/// it to the pickup queue. A run that fails AFTER its PR is opened leaves
+/// the slot empty and is therefore never released: it already reaches
+/// finalise and gets the right outcome label, and re-queuing finished work
+/// would be worse than the bug being fixed here.
+///
+/// Interior mutability (rather than `&mut`) keeps the slot shareable with
+/// the loop across the `&`-borrowing `run_once` call. The lock is only ever
+/// held across a single read or write, so a panic can never leave a
+/// half-written value behind — which is why poisoning is recovered from
+/// rather than propagated.
+#[derive(Debug, Default)]
+pub struct InFlightClaimSlot {
+    claim: std::sync::Mutex<Option<InFlightClaim>>,
+}
+
+impl InFlightClaimSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the claim just made. Overwrites whatever was there —
+    /// concurrency=1 means a fresh claim always supersedes.
+    pub fn set(&self, claim: InFlightClaim) {
+        *self.lock() = Some(claim);
+    }
+
+    /// Forget the in-flight claim. Called on `run_once` entry (so a slot
+    /// can never carry a previous tick's issue into this tick's error arm)
+    /// and immediately after the PR is opened.
+    pub fn clear(&self) {
+        *self.lock() = None;
+    }
+
+    /// Take the in-flight claim, leaving the slot empty. `None` means
+    /// there is nothing to release.
+    pub fn take(&self) -> Option<InFlightClaim> {
+        self.lock().take()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<InFlightClaim>> {
+        self.claim.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Issue #193: return a claimed-but-never-PR'd issue to the pickup label
+/// after its run errored, so the next polling tick re-claims it through
+/// the normal path. Without this, the issue sits at the in-progress label
+/// with no PR, no outcome label and no log comment, invisible to the
+/// polling query, until [`reconcile_stranded_in_progress`] happens to run
+/// at a restart with that repo configured.
+///
+/// No-op when the slot is empty — nothing was claimed this tick, or the
+/// run got far enough to open a PR and `run_once` cleared the slot. Not
+/// touching the post-PR case is the point: that path already reaches
+/// finalise and applies the correct outcome label.
+///
+/// Best-effort and subordinate to the run error the caller is already
+/// surfacing: this returns `()`, so a failed release can neither replace
+/// nor swallow that error. A failure is logged beside it and the issue is
+/// left for the startup sweep, exactly as before this existed.
+///
+/// The log line is deliberately distinguishable from the
+/// `startup reconcile:` lines emitted by [`reconcile_stranded_in_progress`]
+/// — both recovery routes end in the same label swap, and a reader of the
+/// run log needs to be able to tell which one fired.
+pub async fn release_claim_after_run_error(
+    client: &octocrab::Octocrab,
+    slot: &InFlightClaimSlot,
+    in_progress_label: &str,
+    pickup_label: &str,
+    reason: &str,
+    log_writer: &mut dyn Write,
+) {
+    let Some(claim) = slot.take() else {
+        return;
+    };
+    match tracker::reset_in_progress_to_pickup(
+        client,
+        &claim.owner,
+        &claim.repo,
+        claim.issue_number,
+        in_progress_label,
+        pickup_label,
+    )
+    .await
+    {
+        Ok(_) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: run-abort release: returned claimed issue #{} ({}/{}) to `{}` (was `{}`) — the run failed before any PR existed, so it is claimable again on the next tick: {}",
+                claim.issue_number,
+                claim.owner,
+                claim.repo,
+                pickup_label,
+                in_progress_label,
+                reason,
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: run-abort release: could not return claimed issue #{} ({}/{}) to `{}` (leaving it for the startup reconcile sweep): {}",
+                claim.issue_number, claim.owner, claim.repo, pickup_label, e,
+            );
+        }
+    }
+}
+
 pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
     log_writer: &mut dyn Write,
     status_ctx: Option<&StatusContext>,
     container_probe: Option<&dyn AgentContainerProbe>,
+    claim_slot: Option<&InFlightClaimSlot>,
 ) -> Result<RunOutcome, RunError> {
+    // Issue #193: the slot describes THIS tick only. Clearing on entry
+    // means a claim recorded by an earlier tick can never be released by
+    // a later tick's error arm.
+    if let Some(slot) = claim_slot {
+        slot.clear();
+    }
+
     // Issue #126 / ADR-0009 slice 4: pre-claim concurrency=1 gate.
     // Before any per-repo work, ask the host whether a
     // `bellows-managed=true` container is already running; if yes,
@@ -968,6 +1101,17 @@ pub async fn run_once(
         .labels
         .iter()
         .any(|l| l.name == config.agent.weak_test_guard_skip_label);
+
+    // Issue #193: from here until the PR exists, an abort would strand
+    // this issue at the in-progress label. Record the coordinates so the
+    // polling loop's error arm can hand it back to the pickup queue.
+    if let Some(slot) = claim_slot {
+        slot.set(InFlightClaim {
+            owner: owner.clone(),
+            repo: repo.clone(),
+            issue_number: claimed.number,
+        });
+    }
 
     let started = chrono::Utc::now();
     let branch_name = crate::agent_branch_name(claimed.number, &claimed.title);
@@ -2510,6 +2654,13 @@ pub async fn run_once(
         },
     )
     .await?;
+    // Issue #193: the PR exists, so this issue is no longer releasable —
+    // everything from here reaches finalise and gets a real outcome
+    // label, and returning it to the claim queue would put finished work
+    // back in front of the next tick.
+    if let Some(slot) = claim_slot {
+        slot.clear();
+    }
     announce(
         log_writer,
         &format!("bellows: opened PR #{} — finalising labels + log comment", pr.number),

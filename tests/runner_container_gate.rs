@@ -136,7 +136,7 @@ async fn run_once_no_longer_blocks_when_an_open_agent_pr_exists() {
     let mut log = Cursor::new(Vec::new());
     let probe = NoContainerProbe;
 
-    let outcome = run_once(&client, &config, &mut log, None, Some(&probe)).await;
+    let outcome = run_once(&client, &config, &mut log, None, Some(&probe), None).await;
 
     match outcome {
         Err(RunError::MissingAgentBrief(n)) => assert_eq!(
@@ -175,7 +175,7 @@ async fn run_once_returns_blocked_when_agent_container_is_running() {
     let config = config_for(&mock.uri());
     let mut log = Cursor::new(Vec::new());
 
-    let outcome = run_once(&client, &config, &mut log, None, Some(&probe))
+    let outcome = run_once(&client, &config, &mut log, None, Some(&probe), None)
         .await
         .expect("run_once should succeed with the container-presence Blocked path");
 
@@ -241,7 +241,7 @@ pat_env_var = "BELLOWS_TEST_PAT"
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
 
-    let outcome = run_once(&client, &config, &mut log, None, Some(&probe))
+    let outcome = run_once(&client, &config, &mut log, None, Some(&probe), None)
         .await
         .expect("run_once should succeed with the global container-presence Blocked path");
 
