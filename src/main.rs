@@ -1,5 +1,4 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -2139,9 +2138,16 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
     out
 }
 
+/// Write one bellows line to both the console and the run log.
+///
+/// Issue #195: the console keeps the bare line; the file gets the
+/// timestamped one via [`bellows::run_log::narrate`], which is the only
+/// sanctioned narration write. `line` may carry an indented
+/// `caused by:` chain — `narrate` stamps the head and leaves the chain
+/// attached to it.
 fn log(file: &mut File, line: &str) {
     println!("{}", line);
-    let _ = writeln!(file, "{}", line);
+    bellows::run_log::narrate(file, line);
 }
 
 #[cfg(test)]

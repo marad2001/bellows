@@ -2797,8 +2797,7 @@ pub async fn run_once(
              transition completed; continuing): {}",
             pr.number, msg,
         );
-        println!("{line}");
-        let _ = writeln!(log_writer, "{line}");
+        announce(log_writer, &line);
     }
 
     // Issue #168: append this run's structured record to `runs.jsonl`.
@@ -3320,9 +3319,15 @@ fn emit_failed_gate_outputs(body: &mut String, label: &str, gate: &GateOutcome) 
 /// Per-line write errors are swallowed (consistent with the rest of the
 /// codebase's log-writing policy: log lines are diagnostic, not
 /// load-bearing, and a failed write shouldn't halt the pipeline).
-fn announce(log_writer: &mut dyn Write, line: &str) {
+/// Write one bellows line to both the console and the run log.
+///
+/// Issue #195: the console keeps the bare line (an operator watching
+/// live does not need a timestamp on every line); the file gets the
+/// stamped one via [`crate::run_log::narrate`], which is the only
+/// sanctioned narration write.
+fn announce<W: Write + ?Sized>(log_writer: &mut W, line: &str) {
     println!("{}", line);
-    let _ = writeln!(log_writer, "{}", line);
+    crate::run_log::narrate(log_writer, line);
 }
 
 /// Issue #82: path to the per-engine rate-limit state file, written
@@ -4230,8 +4235,7 @@ pub async fn post_merge_verdict_comment_if_present<W: Write + ?Sized>(
             "bellows: posting the Merge verdict comment on PR #{} failed (continuing): {}",
             pr_number, e,
         );
-        println!("{line}");
-        let _ = writeln!(log_writer, "{line}");
+        announce(log_writer, &line);
     }
     Ok(())
 }
