@@ -745,18 +745,17 @@ pub fn is_service_unavailable_signature(text: &str) -> bool {
 /// produced a turn — it failed to start, or lost its connection before
 /// the first turn completed (issue #192).
 ///
-/// Two shapes, both meaning "the phase produced nothing":
+/// Two shapes reported by engines:
 ///   - the zero-turn result envelope (see
 ///     [`is_zero_turn_result_envelope_signature`]);
 ///   - the mid-stream connection loss (see
 ///     [`is_connection_closed_mid_response_signature`]).
 ///
-/// A match is a *resilience retry* signal, not an **Advance** (ADR-0012
-/// / `CONTEXT.md`): the phase discarded nothing, because it produced
-/// nothing, and no operator is summoned. The runner routes it exactly
-/// where a transient backend outage already goes — mark the engine
-/// cooling, fall back to the next hot chain entry — rather than
-/// classifying the run as `Crash`.
+/// A zero-turn envelope is a *resilience retry* signal, not an
+/// **Advance** (ADR-0012 / `CONTEXT.md`). A mid-stream connection loss
+/// is retryable only when the runner separately proves that HEAD and the
+/// worktree are unchanged; the phrase alone does not prove that the
+/// engine produced no turn.
 pub fn is_engine_start_failure_signature(text: &str) -> bool {
     is_zero_turn_result_envelope_signature(text) || is_connection_closed_mid_response_signature(text)
 }

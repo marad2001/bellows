@@ -1710,9 +1710,11 @@ pub async fn run_once(
             // picks the phase engine through `run_invocation_with_fallback`
             // (issue #174): a transient outage or credit/quota
             // exhaustion on one engine falls back to the next hot chain
-            // entry mid-phase (a failed invocation commits nothing, so
-            // the retry is safe), and only a fully-exhausted chain sets
-            // `rate_limited_phase` to terminate as retry-later.
+            // entry mid-phase. An ambiguous mid-response disconnect is
+            // retried only when HEAD and the worktree are unchanged;
+            // otherwise ordinary crash recovery keeps the partial work.
+            // Only a fully-exhausted chain sets `rate_limited_phase` to
+            // terminate as retry-later.
 
             // Per-finding loop: one container per blocker/important
             // finding. Each invocation respects the remaining wall-
@@ -1773,10 +1775,10 @@ pub async fn run_once(
 
                 // Capture HEAD BEFORE the agent runs so we can detect
                 // whether the agent self-committed during the
-                // invocation. Failed in-phase fallback attempts leave
-                // HEAD untouched, so this stays valid across an engine
-                // fallback. See the four-corners comment below the run
-                // for the full contract.
+                // invocation. A mid-response fallback is permitted only
+                // when the attempt left HEAD and the worktree unchanged,
+                // so this stays valid across an engine fallback. See the
+                // four-corners comment below the run for the full contract.
                 let head_before = workspace::head_sha(&workspace).await?;
                 let per_finding_started_at = std::time::Instant::now();
                 let per_finding_invocation = run_invocation_with_fallback(
@@ -3365,6 +3367,21 @@ enum FallbackDecision {
     Exhausted,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FallbackWorkspaceState {
+    head: String,
+    worktree: policy::SampleHash,
+}
+
+async fn capture_fallback_workspace_state(
+    workspace: &workspace::Workspace,
+) -> Result<FallbackWorkspaceState, workspace::WorkspaceError> {
+    Ok(FallbackWorkspaceState {
+        head: workspace::head_sha(workspace).await?,
+        worktree: workspace::sample_workspace_state(workspace.path()).await?,
+    })
+}
+
 /// Classify a completed agent run for in-phase engine fallback and
 /// record the appropriate cooling as a side effect (issue #174,
 /// generalising #170). Two signals warrant falling back to the next
@@ -3379,9 +3396,9 @@ enum FallbackDecision {
 /// A rate-limit no longer terminates outright: credits can run out
 /// mid-run at any phase, and the next chain engine may still be hot, so
 /// we walk to it in-run and only terminate as RateLimited when EVERY
-/// entry is exhausted. Because a failed invocation commits nothing,
-/// re-running on the next engine is safe in every phase, mutating or
-/// not.
+/// entry is exhausted. A mid-response disconnect is ambiguous, so the
+/// caller must prove it left HEAD and the worktree unchanged before it
+/// can take this fallback path.
 #[allow(clippy::too_many_arguments)]
 fn classify_and_record_fallback(
     state: &mut StateFile,
@@ -3392,9 +3409,22 @@ fn classify_and_record_fallback(
     budget: &WallClockBudget,
     attempt: usize,
     chain_len: usize,
+    mid_response_retry_safe: bool,
     log_writer: &mut dyn Write,
 ) -> FallbackDecision {
     if run.exit_code == 0 || budget.exceeded {
+        return FallbackDecision::Keep;
+    }
+    if policy::is_connection_closed_mid_response_signature(&run.stderr_tail)
+        && !mid_response_retry_safe
+    {
+        announce(
+            log_writer,
+            &format!(
+                "bellows: phase `{phase_name}` engine={} disconnected mid-response after the repository state changed or could not be verified; keeping the run on the ordinary crash/recovery path",
+                engine.as_name(),
+            ),
+        );
         return FallbackDecision::Keep;
     }
     let Some(signal) = policy::classify_transient_signal(&run.stderr_tail) else {
@@ -3523,14 +3553,15 @@ async fn run_analysis_agent_with_fallback(
 /// `render_kickoff`, runs the agent; on a transient backend outage OR a
 /// credit/quota-exhaustion signal it marks the engine cooling and
 /// retries on the next hot chain entry, bounded by the chain length.
-/// Because a failed invocation commits nothing, re-running on a
-/// different engine cannot lose work — safe for the mutating fix phases
-/// as well as the read-only analysis/merger phases. Returns the run the
-/// caller should treat as the phase result plus a
+/// Before dispatch, the helper snapshots HEAD and the worktree. An
+/// ambiguous mid-response disconnect can re-run on another engine only
+/// when the post-run snapshot matches; otherwise it remains an ordinary
+/// crash so mutating fix phases preserve partial work. Returns the run
+/// the caller should treat as the phase result plus a
 /// `terminate_as_rate_limited` flag set only when every chain entry is
 /// exhausted/cooling. The caller owns any commit/push that follows —
-/// capturing HEAD before this call stays valid because failed attempts
-/// leave HEAD untouched.
+/// capturing HEAD before this call stays valid across any disconnect
+/// fallback because those attempts are proven not to have moved HEAD.
 #[allow(clippy::too_many_arguments)]
 async fn run_invocation_with_fallback<F>(
     workspace: &workspace::Workspace,
@@ -3578,6 +3609,11 @@ where
         let entry = picked.entry.clone();
         let auth = auth_for_chain_entry(config, &entry);
         let kickoff = render_kickoff(entry.engine);
+        // Capture before writing the handoff file: `run-agent` deletes
+        // `.bellows-kickoff.md` before the engine starts, while the
+        // isolated worktree sampler deliberately sees all untracked
+        // files regardless of `.git/info/exclude`.
+        let workspace_before = capture_fallback_workspace_state(workspace).await.ok();
         tokio::fs::write(workspace.path().join(".bellows-kickoff.md"), kickoff).await?;
         let run = sandbox::run_agent(
             workspace,
@@ -3597,6 +3633,18 @@ where
         )
         .await?;
         budget.mark_killed_if(run.killed_by_deadline);
+        let mid_response_retry_safe =
+            if policy::is_connection_closed_mid_response_signature(&run.stderr_tail) {
+                match (
+                    workspace_before,
+                    capture_fallback_workspace_state(workspace).await,
+                ) {
+                    (Some(before), Ok(after)) => before == after,
+                    _ => false,
+                }
+            } else {
+                true
+            };
         match classify_and_record_fallback(
             state,
             state_path,
@@ -3606,6 +3654,7 @@ where
             budget,
             attempt,
             chain_len,
+            mid_response_retry_safe,
             log_writer,
         ) {
             FallbackDecision::Keep => {
@@ -5747,6 +5796,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             budget,
             attempt,
             chain_len,
+            true,
             &mut sink,
         )
     }
@@ -5834,6 +5884,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
         run: &sandbox::AgentRun,
         attempt: usize,
         chain_len: usize,
+        mid_response_retry_safe: bool,
     ) -> (FallbackDecision, String) {
         let state_path = std::env::temp_dir().join("bellows-test-192-state.json");
         let mut sink = Vec::<u8>::new();
@@ -5846,6 +5897,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             &fallback_test_budget(),
             attempt,
             chain_len,
+            mid_response_retry_safe,
             &mut sink,
         );
         (decision, String::from_utf8(sink).unwrap())
@@ -5858,7 +5910,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
         // than classify the run as a crash.
         let mut state = StateFile::default();
         let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
-        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2);
+        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
         assert_eq!(decision, FallbackDecision::Fallback);
         assert!(
             state.engines.contains_key(Engine::Codex.as_name()),
@@ -5884,7 +5936,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             1,
             "API Error: Connection closed mid-response. The response above may be incomplete.",
         );
-        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2);
+        let (decision, log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
         assert_eq!(decision, FallbackDecision::Fallback);
         assert!(
             log.contains("start-failure"),
@@ -5893,10 +5945,29 @@ api_key_env_file = "~/bellows-test-opencode.env"
     }
 
     #[test]
+    fn classify_fallback_keeps_a_mid_stream_disconnect_after_workspace_changes() {
+        let mut state = StateFile::default();
+        let run = agent_run_with(
+            1,
+            "API Error: Connection closed mid-response. The response above may be incomplete.",
+        );
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 0, 2, false);
+        assert_eq!(
+            decision,
+            FallbackDecision::Keep,
+            "an ambiguous disconnect after partial work must use ordinary crash recovery",
+        );
+        assert!(
+            state.engines.is_empty(),
+            "an unsafe disconnect must not cool the engine as a zero-turn failure",
+        );
+    }
+
+    #[test]
     fn classify_fallback_exhausts_on_a_start_failure_at_the_last_chain_entry() {
         let mut state = StateFile::default();
         let run = agent_run_with(1, ZERO_TURN_ENVELOPE);
-        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 1, 2);
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 1, 2, true);
         assert_eq!(
             decision,
             FallbackDecision::Exhausted,
@@ -5912,7 +5983,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             1,
             "the runner maps subtype error_during_execution onto a crash; 14 turns elapsed",
         );
-        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 0, 2);
+        let (decision, _log) = classify_for_test_with_log(&mut state, &run, 0, 2, true);
         assert_eq!(decision, FallbackDecision::Keep);
         assert!(state.engines.is_empty());
     }
