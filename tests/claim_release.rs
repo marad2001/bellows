@@ -16,8 +16,10 @@ use std::str::FromStr;
 
 use bellows::config::Config;
 use bellows::runner::{
-    release_claim_after_run_error, run_once, InFlightClaim, InFlightClaimSlot, RunError,
+    open_pr_and_clear_claim, release_claim_after_run_error, run_once, InFlightClaim,
+    InFlightClaimSlot, RunError,
 };
+use bellows::workspace::OpenPrRequest;
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -266,12 +268,19 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
     // label; returning it to the pickup queue would put finished work back
     // in front of the next tick.
     //
-    // The seam is the slot: `run_once` empties it the instant `open_pr`
-    // returns, so "the PR exists" IS "the slot is empty". This test
-    // reproduces that transition and asserts the release makes no GitHub
-    // call whatsoever — the mock server has nothing mounted, so any
-    // request at all would show up in `received_requests`.
+    // Exercise the same production boundary as `run_once`: a successful
+    // PR open makes the claim non-releasable before later finalisation
+    // work can fail.
     let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "number": 99,
+            "html_url": "https://github.com/marad2001/test-repo/pull/99"
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
     let client = octocrab_pointed_at(mock.uri());
     let mut log = Cursor::new(Vec::new());
 
@@ -281,9 +290,23 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
         repo: "test-repo".to_string(),
         issue_number: 42,
     });
-    // ...the PR is opened, and the claim stops being releasable.
-    slot.clear();
+    open_pr_and_clear_claim(
+        &client,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/42-aborts-after-pr",
+            base_branch: "master",
+            title: "Bellows agent run for issue #42",
+            body: "Closes #42.",
+            draft: false,
+        },
+        Some(&slot),
+    )
+    .await
+    .expect("PR creation succeeds before the later finalise failure");
 
+    // Simulate the polling loop's error arm after a later finalise error.
     release_claim_after_run_error(
         &client,
         &slot,
@@ -298,10 +321,14 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
         .received_requests()
         .await
         .expect("request recording enabled");
+    let issue_label_requests = requests
+        .iter()
+        .filter(|r| r.url.path() == "/repos/marad2001/test-repo/issues/42")
+        .collect::<Vec<_>>();
     assert!(
-        requests.is_empty(),
+        issue_label_requests.is_empty(),
         "a post-PR failure must not touch the issue's labels; sent {:?}",
-        requests
+        issue_label_requests
             .iter()
             .map(|r| format!("{} {}", r.method, r.url.path()))
             .collect::<Vec<_>>(),
@@ -310,6 +337,52 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
     assert!(
         log_str.is_empty(),
         "nothing was released, so nothing should be logged: {log_str}",
+    );
+}
+
+#[tokio::test]
+async fn pr_open_error_leaves_the_claim_releasable() {
+    // The other side of the production boundary: the claim must remain
+    // recorded until GitHub confirms that the PR exists.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/marad2001/test-repo/pulls"))
+        .respond_with(ResponseTemplate::new(422))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = octocrab_pointed_at(mock.uri());
+    let slot = InFlightClaimSlot::new();
+    slot.set(InFlightClaim {
+        owner: "marad2001".to_string(),
+        repo: "test-repo".to_string(),
+        issue_number: 42,
+    });
+
+    open_pr_and_clear_claim(
+        &client,
+        OpenPrRequest {
+            owner: "marad2001",
+            repo: "test-repo",
+            head_branch: "agent/42-pr-open-fails",
+            base_branch: "master",
+            title: "Bellows agent run for issue #42",
+            body: "Closes #42.",
+            draft: true,
+        },
+        Some(&slot),
+    )
+    .await
+    .expect_err("GitHub rejects PR creation");
+
+    assert_eq!(
+        slot.take(),
+        Some(InFlightClaim {
+            owner: "marad2001".to_string(),
+            repo: "test-repo".to_string(),
+            issue_number: 42,
+        }),
+        "a failed PR open must leave the claim available to the error-arm release",
     );
 }
 

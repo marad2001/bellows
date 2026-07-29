@@ -738,6 +738,25 @@ pub async fn release_claim_after_run_error(
     }
 }
 
+/// Open the run's pull request and make its claim ineligible for abort
+/// recovery, in that order.
+///
+/// Keeping these operations behind one boundary makes the invariant
+/// explicit: an `open_pr` error leaves the claim recorded for the polling
+/// loop to release, while a successful response clears it before any
+/// fallible finalisation work runs.
+pub async fn open_pr_and_clear_claim(
+    client: &octocrab::Octocrab,
+    request: workspace::OpenPrRequest<'_>,
+    claim_slot: Option<&InFlightClaimSlot>,
+) -> Result<workspace::Pr, octocrab::Error> {
+    let pr = workspace::open_pr(client, request).await?;
+    if let Some(slot) = claim_slot {
+        slot.clear();
+    }
+    Ok(pr)
+}
+
 pub async fn run_once(
     client: &octocrab::Octocrab,
     config: &Config,
@@ -2655,7 +2674,7 @@ pub async fn run_once(
         &outcomes,
     );
 
-    let pr = workspace::open_pr(
+    let pr = open_pr_and_clear_claim(
         client,
         workspace::OpenPrRequest {
             owner: &owner,
@@ -2666,15 +2685,9 @@ pub async fn run_once(
             body: &pr_body,
             draft,
         },
+        claim_slot,
     )
     .await?;
-    // Issue #193: the PR exists, so this issue is no longer releasable —
-    // everything from here reaches finalise and gets a real outcome
-    // label, and returning it to the claim queue would put finished work
-    // back in front of the next tick.
-    if let Some(slot) = claim_slot {
-        slot.clear();
-    }
     announce(
         log_writer,
         &format!("bellows: opened PR #{} — finalising labels + log comment", pr.number),
