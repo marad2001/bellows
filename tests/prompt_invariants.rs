@@ -40,8 +40,9 @@ fn review_prompt_preserves_the_address_or_explain_contract() {
 
 #[test]
 fn review_prompt_leaves_code_changes_to_the_review_fix_phase() {
-    // ADR-0011: review is an analysis phase; review-fix is the phase that
-    // changes the implementation.
+    // ADR-0009 records the phase ordering (implement → cargo-checks → review
+    // → review-fix → ...): review is an analysis phase and review-fix is the
+    // separate phase that changes the implementation.
     let lower = REVIEW_PROMPT.to_lowercase();
     assert!(
         lower.contains("read-only")
