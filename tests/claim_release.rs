@@ -314,6 +314,60 @@ async fn run_error_after_the_pr_exists_releases_nothing() {
 }
 
 #[tokio::test]
+async fn operator_cancellation_prevents_run_error_release_from_requeueing_the_issue() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "cancelled while the run was in flight",
+            "labels": [{ "name": "agent-cancelled" }, { "name": KEEP }]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = octocrab_pointed_at(mock.uri());
+    let slot = InFlightClaimSlot::new();
+    slot.set(InFlightClaim {
+        owner: "marad2001".to_string(),
+        repo: "test-repo".to_string(),
+        issue_number: 42,
+    });
+    let mut log = Cursor::new(Vec::new());
+
+    release_claim_after_run_error(
+        &client,
+        &slot,
+        IN_PROGRESS,
+        PICKUP,
+        "workspace failed after the operator cancelled",
+        &mut log,
+    )
+    .await;
+
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("request recording enabled");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != wiremock::http::Method::PATCH),
+        "release must not PATCH a pickup label after ownership was removed; sent {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect::<Vec<_>>(),
+    );
+    let log_str = String::from_utf8(log.into_inner()).expect("utf-8 log");
+    assert!(
+        log_str.contains("no longer carries `agent-running`"),
+        "release must log that it no longer owns the issue: {log_str}",
+    );
+}
+
+#[tokio::test]
 async fn a_failing_release_leaves_the_original_run_error_intact() {
     // Brief AC4: the release is best-effort and subordinate to the run
     // error. When the label PATCH fails, the run error is still what

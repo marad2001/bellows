@@ -578,12 +578,19 @@ pub async fn reconcile_stranded_in_progress(
             )
             .await
             {
-                Ok(_) => {
+                Ok(Some(_)) => {
                     reclaimed += 1;
                     let _ = writeln!(
                         log_writer,
                         "bellows: startup reconcile: reclaimed stranded issue #{} ({}/{}) — `{}` -> `{}`",
                         issue.number, owner, repo, in_progress_label, pickup_label,
+                    );
+                }
+                Ok(None) => {
+                    let _ = writeln!(
+                        log_writer,
+                        "bellows: startup reconcile: skipped issue #{} ({}/{}) because it no longer carries `{}`",
+                        issue.number, owner, repo, in_progress_label,
                     );
                 }
                 Err(e) => {
@@ -702,7 +709,7 @@ pub async fn release_claim_after_run_error(
     )
     .await
     {
-        Ok(_) => {
+        Ok(Some(_)) => {
             let _ = writeln!(
                 log_writer,
                 "bellows: run-abort release: returned claimed issue #{} ({}/{}) to `{}` (was `{}`) — the run failed before any PR existed, so it is claimable again on the next tick: {}",
@@ -712,6 +719,13 @@ pub async fn release_claim_after_run_error(
                 pickup_label,
                 in_progress_label,
                 reason,
+            );
+        }
+        Ok(None) => {
+            let _ = writeln!(
+                log_writer,
+                "bellows: run-abort release: skipped claimed issue #{} ({}/{}) because it no longer carries `{}`; ownership was removed before recovery",
+                claim.issue_number, claim.owner, claim.repo, in_progress_label,
             );
         }
         Err(e) => {
