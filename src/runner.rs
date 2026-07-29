@@ -134,9 +134,16 @@ fn pr_routing_for_reason<'a>(
             draft: false,
             outcome_label: &labels.agent_done,
         },
+        // Issue #196: `BaseAlreadyRed` drafts and labels `agent-failed`
+        // alongside the rest. The run did not produce mergeable work, so
+        // its terminal state is unchanged — what changes is the
+        // attribution the operator reads, not what waits for them. Per
+        // ADR-0012 nothing here may park work, and this does not: the
+        // draft PR is the same terminal state a `FinalTestsRed` reaches.
         ExitReason::AgentSelfReportedFailure
         | ExitReason::Crash
         | ExitReason::FinalTestsRed
+        | ExitReason::BaseAlreadyRed
         | ExitReason::WallClockExceeded
         | ExitReason::AuthError => PrRouting {
             draft: true,
@@ -2536,12 +2543,45 @@ pub async fn run_once(
     )
     .await?;
 
+    // Issue #196: a failing cargo gate says the code did not pass; it
+    // does not say the *diff* is why. Ask the target repo's own CI
+    // whether the base commit this run branched from was already
+    // failing the same check.
+    //
+    // Derived, not remembered (`.out-of-scope/cross-run-memory-store.md`)
+    // — one request against a commit CI has already built, rather than a
+    // cached verdict or a local re-run costing minutes of container time.
+    //
+    // Fires only when a gate actually failed, so the happy path is
+    // untouched and exactly as fast as before. Errors and inconclusive
+    // answers both land on `NotEstablished`, which classifies exactly as
+    // it did before this issue: not knowing is never treated as knowing.
+    let base_health = if policy::should_consult_base_health(
+        &post_implement_gate,
+        end_pipeline_gate.as_ref(),
+    ) {
+        let mirrored = tracker::mirrored_check_names(workspace.gate_commands());
+        let health = tracker::base_commit_health(
+            client,
+            &owner,
+            &repo,
+            &head_before_implement,
+            &mirrored,
+        )
+        .await;
+        announce(log_writer, &base_health_announcement(&health, &head_before_implement));
+        health
+    } else {
+        policy::BaseHealth::NotEstablished
+    };
+
     let outcomes = PhaseOutcomes {
         implement: ImplementOutcome {
             exit_code: implement_agent_run.exit_code,
             stderr_tail: implement_agent_run.stderr_tail.clone(),
             engine: Some(implement_chain_entry.engine),
         },
+        base_health,
         post_implement_gate,
         review: review_outcome,
         review_fix: review_fix_outcome,
@@ -2933,22 +2973,70 @@ pub fn pr_body_for_auth_error(outcomes: &PhaseOutcomes) -> String {
 /// ADR-0004 claim is false and saying it would actively mislead. `Success`
 /// and `AgentSelfReportedFailure` get nothing — the label already means
 /// exactly what it says.
-fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> &'static str {
+///
+/// Issue #196: `BaseAlreadyRed` gets a third shape. It is not a run
+/// failure and not a code failure — the gate reached a real verdict, and
+/// that verdict was already true before the diff existed. The note names
+/// the base SHA and the failing check so the operator can confirm the
+/// claim rather than take it on trust.
+///
+/// Returns an owned `String` because that callout carries run-specific
+/// detail; the other arms are still fixed prose.
+fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> String {
     match reason {
         ExitReason::Crash
         | ExitReason::WallClockExceeded
         | ExitReason::RateLimited
         | ExitReason::AuthError
         | ExitReason::Cancelled => {
-            "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._"
+            "\n\n_This is a Bellows **run** failure — the pipeline did not finish cleanly — not a verdict on the code. If a branch was pushed, this PR's own GitHub CI is the authoritative check on the changes: a green CI here means the code is sound even though Bellows labelled the run `agent-failed`._".to_string()
         }
+        ExitReason::BaseAlreadyRed => match &outcomes.base_health {
+            policy::BaseHealth::Red {
+                base_sha,
+                failing_check,
+            } => format!(
+                "\n\n_**This failure predates the diff.** The `{failing_check}` check was already failing on this repo's own CI at the base commit `{base_sha}` that this run branched from, so the same failure would occur with an empty diff. Nothing in the agent's work is implicated — do not read the diff looking for the cause. Fix the base branch, then re-label the issue to re-run._"
+            ),
+            // Unreachable in practice: `classify_exit` only returns this
+            // reason when `base_health` is `Red`. Kept total rather than
+            // panicking, since a PR-body builder must never fail a run.
+            _ => "\n\n_**This failure predates the diff.** The same check was already failing at the base commit this run branched from._".to_string(),
+        },
         ExitReason::FinalTestsRed if any_gate_oom_killed(outcomes) => {
-            "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._"
+            "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._".to_string()
         }
         ExitReason::FinalTestsRed => {
-            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._"
+            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._".to_string()
         }
-        ExitReason::Success | ExitReason::AgentSelfReportedFailure => "",
+        ExitReason::Success | ExitReason::AgentSelfReportedFailure => String::new(),
+    }
+}
+
+/// Issue #196: the operator-visible line reporting which of the three
+/// base-health outcomes the lookup reached.
+///
+/// All three are announced, not just the interesting one. "We checked
+/// and the base was fine" and "we could not check" lead to the same
+/// classification but mean very different things when an operator is
+/// working out why a run was blamed, and a silent `NotEstablished` is
+/// indistinguishable from the lookup never having run.
+fn base_health_announcement(health: &policy::BaseHealth, base_sha: &str) -> String {
+    let short: String = base_sha.chars().take(12).collect();
+    match health {
+        policy::BaseHealth::Red { failing_check, .. } => format!(
+            "bellows: cargo gate failed, and the repo's own CI reports `{failing_check}` already \
+             failing at base {short} — the failure predates the diff (issue #196)"
+        ),
+        policy::BaseHealth::Green => format!(
+            "bellows: cargo gate failed; the repo's own CI was green at base {short}, so the \
+             failure is attributable to the diff"
+        ),
+        policy::BaseHealth::NotEstablished => format!(
+            "bellows: cargo gate failed; could not establish the health of base {short} (checks \
+             still running, no matching CI checks, or the lookup failed) — classifying on the \
+             gate result alone"
+        ),
     }
 }
 
@@ -2995,6 +3083,28 @@ fn build_pr_body(
              The agent reported done with exit 0 but a post-run cargo check (clippy or test, in either the post-implement or end-of-pipeline gate) failed. See the run-log comment on this PR for the per-phase summary and the failing output."
                 .to_string()
         }
+        // Issue #196: the gate failed, and the repo's own CI says the
+        // same check was already failing at the base commit. The heading
+        // must not read as a verdict on the agent's work.
+        ExitReason::BaseAlreadyRed => match &outcomes.base_health {
+            policy::BaseHealth::Red {
+                base_sha,
+                failing_check,
+            } => format!(
+                "## The base branch was already failing\n\n\
+                 A post-run cargo check failed, but this repo's own CI reports `{failing_check}` \
+                 already failing at the base commit `{base_sha}` this run branched from. The \
+                 failure is not attributable to the diff — an empty diff on the same base would \
+                 fail identically.\n\n\
+                 The agent's work is in this PR's diff and has not been judged. Fix the base \
+                 branch, then re-label the issue so the run can be repeated against a green base. \
+                 See the run-log comment for the failing gate output."
+            ),
+            _ => "## The base branch was already failing\n\n\
+                  A post-run cargo check failed and the same check was already failing at this \
+                  run's base commit, so the failure is not attributable to the diff."
+                .to_string(),
+        },
         ExitReason::WallClockExceeded => {
             "## Wall-clock cap reached\n\n\
              The pipeline exceeded the configured per-issue wall-clock budget and was halted. See the run-log comment on this PR for elapsed minutes and a per-phase breakdown of where the time went."
@@ -3018,7 +3128,7 @@ fn build_pr_body(
     // common case is a no-op and there is no whitespace noise.
     header
         + &body
-        + run_failure_disambiguation(reason, outcomes)
+        + &run_failure_disambiguation(reason, outcomes)
         + &workflow_files_changed_callout(workflow_files_changed)
 }
 
@@ -4454,6 +4564,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4482,6 +4593,95 @@ api_key_env_file = "~/bellows-test-opencode.env"
     fn build_pr_body_for_success_uses_boilerplate_when_no_pr_body() {
         let body = build_pr_body(&ExitReason::Success, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(body.contains("the agent did not write a PR description"));
+    }
+
+    /// Issue #196 fixture: a gate failure whose cause was already on the
+    /// base commit.
+    fn base_already_red_outcomes() -> PhaseOutcomes {
+        PhaseOutcomes {
+            base_health: policy::BaseHealth::Red {
+                base_sha: "7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4".to_string(),
+                failing_check: "cargo clippy".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_pr_body_for_base_already_red_names_the_base_sha_and_the_check() {
+        // AC: the operator must be able to confirm the claim rather than
+        // take it on trust, so both the commit and the check are quoted.
+        let body = build_pr_body(
+            &ExitReason::BaseAlreadyRed,
+            271,
+            None,
+            None,
+            &[],
+            &base_already_red_outcomes(),
+        );
+        assert!(body.contains("7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4"), "{body}");
+        assert!(body.contains("cargo clippy"), "{body}");
+    }
+
+    #[test]
+    fn build_pr_body_for_base_already_red_does_not_read_as_a_verdict_on_the_agent() {
+        // The whole failure of the old behaviour was sending an operator
+        // to read agent work for a cause that was not there.
+        let body = build_pr_body(
+            &ExitReason::BaseAlreadyRed,
+            271,
+            None,
+            None,
+            &[],
+            &base_already_red_outcomes(),
+        );
+        assert!(
+            body.contains("predates the diff") || body.contains("already failing"),
+            "the body must say plainly that the failure is not the diff's: {body}",
+        );
+        assert!(
+            !body.contains("The agent reported done"),
+            "must not reuse the FinalTestsRed framing: {body}",
+        );
+    }
+
+    #[test]
+    fn final_tests_red_body_is_unchanged_when_the_base_was_green() {
+        // Regression guard: a genuinely broken diff must still be
+        // reported exactly as it was before issue #196.
+        let outcomes = PhaseOutcomes {
+            base_health: policy::BaseHealth::Green,
+            ..Default::default()
+        };
+        let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &outcomes);
+        assert!(body.contains("Cargo checks failed after the agent's run"), "{body}");
+        assert!(body.contains("ADR-0004"), "{body}");
+    }
+
+    #[test]
+    fn base_health_announcement_distinguishes_all_three_outcomes() {
+        // AC: "we checked and the base was fine" must be distinguishable
+        // from "we could not check" in the run log — they classify the
+        // same but mean very different things to an operator.
+        let sha = "7d7ab7364443c665743fa2f3ba0f9e1eaf9baff4";
+        let red = base_health_announcement(
+            &policy::BaseHealth::Red {
+                base_sha: sha.to_string(),
+                failing_check: "cargo clippy".to_string(),
+            },
+            sha,
+        );
+        let green = base_health_announcement(&policy::BaseHealth::Green, sha);
+        let unknown = base_health_announcement(&policy::BaseHealth::NotEstablished, sha);
+
+        assert!(red.contains("predates the diff"), "{red}");
+        assert!(red.contains("cargo clippy"), "{red}");
+        assert!(green.contains("attributable to the diff"), "{green}");
+        assert!(unknown.contains("could not establish"), "{unknown}");
+        assert_ne!(green, unknown, "the two must not read alike");
+        for line in [&red, &green, &unknown] {
+            assert!(line.contains("7d7ab7364443"), "each must name the base: {line}");
+        }
     }
 
     #[test]
@@ -4619,6 +4819,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4657,6 +4858,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4698,6 +4900,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 1, output: "regression here".to_string() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4736,6 +4939,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4818,6 +5022,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: Some(ReviewOutcome { findings_text: None, exit_code: 137 }),
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4855,6 +5060,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4899,6 +5105,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4945,6 +5152,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -4999,6 +5207,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5042,6 +5251,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: true,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5090,6 +5300,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             }),
             review_fix: Some(FixOutcome { exit_code: 0 }),
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: vec![
                 ParsedFinding {
@@ -5149,6 +5360,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5217,6 +5429,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: true,
@@ -5390,6 +5603,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5607,6 +5821,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
                 cargo_clippy: Some(CheckResult { exit_code: 0, output: String::new() }),
                 cargo_test: Some(CheckResult { exit_code: 0, output: String::new() }),
             }),
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,
@@ -5675,6 +5890,7 @@ api_key_env_file = "~/bellows-test-opencode.env"
             review: None,
             review_fix: None,
             end_pipeline_gate: None,
+            base_health: policy::BaseHealth::NotEstablished,
             wall_clock_exceeded: false,
             backstop_violations: Vec::new(),
             implement_crash_synthesised: false,

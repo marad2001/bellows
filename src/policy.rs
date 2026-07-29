@@ -45,6 +45,76 @@ pub enum ExitReason {
     /// signal.
     AuthError,
     Cancelled,
+    /// Issue #196: a cargo gate failed, and the target repo's own CI
+    /// reports the same check failing at the run's base commit. The
+    /// failure predates the diff, so blaming the diff — as
+    /// `FinalTestsRed` does — would send the operator to read agent work
+    /// looking for a cause that is not there.
+    ///
+    /// Witnessed on `marad2001/workboard-financial-advice`: four
+    /// consecutive runs (#52, #271, #293, #606) died on a byte-identical
+    /// `doc_lazy_continuation` lint in `financial-advice-dtos`, in a file
+    /// none of the four issues concerned. #271's implement phase exited
+    /// 0 — the agent did its job and was still labelled `agent-failed`.
+    ///
+    /// Distinct from `FinalTestsRed`, never a substitute for it: a gate
+    /// failure that does NOT reproduce at base still routes to
+    /// `FinalTestsRed` unchanged.
+    BaseAlreadyRed,
+}
+
+/// Issue #196: what the target repo's own CI says about the run's base
+/// commit, consulted only when a cargo gate has already failed.
+///
+/// Three states, not two. "We could not find out" is not "the base was
+/// fine" — a base commit whose checks are still running reports a null
+/// conclusion, a repo without CI reports no matching check runs, and the
+/// API can simply fail. Collapsing any of those into `Green` would
+/// reintroduce the defect this exists to fix, in the harder-to-notice
+/// direction.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BaseHealth {
+    /// No lookup was performed, or it could not reach a conclusion.
+    /// Classification proceeds exactly as it did before issue #196.
+    #[default]
+    NotEstablished,
+    /// The mirrored checks concluded successfully at the base commit, so
+    /// the gate failure is genuinely about the diff.
+    Green,
+    /// A check the gate mirrors was already failing at the base commit.
+    Red {
+        /// The base commit the run branched from, quoted to the operator
+        /// so they can confirm the claim themselves.
+        base_sha: String,
+        /// The failing check-run name, e.g. `cargo clippy`. Named so the
+        /// PR body can point at the specific check rather than assert a
+        /// vague "base was broken".
+        failing_check: String,
+    },
+}
+
+impl BaseHealth {
+    /// Whether this health verdict means the gate failure predates the
+    /// diff. Only `Red` does — `NotEstablished` deliberately does not,
+    /// because not knowing is not knowing.
+    pub fn predates_the_diff(&self) -> bool {
+        matches!(self, BaseHealth::Red { .. })
+    }
+}
+
+/// Issue #196: whether this run should ask GitHub about its base
+/// commit's health.
+///
+/// Only a failing gate poses the question. A green run has nothing to
+/// attribute, so the happy path never spends a request and stays exactly
+/// as fast as it was — the AC that keeps this change free in the common
+/// case. Extracted as a predicate rather than inlined at the call site
+/// so that guarantee is testable.
+pub fn should_consult_base_health(
+    post_implement_gate: &GateOutcome,
+    end_pipeline_gate: Option<&GateOutcome>,
+) -> bool {
+    gate_failed(post_implement_gate) || end_pipeline_gate.is_some_and(gate_failed)
 }
 
 /// Classification of `bellows-agent-notes.md` content. Drives the
@@ -308,6 +378,14 @@ pub struct PhaseOutcomes {
     /// runner halted before the fix phase could run.
     pub security_fix: Option<FixOutcome>,
     pub end_pipeline_gate: Option<GateOutcome>,
+    /// Issue #196: what the target repo's own CI says about the run's
+    /// base commit. Populated by the runner only after a cargo gate has
+    /// failed — a passing gate never triggers the lookup, so the happy
+    /// path is unchanged and stays exactly as fast.
+    ///
+    /// `classify_exit` is pure, so the lookup itself (a GitHub API call)
+    /// happens in the runner and arrives here as data.
+    pub base_health: BaseHealth,
     /// True when the runner short-circuited the pipeline because the
     /// per-issue wall-clock budget was exceeded — either the budget hit
     /// zero before a phase started, or a container was killed mid-run
@@ -434,12 +512,23 @@ pub fn classify_exit(outcomes: &PhaseOutcomes) -> ExitReason {
     if outcomes.implement.exit_code != 0 {
         return ExitReason::Crash;
     }
+    // Issue #196: a failing gate means the code did not pass. Whether
+    // that is the *diff's* fault is a separate question, and the base
+    // commit's own CI answers it. Only an established-red base diverts
+    // here; `Green` and `NotEstablished` both fall through to
+    // `FinalTestsRed` exactly as before.
     if gate_failed(&outcomes.post_implement_gate) {
+        if outcomes.base_health.predates_the_diff() {
+            return ExitReason::BaseAlreadyRed;
+        }
         return ExitReason::FinalTestsRed;
     }
     if let Some(end_gate) = &outcomes.end_pipeline_gate
         && gate_failed(end_gate)
     {
+        if outcomes.base_health.predates_the_diff() {
+            return ExitReason::BaseAlreadyRed;
+        }
         return ExitReason::FinalTestsRed;
     }
     // ADR-0011 amendment: a review / review-fix / security-review /
