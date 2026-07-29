@@ -58,12 +58,19 @@ fn batch_nit_prompt_is_scoped_to_the_parser_nit_severity() {
     // exclusion is the load-bearing half — `tests/policy.rs` pins what the nit
     // prompt permits, but nothing else pins that the stricter severities never
     // reach it.
+    //
+    // The negative branch matches the backticked tag form the prompt uses to
+    // name a severity, not the bare word: "important" and "blocker" are
+    // ordinary English, and a sentence like "it is important to run cargo
+    // check" must not fail a scoping contract.
     let nit = Severity::Nit.as_tag();
     assert!(
         BATCH_REVIEW_FIX_NIT_PROMPT.contains(&format!("`{nit}`-severity"))
             && [Severity::Blocker, Severity::Important]
                 .into_iter()
-                .all(|severity| !BATCH_REVIEW_FIX_NIT_PROMPT.contains(severity.as_tag())),
+                .all(|severity| {
+                    !BATCH_REVIEW_FIX_NIT_PROMPT.contains(&format!("`{}`", severity.as_tag()))
+                }),
         "BATCH_REVIEW_FIX_NIT_PROMPT must be exclusive to `{nit}` findings: \
          {BATCH_REVIEW_FIX_NIT_PROMPT}",
     );
