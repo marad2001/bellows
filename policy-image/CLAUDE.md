@@ -36,7 +36,7 @@ Real repos contain large source files (tens of thousands of tokens). The `Read` 
 
 Two destinations, and they are not interchangeable.
 
-- **`/workspace/bellows-agent-notes.md` — about *this run*.** Blockers, trade-offs you took, findings you did not address. It is **ephemeral** by design: Bellows captures it, posts it as a PR comment, then deletes it from the workspace and commits the deletion before the push, so nothing written there survives into the repo (ADR-0006). Defects in Bellows itself — a prompt, a gate, the sandbox — belong here too, for the operator to raise as a `harness-fault` Correction.
+- **`/workspace/bellows-agent-notes.md` — about *this run*.** Blockers, trade-offs you took, findings you did not address. It is **ephemeral** by design: Bellows captures the notes, deletes the file and commits that deletion before the final push, then posts the captured content as a PR comment afterward, so nothing written there survives into the repo (ADR-0006). Defects in Bellows itself — a prompt, a gate, the sandbox — belong here too, for the operator to raise as a `harness-fault` Correction.
 - **The target repo's own context file at `/workspace` — about *this repo*.** This is where a **durable** fact belongs: something true of the repo you are working in that the next run on it should not have to rediscover. It lands in the diff and goes through PR review like any other change. Choose the destination for the active engine:
   - If the active engine is codex, update or create `/workspace/AGENTS.md`; codex does not read `CLAUDE.md`, even when that is the only context file the repo already keeps.
   - If the active engine is claude, update or create `/workspace/CLAUDE.md`.

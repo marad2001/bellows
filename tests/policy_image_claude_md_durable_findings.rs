@@ -172,16 +172,20 @@ fn guidance_routes_each_engine_to_a_context_file_it_will_read() {
 }
 
 #[test]
-fn guidance_states_the_notes_file_is_deleted_before_the_push() {
+fn guidance_states_the_notes_lifecycle_in_execution_order() {
     // AC: "the guidance explicitly states that `bellows-agent-notes.md`
-    // is deleted before the push, so the contrast is unambiguous."
+    // is deleted before the push, so the contrast is unambiguous." The PR
+    // comment can only be posted after that push and the PR has been opened.
     let body = read_policy_image_claude_md();
     let section = where_to_write_section(&body);
     let lower = section.to_lowercase();
     assert!(
-        lower.contains("delet") && lower.contains("before the push"),
-        "The section must state explicitly that `bellows-agent-notes.md` is deleted before the \
-         push (ADR-0006), so the ephemeral-vs-durable contrast is unambiguous: {section}",
+        lower.contains(
+            "bellows captures the notes, deletes the file and commits that deletion before the \
+             final push, then posts the captured content as a pr comment afterward"
+        ),
+        "The section must describe the `bellows-agent-notes.md` lifecycle in execution order \
+         (capture, deletion committed before push, then PR comment): {section}",
     );
 }
 
