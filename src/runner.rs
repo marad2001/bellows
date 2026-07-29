@@ -3128,6 +3128,52 @@ fn any_gate_oom_killed(outcomes: &PhaseOutcomes) -> bool {
             .is_some_and(policy::gate_oom_killed)
 }
 
+/// Issue #191: how a PR body references its source issue.
+///
+/// A run that succeeded claims the issue is resolved and says `Closes
+/// #N`. A run that did not succeed says `Refs #N` instead, because it
+/// has no such claim to make.
+///
+/// The keyword is load-bearing, not decorative. Per issue #59 the
+/// auto-merge workflow parses the PR body for GitHub's close keywords
+/// and calls `issues.update(state: 'closed')` itself — GitHub's own hook
+/// does not fire when the merger is `app/github-actions`. So `Closes #N`
+/// on a failed run's PR is a live instruction to close the issue the
+/// moment anyone merges that PR.
+///
+/// That is what happened to `workboard-financial-advice` #671. Its run
+/// crashed 149 seconds in, having done nothing but the `cargo update
+/// --precise` its brief asked for as step one. Bellows pushed the
+/// resulting four-line `Cargo.lock` diff as PR #676 with `Closes #671`
+/// on it. Merging that PR — the draft guard is the only thing that
+/// stopped it — would have closed a live bug the diff did not touch,
+/// and the operator ended up reimplementing #671 by hand.
+///
+/// `Refs` is deliberately outside the workflow's
+/// `close[sd]?|fix(e[sd])?|resolve[sd]?` matcher, so it links the issue
+/// for a reader without arming the close.
+///
+/// The PR is still opened, and still carries the agent's work. Issue #49
+/// exists precisely so a crashed run produces a visible draft PR rather
+/// than stalling silently at `agent-in-progress`; suppressing the PR
+/// would trade this defect for that one.
+fn pr_body_issue_reference(reason: &ExitReason, issue_number: u64) -> String {
+    match reason {
+        ExitReason::Success => format!("Closes #{issue_number}.\n\n"),
+        // The prose deliberately never places a close keyword directly
+        // before the issue number. Writing the obvious sentence — "this
+        // PR does not claim to close #N" — would re-arm the very hook it
+        // disclaims, because the workflow's matcher reads keywords, not
+        // intent. A unit test below pins that no failure body arms it.
+        _ => format!(
+            "Refs #{issue_number}.\n\n\
+             _This run did not complete successfully. Merging this PR will not close \
+             the linked issue, and the run makes no claim to have finished it. If the \
+             work here turns out to be enough, close the issue yourself._\n\n"
+        ),
+    }
+}
+
 fn build_pr_body(
     reason: &ExitReason,
     issue_number: u64,
@@ -3136,7 +3182,7 @@ fn build_pr_body(
     workflow_files_changed: &[String],
     outcomes: &PhaseOutcomes,
 ) -> String {
-    let header = format!("Closes #{issue_number}.\n\n");
+    let header = pr_body_issue_reference(reason, issue_number);
     let body = match reason {
         ExitReason::Success => claude_pr_body
             .map(str::to_string)
@@ -4664,6 +4710,182 @@ api_key_env_file = "~/bellows-test-opencode.env"
         let body = build_pr_body(&ExitReason::Success, 42, Some("My PR body."), None, &[], &PhaseOutcomes::default());
         assert!(body.starts_with("Closes #42.\n\n"));
         assert!(body.contains("My PR body."));
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #191: only a successful run's PR may claim to close its
+    // issue.
+    //
+    // The close keyword is a live instruction, not a convention. Per
+    // issue #59 the auto-merge workflow parses the PR body for GitHub's
+    // close keywords and calls `issues.update(state: 'closed')` itself,
+    // because GitHub's own hook does not fire when the merger is
+    // `app/github-actions`. `Closes #N` on a failed run's PR therefore
+    // arms the close for whoever merges it.
+    //
+    // `workboard-financial-advice` #671 is the exemplar: the run crashed
+    // 149 seconds in, having done nothing but the `cargo update
+    // --precise` its brief asked for as step one, and bellows opened
+    // PR #676 — a four-line `Cargo.lock` diff — carrying `Closes #671`.
+    // ---------------------------------------------------------------
+
+    /// GitHub's auto-close keywords, mirroring the `keywordRegex` the
+    /// auto-merge workflow uses. Hand-rolled because the repo has no
+    /// regex dev-dependency; `the_auto_merge_keyword_regex_is_unchanged`
+    /// fails if the workflow learns a keyword this list does not know.
+    const CLOSE_KEYWORDS: [&str; 9] = [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ];
+
+    /// Whether `body` carries a keyword that would make merging the PR
+    /// close `issue`. Case-insensitive, word-bounded, and requiring
+    /// `\s+#<digits>` after the keyword — like the workflow's matcher.
+    fn arms_the_auto_close(body: &str, issue: u64) -> bool {
+        let lower = body.to_lowercase();
+        let target = format!("#{issue}");
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        for keyword in CLOSE_KEYWORDS {
+            let mut from = 0;
+            while let Some(hit) = lower[from..].find(keyword) {
+                let start = from + hit;
+                let after = start + keyword.len();
+                from = after;
+                if start > 0 && lower[..start].chars().next_back().is_some_and(is_word) {
+                    continue;
+                }
+                let rest = &lower[after..];
+                if rest.starts_with(is_word) {
+                    continue;
+                }
+                let trimmed = rest.trim_start();
+                if rest.len() != trimmed.len()
+                    && trimmed.starts_with(&target)
+                    && !trimmed[target.len()..].starts_with(|c: char| c.is_ascii_digit())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Fails to compile when `ExitReason` gains a variant, so whoever
+    /// adds one has to decide which side of the close-keyword rule it
+    /// falls on and extend `ALL_EXIT_REASONS` below. An array literal
+    /// alone would not force that — it would just silently under-test
+    /// the new variant.
+    #[allow(dead_code)]
+    fn exit_reason_exhaustiveness_guard(reason: &ExitReason) {
+        match reason {
+            ExitReason::Success
+            | ExitReason::AgentSelfReportedFailure
+            | ExitReason::Crash
+            | ExitReason::FinalTestsRed
+            | ExitReason::BaseAlreadyRed
+            | ExitReason::WallClockExceeded
+            | ExitReason::RateLimited
+            | ExitReason::AuthError
+            | ExitReason::Cancelled => {}
+        }
+    }
+
+    /// Every terminal classification a run can finish on. Kept in step
+    /// with the enum by `exit_reason_exhaustiveness_guard` above.
+    const ALL_EXIT_REASONS: [ExitReason; 9] = [
+        ExitReason::Success,
+        ExitReason::AgentSelfReportedFailure,
+        ExitReason::Crash,
+        ExitReason::FinalTestsRed,
+        ExitReason::BaseAlreadyRed,
+        ExitReason::WallClockExceeded,
+        ExitReason::RateLimited,
+        ExitReason::AuthError,
+        ExitReason::Cancelled,
+    ];
+
+    fn pr_body_for_reason(reason: &ExitReason) -> String {
+        build_pr_body(
+            reason,
+            671,
+            Some("Did the work."),
+            None,
+            &[],
+            &PhaseOutcomes::default(),
+        )
+    }
+
+    #[test]
+    fn a_successful_run_still_arms_the_auto_close() {
+        // The AFK contract depends on this: issue -> PR -> merge ->
+        // issue closed, with no operator intervention.
+        let body = pr_body_for_reason(&ExitReason::Success);
+        assert!(body.starts_with("Closes #671."), "{body}");
+        assert!(arms_the_auto_close(&body, 671), "{body}");
+    }
+
+    #[test]
+    fn no_failed_run_arms_the_auto_close() {
+        for reason in ALL_EXIT_REASONS {
+            if reason == ExitReason::Success {
+                continue;
+            }
+            let body = pr_body_for_reason(&reason);
+            assert!(
+                !arms_the_auto_close(&body, 671),
+                "{reason:?} must not arm the auto-close for #671:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_still_references_its_issue() {
+        // Dropping the keyword must not drop the link — a reader needs
+        // to know which issue produced the PR.
+        for reason in ALL_EXIT_REASONS {
+            if reason == ExitReason::Success {
+                continue;
+            }
+            let body = pr_body_for_reason(&reason);
+            assert!(
+                body.starts_with("Refs #671."),
+                "{reason:?} should lead with the non-closing reference:\n{body}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_says_plainly_that_merging_will_not_close_the_issue() {
+        let body = pr_body_for_reason(&ExitReason::Crash);
+        assert!(body.contains("will not close the linked issue"), "{body}");
+    }
+
+    #[test]
+    fn the_auto_merge_keyword_regex_is_unchanged() {
+        // `arms_the_auto_close` is a hand-rolled mirror of the
+        // workflow's regex. Pin the literal so the mirror cannot
+        // silently stop covering it.
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/auto-merge.yml"
+        ))
+        .expect("auto-merge workflow should be readable");
+        assert!(
+            workflow.contains(r"/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/gi"),
+            "the auto-merge close-keyword regex changed; update CLOSE_KEYWORDS \
+             here to match, then re-check that `Refs` is still outside it",
+        );
+    }
+
+    #[test]
+    fn refs_is_outside_the_workflow_matcher() {
+        // The whole fix rests on this. Guard it directly.
+        assert!(!arms_the_auto_close("Refs #671.", 671));
+        assert!(arms_the_auto_close("Closes #671.", 671));
+        assert!(arms_the_auto_close("resolved  #671", 671));
+        // A different issue number that starts with the same digits.
+        assert!(!arms_the_auto_close("Closes #6710.", 671));
+        // A keyword inside a longer word is not a keyword.
+        assert!(!arms_the_auto_close("prefixes #671", 671));
     }
 
     #[test]
