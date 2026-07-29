@@ -56,6 +56,7 @@ Walk these checks in order. Stop at the first one that fires.
 3. **Is the issue bounded, well-specified, and one-PR-shaped?**
    - The acceptance criteria can be enumerated. The change touches one bounded area. An agent can plausibly finish it inside a single PR.
    - → `ready-for-agent`. Write an `## Agent Brief` carefully — the downstream agent treats it as the contract.
+   - Then, before you emit the verdict, run the mandatory `## Brief self-check` below against the acceptance criteria you just wrote. It can send you back to step 1.
 
 4. **Does the issue require human judgement?**
    - Architectural calls, multi-area changes, decisions between conflicting ADRs, security-sensitive changes, cross-context migrations.
@@ -71,6 +72,24 @@ For very-vague enhancements two routes exist:
 - **Grilling** (a separate skill at `~/.claude/skills/grill-with-docs/`) — drag the reporter through structured back-and-forth until the request is well-shaped. Interactive; not available in bellows's headless flow.
 
 In bellows's headless flow (`bellows triage`), grilling is out of scope — choose `needs-info` and capture the questions.
+
+## Brief self-check
+
+Mandatory before emitting a `ready-for-agent` verdict. You have just written the `## Agent Brief`; now read your own `Acceptance criteria` list back with fresh eyes and hold each entry to one bar:
+
+> Every acceptance criterion must name an observable behaviour that can be mechanically falsified — a reviewer or a test can point at a concrete outcome and say "that did not happen".
+
+Worked examples:
+
+- `handles errors gracefully` — **fails the bar.** Nothing about it can be checked. Graceful how? Which errors? There is no outcome to observe, so the downstream agent has to invent the contract and only discovers it was wrong at review time.
+- `returns Err(InvalidUrl) for a URL with no host` — **passes the bar.** It names the input, the observable result, and the exact variant. A test either produces it or does not.
+
+When a criterion fails the bar:
+
+1. **Rewrite it.** This is the first response, and usually the only one needed — a vague criterion is nearly always the *brief's* failing, not the issue's. Say which function, input, output, file, or literal the criterion is about. Then re-check the rewritten criterion against the bar.
+2. Only if the rewrite cannot be written — because the *issue itself* lacks the substance to state a falsifiable criterion, and there is a real question the reporter can answer — downgrade the verdict to `needs-info` and ask that question. Do not downgrade because your first draft was woolly; that asks the reporter to answer for your writing and parks a well-specified issue for nothing.
+
+Repeat until every criterion passes the bar or the verdict has become `needs-info`.
 
 ## Brief templates
 

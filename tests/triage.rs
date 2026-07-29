@@ -613,6 +613,114 @@ fn policy_image_bakes_triage_skill_with_canonical_taxonomy_content() {
     }
 }
 
+/// Read the baked triage skill from the source tree, the same way
+/// `policy_image_bakes_triage_skill_with_canonical_taxonomy_content`
+/// does. The skill is the canonical home for triage heuristics (the
+/// slice-#61 contract), so brief-quality assertions read it here rather
+/// than inspecting `TRIAGE_PROMPT`.
+fn triage_skill_body() -> String {
+    let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("policy-image")
+        .join("skills")
+        .join("triage")
+        .join("SKILL.md");
+    std::fs::read_to_string(&skill_path)
+        .unwrap_or_else(|e| panic!("triage skill not baked at {}: {e}", skill_path.display()))
+}
+
+/// Slice out one top-level (`## `) section of the skill: everything from
+/// the given header up to the next top-level header (or end of file).
+/// Assertions scoped to a section are what distinguish "the skill
+/// mentions this somewhere" from "this section says it" — the brief for
+/// #171 requires the latter.
+///
+/// The header must match at a *line start*: the decision tree
+/// cross-references `## Brief self-check` inline, so a naive substring
+/// search would slice from that mention instead of the real heading.
+fn skill_section<'a>(body: &'a str, header: &str) -> &'a str {
+    let newline_anchored = format!("\n{header}");
+    let start = if body.starts_with(header) {
+        0
+    } else {
+        body.find(&newline_anchored)
+            .map(|i| i + 1)
+            .unwrap_or_else(|| panic!("baked triage skill has no `{header}` section:\n{body}"))
+    };
+    let rest = &body[start + header.len()..];
+    let end = rest.find("\n## ").map_or(rest.len(), |i| i + 1);
+    &body[start..start + header.len() + end]
+}
+
+#[test]
+fn triage_skill_has_a_brief_self_check_section() {
+    // Issue #171: before emitting `ready-for-agent`, the triage agent
+    // must re-read the acceptance criteria it just wrote against a
+    // falsifiability bar. That heuristic lives in the baked skill (not
+    // `TRIAGE_PROMPT`, which is pinned as a thin shim). Pin the header
+    // literal so the section cannot be silently renamed away.
+    let body = triage_skill_body();
+    assert!(
+        body.contains("## Brief self-check"),
+        "baked triage skill must carry a `## Brief self-check` section so the agent verifies \
+         its own acceptance criteria before emitting `ready-for-agent`:\n{body}"
+    );
+}
+
+#[test]
+fn brief_self_check_ships_both_worked_examples_of_the_falsifiability_bar() {
+    // The bar is only teachable with a contrast pair: one criterion that
+    // fails it and one that passes it. Both live in the self-check
+    // section itself, not scattered elsewhere in the skill.
+    let body = triage_skill_body();
+    let section = skill_section(&body, "## Brief self-check");
+    assert!(
+        section.contains("handles errors gracefully"),
+        "self-check section must ship the worked example that FAILS the falsifiability bar \
+         (`handles errors gracefully`):\n{section}"
+    );
+    assert!(
+        section.contains("returns Err(InvalidUrl) for a URL with no host"),
+        "self-check section must ship the worked example that PASSES the falsifiability bar \
+         (`returns Err(InvalidUrl) for a URL with no host`):\n{section}"
+    );
+}
+
+#[test]
+fn brief_self_check_prescribes_rewrite_first_and_needs_info_as_the_bounded_fallback() {
+    // Both halves of the failure response must be stated *in the
+    // self-check section*: rewrite is the first move, `needs-info` is
+    // the bounded fallback for when the issue itself cannot support a
+    // falsifiable criterion. `needs-info` appears all over the skill, so
+    // asserting it file-wide would prove nothing — scope to the section.
+    let body = triage_skill_body();
+    let section = skill_section(&body, "## Brief self-check");
+    assert!(
+        section.contains("rewrite"),
+        "self-check section must name `rewrite` as the first response to a criterion that \
+         fails the bar:\n{section}"
+    );
+    assert!(
+        section.contains("needs-info"),
+        "self-check section must name `needs-info` as the bounded fallback when the issue \
+         itself cannot support a falsifiable criterion:\n{section}"
+    );
+}
+
+#[test]
+fn decision_tree_reaches_the_brief_self_check_rather_than_stranding_it_as_an_appendix() {
+    // A heuristic the agent never walks into is dead text. The
+    // `ready-for-agent` route in the decision tree must name the
+    // self-check section, so the check is a step on the path to the
+    // verdict rather than an appendix at the bottom of the skill.
+    let body = triage_skill_body();
+    let tree = skill_section(&body, "## Decision tree");
+    assert!(
+        tree.contains("## Brief self-check"),
+        "the `## Decision tree` section must cross-reference `## Brief self-check` so the \
+         check is reachable from the tree, not stranded as an appendix:\n{tree}"
+    );
+}
+
 #[test]
 fn policy_image_dockerfile_bakes_skills_directory_so_triage_skill_propagates() {
     // The triage skill at `policy-image/skills/triage/` only reaches
