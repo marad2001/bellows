@@ -37,7 +37,10 @@ Real repos contain large source files (tens of thousands of tokens). The `Read` 
 Two destinations, and they are not interchangeable.
 
 - **`/workspace/bellows-agent-notes.md` — about *this run*.** Blockers, trade-offs you took, findings you did not address. It is **ephemeral** by design: Bellows captures it, posts it as a PR comment, then deletes it from the workspace and commits the deletion before the push, so nothing written there survives into the repo (ADR-0006). Defects in Bellows itself — a prompt, a gate, the sandbox — belong here too, for the operator to raise as a `harness-fault` Correction.
-- **The target repo's own context file at `/workspace` — about *this repo*.** This is where a **durable** fact belongs: something true of the repo you are working in that the next run on it should not have to rediscover. It lands in the diff and goes through PR review like any other change. claude and opencode both auto-discover `/workspace/CLAUDE.md` by walking up from the working directory; codex does not read `CLAUDE.md` at all — it discovers `AGENTS.md` — so write to whichever of the two the repo already keeps, and create `CLAUDE.md` if it keeps neither.
+- **The target repo's own context file at `/workspace` — about *this repo*.** This is where a **durable** fact belongs: something true of the repo you are working in that the next run on it should not have to rediscover. It lands in the diff and goes through PR review like any other change. Choose the destination for the active engine:
+  - If the active engine is codex, update or create `/workspace/AGENTS.md`; codex does not read `CLAUDE.md`, even when that is the only context file the repo already keeps.
+  - If the active engine is claude, update or create `/workspace/CLAUDE.md`.
+  - If the active engine is opencode, update the first existing local context file in its discovery order (`/workspace/AGENTS.md`, then `/workspace/CLAUDE.md`); if neither exists, create `/workspace/AGENTS.md`.
 
 **The bar for that second destination is high. Default to not writing.** Write only when all four hold:
 
@@ -46,7 +49,7 @@ Two destinations, and they are not interchangeable.
 - it is **stable** — a property of the repo, not of the current branch or issue;
 - it is **not already** stated in the repo's `CLAUDE.md`, `AGENTS.md`, `CONTEXT.md` or README.
 
-If any of those fail, do not write it. One or two sentences appended to the existing file is the right size; if the repo keeps no such file, create one containing only the finding — do not author a general-purpose template. A context file padded with speculative observations loads into every future run on that repo and costs more than it saves.
+If any of those fail, do not write it. One or two sentences appended to the engine-specific file selected above is the right size; when the selected file does not exist, create it containing only the finding — do not author a general-purpose template. A context file padded with speculative observations loads into every future run on that repo and costs more than it saves.
 
 ## What Bellows does after you exit
 

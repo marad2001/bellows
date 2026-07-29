@@ -139,24 +139,35 @@ fn codex_neutralisation_leaves_the_section_untouched() {
 }
 
 #[test]
-fn guidance_states_which_engines_read_the_repos_claude_md() {
+fn guidance_routes_each_engine_to_a_context_file_it_will_read() {
     // AC: "no dangling reference to a file codex will not read." Codex
-    // discovers `AGENTS.md`, not `CLAUDE.md`, so the section must name
-    // per-engine behaviour explicitly instead of implying every engine
-    // in the chain picks the file up.
+    // discovers `AGENTS.md`, not `CLAUDE.md`, so merely naming both files
+    // is insufficient: the instruction must unambiguously route each
+    // active engine to a file that engine will discover on its next run.
     let rendered = rendered_operating_context(Engine::Codex);
     let section = where_to_write_section(&rendered);
     let lower = section.to_lowercase();
     assert!(
-        lower.contains("agents.md"),
-        "The section must name `AGENTS.md` — codex discovers that, not `CLAUDE.md`, so a codex \
-         agent pointed only at `CLAUDE.md` is being pointed at a file it will not read back: \
-         {section}",
+        lower.contains(
+            "if the active engine is codex, update or create `/workspace/agents.md`"
+        ),
+        "The section must route codex specifically to `AGENTS.md`, even when the repo already \
+         keeps only `CLAUDE.md`: {section}",
     );
     assert!(
-        lower.contains("codex"),
-        "The section must say explicitly which engines auto-discover the repo's `CLAUDE.md` and \
-         which do not, rather than implying uniform behaviour: {section}",
+        lower.contains(
+            "if the active engine is claude, update or create `/workspace/claude.md`"
+        ),
+        "The section must route claude specifically to `CLAUDE.md`: {section}",
+    );
+    assert!(
+        lower.contains(
+            "if the active engine is opencode, update the first existing local context file in \
+             its discovery order (`/workspace/agents.md`, then `/workspace/claude.md`); if neither \
+             exists, create `/workspace/agents.md`"
+        ),
+        "The section must route opencode according to its documented local discovery order: \
+         {section}",
     );
 }
 
