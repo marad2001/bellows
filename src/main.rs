@@ -196,8 +196,51 @@ enum SetupDeployKeysAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The stack the whole orchestrator runs on.
+///
+/// `block_on` polls the pipeline on the thread that calls it, so a poll
+/// chain is a chain of real nested stack frames — `main` -> `block_on`
+/// -> `run` -> `run_once` -> the phase helper -> sandbox -> bollard's
+/// docker call, all live at once. In a debug build `run_once`'s async
+/// body alone reserves ~540 KB (every local in a 2,200-line `async fn`
+/// gets its own slot), and the deepest chain — the cargo-checks gate,
+/// which is two frames deeper than the implement phase — measured ~940 KB
+/// of frames against Windows' 1 MB default main-thread stack. It ran out
+/// mid-`run_cargo_checks`, in the first HTTP call to the docker daemon.
+///
+/// `#[tokio::main]` would put us back on that 1 MB PE default, so the
+/// runtime is built by hand on a thread with an explicit stack instead.
+/// Nothing is `tokio::spawn`ed anywhere in the tree, so this thread is
+/// the only stack the pipeline ever runs on — the runtime's worker
+/// threads only carry blocking-pool and IO-driver work.
+///
+/// Sized well clear of the measured high-water mark rather than snugly
+/// above it: the frames grow every time a phase gains a local, and the
+/// cost of an over-large *reserve* is address space, not memory —
+/// Windows commits stack pages on demand.
+const ORCHESTRATOR_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("bellows-main".to_string())
+        .stack_size(ORCHESTRATOR_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?
+                .block_on(run_cli())
+        })
+        .context("spawning the orchestrator thread")?
+        .join()
+        // A panic on the orchestrator thread is the process panicking:
+        // resume it here so it prints and aborts exactly as it would
+        // have when this body ran on the main thread, rather than being
+        // flattened into an `Err` that reads like a handled failure.
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli
         .config
