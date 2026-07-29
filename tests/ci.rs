@@ -78,9 +78,14 @@ fn ci_workflow_runs_cargo_test_with_all_targets_and_features() {
 #[test]
 fn ci_workflow_runs_cargo_clippy_with_exact_bellows_internal_args() {
     let body = read_workflow();
-    // Brief: this is the **load-bearing** correspondence. The
-    // bellows-internal cargo checks gate runs
-    // `cargo clippy --all-targets --all-features -- -D warnings`.
+    // Brief: this is the **load-bearing** correspondence. Bellows runs
+    // its cargo-checks gate against its own repo by parsing this very
+    // workflow (ADR-0004), so whatever clippy args CI declares here are
+    // the args the gate runs. Pinning them keeps the bar explicit and
+    // reviewable rather than something a workflow edit can quietly relax
+    // — the `[gates]` fallback is NOT what runs here, and no longer
+    // denies warnings, so this file is the only place the strict bar for
+    // bellows itself is stated.
     // CI must invoke clippy with **exactly** the same args — any
     // drift (missing `--all-features`, missing `-D warnings`,
     // dropping `--all-targets`) produces a future bug where CI says

@@ -627,8 +627,22 @@ impl Default for GatesConfig {
     }
 }
 
+/// The clippy flags used when bellows could **not** read the target
+/// repo's CI — no `.github/workflows`, or nothing parseable in it.
+///
+/// Deliberately does not deny warnings. This value is only ever reached
+/// when bellows has no evidence of the standard the repo holds itself to,
+/// and `-D warnings` invents one: it failed `marad2001/workboard-core`
+/// (which has no CI at all) on three pre-existing `derivable_impls` hits
+/// in files the agent never touched, and blamed the diff for them. Real
+/// clippy errors still fail the gate, and `cargo test` still gates
+/// behaviour — what is given up is turning a repo's existing lint debt
+/// into an agent's failed run.
+///
+/// An operator who wants the strict posture sets `[gates].clippy_flags`
+/// in `orchestrator.toml`, which is what that knob is for.
 fn default_clippy_flags() -> String {
-    "--all-targets --all-features -- -D warnings".to_string()
+    "--all-targets --all-features".to_string()
 }
 
 fn default_test_flags() -> String {

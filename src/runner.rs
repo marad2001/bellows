@@ -3085,7 +3085,16 @@ fn run_failure_disambiguation(reason: &ExitReason, outcomes: &PhaseOutcomes) -> 
             "\n\n_**This is not a code failure.** Bellows's gate container was killed by the kernel (out of memory) while linking the test binaries, both on the first attempt and on the serialised-link retry — so the checks never reached a verdict on this diff. The repo's own GitHub CI, which runs on a larger machine, is the authoritative signal here._".to_string()
         }
         ExitReason::FinalTestsRed => {
-            "\n\n_Bellows mirrors this repo's CI clippy/test commands (ADR-0004), so this is the same failure GitHub CI would report on the code._".to_string()
+            // Deliberately does not claim CI equivalence. Bellows mirrors
+            // the repo's CI commands only when it could parse them
+            // (ADR-0004); on a fallback it runs the operator-declared
+            // `[gates]` posture, which is bellows's own and can be
+            // stricter than the repo's. Asserting "the same failure
+            // GitHub CI would report" on a fallback run told reviewers
+            // the diff broke something CI would catch, when the gate had
+            // actually applied a standard the repo does not. The run log
+            // names each resolved command and its provenance.
+            "\n\n_Bellows's cargo-checks gate failed on this branch. Where it could read this repo's CI workflow it ran those commands verbatim (ADR-0004); where it could not, it ran the operator-declared `[gates]` fallback, which may be stricter than this repo's own CI. The run-log comment names each command and where it came from._".to_string()
         }
         ExitReason::Success | ExitReason::AgentSelfReportedFailure => String::new(),
     }
@@ -5023,8 +5032,8 @@ api_key_env_file = "~/bellows-test-opencode.env"
         let red =
             build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &PhaseOutcomes::default());
         assert!(
-            red.contains("mirrors this repo's CI"),
-            "FinalTestsRed should say it is the same failure CI would report: {red}",
+            red.contains("cargo-checks gate failed"),
+            "FinalTestsRed should name the gate as the thing that failed: {red}",
         );
         assert!(
             !red.contains("run** failure"),
@@ -6430,9 +6439,9 @@ api_key_env_file = "~/bellows-test-opencode.env"
     }
 
     #[test]
-    fn pr_body_keeps_the_adr_0004_claim_for_a_genuinely_failing_test() {
-        // No-regression: a real failing test still gets the original
-        // wording, because there the claim is true.
+    fn pr_body_presents_a_genuinely_failing_test_as_a_code_signal() {
+        // No-regression counterpart to the OOM case above: a real failing
+        // test must NOT be softened into an infrastructure excuse.
         let outcomes = PhaseOutcomes {
             post_implement_gate: gate_with_test(
                 101,
@@ -6442,10 +6451,39 @@ api_key_env_file = "~/bellows-test-opencode.env"
         };
         let body = build_pr_body(&ExitReason::FinalTestsRed, 42, None, None, &[], &outcomes);
         assert!(
-            body.contains("mirrors this repo's CI"),
+            body.contains("cargo-checks gate failed"),
             "a real test failure IS the code signal: {body}",
         );
         assert!(!body.contains("not a code failure"));
+    }
+
+    #[test]
+    fn pr_body_never_asserts_the_gate_matched_ci_it_could_not_read() {
+        // The footer used to state flatly that bellows "mirrors this
+        // repo's CI clippy/test commands ... so this is the same failure
+        // GitHub CI would report". On a fallback run that is false, and
+        // it was false on a real run: a BOM in `ci.yml` sent the gate to
+        // the `[gates]` default `-D warnings` against a repo whose CI
+        // deliberately does not deny warnings, and the PR told reviewers
+        // CI would have caught it. `PhaseOutcomes` carries no provenance,
+        // so the wording must hold for both cases rather than assert the
+        // one bellows cannot check here.
+        let body = build_pr_body(
+            &ExitReason::FinalTestsRed,
+            42,
+            None,
+            None,
+            &[],
+            &PhaseOutcomes::default(),
+        );
+        assert!(
+            !body.contains("so this is the same failure GitHub CI would report"),
+            "must not claim CI equivalence it cannot establish: {body}",
+        );
+        assert!(
+            body.contains("fallback"),
+            "must admit the fallback posture exists: {body}",
+        );
     }
 
     #[test]

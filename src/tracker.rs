@@ -1255,20 +1255,32 @@ pub fn classify_base_health(
 /// docs job, a deploy step — from being read as "the base is broken" for
 /// a clippy failure.
 ///
-/// The consequence of exactness: a repo whose CI job is named `build`
-/// rather than after the command it runs will never match, and the
-/// lookup returns `NotEstablished`. That is the intended degradation —
-/// no answer rather than a wrong one.
+/// A matrix job's check-runs carry their axis values in the name —
+/// `ci (ubuntu-latest)`, `ci (windows-latest)` — so the suffix is
+/// stripped before comparing. One matrix leg failing is the job failing,
+/// which is what the base-health question is asking.
 fn check_is_mirrored(check_name: &str, mirrored_checks: &[String]) -> bool {
-    let name = check_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(check_name)
-        .trim()
-        .to_lowercase();
-    mirrored_checks
-        .iter()
-        .any(|mirrored| !mirrored.is_empty() && mirrored.trim().to_lowercase() == name)
+    let name = normalise_check_name(check_name);
+    mirrored_checks.iter().any(|mirrored| {
+        let mirrored = normalise_check_name(mirrored);
+        !mirrored.is_empty() && mirrored == name
+    })
+}
+
+/// Reduce a check-run name to the job identity bellows matches on:
+/// drop GitHub's `workflow / job` prefix, drop a matrix `(axis)` suffix,
+/// trim, lowercase.
+fn normalise_check_name(raw: &str) -> String {
+    let without_workflow = raw.rsplit('/').next().unwrap_or(raw).trim();
+    // Only a *trailing* parenthesised group is a matrix axis. A job
+    // genuinely named `build (fast)` loses its suffix too, which costs
+    // nothing: it is compared against a mirrored name normalised the
+    // same way.
+    let base = match without_workflow.rfind(" (") {
+        Some(idx) if without_workflow.ends_with(')') => &without_workflow[..idx],
+        _ => without_workflow,
+    };
+    base.trim().to_lowercase()
 }
 
 /// Derive the check-run names to consult from the cargo commands the
@@ -1276,47 +1288,43 @@ fn check_is_mirrored(check_name: &str, mirrored_checks: &[String]) -> bool {
 /// workflow on every run, so these are derived too — nothing here is
 /// remembered).
 ///
-/// A command like `cargo clippy --locked --workspace --all-targets` maps
-/// to the key `cargo clippy`: everything up to the first flag. In
-/// practice CI jobs that run a cargo command are named after it, which
-/// is what makes the mapping work — `marad2001/workboard-financial-advice`
-/// surfaces `cargo clippy` and `cargo test` as check-run names.
+/// The name is the **CI job** each mirrored command was taken from, which
+/// the parser records at extract time. GitHub names a check-run after the
+/// job, so that is the only thing on the commits API a gate command can be
+/// matched to.
+///
+/// This used to derive the name from the command instead — `cargo clippy
+/// --locked --workspace` → the key `cargo clippy` — which works only for a
+/// repo that happens to name its jobs after the commands they run.
+/// `marad2001/workboard-financial-advice` does exactly that and the
+/// heuristic held there, which is how it shipped. Every other configured
+/// repo names the job `ci`, so nothing ever matched, `relevant` was always
+/// empty, and the lookup returned `NotEstablished` on every run while its
+/// unit tests stayed green against fixtures drawn from the one repo where
+/// it worked. Reading the job name covers both: on that repo the job *is*
+/// named `cargo clippy`.
+///
 /// Only commands actually parsed from the target's workflow contribute a
-/// key. A command that fell back to the operator-declared `[gates]`
-/// flags is not mirroring CI at all, so there is no CI job it
-/// corresponds to and guessing one would be exactly the kind of wrong
-/// answer this design refuses to give. With no parsed command, the
-/// caller gets no keys and the lookup returns `NotEstablished`.
+/// name. A command that fell back to the operator-declared `[gates]` flags
+/// is not mirroring CI at all, so there is no CI job it corresponds to and
+/// guessing one would be exactly the kind of wrong answer this design
+/// refuses to give. With no parsed command, the caller gets no names and
+/// the lookup returns `NotEstablished`.
+///
+/// Duplicates are collapsed: the common single-job workflow yields the same
+/// name for both commands, and asking GitHub about `ci` twice is noise.
 pub fn mirrored_check_names(commands: &crate::workspace::GateCommands) -> Vec<String> {
-    use crate::workflow_parse::Provenance;
-
-    let parsed = |command: &str, source: &Provenance| -> Option<String> {
-        match source {
-            Provenance::ParsedFromWorkflow(_) => check_key_for_command(command),
-            Provenance::FallbackFromConfig => None,
+    let mut names: Vec<String> = Vec::new();
+    for candidate in [&commands.clippy_check, &commands.test_check]
+        .into_iter()
+        .flatten()
+    {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() && !names.iter().any(|seen| seen == trimmed) {
+            names.push(trimmed.to_string());
         }
-    };
-
-    [
-        parsed(&commands.clippy, &commands.clippy_source),
-        parsed(&commands.test, &commands.test_source),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-/// `cargo clippy --locked --workspace` → `cargo clippy`.
-/// Returns `None` when the command has no leading non-flag tokens.
-fn check_key_for_command(command: &str) -> Option<String> {
-    let key: Vec<&str> = command
-        .split_whitespace()
-        .take_while(|token| !token.starts_with('-'))
-        .collect();
-    if key.is_empty() {
-        return None;
     }
-    Some(key.join(" "))
+    names
 }
 
 /// Whether a check-run conclusion is a failure the base is answerable

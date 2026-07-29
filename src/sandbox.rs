@@ -3020,9 +3020,11 @@ mod tests {
             clippy: "cargo clippy --all-targets -- -D clippy::correctness".to_string(),
             clippy_source: crate::workflow_parse::Provenance::FallbackFromConfig,
             clippy_env: Vec::new(),
+            clippy_check: None,
             test: "cargo test --features in-memory".to_string(),
             test_source: crate::workflow_parse::Provenance::FallbackFromConfig,
             test_env: Vec::new(),
+            test_check: None,
         };
         let env = build_cargo_checks_env(&gc, &[]);
         assert!(
@@ -3048,11 +3050,13 @@ mod tests {
                 std::path::PathBuf::from(".github/workflows/ci.yml"),
             ),
             clippy_env: vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())],
+            clippy_check: Some("ci".to_string()),
             test: "cargo test --locked --workspace --lib --bins --tests --all-features".to_string(),
             test_source: crate::workflow_parse::Provenance::ParsedFromWorkflow(
                 std::path::PathBuf::from(".github/workflows/ci.yml"),
             ),
             test_env: vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
+            test_check: Some("ci".to_string()),
         };
         let env = build_cargo_checks_env(&gc, &[]);
         assert!(

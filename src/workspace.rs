@@ -81,12 +81,19 @@ pub struct GateCommands {
     /// `[gates]` fallback — an operator-declared flag set carries no CI
     /// environment to mirror.
     pub clippy_env: Vec<(String, String)>,
+    /// The CI job whose steps this command was mirrored from, which is
+    /// the name GitHub gives the corresponding check-run. `None` when the
+    /// command came from the `[gates]` fallback: bellows invented that
+    /// posture, so no check-run on the repo corresponds to it.
+    pub clippy_check: Option<String>,
     pub test: String,
     pub test_source: Provenance,
     /// Build-relevant env the target's CI ran tests under. See
     /// `clippy_env`; kept per-command because a repo can split clippy
     /// and test into sibling jobs with differing env blocks.
     pub test_env: Vec<(String, String)>,
+    /// See `clippy_check`.
+    pub test_check: Option<String>,
 }
 
 impl GateCommands {
@@ -275,29 +282,43 @@ pub async fn prepare_with_gates(
 /// not CI's, so pairing it with CI's environment would mirror half of
 /// each and could produce a build posture neither side ever ran.
 fn materialise_gate_commands(extracted: ExtractedCommands, gates: &GatesConfig) -> GateCommands {
-    let (clippy, clippy_source, clippy_env) = match extracted.clippy {
-        Some(cmd) => (cmd, extracted.source.clone(), extracted.clippy_env),
+    let (clippy, clippy_source, clippy_env, clippy_check) = match extracted.clippy {
+        Some(cmd) => (
+            cmd,
+            extracted.source.clone(),
+            extracted.clippy_env,
+            extracted.clippy_check,
+        ),
         None => (
             format!("cargo clippy {}", gates.clippy_flags),
             Provenance::FallbackFromConfig,
             Vec::new(),
+            None,
         ),
     };
-    let (test, test_source, test_env) = match extracted.test {
-        Some(cmd) => (cmd, extracted.source, extracted.test_env),
+    let (test, test_source, test_env, test_check) = match extracted.test {
+        Some(cmd) => (
+            cmd,
+            extracted.source,
+            extracted.test_env,
+            extracted.test_check,
+        ),
         None => (
             format!("cargo test {}", gates.test_flags),
             Provenance::FallbackFromConfig,
             Vec::new(),
+            None,
         ),
     };
     GateCommands {
         clippy,
         clippy_source,
         clippy_env,
+        clippy_check,
         test,
         test_source,
         test_env,
+        test_check,
     }
 }
 

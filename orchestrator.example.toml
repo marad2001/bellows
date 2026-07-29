@@ -244,7 +244,17 @@ advance_budget_floor_fraction = 0.5
 # extract `cargo test` from the workflow but still fall back on
 # `cargo clippy` if the latter alone is unparseable.
 #
-# The defaults below preserve today's strict bar so an existing
-# operator who omits `[gates]` sees no change in behaviour.
-clippy_flags = "--all-targets --all-features -- -D warnings"
+# The clippy default deliberately does NOT deny warnings. It is only
+# ever reached when bellows has no evidence of the standard the repo
+# holds itself to, and `-D warnings` invents one: a repo with no CI at
+# all failed the gate on pre-existing lints in files the agent never
+# touched, and the diff was blamed for them. Real clippy errors still
+# fail the gate; `cargo test` still gates behaviour.
+#
+# To hold every target repo to a strict bar regardless of its own CI,
+# set the flags explicitly:
+#
+#   clippy_flags = "--all-targets --all-features -- -D warnings"
+#
+clippy_flags = "--all-targets --all-features"
 test_flags   = "--all-targets --all-features"

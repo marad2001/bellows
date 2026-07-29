@@ -342,3 +342,113 @@ fn either_failing_gate_triggers_the_base_health_lookup() {
         "so does a failing end-pipeline gate, which runs after the fixups",
     );
 }
+
+// ---------------------------------------------------------------------
+// Which names the lookup asks about.
+//
+// GitHub names a check-run after the **job**, not the step. Deriving the
+// name from the gate command instead — `cargo clippy --locked ...` → the
+// key `cargo clippy` — only ever matched on a repo that happens to name
+// its jobs after the commands they run. `workboard-financial-advice`
+// does, which is why the fixtures above are shaped that way and why the
+// heuristic shipped looking correct. Every other configured repo names
+// the job `ci`, so nothing matched, `relevant` was empty, and the whole
+// feature returned `NotEstablished` on every run with its tests green.
+// ---------------------------------------------------------------------
+
+fn gate_commands(
+    clippy_check: Option<&str>,
+    test_check: Option<&str>,
+) -> bellows::workspace::GateCommands {
+    use bellows::workflow_parse::Provenance;
+    let provenance = |check: Option<&str>| match check {
+        Some(_) => Provenance::ParsedFromWorkflow(std::path::PathBuf::from(
+            ".github/workflows/ci.yml",
+        )),
+        None => Provenance::FallbackFromConfig,
+    };
+    bellows::workspace::GateCommands {
+        clippy: "cargo clippy --locked --all-targets".to_string(),
+        clippy_source: provenance(clippy_check),
+        clippy_env: Vec::new(),
+        clippy_check: clippy_check.map(str::to_string),
+        test: "cargo test --locked --all-targets".to_string(),
+        test_source: provenance(test_check),
+        test_env: Vec::new(),
+        test_check: test_check.map(str::to_string),
+    }
+}
+
+#[test]
+fn a_single_job_workflow_asks_about_that_job_not_the_commands() {
+    // The shape that was silently broken: one job called `ci` running
+    // both commands. The lookup must ask GitHub about `ci`.
+    let names = bellows::tracker::mirrored_check_names(&gate_commands(Some("ci"), Some("ci")));
+    assert_eq!(names, vec!["ci".to_string()], "one job means one check to ask about");
+}
+
+#[test]
+fn sibling_jobs_are_both_asked_about() {
+    let names = bellows::tracker::mirrored_check_names(&gate_commands(
+        Some("cargo clippy"),
+        Some("cargo test"),
+    ));
+    assert_eq!(names, vec!["cargo clippy".to_string(), "cargo test".to_string()]);
+}
+
+#[test]
+fn a_fallback_command_contributes_no_check_name() {
+    // Unchanged contract: bellows invented that command's posture, so no
+    // check-run on the repo corresponds to it and guessing one would
+    // answer a question about a check it never mirrored.
+    assert!(bellows::tracker::mirrored_check_names(&gate_commands(None, None)).is_empty());
+    assert_eq!(
+        bellows::tracker::mirrored_check_names(&gate_commands(None, Some("ci"))),
+        vec!["ci".to_string()],
+    );
+}
+
+#[test]
+fn a_single_job_running_both_commands_is_asked_about_once() {
+    let names = bellows::tracker::mirrored_check_names(&gate_commands(Some("ci"), Some("ci")));
+    assert_eq!(names.len(), 1, "asking GitHub about `ci` twice is noise: {names:?}");
+}
+
+#[test]
+fn a_matrix_legs_axis_suffix_still_matches_its_job() {
+    // A matrix job's check-runs carry their axis values —
+    // `ci (ubuntu-latest)`. One leg failing is the job failing.
+    let health = classify_base_health(
+        &[check("ci (ubuntu-latest)", Some("failure"))],
+        BASE,
+        &["ci".to_string()],
+    );
+    assert!(
+        matches!(health, BaseHealth::Red { .. }),
+        "a failing matrix leg is the job failing: {health:?}",
+    );
+}
+
+#[test]
+fn a_workflow_prefixed_check_name_still_matches_its_job() {
+    // GitHub prefixes `workflow / job` on checks required through a
+    // ruleset. Unchanged behaviour, re-pinned against the job-name path.
+    let health =
+        classify_base_health(&[check("CI / ci", Some("success"))], BASE, &["ci".to_string()]);
+    assert!(matches!(health, BaseHealth::Green), "{health:?}");
+}
+
+#[test]
+fn an_unrelated_job_failing_at_base_is_still_not_the_gates_business() {
+    // The filter's whole point survives the change: a red deploy job is
+    // not evidence that the clippy the gate mirrors was already failing.
+    let health = classify_base_health(
+        &[
+            check("deploy", Some("failure")),
+            check("ci", Some("success")),
+        ],
+        BASE,
+        &["ci".to_string()],
+    );
+    assert!(matches!(health, BaseHealth::Green), "{health:?}");
+}

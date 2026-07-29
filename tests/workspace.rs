@@ -1398,8 +1398,16 @@ jobs:
         "clippy line must tag parsed provenance: {:?}",
         lines[0],
     );
+    // Built from `Path` components rather than a literal: the line
+    // carries a real host path, so on Windows it renders with
+    // backslashes and a hardcoded `/` never matched. This assertion was
+    // permanently red on the host bellows actually runs on, while CI
+    // (Linux) stayed green — the one failure an operator running the
+    // suite locally had to learn to ignore.
+    let workflow_suffix: std::path::PathBuf =
+        [".github", "workflows", "ci.yml"].iter().collect();
     assert!(
-        lines[0].contains(".github/workflows/ci.yml"),
+        lines[0].contains(&workflow_suffix.to_string_lossy().to_string()),
         "clippy line must name the workflow path: {:?}",
         lines[0],
     );
@@ -1642,11 +1650,16 @@ async fn push_branch_rejects_when_external_writer_advanced_origin_and_surfaces_s
 #[tokio::test]
 async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_config() {
     // Back-compat acceptance: the legacy two-arg `prepare(url, branch)`
-    // shape is still supported and resolves to the strict-default
+    // shape is still supported and resolves to the default
     // GatesConfig. This keeps existing test callers and any code path
     // that does not have access to the runtime config working without
     // a forced rewrite, while still exposing a populated
     // `gate_commands` field on the returned Workspace.
+    //
+    // The clippy default no longer denies warnings: it is reached only
+    // when bellows could not read the repo's CI, where `-D warnings`
+    // invents a bar the repo may never have met and blames the diff for
+    // pre-existing lint debt.
     let remote_dir = TempDir::new().unwrap();
     init_remote_repo(remote_dir.path());
     let remote_url = remote_dir.path().to_string_lossy().to_string();
@@ -1654,12 +1667,14 @@ async fn prepare_keeps_existing_default_gates_behaviour_for_callers_without_conf
         .await
         .unwrap();
     let gc = workspace.gate_commands();
-    assert_eq!(
-        gc.clippy, "cargo clippy --all-targets --all-features -- -D warnings",
-    );
+    assert_eq!(gc.clippy, "cargo clippy --all-targets --all-features");
     assert_eq!(gc.test, "cargo test --all-targets --all-features");
     assert!(matches!(gc.clippy_source, Provenance::FallbackFromConfig));
     assert!(matches!(gc.test_source, Provenance::FallbackFromConfig));
+    // A fallback command mirrors no CI job, so it contributes no
+    // check-run name for the base-health lookup to ask about.
+    assert_eq!(gc.clippy_check, None);
+    assert_eq!(gc.test_check, None);
 }
 
 // ---- Issue #161: large-file pre-scan snapshot + announcement ----

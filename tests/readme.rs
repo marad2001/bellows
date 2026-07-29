@@ -614,10 +614,11 @@ fn readme_documents_the_per_run_metrics_file_and_its_shape() {
 #[test]
 fn orchestrator_example_documents_gates_table_and_fallback_flags() {
     // ADR-0004 acceptance: orchestrator.example.toml documents the
-    // new `[gates]` table with explanatory comments. The defaults
-    // listed must match the strict-default flags so an operator
-    // copying the example into orchestrator.toml verbatim continues
-    // to see today's behaviour.
+    // `[gates]` table with explanatory comments. The values listed must
+    // match the real defaults, so an operator copying the example
+    // verbatim gets default behaviour — and the strict
+    // `-- -D warnings` posture must still appear, documented as the
+    // explicit opt-in it now is rather than as the default it used to be.
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("orchestrator.example.toml");
     let body = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("orchestrator.example.toml must exist: {}", e));
