@@ -6,8 +6,10 @@
 //!
 //! Each contract is pinned in exactly ONE place. Contracts already pinned by
 //! `tests/policy.rs` (the severity vocabulary, the security-review handoff
-//! paths and read-only rule, the per-finding scope / address-or-explain /
-//! verbatim-title rules, the nit skip-and-do-not-escalate rules) and by
+//! paths and read-only rule, the security-fix findings path / removal step /
+//! commit-per-finding / unaddressed-finding routing, the per-finding scope /
+//! address-or-explain / verbatim-title rules, the nit
+//! skip-and-do-not-escalate rules) and by
 //! `tests/triage.rs` (the verdict JSON schema fields, the four verdict
 //! states, the headless `gh`/no-human override, the verdict file path) are
 //! NOT restated here. Add an assertion to this file only when no existing
