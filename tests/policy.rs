@@ -3079,3 +3079,79 @@ fn a_daemon_that_answers_with_an_error_is_not_classified_unreachable() {
         );
     }
 }
+
+// ---- Container resource ceiling (2026-07-30 OOM) ----
+//
+// ADR-0004 mirrors the target's CI commands, and #180 mirrors the env
+// they run under. Neither mirrors the *machine*, and cargo's default
+// parallelism is `nproc`. GitHub's `ubuntu-latest` ran the workspace on
+// 4 CPUs / 16 GB; the gate container had 16 CPUs / 7.6 GB and
+// `cgroup memory.max = max`. Four times the parallel links on half the
+// memory, with no bound for the kernel to enforce, so the OOM killer
+// ranged over the whole VM and took `dockerd` with it.
+
+use bellows::policy::derive_container_limits;
+
+const GIB: i64 = 1024 * 1024 * 1024;
+
+#[test]
+fn the_container_ceiling_leaves_the_daemon_room_to_survive() {
+    // The remainder is not slack — `dockerd` shares the VM, and it is
+    // what dies when a container may take everything.
+    let limits = derive_container_limits(8 * GIB, 16).expect("usable daemon report");
+    assert_eq!(limits.memory_bytes, 6 * GIB, "expected 75% of the daemon's memory");
+    assert!(
+        limits.memory_bytes < 8 * GIB,
+        "a ceiling equal to the daemon's own memory contains nothing",
+    );
+}
+
+#[test]
+fn the_host_that_actually_died_would_have_been_capped_well_below_sixteen_jobs() {
+    // 7.6 GB / 16 CPUs — the real reading from the incident host.
+    let limits = derive_container_limits(7_962_808 * 1024, 16).expect("usable daemon report");
+    assert!(
+        limits.build_jobs <= 4,
+        "16 concurrent links is what killed the daemon; got {}",
+        limits.build_jobs,
+    );
+    assert!(limits.build_jobs >= 1);
+}
+
+#[test]
+fn a_large_host_still_gets_real_parallelism() {
+    // The ceiling must scale with the host, or it becomes the reason
+    // every gate is slow on a machine that could afford the work.
+    let limits = derive_container_limits(64 * GIB, 32).expect("usable daemon report");
+    assert!(
+        limits.build_jobs >= 16,
+        "a 64 GB host should not be throttled to a laptop's job count; got {}",
+        limits.build_jobs,
+    );
+}
+
+#[test]
+fn jobs_never_exceed_the_cpus_available() {
+    // Past the CPU count, jobs contend for cores while each still holds
+    // its peak memory — strictly worse on both axes.
+    let limits = derive_container_limits(64 * GIB, 4).expect("usable daemon report");
+    assert_eq!(limits.build_jobs, 4);
+}
+
+#[test]
+fn a_tiny_host_still_asks_for_at_least_one_job() {
+    // A ceiling too small for even one link is a reason to let the build
+    // fail on its own terms, not to ask cargo for zero jobs.
+    let limits = derive_container_limits(GIB, 2).expect("usable daemon report");
+    assert_eq!(limits.build_jobs, 1);
+}
+
+#[test]
+fn an_unreadable_daemon_report_imposes_nothing() {
+    // A limit derived from a nonsense reading is worse than no limit: it
+    // could throttle a healthy host to one job, or set a ceiling below
+    // what any build needs. `None` means "behave exactly as before".
+    assert_eq!(derive_container_limits(0, 16), None);
+    assert_eq!(derive_container_limits(8 * GIB, 0), None);
+    assert_eq!(derive_container_limits(-1, -1), None);
+}

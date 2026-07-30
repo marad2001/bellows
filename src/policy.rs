@@ -964,6 +964,83 @@ impl TransientSignal {
 /// carries, if any. `None` means a genuine crash — the caller keeps the
 /// run and classifies it as it always has.
 ///
+/// The resource ceiling bellows imposes on a sandbox container.
+///
+/// ADR-0004 makes the gate mirror the target repo's CI *commands* and
+/// (issue #180) the *environment* they run under. It does not mirror the
+/// *machine*, and cargo's default parallelism comes from the machine:
+/// `nproc`. On 2026-07-30 that gap was fatal. GitHub's `ubuntu-latest`
+/// runs `workboard-financial-advice` on 4 CPUs and 16 GB; the gate
+/// container saw 16 CPUs and 7.6 GB — four times the parallel link jobs
+/// on half the memory — and with `cgroup memory.max = max` there was no
+/// bound for the kernel to enforce, so the OOM killer chose victims
+/// across the whole VM and took `dockerd` with it. The orchestrator then
+/// spun claim/release on the dead daemon until it was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerLimits {
+    /// Hard memory ceiling for the container, in bytes.
+    ///
+    /// The containment half. Its job is not to make builds fit — it is to
+    /// make an overrun *local*: with a cgroup limit the OOM killer acts
+    /// inside the container and bellows sees the SIGKILL that issue #186
+    /// already knows how to retry, instead of the daemon dying.
+    pub memory_bytes: i64,
+    /// Value for `CARGO_BUILD_JOBS`.
+    ///
+    /// The prevention half — sized so concurrent link jobs fit the
+    /// ceiling above rather than discovering they don't.
+    pub build_jobs: u32,
+}
+
+/// Fraction of the daemon's memory a single container may take.
+///
+/// The remainder is not slack: `dockerd` lives in the same VM under
+/// Docker Desktop, and it is what dies when a container is allowed to
+/// consume everything.
+const CONTAINER_MEMORY_NUMERATOR: i64 = 3;
+const CONTAINER_MEMORY_DENOMINATOR: i64 = 4;
+
+/// Memory budgeted per concurrent cargo job.
+///
+/// Linking a Rust test binary is the peak: a workspace pulling in
+/// `aws-sdk-*`, `ring` and `aws-lc-sys` reaches well over a gigabyte per
+/// link even with `CARGO_PROFILE_TEST_DEBUG=0`. 1.5 GiB is chosen to sit
+/// above the observed peak while still granting real parallelism on a
+/// normal developer machine — a 32 GB host yields 16 jobs.
+const BYTES_PER_BUILD_JOB: i64 = 1536 * 1024 * 1024;
+
+/// Derive a container ceiling from what the daemon reports about itself.
+///
+/// Self-configuring rather than a fixed number, because the right answer
+/// is a property of the host: the same constant that saves a 8 GB laptop
+/// would waste most of a 64 GB workstation.
+///
+/// `None` means "impose nothing" — the pre-existing behaviour. Returned
+/// when the daemon reports values bellows cannot reason about, because a
+/// limit derived from a nonsense reading is worse than no limit: it could
+/// throttle a healthy host to one job, or set a ceiling below what any
+/// build needs.
+pub fn derive_container_limits(
+    daemon_memory_bytes: i64,
+    daemon_cpus: i64,
+) -> Option<ContainerLimits> {
+    if daemon_memory_bytes <= 0 || daemon_cpus <= 0 {
+        return None;
+    }
+    let memory_bytes = daemon_memory_bytes / CONTAINER_MEMORY_DENOMINATOR * CONTAINER_MEMORY_NUMERATOR;
+    // At least one job always: a ceiling too small for even a single link
+    // is a reason to let the build fail on its own terms, not a reason to
+    // ask cargo for zero jobs.
+    let by_memory = (memory_bytes / BYTES_PER_BUILD_JOB).max(1);
+    // Never more jobs than CPUs — past that, jobs contend for cores while
+    // still each holding their peak memory.
+    let build_jobs = by_memory.min(daemon_cpus).max(1);
+    Some(ContainerLimits {
+        memory_bytes,
+        build_jobs: build_jobs as u32,
+    })
+}
+
 /// Whether a container-probe failure means the Docker daemon is
 /// **unreachable**, as opposed to reachable but uncooperative.
 ///

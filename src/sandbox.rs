@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::auth::Auth;
 use crate::chain_walker::format_idleness_log;
-use crate::policy::{CheckResult, GateOutcome, Stall, StallTracker};
+use crate::policy::{self, CheckResult, GateOutcome, Stall, StallTracker};
 use crate::workspace::{GateCommands, Workspace};
 
 const POLICY_IMAGE_DIR: &str = "policy-image";
@@ -293,6 +293,43 @@ const CONTAINER_CLEANUP_RESERVE: Duration = Duration::from_secs(5);
 /// `DOCKER_HOST` or a missing socket path, not an unreachable daemon.
 pub fn connect_docker() -> Result<Docker, SandboxError> {
     Ok(with_daemon_timeout(Docker::connect_with_local_defaults()?))
+}
+
+/// Ask the daemon what it has, and turn that into the ceiling a single
+/// sandbox container may take (see [`policy::ContainerLimits`]).
+///
+/// Best-effort by construction. A failed `info` call, or a daemon that
+/// reports values bellows cannot reason about, yields `None` and the
+/// container runs exactly as it did before — unbounded. A run must never
+/// fail because a *sizing* query failed; the ceiling is a safety measure,
+/// and a safety measure that can itself break the pipeline is a worse
+/// bargain than the risk it removes.
+async fn resolve_container_limits(docker: &Docker) -> Option<policy::ContainerLimits> {
+    let info = docker.info().await.ok()?;
+    policy::derive_container_limits(info.mem_total.unwrap_or(0), info.ncpu.unwrap_or(0))
+}
+
+/// Narrate the ceiling once per container so an operator reading
+/// `bellows.log` can see why a build had the parallelism it did — the
+/// alternative is a gate that is mysteriously slower than CI with nothing
+/// in the log to explain it.
+fn narrate_container_limits<W: Write + ?Sized>(
+    log_writer: &mut W,
+    limits: Option<policy::ContainerLimits>,
+    what: &str,
+) {
+    match limits {
+        Some(l) => narrate!(
+            log_writer,
+            "  {what} container limits: memory {} MiB, CARGO_BUILD_JOBS={} [derived from the docker daemon's own capacity]",
+            l.memory_bytes / (1024 * 1024),
+            l.build_jobs,
+        ),
+        None => narrate!(
+            log_writer,
+            "  {what} container limits: none (docker daemon did not report usable capacity)",
+        ),
+    }
 }
 
 /// Apply [`DAEMON_REQUEST_TIMEOUT`] to a client. Split out from
@@ -1039,8 +1076,16 @@ pub async fn run_agent(
         mounts.push(m);
     }
 
+    // The agent container runs cargo too — the implement phase builds and
+    // tests as it works — so it carries the same ceiling. Containment
+    // matters more than sizing here: bellows does not choose the agent's
+    // commands, but it can stop them taking the daemon down.
+    let limits = resolve_container_limits(&docker).await;
+    narrate_container_limits(log_writer, limits, "agent");
+
     let host_config = HostConfig {
         mounts: Some(mounts),
+        memory: limits.map(|l| l.memory_bytes),
         ..Default::default()
     };
 
@@ -1155,8 +1200,15 @@ pub async fn run_cargo_checks(
         mounts.push(m);
     }
 
+    // The gate is where the OOM of 2026-07-30 happened, and where the
+    // ceiling matters most: bellows chooses the command here, so it can
+    // size the parallelism to the host rather than inherit `nproc`.
+    let limits = resolve_container_limits(&docker).await;
+    narrate_container_limits(log_writer, limits, "gate");
+
     let host_config = HostConfig {
         mounts: Some(mounts),
+        memory: limits.map(|l| l.memory_bytes),
         ..Default::default()
     };
 
@@ -1178,6 +1230,7 @@ pub async fn run_cargo_checks(
         env: Some(build_cargo_checks_env(
             workspace.gate_commands(),
             env_override,
+            limits,
         )),
         working_dir: Some("/workspace".to_string()),
         labels: Some(labels),
@@ -1438,15 +1491,42 @@ fn build_cargo_checks_entrypoint() -> Vec<String> {
 fn build_cargo_checks_env(
     gate_commands: &GateCommands,
     env_override: &[(String, String)],
+    limits: Option<policy::ContainerLimits>,
 ) -> Vec<String> {
+    // Sits *below* the CI-mirrored env, so a repo that declares its own
+    // `CARGO_BUILD_JOBS` still wins: that is a deliberate statement about
+    // how the project builds, and ADR-0004 says mirror it. This layer only
+    // fills the far more common case of a repo that says nothing, where
+    // the alternative is cargo reading `nproc` off a machine that looks
+    // nothing like the CI runner the command was written for. The #186
+    // serialised-link retry arrives as an `env_override` and still beats
+    // both.
+    let defaults: Vec<(String, String)> = limits
+        .map(|l| {
+            vec![(
+                "CARGO_BUILD_JOBS".to_string(),
+                l.build_jobs.to_string(),
+            )]
+        })
+        .unwrap_or_default();
     vec![
         format!(
             "BELLOWS_CLIPPY_CMD={}",
-            with_env_prefix(&gate_commands.clippy_env, env_override, &gate_commands.clippy),
+            with_env_prefix(
+                &defaults,
+                &gate_commands.clippy_env,
+                env_override,
+                &gate_commands.clippy,
+            ),
         ),
         format!(
             "BELLOWS_TEST_CMD={}",
-            with_env_prefix(&gate_commands.test_env, env_override, &gate_commands.test),
+            with_env_prefix(
+                &defaults,
+                &gate_commands.test_env,
+                env_override,
+                &gate_commands.test,
+            ),
         ),
     ]
 }
@@ -1462,15 +1542,20 @@ fn build_cargo_checks_env(
 /// name, because `VAR=a VAR=b cmd` is not portably defined — one
 /// assignment per name keeps the composed command unambiguous.
 fn with_env_prefix(
+    defaults: &[(String, String)],
     env: &[(String, String)],
     overrides: &[(String, String)],
     cmd: &str,
 ) -> String {
-    if env.is_empty() && overrides.is_empty() {
+    if defaults.is_empty() && env.is_empty() && overrides.is_empty() {
         return cmd.to_string();
     }
-    let mut merged: std::collections::BTreeMap<&str, &str> = env
+    // Three layers, lowest first: bellows's host-derived defaults, the
+    // env mirrored from the target's CI (#180), then per-run overrides
+    // (#186's serialised link).
+    let mut merged: std::collections::BTreeMap<&str, &str> = defaults
         .iter()
+        .chain(env.iter())
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     for (key, value) in overrides {
@@ -3026,7 +3111,7 @@ mod tests {
             test_env: Vec::new(),
             test_check: None,
         };
-        let env = build_cargo_checks_env(&gc, &[]);
+        let env = build_cargo_checks_env(&gc, &[], None);
         assert!(
             env.iter().any(|e| e
                 == "BELLOWS_CLIPPY_CMD=cargo clippy --all-targets -- -D clippy::correctness"),
@@ -3058,7 +3143,7 @@ mod tests {
             test_env: vec![("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string())],
             test_check: Some("ci".to_string()),
         };
-        let env = build_cargo_checks_env(&gc, &[]);
+        let env = build_cargo_checks_env(&gc, &[], None);
         assert!(
             env.iter().any(|e| e
                 == "BELLOWS_TEST_CMD=CARGO_PROFILE_TEST_DEBUG='0' cargo test --locked --workspace --lib --bins --tests --all-features"),
@@ -3076,7 +3161,7 @@ mod tests {
         // Issue #180 no-regression: repos whose CI sets no build env
         // (e.g. bellows itself) must see a byte-identical command.
         assert_eq!(
-            with_env_prefix(&[], &[], "cargo test --all-features"),
+            with_env_prefix(&[], &[], &[], "cargo test --all-features"),
             "cargo test --all-features",
         );
     }
@@ -3092,7 +3177,7 @@ mod tests {
             ("CARGO_PROFILE_TEST_DEBUG".to_string(), "0".to_string()),
         ];
         let overrides = vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())];
-        let rendered = with_env_prefix(&ci, &overrides, "cargo test --workspace");
+        let rendered = with_env_prefix(&[], &ci, &overrides, "cargo test --workspace");
         assert_eq!(
             rendered,
             "CARGO_BUILD_JOBS='1' CARGO_PROFILE_TEST_DEBUG='0' cargo test --workspace",
@@ -3110,9 +3195,75 @@ mod tests {
         // with no CI build env, still gets serialised linking.
         let overrides = vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())];
         assert_eq!(
-            with_env_prefix(&[], &overrides, "cargo test"),
+            with_env_prefix(&[], &[], &overrides, "cargo test"),
             "CARGO_BUILD_JOBS='1' cargo test",
         );
+    }
+
+    #[test]
+    fn the_derived_job_cap_reaches_the_gate_commands() {
+        // Prevention half of the 2026-07-30 fix: without this the
+        // container reads `nproc` (16 on the host that died) and links at
+        // a parallelism sized for nobody's machine in particular.
+        let gc = gate_commands_fixture();
+        let limits = policy::derive_container_limits(8 * 1024 * 1024 * 1024, 16);
+        let env = build_cargo_checks_env(&gc, &[], limits);
+        assert!(
+            env.iter().any(|e| e.contains("CARGO_BUILD_JOBS=")),
+            "the gate must carry a job cap: {env:?}",
+        );
+    }
+
+    #[test]
+    fn a_repo_that_declares_its_own_job_count_still_wins() {
+        // ADR-0004 says mirror CI. A repo that sets `CARGO_BUILD_JOBS`
+        // has made a deliberate statement about how it builds, and the
+        // host-derived default is only meant to fill the far more common
+        // silence.
+        let ci = vec![("CARGO_BUILD_JOBS".to_string(), "8".to_string())];
+        let defaults = vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())];
+        let rendered = with_env_prefix(&defaults, &ci, &[], "cargo test");
+        assert_eq!(rendered, "CARGO_BUILD_JOBS='8' cargo test");
+    }
+
+    #[test]
+    fn the_serialised_link_retry_still_beats_the_derived_default() {
+        // Issue #186's retry is the last word: it runs precisely because
+        // the previous attempt was OOM-killed, so nothing below it may
+        // reintroduce parallelism.
+        let defaults = vec![("CARGO_BUILD_JOBS".to_string(), "3".to_string())];
+        let ci = vec![("CARGO_BUILD_JOBS".to_string(), "8".to_string())];
+        let overrides = vec![("CARGO_BUILD_JOBS".to_string(), "1".to_string())];
+        let rendered = with_env_prefix(&defaults, &ci, &overrides, "cargo test");
+        assert_eq!(rendered, "CARGO_BUILD_JOBS='1' cargo test");
+    }
+
+    #[test]
+    fn an_unreadable_daemon_leaves_the_gate_command_byte_identical() {
+        // `None` limits must reproduce the pre-change command exactly —
+        // a sizing query that failed must not alter what runs.
+        let gc = gate_commands_fixture();
+        let with_none = build_cargo_checks_env(&gc, &[], None);
+        assert!(
+            !with_none.iter().any(|e| e.contains("CARGO_BUILD_JOBS")),
+            "no limit means no injected job cap: {with_none:?}",
+        );
+    }
+
+    /// Minimal `GateCommands` for the env-composition tests: fallback
+    /// provenance, no CI env, so any `CARGO_BUILD_JOBS` in the rendered
+    /// command can only have come from the derived default.
+    fn gate_commands_fixture() -> crate::workspace::GateCommands {
+        crate::workspace::GateCommands {
+            clippy: "cargo clippy --all-targets".to_string(),
+            clippy_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+            clippy_env: Vec::new(),
+            clippy_check: None,
+            test: "cargo test --all-targets".to_string(),
+            test_source: crate::workflow_parse::Provenance::FallbackFromConfig,
+            test_env: Vec::new(),
+            test_check: None,
+        }
     }
 
     #[test]
