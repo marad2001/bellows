@@ -3037,3 +3037,45 @@ fn gate_oom_killed_only_consults_checks_that_actually_failed() {
     };
     assert!(!bellows::policy::gate_oom_killed(&real_failure));
 }
+
+// ---- Docker-daemon reachability classification ----
+
+/// The rendered shapes a probe failure actually takes. `ProbeError`
+/// erases bollard's types at the trait boundary, so classification is on
+/// the rendered string and these strings are the contract.
+#[test]
+fn a_connect_failure_is_recognised_as_an_unreachable_daemon() {
+    for rendered in [
+        // The exact 2026-07-30 line, via hyper's named-pipe transport.
+        "container probe failed: Error in the hyper legacy client: client error (Connect)",
+        "error trying to connect: No connection could be made",
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        "Is the Docker daemon running?",
+        "connection refused",
+        // Docker Desktop stopped: the named pipe simply is not there.
+        "The system cannot find the file specified. (os error 2)",
+    ] {
+        assert!(
+            bellows::policy::probe_failure_is_daemon_unreachable(rendered),
+            "must be classified as unreachable: {rendered:?}",
+        );
+    }
+}
+
+#[test]
+fn a_daemon_that_answers_with_an_error_is_not_classified_unreachable() {
+    // These keep the proceed-anyway path: the daemon replied, so a
+    // pipeline may still run, and blocking every repo on one odd reply
+    // is the more expensive mistake.
+    for rendered in [
+        "container probe failed: 500 Internal Server Error",
+        "container probe failed: permission denied while trying to connect to the Docker daemon socket",
+        "container probe failed: Timeout error",
+        "container probe failed: error reading a body from connection",
+    ] {
+        assert!(
+            !bellows::policy::probe_failure_is_daemon_unreachable(rendered),
+            "must NOT be classified as unreachable: {rendered:?}",
+        );
+    }
+}

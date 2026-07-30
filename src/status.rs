@@ -403,6 +403,11 @@ fn format_blocked_line(reason: &BlockReason) -> String {
                 "bellows: blocked — pre-claim deletion of stale agent branch `{branch}` failed: {error} (retrying next tick)",
             )
         }
+        BlockReason::DockerUnavailable { error } => {
+            format!(
+                "bellows: blocked — cannot reach the Docker daemon, so no issue is claimed: {error} (retrying next tick; start Docker to resume)",
+            )
+        }
     }
 }
 
@@ -515,6 +520,12 @@ fn format_blocked_summary(s: &Status, b: &BlockedState) -> String {
             s.pid,
             s.started_at.to_rfc3339(),
             branch,
+            error,
+        ),
+        BlockReason::DockerUnavailable { error } => format!(
+            "bellows is running (PID {}, started at {}), blocked — cannot reach the Docker daemon, so no issue is claimed: {} (retrying next tick; start Docker to resume).",
+            s.pid,
+            s.started_at.to_rfc3339(),
             error,
         ),
     }

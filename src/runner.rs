@@ -224,6 +224,18 @@ pub enum BlockReason {
         branch: String,
         error: String,
     },
+    /// The pre-claim probe could not reach the Docker daemon at all.
+    ///
+    /// Distinct from a probe that merely errored: a connect failure means
+    /// no container can start, so every phase of every pipeline will fail.
+    /// Claiming an issue in that state costs two GitHub label writes, a
+    /// branch sweep and a clone per tick, and leaves the issue flickering
+    /// between `agent-in-progress` and `ready-for-agent` — which is
+    /// exactly what happened on 2026-07-30, once every 42 seconds, after
+    /// an OOM-killed link took the daemon down with it.
+    DockerUnavailable {
+        error: String,
+    },
 }
 
 /// A bellows-managed agent container detected by the pre-claim
@@ -885,9 +897,28 @@ pub async fn run_once(
                 return Ok(RunOutcome::Blocked { reason });
             }
             Ok(None) => {}
+            // A probe that could not reach the daemon at all is not a
+            // hiccup — it is the whole run surface being gone. Proceeding
+            // claims an issue that cannot possibly be worked, then
+            // releases it when the first docker call fails, every tick
+            // for as long as the daemon stays down.
+            Err(e) if policy::probe_failure_is_daemon_unreachable(&e.to_string()) => {
+                let reason = BlockReason::DockerUnavailable {
+                    error: e.to_string(),
+                };
+                if let Some(ctx) = status_ctx
+                    && let Err(e) = ctx.write_blocked(&reason).await
+                {
+                    narrate!(log_writer,
+                        "bellows: could not write blocked status (continuing): {}",
+                        e,
+                    );
+                }
+                return Ok(RunOutcome::Blocked { reason });
+            }
             Err(e) => {
-                // Probe failure is logged but not fail-closed: the
-                // concurrency=1 invariant is also enforced by the
+                // Any other probe failure is logged but not fail-closed:
+                // the concurrency=1 invariant is also enforced by the
                 // serial polling loop itself, so a transient daemon
                 // hiccup must not stall every repo's throughput.
                 // Subsequent ticks retry the probe.

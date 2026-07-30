@@ -265,3 +265,125 @@ pat_env_var = "BELLOWS_TEST_PAT"
         "container probe must be consulted ONCE per tick (global), not per-repo",
     );
 }
+
+// ---- An unreachable Docker daemon blocks the tick instead of
+//      claim-and-release churn. ----
+
+/// Test double whose probe fails with a given rendered error.
+struct FailingProbe {
+    error: String,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AgentContainerProbe for FailingProbe {
+    fn detect<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RunningAgentContainer>, ProbeError>> + Send + 'a>>
+    {
+        let error = self.error.clone();
+        let calls = Arc::clone(&self.calls);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProbeError::Daemon(error))
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_docker_daemon_blocks_the_tick_without_claiming() {
+    // 2026-07-30: an OOM-killed link took the Docker daemon down. The
+    // probe reported `client error (Connect)`, the tick proceeded
+    // anyway, claimed issue #651, failed on the first `docker images`
+    // call, and released the issue — once every 42 seconds, indefinitely.
+    // Each cycle cost two GitHub label writes and left the issue
+    // flickering between `agent-in-progress` and `ready-for-agent`.
+    //
+    // No GitHub mocks are mounted at all: if the tick reaches issue
+    // listing it will fail loudly rather than return Blocked, which is
+    // exactly the regression this pins.
+    let mock = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe = FailingProbe {
+        error: "Error in the hyper legacy client: client error (Connect)".to_string(),
+        calls: Arc::clone(&calls),
+    };
+    let config = config_for(&mock.uri());
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+
+    let outcome = run_once(&client, &config, &mut log, None, Some(&probe), None)
+        .await
+        .expect("an unreachable daemon is a blocked tick, not a run error");
+
+    match outcome {
+        RunOutcome::Blocked {
+            reason: BlockReason::DockerUnavailable { error },
+        } => {
+            assert!(
+                error.contains("client error (Connect)"),
+                "the operator needs the underlying error to act on: {error}",
+            );
+        }
+        other => panic!("expected Blocked(DockerUnavailable), got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "probe runs once per tick");
+
+    // The point of blocking: a tick that cannot possibly work an issue
+    // must not touch GitHub at all.
+    assert!(
+        mock.received_requests().await.unwrap_or_default().is_empty(),
+        "a blocked tick must make no GitHub calls",
+    );
+}
+
+#[tokio::test]
+async fn a_probe_error_that_is_not_a_connect_failure_still_proceeds() {
+    // The daemon answered and said something unhelpful. That may still
+    // run a pipeline, and the concurrency=1 invariant is separately
+    // enforced by the serial polling loop — so this must keep today's
+    // proceed-anyway behaviour rather than stall every repo. Reaching
+    // `MissingAgentBrief` proves the tick got past the gate.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues"))
+        .and(query_param("labels", "ready-for-agent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "number": 42,
+                "title": "proceeds past an unrecognised probe error",
+                "created_at": "2026-05-12T10:00:00Z",
+                "labels": [{ "name": "ready-for-agent" }]
+            }
+        ])))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/git/matching-refs/heads/agent/42-"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/marad2001/test-repo/issues/42/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&mock)
+        .await;
+
+    let probe = FailingProbe {
+        error: "500 Internal Server Error: something odd".to_string(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let config = config_for(&mock.uri());
+    let client = octocrab_pointed_at(mock.uri());
+    let mut log: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+
+    let result = run_once(&client, &config, &mut log, None, Some(&probe), None).await;
+    assert!(
+        matches!(result, Err(RunError::MissingAgentBrief(42))),
+        "an unrecognised probe error must not block the tick, got {result:?}",
+    );
+    let log_text = String::from_utf8(log.into_inner()).expect("utf-8");
+    assert!(
+        log_text.contains("proceeding this tick"),
+        "the proceed decision must stay visible in the log: {log_text}",
+    );
+}
