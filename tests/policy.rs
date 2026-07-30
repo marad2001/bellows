@@ -3155,3 +3155,92 @@ fn an_unreadable_daemon_report_imposes_nothing() {
     assert_eq!(derive_container_limits(8 * GIB, 0), None);
     assert_eq!(derive_container_limits(-1, -1), None);
 }
+
+// ---- Exhausted credit is not a crash (2026-07-30, issue #669) ----
+//
+// codex/gpt-5.5 exited 1 after nine seconds with
+// `ERROR: Your workspace is out of credits. Add credits to continue.`
+// No signature matched, so it fell through every transient check to
+// `Crash`: issue #669 shipped as a Crash-labelled draft, discarding a
+// successful implement, review and review-fix — ~3,400s of work — while
+// a healthy `claude` sat second in the very same chain.
+
+use bellows::policy::{
+    classify_transient_signal, is_credits_exhausted_signature, TransientSignal,
+};
+
+/// The line as codex actually emitted it.
+const CODEX_OUT_OF_CREDITS: &str =
+    "ERROR: Your workspace is out of credits. Add credits to continue.";
+
+#[test]
+fn the_codex_out_of_credits_line_is_recognised() {
+    assert!(is_credits_exhausted_signature(CODEX_OUT_OF_CREDITS));
+    assert_eq!(
+        classify_transient_signal(CODEX_OUT_OF_CREDITS),
+        Some(TransientSignal::CreditsExhausted),
+        "must never fall through to Crash again",
+    );
+}
+
+#[test]
+fn billing_shapes_from_both_providers_are_recognised() {
+    for tail in [
+        "error: insufficient_quota: You exceeded your current quota",
+        "billing_hard_limit_reached",
+        "Your credit balance is too low to access the Anthropic API",
+    ] {
+        assert_eq!(
+            classify_transient_signal(tail),
+            Some(TransientSignal::CreditsExhausted),
+            "{tail:?}",
+        );
+    }
+}
+
+#[test]
+fn exhausted_credit_outranks_a_rate_limit_in_the_same_tail() {
+    // Precedence is by cooling cost, and this is the one signal that
+    // does not clear on its own — so an incidental rate-limit substring
+    // must not shorten its window back down to a parsed reset time that
+    // will come and go with the account still empty.
+    let both = "rate_limit_error ... your workspace is out of credits";
+    assert_eq!(
+        classify_transient_signal(both),
+        Some(TransientSignal::CreditsExhausted),
+    );
+}
+
+#[test]
+fn an_ordinary_rate_limit_is_still_a_rate_limit() {
+    // The new branch must not swallow the existing signals: a rate limit
+    // clears on its own and should keep its parsed, shorter cooldown.
+    assert_eq!(
+        classify_transient_signal("rate_limit_error"),
+        Some(TransientSignal::RateLimit),
+    );
+    assert_eq!(
+        classify_transient_signal("quota exceeded"),
+        Some(TransientSignal::RateLimit),
+    );
+}
+
+#[test]
+fn ordinary_agent_prose_is_not_mistaken_for_a_billing_failure() {
+    // The signatures are matched against a stderr tail that also carries
+    // the agent's own output, so a false positive would cool a perfectly
+    // healthy engine for hours.
+    for benign in [
+        "the credits page in the README lists contributors",
+        "we ran out of time, not out of ideas",
+        "quota is a noun",
+    ] {
+        assert_eq!(classify_transient_signal(benign), None, "{benign:?}");
+    }
+}
+
+// No test pins the cooldown length: `CREDITS_EXHAUSTED_COOLDOWN_HOURS`
+// is a literal compared against a literal, so any assertion on it is
+// constant-folded and proves nothing. What matters is that the signal is
+// classified distinctly, which the tests above cover — the runner's use
+// of the longer window follows from the match arm.

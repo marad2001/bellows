@@ -942,6 +942,20 @@ pub enum TransientSignal {
     /// The **Engine** never produced a turn — it failed to start, or
     /// lost its connection mid-stream (issue #192).
     EngineStartFailure,
+    /// The engine's account has no credit left. Distinct from
+    /// `RateLimit` despite looking similar, because the two differ in
+    /// the only way that matters to routing: a rate limit clears on its
+    /// own, and this does not. Nothing but an operator adding credit
+    /// changes the answer, so a short cooldown just re-runs into the
+    /// same wall every few minutes — burning a chain entry each time.
+    ///
+    /// Observed on 2026-07-30: codex/gpt-5.5 exited 1 after nine seconds
+    /// with `ERROR: Your workspace is out of credits.` No signature
+    /// matched, so it classified as `Crash` and shipped issue #669 as a
+    /// Crash-labelled draft — discarding a successful implement, review
+    /// and review-fix, roughly 3,400 seconds of work — while a healthy
+    /// `claude` sat next in the very same chain.
+    CreditsExhausted,
 }
 
 impl TransientSignal {
@@ -956,8 +970,41 @@ impl TransientSignal {
                 "a zero-turn engine start-failure (the engine never started, \
                  or lost its connection mid-stream)"
             }
+            TransientSignal::CreditsExhausted => {
+                "an exhausted credit balance (only an operator can clear this)"
+            }
         }
     }
+}
+
+/// How long an engine is cooled after [`TransientSignal::CreditsExhausted`].
+///
+/// Long enough that a run does not keep spending a chain entry on an
+/// engine that cannot answer, short enough that topping up mid-session
+/// is picked up without restarting bellows. The other signals cool for
+/// two minutes because they clear themselves; this one does not.
+pub const CREDITS_EXHAUSTED_COOLDOWN_HOURS: i64 = 6;
+
+/// Whether `text` says the engine's account is out of credit.
+///
+/// Deliberately not folded into [`is_rate_limit_signature`]. Both mean
+/// "this engine cannot serve you", but the rate-limit path parses a
+/// reset timestamp and cools until then — machinery that is actively
+/// wrong here, because there is no reset to wait for.
+pub fn is_credits_exhausted_signature(text: &str) -> bool {
+    const SIGNATURES: [&str; 5] = [
+        // Codex CLI, observed verbatim on workboard-financial-advice
+        // during issue #669's security-review phase.
+        "out of credits",
+        // OpenAI API billing shapes.
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        // Anthropic API billing shapes.
+        "credit balance is too low",
+        "billing_error",
+    ];
+    let lower = text.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
 /// Classify a failed run's stderr tail into the transient signal it
@@ -1079,12 +1126,17 @@ pub fn probe_failure_is_daemon_unreachable(rendered: &str) -> bool {
     SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
-/// Precedence is by cooling cost: a rate-limit shape wins over an
-/// incidental 503 substring so the longer, parsed cooldown is recorded
-/// rather than the short one, and either outage shape wins over a
-/// start-failure for the same reason.
+/// Precedence is by cooling cost: exhausted credit outranks everything
+/// because it is the only signal that does not clear on its own, so its
+/// cooldown must not be shortened by an incidental rate-limit or 503
+/// substring in the same tail. Below it, a rate-limit shape wins over an
+/// incidental 503 so the longer, parsed cooldown is recorded rather than
+/// the short one, and either outage shape wins over a start-failure for
+/// the same reason.
 pub fn classify_transient_signal(text: &str) -> Option<TransientSignal> {
-    if is_rate_limit_signature(text) {
+    if is_credits_exhausted_signature(text) {
+        Some(TransientSignal::CreditsExhausted)
+    } else if is_rate_limit_signature(text) {
         Some(TransientSignal::RateLimit)
     } else if is_service_unavailable_signature(text) {
         Some(TransientSignal::ServiceOutage)
