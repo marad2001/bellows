@@ -964,6 +964,44 @@ impl TransientSignal {
 /// carries, if any. `None` means a genuine crash — the caller keeps the
 /// run and classifies it as it always has.
 ///
+/// Whether a container-probe failure means the Docker daemon is
+/// **unreachable**, as opposed to reachable but uncooperative.
+///
+/// The distinction decides whether a tick claims an issue. A daemon that
+/// answers and returns an error may still run a pipeline; a daemon that
+/// cannot be connected to will fail every phase of every run, so claiming
+/// costs two GitHub label writes, a stale-branch sweep and a clone, and
+/// then hands the issue straight back. On 2026-07-30 an OOM-killed link
+/// took the daemon down and bellows spun that cycle every 42 seconds,
+/// flickering issue #651 between `agent-in-progress` and
+/// `ready-for-agent` with no prospect of progress.
+///
+/// Matched on the rendered error rather than a typed variant because the
+/// probe deliberately erases bollard's types at its boundary
+/// (`ProbeError::Daemon(String)`) to keep the trait dependency-free for
+/// test doubles.
+///
+/// Signature list is conservative: an unrecognised error keeps today's
+/// proceed-anyway behaviour, which fails one run rather than stalling
+/// every repo on a false positive.
+pub fn probe_failure_is_daemon_unreachable(rendered: &str) -> bool {
+    // Lowercased comparison; each entry is already lowercase.
+    const SIGNATURES: [&str; 7] = [
+        // hyper/bollard, both named-pipe and unix-socket transports
+        "client error (connect)",
+        "error trying to connect",
+        // classic daemon-down shapes
+        "connection refused",
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
+        // Windows: the named pipe is absent when Docker Desktop is stopped
+        "the system cannot find the file specified",
+        "no such file or directory",
+    ];
+    let lower = rendered.to_lowercase();
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
 /// Precedence is by cooling cost: a rate-limit shape wins over an
 /// incidental 503 substring so the longer, parsed cooldown is recorded
 /// rather than the short one, and either outage shape wins over a
