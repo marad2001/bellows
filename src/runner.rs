@@ -3768,6 +3768,29 @@ fn classify_and_record_implement_transient(
                 advances_used,
             )
         }
+        // Exhausted credit is cooled for hours, not minutes: it is the
+        // one signal here that no amount of waiting clears, so a short
+        // window would spend a chain entry re-discovering the same wall
+        // every couple of minutes.
+        policy::TransientSignal::CreditsExhausted => {
+            state.record_rate_limit(
+                engine,
+                now + chrono::Duration::hours(policy::CREDITS_EXHAUSTED_COOLDOWN_HOURS),
+            );
+            announce(
+                log_writer,
+                &format!(
+                    "bellows: implement engine={} hit {}; marking it cooling for {} hours — add credit to restore it sooner",
+                    engine.as_name(),
+                    signal.log_label(),
+                    policy::CREDITS_EXHAUSTED_COOLDOWN_HOURS,
+                ),
+            );
+            match decide_implement_rate_limit_action(at_base_sha, advances_used) {
+                ImplementRateLimitAction::InPlaceAdvance => RateLimitDisposition::InPlaceAdvance,
+                ImplementRateLimitAction::Terminate => RateLimitDisposition::Terminate,
+            }
+        }
         policy::TransientSignal::ServiceOutage | policy::TransientSignal::EngineStartFailure => {
             state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
             announce(
@@ -3907,6 +3930,16 @@ fn classify_and_record_fallback(
         // is enough to let the chain walk past this engine in-run.
         policy::TransientSignal::ServiceOutage | policy::TransientSignal::EngineStartFailure => {
             state.record_rate_limit(engine, now + chrono::Duration::minutes(2));
+        }
+        // Exhausted credit does not clear itself, so the window is hours:
+        // every later phase in this run — and the next few runs — should
+        // walk straight past this engine rather than spend a chain entry
+        // rediscovering it.
+        policy::TransientSignal::CreditsExhausted => {
+            state.record_rate_limit(
+                engine,
+                now + chrono::Duration::hours(policy::CREDITS_EXHAUSTED_COOLDOWN_HOURS),
+            );
         }
     }
     let signal = signal.log_label();
