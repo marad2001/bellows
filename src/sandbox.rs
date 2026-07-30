@@ -1044,11 +1044,14 @@ pub async fn run_agent(
     deadline: Option<Duration>,
     stall_watch: Option<StallWatch>,
 ) -> Result<AgentRun, SandboxError> {
-    let env = build_agent_env(issue_number, auth)?;
-
     let image_tag = ensure_policy_image().await?;
 
     let docker = connect_docker()?;
+
+    // Resolved before the env is built, because the env carries the job
+    // cap derived from it.
+    let limits = resolve_container_limits(&docker).await;
+    let env = build_agent_env(issue_number, auth, limits)?;
     let run_id = Uuid::new_v4().to_string();
 
     // tempfile gives an absolute path already; canonicalize() on Windows
@@ -1116,8 +1119,29 @@ pub async fn run_agent(
     })
 }
 
-fn build_agent_env(issue_number: u64, auth: &Auth) -> Result<Vec<String>, SandboxError> {
+fn build_agent_env(
+    issue_number: u64,
+    auth: &Auth,
+    limits: Option<policy::ContainerLimits>,
+) -> Result<Vec<String>, SandboxError> {
     let mut env = vec![format!("BELLOWS_ISSUE_NUMBER={issue_number}")];
+    // The agent builds and tests as it works, so it needs the same job
+    // cap the gate gets (#209). Without it the memory ceiling is only
+    // containment: cargo reads `nproc` — 16 on the host that prompted
+    // this — and can start sixteen jobs against a hard limit that one
+    // `rustc` was already occupying 3.1 GiB of, so the cgroup kills the
+    // agent's build mid-implement.
+    //
+    // #209 set the ceiling here but left the cap to the gate, reasoning
+    // that bellows does not choose the agent's commands. That was the
+    // wrong cut: bellows does not choose the commands, but it does own
+    // the environment they run in, which is exactly where a default
+    // belongs. A container-level env var is a floor, not a rule — an
+    // agent that has reason to pick its own parallelism still can, by
+    // setting the variable on the command it runs.
+    if let Some(l) = limits {
+        env.push(format!("CARGO_BUILD_JOBS={}", l.build_jobs));
+    }
     env.extend(auth.try_extra_env().map_err(SandboxError::AuthEnv)?);
     Ok(env)
 }
@@ -2509,6 +2533,44 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_container_carries_the_same_job_cap_as_the_gate() {
+        // The agent builds and tests as it works. #209 gave this
+        // container a memory ceiling but left the job cap to the gate,
+        // so cargo still read `nproc` — 16 on the host that prompted
+        // this — and could start sixteen jobs against a hard limit one
+        // `rustc` was already holding 3.1 GiB of.
+        let auth = Auth::Subscription {
+            engine: crate::config::Engine::Claude,
+            model: None,
+            credentials_volume_name: "bellows-claude-credentials".to_string(),
+        };
+        let limits = policy::derive_container_limits(8 * 1024 * 1024 * 1024, 16)
+            .expect("usable daemon report");
+        let env = build_agent_env(42, &auth, Some(limits)).expect("env builds");
+        assert!(
+            env.iter()
+                .any(|e| e == &format!("CARGO_BUILD_JOBS={}", limits.build_jobs)),
+            "the agent container must carry the derived job cap: {env:?}",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_daemon_leaves_the_agent_env_as_it_was() {
+        // Same contract as the gate: a failed sizing query must not
+        // change what the container runs with.
+        let auth = Auth::Subscription {
+            engine: crate::config::Engine::Claude,
+            model: None,
+            credentials_volume_name: "bellows-claude-credentials".to_string(),
+        };
+        let env = build_agent_env(42, &auth, None).expect("env builds");
+        assert!(
+            !env.iter().any(|e| e.starts_with("CARGO_BUILD_JOBS")),
+            "no limits means no injected cap: {env:?}",
+        );
+    }
+
+    #[test]
     fn build_agent_env_surfaces_env_file_errors_without_panicking() {
         let dir = TempDir::new().unwrap();
         let auth = Auth::EnvFile {
@@ -2517,7 +2579,7 @@ mod tests {
             env_file_path: dir.path().join("missing.env"),
         };
 
-        let err = build_agent_env(42, &auth).expect_err("missing env-file must error");
+        let err = build_agent_env(42, &auth, None).expect_err("missing env-file must error");
 
         assert!(matches!(err, SandboxError::AuthEnv(_)));
     }
